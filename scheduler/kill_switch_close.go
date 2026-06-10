@@ -74,6 +74,11 @@ type KillSwitchCloseInputs struct {
 	TSCloser  TopStepLiveCloser
 	TSFetcher TopStepPositionsFetcher
 
+	// BloFinLiveAllPerps: every live BloFin perps strategy configured.
+	BloFinLiveAllPerps []StrategyConfig
+	BloFinCloser        BloFinLiveCloser
+	BloFinFetcher       BloFinPositionsFetcher
+
 	PortfolioReason string
 
 	// CloseTimeout is the default per-platform close-budget when a

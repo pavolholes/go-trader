@@ -49,9 +49,10 @@ func collectPriceSymbols(strategies []StrategyConfig) []string {
 // The returned coins are used as inputs to fetchHyperliquidMids and
 // fetchOKXPerpsMids respectively. This is the correct oracle for perps
 // positions; see issue #263 for why BinanceUS spot is wrong.
-func collectPerpsMarkSymbols(strategies []StrategyConfig) (hlCoins, okxCoins []string) {
+func collectPerpsMarkSymbols(strategies []StrategyConfig) (hlCoins, okxCoins, blofinCoins []string) {
 	hlSet := make(map[string]bool)
 	okxSet := make(map[string]bool)
+	blofinSet := make(map[string]bool)
 	for _, sc := range strategies {
 		if sc.Type != "perps" {
 			continue
@@ -68,6 +69,8 @@ func collectPerpsMarkSymbols(strategies []StrategyConfig) (hlCoins, okxCoins []s
 			hlSet[coin] = true
 		case "okx":
 			okxSet[coin] = true
+		case "blofin":
+			blofinSet[coin] = true
 		}
 	}
 	hlCoins = make([]string, 0, len(hlSet))
@@ -81,7 +84,13 @@ func collectPerpsMarkSymbols(strategies []StrategyConfig) (hlCoins, okxCoins []s
 		okxCoins = append(okxCoins, c)
 	}
 	sort.Strings(okxCoins)
-	return hlCoins, okxCoins
+
+	blofinCoins = make([]string, 0, len(blofinSet))
+	for c := range blofinSet {
+		blofinCoins = append(blofinCoins, c)
+	}
+	sort.Strings(blofinCoins)
+	return hlCoins, okxCoins, blofinCoins
 }
 
 // mergePerpsMarks copies non-zero perps mark prices into the shared prices
@@ -638,6 +647,10 @@ const PlatformPendingCloseHyperliquid = "hyperliquid"
 // OKX perpetual swap reduce-only closes (#360 phase 2 of #357).
 const PlatformPendingCloseOKX = "okx"
 
+// PlatformPendingCloseBloFin is the map key in RiskState.PendingCircuitCloses for
+// BloFin perpetual swap reduce-only closes.
+const PlatformPendingCloseBloFin = "blofin"
+
 // PlatformPendingCloseRobinhood is the map key in RiskState.PendingCircuitCloses
 // for Robinhood crypto closes (#361 phase 3). Robinhood crypto has no
 // reduce-only primitive — the drain submits a full market_sell of the coin's
@@ -734,6 +747,11 @@ type PlatformRiskAssist struct {
 	// crypto (Type=="spot") strategy. Left nil at the CheckRisk call site today
 	// — see setRobinhoodCircuitBreakerPending.
 	RHLiveAll []StrategyConfig
+	// BloFinPositions is the pre-fetched live BloFin perps position snapshot.
+	BloFinPositions []BloFinPosition
+	// BloFinLiveAll mirrors HLLiveAll/OKXLiveAll — every live configured BloFin
+	// perps strategy on this scheduler.
+	BloFinLiveAll []StrategyConfig
 	// TSPositions is the pre-fetched live TopStep futures position snapshot
 	// for the configured account. Populated in main.go from a once-per-cycle
 	// fetch_topstep_positions.py call (#362). Empty slice with TSLiveAll set
@@ -1101,6 +1119,31 @@ func setOKXCircuitBreakerPending(sc *StrategyConfig, s *StrategyState, assist *P
 	})
 }
 
+// setBloFinCircuitBreakerPending mirrors setOKXCircuitBreakerPending for
+// BloFin perps.
+func setBloFinCircuitBreakerPending(sc *StrategyConfig, s *StrategyState, assist *PlatformRiskAssist) {
+	if sc == nil || assist == nil || len(assist.BloFinPositions) == 0 {
+		return
+	}
+	if sc.Platform != "blofin" || sc.Type != "perps" || !blofinIsLive(sc.Args) {
+		return
+	}
+	sym := blofinSymbol(sc.Args)
+	if sym == "" {
+		return
+	}
+	if _, ok := s.Positions[sym]; !ok {
+		return
+	}
+	qty, ok := computeBloFinCircuitCloseQty(sym, s.ID, assist.BloFinPositions, assist.BloFinLiveAll)
+	if !ok || qty <= 0 {
+		return
+	}
+	s.RiskState.setPendingCircuitClose(PlatformPendingCloseBloFin, &PendingCircuitClose{
+		Symbols: []PendingCircuitCloseSymbol{{Symbol: sym, Size: qty}},
+	})
+}
+
 // rolloverDailyPnL resets DailyPnL to zero whenever the UTC date has advanced
 // past DailyPnLDate. Calling this at both risk-check time and trade-record time
 // ensures the reset is applied regardless of which code path runs first after
@@ -1376,6 +1419,7 @@ func CheckRisk(sc *StrategyConfig, s *StrategyState, portfolioValue float64, pri
 			r.CircuitBreakerUntil = now.Add(24 * time.Hour)
 			setHyperliquidCircuitBreakerPending(sc, s, assist)
 			setOKXCircuitBreakerPending(sc, s, assist)
+			setBloFinCircuitBreakerPending(sc, s, assist)
 			setRobinhoodCircuitBreakerPending(sc, s, assist)
 			setTopStepCircuitBreakerPending(sc, s, assist)
 			setOperatorRequiredCircuitBreakerPending(sc, s)
@@ -1393,6 +1437,7 @@ func CheckRisk(sc *StrategyConfig, s *StrategyState, portfolioValue float64, pri
 		r.CircuitBreakerUntil = now.Add(1 * time.Hour)
 		setHyperliquidCircuitBreakerPending(sc, s, assist)
 		setOKXCircuitBreakerPending(sc, s, assist)
+		setBloFinCircuitBreakerPending(sc, s, assist)
 		setRobinhoodCircuitBreakerPending(sc, s, assist)
 		setTopStepCircuitBreakerPending(sc, s, assist)
 		setOperatorRequiredCircuitBreakerPending(sc, s)

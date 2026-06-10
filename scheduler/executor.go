@@ -1391,3 +1391,189 @@ func FetchFuturesMarks(symbols []string) (map[string]float64, string, error) {
 	}
 	return marks, mode, nil
 }
+
+// BloFinResult is the JSON output from check_blofin.py (signal check mode).
+type BloFinResult struct {
+	StrategyDecisionFields
+	Strategy   string                 `json:"strategy"`
+	Symbol     string                 `json:"symbol"`
+	Timeframe  string                 `json:"timeframe"`
+	Signal     int                    `json:"signal"`
+	Price      float64                `json:"price"`
+	Indicators map[string]interface{} `json:"indicators"`
+	Mode       string                 `json:"mode"`
+	Platform   string                 `json:"platform"`
+	Timestamp  string                 `json:"timestamp"`
+	Error      string                 `json:"error,omitempty"`
+}
+
+// BloFinFill holds fill details from a live BloFin order.
+type BloFinFill struct {
+	AvgPx   float64 `json:"avg_px"`
+	TotalSz float64 `json:"total_sz"`
+	OID     string  `json:"oid,omitempty"`
+	Fee     float64 `json:"fee,omitempty"`
+}
+
+// BloFinExecution is the execution block from check_blofin.py --execute output.
+type BloFinExecution struct {
+	Action string       `json:"action"`
+	Symbol string       `json:"symbol"`
+	Size   float64      `json:"size"`
+	Fill   *BloFinFill  `json:"fill,omitempty"`
+}
+
+// BloFinExecuteResult is the top-level JSON from check_blofin.py --execute.
+type BloFinExecuteResult struct {
+	Execution *BloFinExecution `json:"execution"`
+	Platform  string           `json:"platform"`
+	Timestamp string           `json:"timestamp"`
+	Error     string           `json:"error,omitempty"`
+}
+
+// BloFinCloseFill is the parsed fill block from close_blofin_position.py.
+type BloFinCloseFill struct {
+	AvgPx   float64 `json:"avg_px,omitempty"`
+	TotalSz float64 `json:"total_sz,omitempty"`
+	OID     string  `json:"oid,omitempty"`
+	Fee     float64 `json:"fee,omitempty"`
+}
+
+// BloFinClose is the close block from close_blofin_position.py.
+type BloFinClose struct {
+	Symbol      string         `json:"symbol"`
+	Fill        *BloFinCloseFill `json:"fill,omitempty"`
+	AlreadyFlat bool           `json:"already_flat,omitempty"`
+}
+
+// BloFinCloseResult is the top-level JSON from close_blofin_position.py.
+type BloFinCloseResult struct {
+	Close     *BloFinClose `json:"close"`
+	Platform  string       `json:"platform"`
+	Timestamp string       `json:"timestamp"`
+	Error     string       `json:"error,omitempty"`
+}
+
+// BloFinPositionJSON is the per-position payload from fetch_blofin_positions.py.
+type BloFinPositionJSON struct {
+	Coin          string  `json:"coin"`
+	Size          float64 `json:"size"`
+	EntryPrice    float64 `json:"entry_price"`
+	Side          string  `json:"side"`
+	UnrealizedPnL float64 `json:"unrealized_pnl"`
+}
+
+// BloFinPositionsResult is the JSON output from fetch_blofin_positions.py.
+type BloFinPositionsResult struct {
+	Positions []BloFinPositionJSON `json:"positions"`
+	Platform  string               `json:"platform"`
+	Timestamp string               `json:"timestamp"`
+	Error     string               `json:"error,omitempty"`
+}
+
+// RunBloFinCheck runs check_blofin.py in signal check mode and parses the result.
+func RunBloFinCheck(script string, args []string) (*BloFinResult, string, error) {
+	stdout, stderr, err := RunPythonScript(script, args)
+	stderrStr := string(stderr)
+	if err != nil {
+		var result BloFinResult
+		if jsonErr := json.Unmarshal(stdout, &result); jsonErr == nil && result.Error != "" {
+			return &result, stderrStr, nil
+		}
+		return nil, stderrStr, fmt.Errorf("script error: %w (stderr: %s)", err, stderrStr)
+	}
+	var result BloFinResult
+	if err := json.Unmarshal(stdout, &result); err != nil {
+		return nil, stderrStr, fmt.Errorf("parse output: %w (stdout: %s)", err, string(stdout))
+	}
+	return &result, stderrStr, nil
+}
+
+// RunBloFinExecute runs check_blofin.py in execute mode (live orders).
+func RunBloFinExecute(script, symbol, side string, size float64) (*BloFinExecuteResult, string, error) {
+	args := []string{
+		"--execute",
+		fmt.Sprintf("--symbol=%s", symbol),
+		fmt.Sprintf("--side=%s", side),
+		fmt.Sprintf("--size=%g", size),
+		"--mode=live",
+	}
+	stdout, stderr, err := runPythonSideEffect(script, args)
+	stderrStr := string(stderr)
+	if err != nil {
+		var result BloFinExecuteResult
+		if jsonErr := json.Unmarshal(stdout, &result); jsonErr == nil && result.Error != "" {
+			return &result, stderrStr, nil
+		}
+		return nil, stderrStr, fmt.Errorf("execute error: %w (stderr: %s)", err, stderrStr)
+	}
+	var result BloFinExecuteResult
+	if err := json.Unmarshal(stdout, &result); err != nil {
+		return nil, stderrStr, fmt.Errorf("parse execute output: %w (stdout: %s)", err, string(stdout))
+	}
+	return &result, stderrStr, nil
+}
+
+// RunBloFinClose runs close_blofin_position.py to submit a reduce-only market close.
+func RunBloFinClose(script, symbol string, partialSz *float64) (*BloFinCloseResult, string, error) {
+	args := []string{
+		fmt.Sprintf("--symbol=%s", symbol),
+		"--mode=live",
+	}
+	if partialSz != nil {
+		args = append(args, fmt.Sprintf("--sz=%s", strconv.FormatFloat(*partialSz, 'f', -1, 64)))
+	}
+	stdout, stderr, runErr := runPythonSideEffect(script, args)
+	return parseBloFinCloseOutput(stdout, string(stderr), runErr)
+}
+
+// parseBloFinCloseOutput turns raw subprocess output into (*BloFinCloseResult, stderr, error).
+func parseBloFinCloseOutput(stdout []byte, stderrStr string, runErr error) (*BloFinCloseResult, string, error) {
+	var result BloFinCloseResult
+	parseErr := json.Unmarshal(stdout, &result)
+	switch {
+	case runErr == nil && parseErr == nil && result.Error == "":
+		return &result, stderrStr, nil
+	case runErr == nil && parseErr == nil && result.Error != "":
+		return &result, stderrStr, fmt.Errorf("close reported error despite exit 0: %s", result.Error)
+	case parseErr == nil && result.Error != "":
+		return &result, stderrStr, fmt.Errorf("close failed: %s", result.Error)
+	case parseErr == nil && runErr != nil:
+		return &result, stderrStr, fmt.Errorf("close subprocess exit %v with no error field (stderr: %s)", runErr, stderrStr)
+	default:
+		return nil, stderrStr, fmt.Errorf("parse close output: %v (run err: %v, stdout: %s)", parseErr, runErr, string(stdout))
+	}
+}
+
+// RunBloFinFetchPositions runs fetch_blofin_positions.py and returns the parsed result.
+func RunBloFinFetchPositions(script string) (*BloFinPositionsResult, string, error) {
+	stdout, stderr, runErr := RunPythonScript(script, nil)
+	return parseBloFinPositionsOutput(stdout, string(stderr), runErr)
+}
+
+// parseBloFinPositionsOutput is the pure parser for fetch_blofin_positions.py output.
+func parseBloFinPositionsOutput(stdout []byte, stderrStr string, runErr error) (*BloFinPositionsResult, string, error) {
+	var result BloFinPositionsResult
+	parseErr := json.Unmarshal(stdout, &result)
+	switch {
+	case runErr == nil && parseErr == nil && result.Error == "":
+		return &result, stderrStr, nil
+	case runErr == nil && parseErr == nil && result.Error != "":
+		return &result, stderrStr, fmt.Errorf("positions reported error despite exit 0: %s", result.Error)
+	case parseErr == nil && result.Error != "":
+		return &result, stderrStr, fmt.Errorf("positions fetch failed: %s", result.Error)
+	case parseErr == nil && runErr != nil:
+		return &result, stderrStr, fmt.Errorf("positions subprocess exit %v with no error field (stderr: %s)", runErr, stderrStr)
+	default:
+		return nil, stderrStr, fmt.Errorf("parse positions output: %v (run err: %v, stdout: %s)", parseErr, runErr, string(stdout))
+	}
+}
+
+// ComputePerpsSize computes the perps order size in base units from a notional
+// value and a reference price.
+func ComputePerpsSize(sc StrategyConfig, notional, price float64) float64 {
+	if price <= 0 {
+		return 0
+	}
+	return notional / price
+}

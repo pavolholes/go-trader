@@ -65,7 +65,7 @@ func NewStatusServer(state *AppState, mu *sync.RWMutex, statusToken string, stra
 	// venue the position lives on (#263); futures on the TopStep rail (#261).
 	symbols := collectPriceSymbols(strategies)
 	futuresSymbols := collectFuturesMarkSymbols(strategies)
-	hlCoins, okxCoins := collectPerpsMarkSymbols(strategies)
+	hlCoins, okxCoins, _ := collectPerpsMarkSymbols(strategies)
 	return &StatusServer{
 		state:          state,
 		mu:             mu,

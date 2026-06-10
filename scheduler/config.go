@@ -870,6 +870,8 @@ func loadConfig(path string, skipLiveCredentialChecks bool) (*Config, error) {
 				cfg.Strategies[i].Platform = "luno"
 			case strings.HasPrefix(cfg.Strategies[i].ID, "okx-"):
 				cfg.Strategies[i].Platform = "okx"
+			case strings.HasPrefix(cfg.Strategies[i].ID, "bl-"):
+				cfg.Strategies[i].Platform = "blofin"
 			case cfg.Strategies[i].Type == "options":
 				cfg.Strategies[i].Platform = "deribit"
 			default:
@@ -1444,6 +1446,16 @@ func validateConfig(cfg *Config, skipLiveCredentialChecks bool) error {
 						} else if sc.Platform == "hyperliquid" || sc.Platform == "" {
 							if os.Getenv("HYPERLIQUID_SECRET_KEY") == "" {
 								errs = append(errs, fmt.Sprintf("%s: --mode=live requires HYPERLIQUID_SECRET_KEY env var", prefix))
+							}
+						} else if sc.Platform == "blofin" {
+							if os.Getenv("BLOFIN_API_KEY") == "" {
+								errs = append(errs, fmt.Sprintf("%s: --mode=live requires BLOFIN_API_KEY env var", prefix))
+							}
+							if os.Getenv("BLOFIN_API_SECRET") == "" {
+								errs = append(errs, fmt.Sprintf("%s: --mode=live requires BLOFIN_API_SECRET env var", prefix))
+							}
+							if os.Getenv("BLOFIN_PASSPHRASE") == "" {
+								errs = append(errs, fmt.Sprintf("%s: --mode=live requires BLOFIN_PASSPHRASE env var", prefix))
 							}
 						}
 						break
