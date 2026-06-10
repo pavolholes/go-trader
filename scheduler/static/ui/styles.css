@@ -583,7 +583,7 @@ h3 {
 .trade-history-table td {
   padding: 7px 10px;
   text-align: left;
-  border-bottom: 1px solid #edf0ea;
+  border-bottom: 1px solid var(--line);
   white-space: nowrap;
 }
 
@@ -731,7 +731,7 @@ h3 {
 
 .view-mode-button[aria-pressed="true"] {
   border-color: #2f6f51;
-  background: #e8efe8;
+  background: var(--strategy-active-bg);
 }
 
 .content {
@@ -776,7 +776,7 @@ h3 {
 .overview-table th,
 .overview-table td {
   padding: 10px 12px;
-  border-bottom: 1px solid #edf0ea;
+  border-bottom: 1px solid var(--line);
   text-align: left;
   white-space: nowrap;
 }
@@ -784,7 +784,7 @@ h3 {
 .overview-table th {
   position: sticky;
   top: 0;
-  background: #fbfcf8;
+  background: var(--sidebar-bg);
   color: var(--muted);
   font-size: 12px;
   text-transform: uppercase;
@@ -811,11 +811,11 @@ h3 {
 }
 
 .overview-row:hover {
-  background: #eef2ea;
+  background: var(--strategy-hover);
 }
 
 .overview-row.active {
-  background: #e8efe8;
+  background: var(--strategy-active-bg);
 }
 
 .overview-table td {

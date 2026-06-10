@@ -11,5 +11,6 @@ RUN mkdir -p /app/.venv/bin && ln -sf /usr/local/bin/python3 /app/.venv/bin/pyth
 WORKDIR /app
 COPY --from=builder /build /app
 COPY --from=builder /go-trader /app/scheduler/go-trader
+RUN mkdir -p /app/scheduler/logs && chmod 777 /app/scheduler/logs
 EXPOSE 8100
 CMD ./scheduler/go-trader
