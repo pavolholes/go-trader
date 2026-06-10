@@ -25,9 +25,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "platforms", "b
 def main():
     try:
         from adapter import BloFinExchangeAdapter
-        adapter = BloFinExchangeAdapter(mode="live")
+        adapter = BloFinExchangeAdapter()
         if not adapter.is_live:
-            _emit_error("BloFin adapter not live — set BLOFIN_API_KEY_LIVE / BLOFIN_API_SECRET_LIVE / BLOFIN_PASSPHRASE_LIVE")
+            _emit_error("BloFin adapter not live — set BLOFIN_API_KEY / BLOFIN_API_SECRET / BLOFIN_PASSPHRASE")
             return
         raw = adapter.get_positions()
     except Exception as e:

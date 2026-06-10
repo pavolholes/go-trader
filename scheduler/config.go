@@ -1448,14 +1448,14 @@ func validateConfig(cfg *Config, skipLiveCredentialChecks bool) error {
 								errs = append(errs, fmt.Sprintf("%s: --mode=live requires HYPERLIQUID_SECRET_KEY env var", prefix))
 							}
 						} else if sc.Platform == "blofin" {
-							if os.Getenv("BLOFIN_API_KEY_LIVE") == "" {
-								errs = append(errs, fmt.Sprintf("%s: --mode=live requires BLOFIN_API_KEY_LIVE env var", prefix))
+							if os.Getenv("BLOFIN_API_KEY") == "" {
+								errs = append(errs, fmt.Sprintf("%s: --mode=live requires BLOFIN_API_KEY env var", prefix))
 							}
-							if os.Getenv("BLOFIN_API_SECRET_LIVE") == "" {
-								errs = append(errs, fmt.Sprintf("%s: --mode=live requires BLOFIN_API_SECRET_LIVE env var", prefix))
+							if os.Getenv("BLOFIN_API_SECRET") == "" {
+								errs = append(errs, fmt.Sprintf("%s: --mode=live requires BLOFIN_API_SECRET env var", prefix))
 							}
-							if os.Getenv("BLOFIN_PASSPHRASE_LIVE") == "" {
-								errs = append(errs, fmt.Sprintf("%s: --mode=live requires BLOFIN_PASSPHRASE_LIVE env var", prefix))
+							if os.Getenv("BLOFIN_PASSPHRASE") == "" {
+								errs = append(errs, fmt.Sprintf("%s: --mode=live requires BLOFIN_PASSPHRASE env var", prefix))
 							}
 						}
 						break

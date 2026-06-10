@@ -100,7 +100,7 @@ def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=
             list_close_strategies,
         )
 
-        adapter = BloFinExchangeAdapter(mode=mode)
+        adapter = BloFinExchangeAdapter()
 
         strategy_params = {}
         if strategy_name == "delta_neutral_funding" and inst_type == "swap":
@@ -277,7 +277,7 @@ def run_execute(symbol, side, size, mode):
 
     try:
         from adapter import BloFinExchangeAdapter
-        adapter = BloFinExchangeAdapter(mode=mode)
+        adapter = BloFinExchangeAdapter()
         is_buy = side.lower() == "buy"
         result = adapter.market_open(symbol, is_buy, size, inst_type="swap")
 

@@ -5,15 +5,10 @@ Supports paper (public API only, no credentials) and
 live (real orders on BloFin, API credentials required) modes.
 
 Environment variables:
-    BLOFIN_API_KEY_LIVE     — API key for live mode
-    BLOFIN_API_SECRET_LIVE  — API secret for live mode
-    BLOFIN_PASSPHRASE_LIVE  — API passphrase for live mode
-    BLOFIN_BASE_URL_LIVE    — API base URL for live mode
-    BLOFIN_API_KEY_DEMO     — API key for demo/paper mode
-    BLOFIN_API_SECRET_DEMO  — API secret for demo/paper mode
-    BLOFIN_PASSPHRASE_DEMO  — API passphrase for demo/paper mode
-    BLOFIN_BASE_URL_DEMO    — API base URL for demo/paper mode (default: https://demo-trading-openapi.blofin.com)
-    (fallback: BLOFIN_API_KEY, BLOFIN_API_SECRET, BLOFIN_PASSPHRASE, BLOFIN_BASE_URL)
+    BLOFIN_API_KEY       — API key for live trading
+    BLOFIN_API_SECRET    — API secret for live trading
+    BLOFIN_PASSPHRASE    — API passphrase for live trading
+    BLOFIN_BASE_URL      — API base URL (demo or live)
 """
 
 import hashlib
@@ -36,18 +31,16 @@ class BloFinExchangeAdapter:
     Exchange adapter for BloFin — perpetual swaps (futures).
 
     Paper mode:  no credentials needed; uses public API for market data.
-    Live mode:   requires BLOFIN_API_KEY_LIVE, BLOFIN_API_SECRET_LIVE, BLOFIN_PASSPHRASE_LIVE.
+    Live mode:   requires BLOFIN_API_KEY, BLOFIN_API_SECRET, BLOFIN_PASSPHRASE.
     """
 
-    def __init__(self, mode: str = "live"):
-        mode_prefix = "LIVE" if mode == "live" else "DEMO"
-        self.api_key = os.environ.get(f"BLOFIN_API_KEY_{mode_prefix}", os.environ.get("BLOFIN_API_KEY", ""))
-        self.api_secret = os.environ.get(f"BLOFIN_API_SECRET_{mode_prefix}", os.environ.get("BLOFIN_API_SECRET", ""))
-        self.passphrase = os.environ.get(f"BLOFIN_PASSPHRASE_{mode_prefix}", os.environ.get("BLOFIN_PASSPHRASE", ""))
-        base_default = "https://openapi.blofin.com" if mode == "live" else "https://demo-trading-openapi.blofin.com"
-        self.base_url = os.environ.get(f"BLOFIN_BASE_URL_{mode_prefix}", os.environ.get("BLOFIN_BASE_URL", base_default))
-        self._mode = mode
-        self._is_live = mode == "live" and bool(self.api_key and self.api_secret and self.passphrase)
+    def __init__(self):
+        self.api_key = os.environ.get("BLOFIN_API_KEY", "")
+        self.api_secret = os.environ.get("BLOFIN_API_SECRET", "")
+        self.passphrase = os.environ.get("BLOFIN_PASSPHRASE", "")
+        self.base_url = os.environ.get("BLOFIN_BASE_URL", "https://demo-trading-openapi.blofin.com")
+
+        self._is_live = bool(self.api_key and self.api_secret and self.passphrase)
 
     @property
     def is_live(self) -> bool:
@@ -152,7 +145,7 @@ class BloFinExchangeAdapter:
 
     def get_perp_price(self, symbol: str) -> float:
         try:
-            ticker = self.get_ticker(f"{symbol}-USDT")
+            ticker = self.get_ticker(f"{symbol}-USDT-SWAP")
             price = float(ticker.get("last", 0) or ticker.get("askPx", 0))
             return price if price > 0 else 0.0
         except Exception:
@@ -183,11 +176,11 @@ class BloFinExchangeAdapter:
         return result
 
     def get_perp_ohlcv(self, symbol: str, interval: str = "1h", limit: int = 200) -> list:
-        return self.get_ohlcv(f"{symbol}-USDT", interval, limit)
+        return self.get_ohlcv(f"{symbol}-USDT-SWAP", interval, limit)
 
     def get_funding_rate(self, symbol: str) -> float:
         try:
-            data = self._public_get("/api/v1/market/funding-rate", {"instId": f"{symbol}-USDT"})
+            data = self._public_get("/api/v1/market/funding-rate", {"instId": f"{symbol}-USDT-SWAP"})
             rates = data.get("data", [])
             if rates:
                 return float(rates[0].get("fundingRate", 0))
@@ -198,7 +191,7 @@ class BloFinExchangeAdapter:
     def get_funding_rate_history(self, symbol: str, limit: int = 100) -> list:
         try:
             data = self._public_get("/api/v1/market/funding-rate-history", {
-                "instId": f"{symbol}-USDT",
+                "instId": f"{symbol}-USDT-SWAP",
                 "limit": str(limit),
             })
             records = data.get("data", [])
@@ -302,11 +295,11 @@ class BloFinExchangeAdapter:
     def market_open(self, symbol: str, is_buy: bool, size: float, inst_type: str = "swap") -> dict:
         if not self._is_live:
             raise RuntimeError(
-                "market_open requires live mode (set BLOFIN_API_KEY_LIVE, BLOFIN_API_SECRET_LIVE, BLOFIN_PASSPHRASE_LIVE)"
+                "market_open requires live mode (set BLOFIN_API_KEY, BLOFIN_API_SECRET, BLOFIN_PASSPHRASE)"
             )
         side = "buy" if is_buy else "sell"
         result = self.place_order(
-            inst_id=f"{symbol}-USDT",
+            inst_id=f"{symbol}-USDT-SWAP",
             margin_mode="cross",
             side=side,
             order_type="market",
@@ -317,9 +310,9 @@ class BloFinExchangeAdapter:
     def market_close(self, symbol: str, sz: Optional[float] = None) -> dict:
         if not self._is_live:
             raise RuntimeError(
-                "market_close requires live mode (set BLOFIN_API_KEY_LIVE, BLOFIN_API_SECRET_LIVE, BLOFIN_PASSPHRASE_LIVE)"
+                "market_close requires live mode (set BLOFIN_API_KEY, BLOFIN_API_SECRET, BLOFIN_PASSPHRASE)"
             )
-        inst_id = f"{symbol}-USDT"
+        inst_id = f"{symbol}-USDT-SWAP"
         positions = self.get_positions(inst_id)
         pos_side = "net"
         pos_qty = 0.0
