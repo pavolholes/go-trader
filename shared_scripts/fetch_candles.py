@@ -80,7 +80,7 @@ def _load_adapter(platform, mode):
         sys.path.insert(0, os.path.join(ROOT, "platforms", "blofin"))
         from adapter import BloFinExchangeAdapter
 
-        return BloFinExchangeAdapter()
+        return BloFinExchangeAdapter(mode=mode)
     return None
 
 

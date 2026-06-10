@@ -23,9 +23,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "platforms", "b
 def main():
     try:
         from adapter import BloFinExchangeAdapter
-        adapter = BloFinExchangeAdapter()
+        adapter = BloFinExchangeAdapter(mode="live")
         if not adapter.is_live:
-            _emit_error("BloFin adapter not live — set BLOFIN_API_KEY / BLOFIN_API_SECRET / BLOFIN_PASSPHRASE")
+            _emit_error("BloFin adapter not live — set BLOFIN_API_KEY_LIVE / BLOFIN_API_SECRET_LIVE / BLOFIN_PASSPHRASE_LIVE")
             return
         balance = adapter.get_account_balance()
     except Exception as e:

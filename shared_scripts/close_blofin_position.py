@@ -37,7 +37,7 @@ def main():
 
     try:
         from adapter import BloFinExchangeAdapter
-        adapter = BloFinExchangeAdapter()
+        adapter = BloFinExchangeAdapter(mode=args.mode)
         if not adapter.is_live:
             _emit_error(args.symbol, "BloFin adapter not live — set BLOFIN_API_KEY / BLOFIN_API_SECRET / BLOFIN_PASSPHRASE")
             return

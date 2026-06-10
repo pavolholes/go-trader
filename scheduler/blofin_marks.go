@@ -50,7 +50,7 @@ func fetchBloFinPerpsMids(coins []string) (map[string]float64, error) {
 
 	want := make(map[string]string, len(coins))
 	for _, c := range coins {
-		want[c+"-USDT-SWAP"] = c
+		want[c+"-USDT"] = c
 	}
 
 	marks := make(map[string]float64, len(coins))

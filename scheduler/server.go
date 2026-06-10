@@ -175,7 +175,7 @@ func bindWithFallback(port, maxAttempts int) (net.Listener, int, error) {
 	var lastErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		tryPort := port + attempt
-		addr := fmt.Sprintf("localhost:%d", tryPort)
+		addr := fmt.Sprintf(":%d", tryPort)
 		listener, err := net.Listen("tcp", addr)
 		if err == nil {
 			return listener, tryPort, nil
@@ -213,8 +213,8 @@ func (ss *StatusServer) Start(port int) {
 		// /health pid as the external detection signal.
 		fmt.Printf("[server] WARNING: requested port %d was in use, bound to %d instead — another go-trader may already be running on %d; compare /health pid across ports\n", port, boundPort, port)
 	}
-	fmt.Printf("[server] Status endpoint at http://localhost:%d/status\n", boundPort)
-	fmt.Printf("[server] Dashboard at http://localhost:%d/dashboard\n", boundPort)
+	fmt.Printf("[server] Status endpoint at http://:%d/status\n", boundPort)
+	fmt.Printf("[server] Dashboard at http://:%d/dashboard\n", boundPort)
 	if ss.statusToken != "" {
 		fmt.Printf("[server] Dashboard API requires the configured status token\n")
 	}
