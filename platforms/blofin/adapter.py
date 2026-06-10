@@ -145,7 +145,7 @@ class BloFinExchangeAdapter:
 
     def get_perp_price(self, symbol: str) -> float:
         try:
-            ticker = self.get_ticker(f"{symbol}-USDT-SWAP")
+            ticker = self.get_ticker(f"{symbol}-USDT")
             price = float(ticker.get("last", 0) or ticker.get("askPx", 0))
             return price if price > 0 else 0.0
         except Exception:
@@ -176,11 +176,11 @@ class BloFinExchangeAdapter:
         return result
 
     def get_perp_ohlcv(self, symbol: str, interval: str = "1h", limit: int = 200) -> list:
-        return self.get_ohlcv(f"{symbol}-USDT-SWAP", interval, limit)
+        return self.get_ohlcv(f"{symbol}-USDT", interval, limit)
 
     def get_funding_rate(self, symbol: str) -> float:
         try:
-            data = self._public_get("/api/v1/market/funding-rate", {"instId": f"{symbol}-USDT-SWAP"})
+            data = self._public_get("/api/v1/market/funding-rate", {"instId": f"{symbol}-USDT"})
             rates = data.get("data", [])
             if rates:
                 return float(rates[0].get("fundingRate", 0))
@@ -191,7 +191,7 @@ class BloFinExchangeAdapter:
     def get_funding_rate_history(self, symbol: str, limit: int = 100) -> list:
         try:
             data = self._public_get("/api/v1/market/funding-rate-history", {
-                "instId": f"{symbol}-USDT-SWAP",
+                "instId": f"{symbol}-USDT",
                 "limit": str(limit),
             })
             records = data.get("data", [])
@@ -299,7 +299,7 @@ class BloFinExchangeAdapter:
             )
         side = "buy" if is_buy else "sell"
         result = self.place_order(
-            inst_id=f"{symbol}-USDT-SWAP",
+            inst_id=f"{symbol}-USDT",
             margin_mode="cross",
             side=side,
             order_type="market",
@@ -312,7 +312,7 @@ class BloFinExchangeAdapter:
             raise RuntimeError(
                 "market_close requires live mode (set BLOFIN_API_KEY, BLOFIN_API_SECRET, BLOFIN_PASSPHRASE)"
             )
-        inst_id = f"{symbol}-USDT-SWAP"
+        inst_id = f"{symbol}-USDT"
         positions = self.get_positions(inst_id)
         pos_side = "net"
         pos_qty = 0.0
