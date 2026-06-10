@@ -545,7 +545,7 @@ h3 {
   flex: 0 0 auto;
   border-top: 1px solid var(--line);
   padding: 12px 14px 14px;
-  background: #fbfcf8;
+  background: var(--sidebar-bg);
 }
 
 .trade-history h3 {
