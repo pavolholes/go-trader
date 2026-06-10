@@ -76,13 +76,18 @@ def _load_adapter(platform, mode):
         from adapter import RobinhoodExchangeAdapter
 
         return RobinhoodExchangeAdapter(mode=mode or "paper")
+    if platform == "blofin":
+        sys.path.insert(0, os.path.join(ROOT, "platforms", "blofin"))
+        from adapter import BloFinExchangeAdapter
+
+        return BloFinExchangeAdapter()
     return None
 
 
 def _fetch(args):
     adapter = _load_adapter(args.platform, args.mode)
     if adapter is not None:
-        if args.platform == "okx" and args.type == "perps":
+        if args.platform in ("okx", "blofin") and args.type == "perps":
             rows = adapter.get_perp_ohlcv(args.symbol, interval=args.timeframe, limit=args.limit)
         else:
             rows = adapter.get_ohlcv(args.symbol, interval=args.timeframe, limit=args.limit)
@@ -94,7 +99,7 @@ def _fetch(args):
     if "/" not in symbol and args.type in ("perps", "manual"):
         symbol = f"{symbol}/USDT"
     exchange_id = args.platform if args.platform else "binanceus"
-    if exchange_id in ("manual", "hyperliquid"):
+    if exchange_id in ("manual", "hyperliquid", "blofin"):
         exchange_id = "binanceus"
     df = fetch_ohlcv(
         symbol=symbol,
