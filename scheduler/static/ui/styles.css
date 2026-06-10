@@ -313,7 +313,6 @@ h3 {
 }
 
 .sidebar-toggle {
-  display: none;
   flex-shrink: 0;
 }
 
@@ -346,6 +345,10 @@ h3 {
   border-radius: 6px;
   cursor: pointer;
   font-weight: 800;
+}
+
+.sidebar-toggle {
+  display: none;
 }
 
 .icon-button[aria-pressed="true"] {
@@ -624,9 +627,7 @@ h3 {
   }
 
   .sidebar-toggle {
-    display: flex;
-    align-items: center;
-    justify-content: center;
+    display: grid;
   }
 
   .sidebar {
