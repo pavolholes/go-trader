@@ -384,6 +384,7 @@ h3 {
 }
 
 .chart-panel {
+  max-height: calc(100vh - 140px);
   display: flex;
   flex-direction: column;
   min-height: 520px;
@@ -391,6 +392,7 @@ h3 {
 }
 
 .chart-wrap {
+  max-height: 520px;
   position: relative;
   flex: 1 1 auto;
   min-height: 320px;
