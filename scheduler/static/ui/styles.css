@@ -50,6 +50,17 @@ html.dark {
   --focus-border: #3d9a6f;
 }
 
+
+html.dark .view-mode-button[aria-pressed="true"] {
+  border-color: #3d9a6f;
+  background: #28332d;
+}
+
+
+html.dark .overview-table th {
+  background: var(--sidebar-bg);
+}
+
 * {
   box-sizing: border-box;
 }
@@ -551,7 +562,7 @@ h3 {
   overflow: auto;
   border: 1px solid var(--line);
   border-radius: 6px;
-  background: #ffffff;
+  background: var(--panel);
 }
 
 .trade-history-table {
@@ -709,7 +720,7 @@ h3 {
 }
 .view-mode-button {
   border: 1px solid var(--line-strong);
-  background: #ffffff;
+  background: var(--input-bg);
   color: var(--text);
   border-radius: 6px;
   padding: 0 14px;
