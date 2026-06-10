@@ -624,7 +624,9 @@ h3 {
   }
 
   .sidebar-toggle {
-    display: grid;
+    display: flex;
+    align-items: center;
+    justify-content: center;
   }
 
   .sidebar {

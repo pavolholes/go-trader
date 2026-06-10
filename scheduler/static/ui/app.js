@@ -145,7 +145,13 @@
     els.sidebarBackdrop.addEventListener("click", function () {
       setSidebarOpen(false);
     });
-    window.matchMedia(MOBILE_SIDEBAR_MQ).addEventListener("change", syncSidebarForViewport);
+    var mql = window.matchMedia(MOBILE_SIDEBAR_MQ);
+    if (mql.addEventListener) {
+      mql.addEventListener("change", syncSidebarForViewport);
+    } else if (mql.addListener) {
+      mql.addListener(syncSidebarForViewport);
+    }
+
     document.addEventListener("keydown", function (event) {
       if (event.key === "Escape" && document.body.classList.contains("sidebar-open")) {
         setSidebarOpen(false);
