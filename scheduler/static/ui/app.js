@@ -875,8 +875,31 @@
     return value === undefined || value === null ? "" : String(value).toLowerCase();
   }
 
+  function filterValue(row, key) {
+    if (key === "pnl_pct") return fmtPct(row.pnl_pct);
+    if (key === "win_rate") return row.win_rate ? fmtPct(row.win_rate) : "-";
+    if (key === "sharpe") return row.sharpe ? fmtNumber(row.sharpe) : "-";
+    return row[key] === undefined || row[key] === null ? "-" : String(row[key]);
+  }
+
+  function filterOverviewRows(rows) {
+    const filters = {};
+    document.querySelectorAll(".overview-filter-input").forEach(function (input) {
+      const key = input.dataset.key;
+      const value = input.value.trim().toLowerCase();
+      if (value) filters[key] = value;
+    });
+    if (Object.keys(filters).length === 0) return rows;
+    return rows.filter(function (row) {
+      return Object.keys(filters).every(function (key) {
+        const filterValueStr = filterValue(row, key).toLowerCase();
+        return filterValueStr.indexOf(filters[key]) !== -1;
+      });
+    });
+  }
+
   function sortedOverviewRows() {
-    const rows = state.overviewRows.slice();
+    const rows = filterOverviewRows(state.overviewRows.slice());
     const dir = state.sortDir === "desc" ? -1 : 1;
     rows.sort(function (a, b) {
       const av = sortValue(a, state.sortKey);
@@ -892,6 +915,13 @@
     document.querySelectorAll(".sort-button").forEach(function (button) {
       const key = button.dataset.key;
       const active = key === state.sortKey;
+      const baseText = button.dataset.key.toUpperCase();
+      if (active) {
+        const arrow = state.sortDir === "asc" ? "▲" : "▼";
+        button.innerHTML = baseText + ' <span class="sort-arrow">' + arrow + "</span>";
+      } else {
+        button.textContent = baseText;
+      }
       button.classList.toggle("active", active);
       button.setAttribute("aria-sort", active ? (state.sortDir === "asc" ? "ascending" : "descending") : "none");
     });
@@ -1068,6 +1098,11 @@
         state.sortKey = key;
         state.sortDir = "asc";
       }
+      renderOverviewTable();
+    });
+  });
+  document.querySelectorAll(".overview-filter-input").forEach(function (input) {
+    input.addEventListener("input", function () {
       renderOverviewTable();
     });
   });

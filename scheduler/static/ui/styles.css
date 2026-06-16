@@ -808,6 +808,12 @@ h3 {
   font-weight: 700;
 }
 
+.sort-arrow {
+  font-size: 10px;
+  margin-left: 4px;
+  opacity: 0.8;
+}
+
 .overview-row {
   cursor: pointer;
 }
@@ -822,6 +828,29 @@ h3 {
 
 .overview-table td {
   font-variant-numeric: tabular-nums;
+}
+
+.overview-filter-row td {
+  padding: 6px;
+  border-bottom: 1px solid var(--line);
+  background: var(--sidebar-bg);
+}
+
+.overview-filter-input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 4px 6px;
+  border: 1px solid var(--line-strong);
+  background: var(--input-bg);
+  color: var(--text);
+  border-radius: 4px;
+  outline: none;
+  font: inherit;
+  font-size: 11px;
+}
+
+.overview-filter-input:focus {
+  border-color: var(--focus-border);
 }
 
 .pnl-pos {

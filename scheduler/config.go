@@ -1512,7 +1512,7 @@ func validateConfig(cfg *Config, skipLiveCredentialChecks bool) error {
 			if sc.Type != "perps" && sc.Type != "manual" {
 				errs = append(errs, fmt.Sprintf("%s: leverage is only supported for perps strategies (got type %q)", prefix, sc.Type))
 			}
-			if sc.Leverage < 1 || sc.Leverage > 100 {
+			if sc.Leverage < 1 || sc.Leverage > 150 {
 				errs = append(errs, fmt.Sprintf("%s: leverage must be in [1, 100], got %g", prefix, sc.Leverage))
 			}
 		}
@@ -1525,7 +1525,7 @@ func validateConfig(cfg *Config, skipLiveCredentialChecks bool) error {
 			if sc.Type != "perps" && sc.Type != "manual" {
 				errs = append(errs, fmt.Sprintf("%s: sizing_leverage is only supported for perps strategies (got type %q)", prefix, sc.Type))
 			}
-			if sc.SizingLeverage < 0.01 || sc.SizingLeverage > 100 {
+			if sc.SizingLeverage < 0.01 || sc.SizingLeverage > 150 {
 				errs = append(errs, fmt.Sprintf("%s: sizing_leverage must be in [0.01, 100], got %g", prefix, sc.SizingLeverage))
 			}
 		}

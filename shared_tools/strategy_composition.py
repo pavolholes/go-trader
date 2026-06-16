@@ -25,6 +25,8 @@ POSITION_CONTEXT_PARAM_KEYS = {"side", "avg_cost", "current_quantity", "initial_
 class CloseEvaluation:
     strategy: str
     close_fraction: float
+    sl_price: float = 0.0
+    atr_value: float = 0.0
 
 
 @dataclass
@@ -355,6 +357,8 @@ def evaluate_open_close(
                 close_evals.append(CloseEvaluation(
                     strategy=resolved,
                     close_fraction=result.get("close_fraction", 0.0),
+                    sl_price=result.get("sl_price", 0.0),
+                    atr_value=result.get("atr_value", 0.0),
                 ))
                 continue
             except ValueError as exc:
@@ -377,6 +381,7 @@ def evaluate_open_close(
     )
 
 
+
 def finalize_decision(
     evaluation: OpenCloseEvaluation,
     position_side: str,
@@ -385,6 +390,13 @@ def finalize_decision(
     signal = evaluation.open_signal if open_signal is None else normalize_signal(open_signal)
     open_action = open_action_from_signal(signal)
     close_fraction, close_strategy = max_close_fraction(evaluation.close_evaluations)
+    sl_price = 0.0
+    atr_value = 0.0
+    for ev in evaluation.close_evaluations:
+        if clamp_close_fraction(ev.close_fraction) == close_fraction and ev.sl_price > 0:
+            sl_price = ev.sl_price
+            atr_value = ev.atr_value
+            break
     return {
         "open_strategy": evaluation.open_strategy,
         "close_strategies": evaluation.close_strategies,
@@ -392,4 +404,6 @@ def finalize_decision(
         "close_fraction": close_fraction,
         "close_strategy": close_strategy,
         "signal": compose_signal(open_action, close_fraction, position_side),
+        "sl_price": sl_price,
+        "atr_value": atr_value,
     }

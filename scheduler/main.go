@@ -1368,6 +1368,7 @@ func main() {
 					okxLiveStrategy := sc.Platform == "okx" && okxIsLive(sc.Args)
 					rhLiveStrategy := sc.Type == "spot" && sc.Platform == "robinhood" && robinhoodIsLive(sc.Args)
 					tsLiveStrategy := sc.Type == "futures" && sc.Platform == "topstep" && topstepIsLive(sc.Args)
+					blofinLiveStrategy := sc.Type == "perps" && sc.Platform == "blofin" && blofinIsLive(sc.Args)
 
 					// Phase 1: RLock — read inputs needed for subprocess
 					mu.RLock()
@@ -1425,6 +1426,24 @@ func main() {
 								hlLastAddPrice = pos.LastAddPrice
 								hlAddedNotionalUSD = pos.AddedNotionalUSD
 								hlScaleInResizePending = pos.ScaleInResizePending
+							}
+						}
+					}
+					var blofinCash float64
+					var blofinPosQty float64
+					var blofinPosSide string
+					var blofinAvgCost float64
+					var blofinPosCtx PositionCtx
+					if sc.Platform == "blofin" {
+						if blofinLiveStrategy {
+							blofinCash = stratState.Cash
+						}
+						if sym := blofinSymbol(sc.Args); sym != "" {
+							if pos, ok := stratState.Positions[sym]; ok {
+								blofinPosCtx = positionCtxForCheck(sc, pos, cfg.Regime)
+								blofinPosSide = blofinPosCtx.Side
+								blofinPosQty = blofinPosCtx.Quantity
+								blofinAvgCost = blofinPosCtx.AvgCost
 							}
 						}
 					}
@@ -1650,6 +1669,33 @@ func main() {
 								if !liveExecFailed {
 									mu.Lock()
 									trades, detail = executeOKXResult(sc, stratState, stateDB, result, execResult, signalStr, price, cfg.Regime, logger)
+									mu.Unlock()
+								}
+							}
+						} else if sc.Platform == "blofin" {
+							if result, signalStr, price, ok := runBloFinCheck(sc, prices, blofinPosCtx, cfg.Regime, notifier, logger); ok {
+								prices[result.Symbol] = price
+								storeRegime := globalRegimeStore.PayloadForStrategy(sc, cfg.Regime)
+								result.Regime = &storeRegime
+								if gateRegime, regimeBlocked := applyRegimeGate(sc, storeRegime, cfg.Regime, blofinPosQty); regimeBlocked {
+									logger.Info("Regime gate: open signal blocked (regime=%s)", gateRegime)
+									result.Signal = 0
+								}
+								mu.Lock()
+								syncStrategyRegimeState(stratState, storeRegime, cfg.Regime)
+								mu.Unlock()
+								var execResult *BloFinExecuteResult
+								liveExecFailed := false
+								if blofinIsLive(sc.Args) && result.Signal != 0 {
+									if er, ok2 := runBloFinExecuteOrder(sc, result, price, blofinCash, blofinPosQty, blofinPosSide, blofinAvgCost, notifier, logger); ok2 {
+										execResult = er
+									} else {
+										liveExecFailed = true
+									}
+								}
+								if !liveExecFailed {
+									mu.Lock()
+									trades, detail = executeBloFinResult(sc, stratState, stateDB, result, execResult, signalStr, price, cfg.Regime, logger)
 									mu.Unlock()
 								}
 							}
@@ -4191,8 +4237,11 @@ func runBloFinExecuteOrder(sc StrategyConfig, result *BloFinResult, price, cash,
 		logger.Info("BloFin: computed size <= 0, skipping order")
 		return nil, false
 	}
+	if result.StopLossPrice > 0 {
+		logger.Info("BloFin: SL price=%.2f for %s", result.StopLossPrice, sym)
+	}
 	logger.Info("BloFin: placing %s order %s sz=%.6f (notional=%.2f)", side, sym, size, notional)
-	execResult, stderr, err := RunBloFinExecute(sc.Script, sym, side, size)
+	execResult, stderr, err := RunBloFinExecute(sc.Script, sym, side, size, result.StopLossPrice)
 	if stderr != "" {
 		logger.Warn("BloFin execute stderr: %s", stderr)
 	}
@@ -4225,6 +4274,10 @@ func executeBloFinResult(sc StrategyConfig, s *StrategyState, db *StateDB, resul
 		logger.Info("Live fill at $%.2f qty=%.6f (mid was $%.2f)", fillPrice, fillQty, price)
 	}
 
+	if result.StopLossPrice > 0 {
+		logger.Info("SL hit for %s: sl_price=$.2f atr_value=%.2f", result.Symbol, result.StopLossPrice, result.ATRValue)
+	}
+
 	exec, err := ExecutePerpsSignalWithLeverageDeferredOpen(s, result.Signal, result.Symbol, fillPrice, EffectiveSizingLeverage(sc), EffectiveExchangeLeverage(sc), EffectiveMarginPerTradeUSD(sc), fillQty, fillOID, fillFee, EffectiveDirection(sc), result.CloseFraction, logger)
 	if err != nil {
 		logger.Error("Trade execution failed: %v", err)
@@ -4247,4 +4300,3 @@ func executeBloFinResult(sc StrategyConfig, s *StrategyState, db *StateDB, resul
 	}
 	return trades, detail
 }
-

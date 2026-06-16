@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -1490,13 +1491,23 @@ func RunBloFinCheck(script string, args []string) (*BloFinResult, string, error)
 }
 
 // RunBloFinExecute runs check_blofin.py in execute mode (live orders).
-func RunBloFinExecute(script, symbol, side string, size float64) (*BloFinExecuteResult, string, error) {
+func RunBloFinExecute(script, symbol, side string, size float64, slPrice float64, tpPrices ...float64) (*BloFinExecuteResult, string, error) {
 	args := []string{
 		"--execute",
 		fmt.Sprintf("--symbol=%s", symbol),
 		fmt.Sprintf("--side=%s", side),
 		fmt.Sprintf("--size=%g", size),
 		"--mode=live",
+	}
+	if slPrice > 0 {
+		args = append(args, fmt.Sprintf("--sl-price=%g", slPrice))
+	}
+	if len(tpPrices) > 0 {
+		tpStrs := make([]string, len(tpPrices))
+		for i, tp := range tpPrices {
+			tpStrs[i] = strconv.FormatFloat(tp, 'f', -1, 64)
+		}
+		args = append(args, "--tp-prices="+strings.Join(tpStrs, ","))
 	}
 	stdout, stderr, err := runPythonSideEffect(script, args)
 	stderrStr := string(stderr)

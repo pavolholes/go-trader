@@ -392,6 +392,22 @@ func buildEditableFields(sc StrategyConfig, mergedParams, defaults map[string]in
 		)
 	}
 
+	if sc.Type == "perps" && sc.Platform == "blofin" {
+		if sc.CloseStrategy != nil {
+			if v, ok := sc.CloseStrategy.Params["sl_atr_mult"]; ok {
+				if f, ok := v.(float64); ok {
+					fields = append(fields, UIEditableField{
+						Key:     "close_strategy.params.sl_atr_mult",
+						Label:   "Close SL ATR mult",
+						Type:    "number",
+						Value:   f,
+						Group:   "risk",
+					})
+				}
+			}
+		}
+	}
+
 	keys := make([]string, 0, len(mergedParams))
 	for k := range mergedParams {
 		keys = append(keys, k)
@@ -542,6 +558,27 @@ func mergeStrategyTunerOverrides(base StrategyConfig, overrides map[string]json.
 		}
 		out.OpenStrategy.Params[paramKey] = v
 	}
+	for key, raw := range overrides {
+		if !strings.HasPrefix(key, "close_strategy.params.") {
+			continue
+		}
+		paramKey := strings.TrimPrefix(key, "close_strategy.params.")
+		if paramKey == "" {
+			continue
+		}
+		if out.CloseStrategy == nil {
+			out.CloseStrategy = &StrategyRef{Name: "tiered_tp_atr_regime"}
+		}
+		if out.CloseStrategy.Params == nil {
+			out.CloseStrategy.Params = make(map[string]interface{})
+		}
+		var v interface{}
+		if err := json.Unmarshal(raw, &v); err != nil {
+			return out, fmt.Errorf("%s: %w", key, err)
+		}
+		out.CloseStrategy.Params[paramKey] = v
+	}
+
 	return out, nil
 }
 
@@ -864,5 +901,63 @@ func patchStrategyJSON(item map[string]json.RawMessage, merged StrategyConfig, o
 			return item, err
 		}
 	}
+	closeParamOverrides := map[string]interface{}{}
+	for key, raw := range overrides {
+		if !strings.HasPrefix(key, "close_strategy.params.") {
+			continue
+		}
+		paramKey := strings.TrimPrefix(key, "close_strategy.params.")
+		if paramKey == "" {
+			continue
+		}
+		var v interface{}
+		if err := json.Unmarshal(raw, &v); err != nil {
+			return item, fmt.Errorf("%s: %w", key, err)
+		}
+		closeParamOverrides[paramKey] = v
+	}
+	if raw, ok := overrides["close_strategy"]; ok {
+		var ref StrategyRef
+		if err := json.Unmarshal(raw, &ref); err != nil {
+			return item, fmt.Errorf("close_strategy: %w", err)
+		}
+		closeRef := merged.CloseStrategy
+		if ref.Name != "" {
+			closeRef.Name = ref.Name
+		}
+		if ref.Params != nil {
+			if closeRef.Params == nil {
+				closeRef.Params = map[string]interface{}{}
+			}
+			for k, v := range ref.Params {
+				closeRef.Params[k] = v
+			}
+		}
+		if err := set("close_strategy", closeRef); err != nil {
+			return item, err
+		}
+	} else if len(closeParamOverrides) > 0 {
+		closeRef := StrategyRef{}
+		if raw, ok := item["close_strategy"]; ok {
+			_ = json.Unmarshal(raw, &closeRef)
+		}
+		if closeRef.Name == "" {
+			if merged.CloseStrategy != nil && merged.CloseStrategy.Name != "" {
+				closeRef.Name = merged.CloseStrategy.Name
+			} else {
+				closeRef.Name = "tiered_tp_atr_regime"
+			}
+		}
+		if closeRef.Params == nil {
+			closeRef.Params = map[string]interface{}{}
+		}
+		for k, v := range closeParamOverrides {
+			closeRef.Params[k] = v
+		}
+		if err := set("close_strategy", closeRef); err != nil {
+			return item, err
+		}
+	}
+
 	return item, nil
 }

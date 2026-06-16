@@ -1,11 +1,11 @@
-"""Regime-aware tiered ATR take-profit (frozen at open) — #733.
+"""Regime-aware tiered ATR take-profit with SL support.
 
 Multipliers are resolved once at position open via ``position["regime"]``
 (the regime stamped on the Go-side Position) and frozen for the lifetime
 of the position. Compatible with HL on-chain reduce-only TP placement
 because the tier prices are determined when the order is armed.
 
-For per-bar re-resolution see :mod:`tiered_tp_atr_live_regime`.
+SL is checked first (takes priority over TP).
 """
 
 from __future__ import annotations
@@ -29,19 +29,17 @@ from regime_atr import (
 )
 
 
+DEFAULT_SL_ATR_MULT = 1.5
+
+
 def _resolve_tiers_for_regime(
     params: dict, regime: str
 ) -> Tuple[List[Tuple[float, float]], List[str]]:
     """Walk the configured tier specs and return concrete
     [(atr_multiple, cumulative_close_fraction)] for the given regime label.
 
-    Returns (tiers, errors). Errors are returned as strings so the caller
-    can surface them — the live runtime should never see errors here (the
-    Go config loader validates at startup), but tests and the backtester
-    rely on this helper to mirror parser semantics.
+    Returns (tiers, errors).
     """
-    # #841 2b: unified per-regime block — select this regime's scalar ladder and
-    # build the cumulative (atr_multiple, close_fraction) list directly.
     if close_params_are_unified_regime(params):
         scalar, _ = unified_regime_scalar_params(params, regime)
         if scalar is None:
@@ -66,11 +64,6 @@ def _resolve_tiers_for_regime(
     use_defaults = bool(params.get("use_defaults"))
     raw_tiers = tier_list_from_params(params)
     if use_defaults and raw_tiers is None:
-        # #870: resolve the per-quality-group default ladder for the stamped
-        # regime directly. The ragged tier counts (clean 4 / choppy 3 / ranging
-        # 2) can't round-trip the positional spec union when the evaluator is
-        # invoked with the default ADX vocabulary, and the regime here may be a
-        # composite label. Mirrors Go's defaultRegimeTPTiersForRegime.
         group = regime_close_default_group(regime)
         ladder = REGIME_TP_TIER_GROUP_DEFAULTS.get(group) if group else None
         if not ladder:
@@ -95,7 +88,6 @@ def _resolve_tiers_for_regime(
 
     resolved.sort(key=lambda p: p[0])
     if resolved:
-        # Final tier always 1.0 — matches live strategyTPTiers contract.
         atr, _ = resolved[-1]
         resolved[-1] = (atr, 1.0)
     return resolved, []
@@ -118,6 +110,19 @@ def evaluate(position: dict, market: dict, params: dict) -> dict:
     if not regime:
         return {"close_fraction": 0.0, "reason": "noop:missing_position_regime"}
 
+    # SL check (takes priority over TP) - uses sl_atr_mult from params
+    sl_atr_mult = params.get("sl_atr_mult", 0.0)
+    if sl_atr_mult and sl_atr_mult > 0:
+        sl_price = avg_cost - sl_atr_mult * entry_atr if side == "long" else avg_cost + sl_atr_mult * entry_atr
+        sl_hit = (side == "long" and mark_price <= sl_price) or (side == "short" and mark_price >= sl_price)
+        if sl_hit:
+            return {
+                "close_fraction": 1.0,
+                "reason": "sl_hit",
+                "sl_price": sl_price,
+                "atr_value": entry_atr,
+            }
+
     tiers, errs = _resolve_tiers_for_regime(params, regime)
     if errs or not tiers:
         return {"close_fraction": 0.0, "reason": "noop:tier_resolution_failed"}
@@ -136,3 +141,4 @@ def evaluate(position: dict, market: dict, params: dict) -> dict:
         "close_fraction": close_fraction,
         "reason": f"tiered_tp_atr_regime:{regime}:{multiple:g}",
     }
+

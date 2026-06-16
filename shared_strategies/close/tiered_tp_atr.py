@@ -1,4 +1,4 @@
-"""Tiered ATR-multiple take-profit close evaluator."""
+"""Tiered ATR-multiple take-profit close evaluator with SL support."""
 
 from __future__ import annotations
 
@@ -19,6 +19,8 @@ DEFAULT_TIERS = (
     {"atr_multiple": 3.0, "close_fraction": 0.80},
     {"atr_multiple": 5.0, "close_fraction": 1.00},
 )
+
+DEFAULT_SL_ATR_MULT = 1.5
 
 
 def _tiers(raw) -> list[tuple[float, float]]:
@@ -53,6 +55,19 @@ def evaluate(position: dict, market: dict, params: dict) -> dict:
         return {"close_fraction": 0.0, "reason": "noop:missing_position"}
     if entry_atr <= 0:
         return {"close_fraction": 0.0, "reason": "noop:missing_entry_atr"}
+
+    # SL check (takes priority over TP)
+    sl_atr_mult = params.get("sl_atr_mult", 0.0)
+    if sl_atr_mult and sl_atr_mult > 0:
+        sl_price = avg_cost - sl_atr_mult * entry_atr if side == "long" else avg_cost + sl_atr_mult * entry_atr
+        sl_hit = (side == "long" and mark_price <= sl_price) or (side == "short" and mark_price >= sl_price)
+        if sl_hit:
+            return {
+                "close_fraction": 1.0,
+                "reason": "sl_hit",
+                "sl_price": sl_price,
+                "atr_value": entry_atr,
+            }
 
     profit_distance = mark_price - avg_cost if side == "long" else avg_cost - mark_price
     atr_profit = profit_distance / entry_atr

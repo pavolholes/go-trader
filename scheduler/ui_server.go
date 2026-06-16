@@ -40,6 +40,7 @@ type UIStrategyOverview struct {
 	PortfolioValue   float64                `json:"portfolio_value"`
 	InitialCapital   float64                `json:"initial_capital"`
 	RegimeDivergence *RegimeDivergenceState `json:"regime_divergence,omitempty"` // #907: active window-divergence state; nil when none
+	RegimeConfig     *RegimeConfig              `json:"regime_config,omitempty"`        // global regime config from top-level
 }
 
 type UIStrategyStatus struct {
@@ -60,6 +61,7 @@ type UIStrategyStatus struct {
 	Sharpe           float64                    `json:"sharpe,omitempty"`
 	Regime           string                     `json:"regime,omitempty"`
 	RegimeDivergence *RegimeDivergenceState     `json:"regime_divergence,omitempty"` // #907: active window-divergence state; nil when none
+	RegimeConfig     *RegimeConfig              `json:"regime_config,omitempty"`        // global regime config from top-level
 	RiskState        RiskState                  `json:"risk_state"`
 	Positions        map[string]*Position       `json:"positions"`
 	OptionPositions  map[string]*OptionPosition `json:"option_positions"`
@@ -508,6 +510,7 @@ func (ss *StatusServer) handleAPIStrategyStatus(w http.ResponseWriter, r *http.R
 		PortfolioValue:   overview.PortfolioValue,
 		PnL:              overview.PnL,
 		PnLPct:           overview.PnLPct,
+		RegimeConfig:     ss.regime,
 		TradeCount:       len(snapshot.TradeHistory),
 		WinRate:          overview.WinRate,
 		LifetimeStats:    lifetime,

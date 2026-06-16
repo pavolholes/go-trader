@@ -13,7 +13,7 @@
         } catch (e) {}
       })();
     </script>
-    <link rel="stylesheet" href="/dashboard/styles.css">
+    <link rel="stylesheet" href="/dashboard/styles.css?v=9">
   </head>
   <body>
     <div class="shell">
@@ -85,6 +85,16 @@
                   <th scope="col"><button type="button" class="sort-button" data-key="sharpe">Sharpe</button></th>
                   <th scope="col"><button type="button" class="sort-button" data-key="regime">Regime</button></th>
                   <th scope="col"><button type="button" class="sort-button" data-key="direction">Direction</button></th>
+                </tr>
+                <tr class="overview-filter-row">
+                  <td><input type="text" class="overview-filter-input" data-key="id" placeholder="Filter ID..."></td>
+                  <td><input type="text" class="overview-filter-input" data-key="platform" placeholder="Filter Platform..."></td>
+                  <td><input type="text" class="overview-filter-input" data-key="symbol" placeholder="Filter Symbol..."></td>
+                  <td><input type="text" class="overview-filter-input" data-key="pnl_pct" placeholder="Filter PnL %..."></td>
+                  <td><input type="text" class="overview-filter-input" data-key="win_rate" placeholder="Filter Win Rate..."></td>
+                  <td><input type="text" class="overview-filter-input" data-key="sharpe" placeholder="Filter Sharpe..."></td>
+                  <td><input type="text" class="overview-filter-input" data-key="regime" placeholder="Filter Regime..."></td>
+                  <td><input type="text" class="overview-filter-input" data-key="direction" placeholder="Filter Direction..."></td>
                 </tr>
               </thead>
               <tbody id="overview-body"></tbody>

@@ -12,6 +12,8 @@ import (
 // by check scripts when a strategy opts into issue #480's split entry/exit
 // model. The legacy signal field remains authoritative for execution.
 type StrategyDecisionFields struct {
+	StopLossPrice float64 `json:"sl_price,omitempty"`
+	ATRValue float64 `json:"atr_value,omitempty"`
 	OpenStrategy    string         `json:"open_strategy,omitempty"`
 	CloseStrategies []string       `json:"close_strategies,omitempty"`
 	OpenAction      string         `json:"open_action,omitempty"`

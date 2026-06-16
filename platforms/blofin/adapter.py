@@ -153,8 +153,10 @@ class BloFinExchangeAdapter:
 
     def get_ohlcv(self, symbol: str, interval: str = "1h", limit: int = 200) -> list:
         bar = self._ccxt_to_blofin_bar(interval)
+        # Perps need "-USDT" suffix; keep raw symbol if it already has a dash
+        inst_id = symbol if "-" in symbol else f"{symbol}-USDT"
         data = self._public_get("/api/v1/market/candles", {
-            "instId": symbol,
+            "instId": inst_id,
             "bar": bar,
             "limit": str(limit),
         })

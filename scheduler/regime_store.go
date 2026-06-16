@@ -231,10 +231,14 @@ func strategyRegimeDataPlatform(sc StrategyConfig) string {
 			return "binanceus"
 		}
 	case "perps":
-		if sc.Platform == "okx" {
+		switch sc.Platform {
+		case "okx":
 			return "okx"
+		case "blofin":
+			return "blofin"
+		default:
+			return "hyperliquid"
 		}
-		return "hyperliquid"
 	case "futures":
 		return "topstep"
 	case "manual":
