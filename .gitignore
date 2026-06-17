@@ -1,6 +1,9 @@
 __pycache__/
 *.pyc
 *.pyo
+# State databases — never commit. Generic *.db plus the SQLite sidecar/lock
+# globs so a renamed or per-instance DB at any path stays protected (#1012).
+*.db
 trading_bot.db
 *.db-wal
 *.db-shm
@@ -21,6 +24,8 @@ local/
 # macOS
 .DS_Store
 architecture.md
+# ...but the canonical project architecture reference is tracked
+!docs/ARCHITECTURE.md
 
 # consolidation research generated output (regenerable)
 backtest/consolidation_out/

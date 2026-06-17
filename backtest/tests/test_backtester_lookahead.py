@@ -29,6 +29,18 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
 
 from backtester import Backtester
 
+_NEVER_FIRES_CLOSE = [{"name": "tiered_tp_pct", "params": {"tp_tiers": [
+    {"profit_pct": 0.9, "close_fraction": 1.0},
+]}}]
+
+_REGIME_DIRECTIONAL_POLICY = {
+    "trend_regime": {
+        "trending_up": {"direction": "long", "invert_signal": False},
+        "trending_down": {"direction": "short", "invert_signal": True},
+        "ranging": {"direction": "long", "invert_signal": False},
+    },
+}
+
 
 def _step_up_df(n: int = 20, jump_bar: int = 10, jump_pct: float = 0.10) -> pd.DataFrame:
     """Flat price with a single up-jump at ``jump_bar``.
@@ -185,6 +197,32 @@ def test_regime_gate_blocks_when_prior_bar_regime_disallows():
     )
 
 
+def test_regime_directional_policy_uses_prior_bar_regime_not_current():
+    """A policy-resolved entry at row N+1 must use bar N's regime label."""
+    df = _step_up_df(n=20, jump_bar=15)
+    df["signal"] = 0
+    df.iloc[9, df.columns.get_loc("signal")] = 1
+    df["regime"] = "trending_up"
+    df.iloc[9, df.columns.get_loc("regime")] = "trending_down"
+    # bar 10 stays trending_up. A look-ahead resolver would open long; the
+    # correct closed-bar resolver opens the inverse short from bar 9's label.
+
+    bt = Backtester(
+        initial_capital=1000.0,
+        commission_pct=0.0,
+        slippage_pct=0.0,
+        close_strategies=_NEVER_FIRES_CLOSE,
+        regime_enabled=True,
+        regime_directional_policy=_REGIME_DIRECTIONAL_POLICY,
+    )
+    result = bt.run(df, save=False)
+
+    assert [t["side"] for t in result["trades"]] == ["short"], (
+        "Policy resolver must read bar 9's trending_down label for the bar 10 "
+        "fill. Reading bar 10's trending_up label would open long instead."
+    )
+
+
 # ─── 3. Forward-peek in caller signal is NOT defended (documented limit) ─────
 
 
@@ -263,3 +301,111 @@ def test_shift_moves_signal_by_exactly_one_row():
     exit_date = pd.Timestamp(result["trades"][0]["exit_date"])
     assert entry_date == df.index[6], f"Entry should be at bar 6, got {entry_date}"
     assert exit_date == df.index[11], f"Exit should be at bar 11, got {exit_date}"
+
+
+def test_zscore_target_close_uses_closed_bar_z_and_fills_next_open():
+    """#997: the zscore_target exit must read bar N's closed-bar z-score and
+    fill at bar N+1's open — never act on a spike intrabar at bar N.
+
+    Build a flat series that spikes once at bar K. The rolling z first reaches
+    the target at bar K (computed from closed data through K); the close must
+    therefore fill at K+1's open, not K's close.
+    """
+    import pandas as pd
+    n = 12
+    idx = pd.date_range("2024-01-01", periods=n, freq="h")
+    closes = [100.0] * 6 + [100.0, 100.0, 130.0, 130.0, 130.0, 130.0]
+    spike_bar = 8  # close jumps here
+    df = pd.DataFrame({
+        "open": closes, "high": closes, "low": closes, "close": closes,
+        "open_action": ["long"] + ["none"] * (n - 1),
+    }, index=idx)
+    bt = Backtester(initial_capital=1000.0, commission_pct=0.0, slippage_pct=0.0,
+                    open_strategy={"name": "x"},
+                    close_strategies=[{"name": "zscore_target",
+                                       "params": {"lookback": 4, "z_target": 1.0}}],
+                    direction="long")
+    result = bt.run(df, strategy_name="x", save=False)
+    assert result["total_trades"] == 1
+    exit_date = pd.Timestamp(result["trades"][0]["exit_date"])
+    # z first crosses the target at the spike bar (closed-bar data); the exit
+    # fills at the NEXT bar's open, strictly after the spike bar.
+    assert exit_date > df.index[spike_bar], (
+        f"exit {exit_date} must be after the spike bar {df.index[spike_bar]} "
+        "(next-open fill, not intrabar)"
+    )
+    assert result["trades"][0]["exit_reason"].startswith("zscore_target:")
+
+
+# ─── anchored_vwap: signals at bars <= cut don't depend on future bars (#1016) ─
+sys.path.insert(0, str(pathlib.Path(__file__).parent.parent.parent / "shared_strategies" / "open"))
+from anchored_vwap import anchored_vwap_core  # noqa: E402
+
+
+_AVWAP_PARAMS = dict(pivot_strength=2, confirm_bars=2, atr_period=3)
+
+
+def _avwap_mixed_fixture() -> pd.DataFrame:
+    """OHLCV forming a strict swing LOW (idx 5) then a strict swing HIGH (idx 17).
+
+    The reclaim above the low-anchored AVWAP fires +1 (bar 11) and the breakdown
+    below the high-anchored AVWAP fires -1 (bar 20) — a non-trivial mix across a
+    re-anchor (anchors progress -1 -> 5 -> 9 -> 17). A smooth linspace fixture is
+    NOT usable here: equal lows/highs at a monotonic turn tie under the strict
+    pivot rule, so no pivot confirms, anchor_index stays -1, signal is all zeros,
+    and the truncation assertion would be vacuous (#1019 review).
+    """
+    seg = [110, 108, 106, 104, 102, 100, 100.5, 100.2, 99.8, 99.5,
+           103.5, 104, 104.5, 105, 105.5, 106, 108, 110, 109.5, 109,
+           108.5, 104.5, 104, 103.5, 103]
+    closes = np.array(seg, dtype=float)
+    idx = pd.date_range("2026-01-01", periods=len(closes), freq="1h")
+    return pd.DataFrame(
+        {"open": closes, "high": closes + 0.5, "low": closes - 0.5,
+         "close": closes, "volume": np.full(len(closes), 10.0)},
+        index=idx,
+    )
+
+
+def test_anchored_vwap_no_lookahead():
+    """Truncating future bars must not change any signal at bars <= cut.
+
+    anchored_vwap_core anchors to *confirmed* pivots (pivot_strength bars on each
+    side) and derives AVWAP/ATR from prefix sums — all using only data at or
+    before the current bar, so appending future bars cannot change an earlier
+    signal.
+
+    Guards against the #1019 review finding (a vacuous all-zero fixture): the
+    fixture must emit nonzero signals, and a deliberately forward-peeking variant
+    must make the invariance assertion FAIL (sensitivity check), proving the test
+    can actually detect look-ahead.
+    """
+    df = _avwap_mixed_fixture()
+    cut = 20  # straddles the confirm_bars window [19, 20]; bar 20 fires -1
+
+    def real(d):
+        return anchored_vwap_core(d, **_AVWAP_PARAMS)["signal"].to_numpy()
+
+    def forward_peeking(d):
+        # bar n adopts bar n+1's signal — a canonical look-ahead contamination.
+        s = anchored_vwap_core(d, **_AVWAP_PARAMS)["signal"].to_numpy().copy()
+        if len(s) > 1:
+            s[:-1] = s[1:]
+        return s
+
+    full = real(df)
+    # Non-vacuity: the fixture must actually produce signals (both directions).
+    assert (full != 0).any(), "fixture is vacuous — no signal to guard"
+    assert (full == 1).any() and (full == -1).any(), "expected a +1 and a -1"
+
+    # Invariant: signals at bars < cut are unchanged when future bars are dropped.
+    trunc = real(df.iloc[:cut])
+    assert np.array_equal(full[:cut], trunc), "signals < cut must not depend on future bars"
+
+    # Sensitivity: a forward-peeking core variant must NOT be truncation-invariant,
+    # else the assertion above proves nothing.
+    bf = forward_peeking(df)
+    bt = forward_peeking(df.iloc[:cut])
+    assert not np.array_equal(bf[:cut], bt), (
+        "forward-peeking variant should break truncation-invariance — the test "
+        "is not sensitive to look-ahead")

@@ -903,6 +903,18 @@ func main() {
 				}
 			}
 
+			// #954: pull funding payments + non-trade cash flows for each HL
+			// shared wallet (two HTTP POSTs, outside the state lock). Booked
+			// under the risk-phase write lock below, before the display
+			// reconcile, so this cycle's ledger sums include them. Skipped
+			// when the balance fetch failed — the reconcile skips the wallet
+			// then too, and the watermark keeps the events for next cycle.
+			var walletLedgerFetches []walletLedgerFetchResult
+			if hlShared && hlStateFetched {
+				walletLedgerFetches = append(walletLedgerFetches,
+					fetchWalletLedgerEvents(stateDB, hlKey, time.Now().UTC()))
+			}
+
 			// #360: Fetch OKX positions once if any live OKX perps strategy
 			// exists. Drives per-strategy circuit-breaker pending closes
 			// (PlatformRiskAssist.OKXPositions). Gated on OKX_API_KEY so
@@ -1008,13 +1020,17 @@ func main() {
 			if notionalBlocked {
 				fmt.Printf("[WARN] %s\n", portfolioReason)
 			}
-			// #918: exchange-authoritative shared-wallet reconciliation. Derive
-			// each member strategy's display value from the real account balance
-			// + on-chain positions just fetched (no extra I/O) so the per-strategy
-			// operator rows sum EXACTLY to the wallet balance, and capture
-			// per-wallet drift for the alarm below. Runs under the same write lock
-			// the risk check holds (mutates StrategyState.SharedWalletValue*).
-			driftResults := reconcileSharedWalletDisplayValues(cfg.Strategies, state, sharedWallets, walletBalances, hlPositions, okxPositions, okxStateFetched)
+			// #954: book this cycle's funding payments + non-trade flows into
+			// the ledger BEFORE the display reconcile reads the ledger sums —
+			// the wallet balance being reconciled already includes them.
+			ingestSharedWalletLedgers(stateDB, state, cfg.Strategies, sharedWallets, walletLedgerFetches)
+			// #918/#954: shared-wallet display reconciliation. HL wallets derive
+			// each member's display value from the local trades ledger
+			// (initial_capital + ledger PnL + owned uPnL); the real balance is a
+			// pure drift alarm. OKX wallets keep the #918 capital-weight split.
+			// Runs under the same write lock the risk check holds (mutates
+			// StrategyState.SharedWalletValue*).
+			driftResults := reconcileSharedWalletDisplayValues(cfg.Strategies, state, stateDB, sharedWallets, walletBalances, hlPositions, okxPositions, okxStateFetched)
 			mu.Unlock()
 
 			// Fire throttled drift alarms outside the lock (notifier I/O).
@@ -1328,6 +1344,12 @@ func main() {
 							fmt.Fprintf(os.Stderr, "[WARN] hl-sync: json.Marshal(fillHints): %v\n", err)
 						}
 					}
+					// #971: surface persistent shared-coin reconciliation gaps
+					// (fail-closed residuals the reconciler could not confirm by
+					// exact OID, leaving a phantom virtual position) to the
+					// operator after a short confirmation window. Alerting only —
+					// never books or guesses, so the fail-closed invariant holds.
+					reportHLReconcileGaps(notifier, collectHLReconcileGapResults(state, &mu))
 				}
 
 				// #621: Build a coin→|on-chain qty| map from the pre-fetched positions
@@ -1393,15 +1415,22 @@ func main() {
 					var hlTPOIDs []int64
 					var hlStopLossTriggerPx float64
 					var hlStopLossHighWaterPx float64
-					var hlPostTPTrailingATRMult *float64
+					var hlPosSnapshot *Position
 					var hlScaleInCount int
 					var hlLastAddPrice float64
 					var hlAddedNotionalUSD float64
 					var hlScaleInCash float64
 					var hlScaleInResizePending bool
+					var hlProfileState *RegimeProfileState
 					if sc.Type == "perps" && sc.Platform == "hyperliquid" {
 						if hlLiveStrategy {
 							hlCash = stratState.Cash
+						}
+						// #998: snapshot the regime-profile switch state under the
+						// Phase-1 RLock so the lock-free resolution reads a stable copy.
+						if stratState.RegimeProfile != nil {
+							cp := *stratState.RegimeProfile
+							hlProfileState = &cp
 						}
 						// #873: scale-in's default per-add notional uses the
 						// strategy cash like a fresh open — captured for paper too
@@ -1421,7 +1450,7 @@ func main() {
 								hlTPOIDs = cloneInt64s(pos.TPOIDs)
 								hlStopLossTriggerPx = pos.StopLossTriggerPx
 								hlStopLossHighWaterPx = pos.StopLossHighWaterPx
-								hlPostTPTrailingATRMult = pos.PostTPTrailingATRMult
+								hlPosSnapshot = hyperliquidProtectionPositionSnapshot(pos)
 								hlScaleInCount = pos.ScaleInCount
 								hlLastAddPrice = pos.LastAddPrice
 								hlAddedNotionalUSD = pos.AddedNotionalUSD
@@ -1642,6 +1671,25 @@ func main() {
 							}
 						}
 					case "perps":
+						// #998: regime-profile allocation resolves BEFORE the check
+						// subprocess so the active profile's params shape the signal
+						// itself (the merged params ride the --strategy-refs JSON).
+						// HL perps only; the switch reads the global regime store at
+						// the configured long window and the closed-bar hysteresis
+						// counter advances only when the bundle's BarTime moves.
+						var hlProfileNext RegimeProfileState
+						var hlProfileActive string
+						hlProfileResolved := false
+						if sc.Platform == "hyperliquid" && sc.RegimeProfileAllocation.IsConfigured() {
+							palPayload := globalRegimeStore.PayloadForStrategy(sc, cfg.Regime)
+							palBarTime := globalRegimeStore.BarTimeForStrategy(sc, cfg.Regime)
+							palLabel := palPayload.Label(sc.RegimeProfileAllocation.Window, cfg.Regime)
+							hlProfileActive, hlProfileNext = resolveRegimeProfile(sc.RegimeProfileAllocation, palLabel, palBarTime, hlProfileState, hlPosQty, hlPosCtx.Profile)
+							applyRegimeProfileParams(&sc, sc.RegimeProfileAllocation, hlProfileActive)
+							hlProfileResolved = true
+							logger.Info("Regime profile: window=%s label=%s active=%q (pending=%q seen=%d)",
+								sc.RegimeProfileAllocation.Window, palLabel, hlProfileActive, hlProfileNext.PendingProfile, hlProfileNext.PendingBarsSeen)
+						}
 						if sc.Platform == "okx" {
 							if result, signalStr, price, ok := runOKXCheck(sc, prices, okxPosCtx, cfg.Regime, notifier, logger); ok {
 								prices[result.Symbol] = price
@@ -1719,13 +1767,11 @@ func main() {
 							mu.Unlock()
 							var execResult *HyperliquidExecuteResult
 							liveExecFailed := false
-							hlPosSnapshot := &Position{AvgCost: hlAvgCost, EntryATR: hlEntryATR, PostTPTrailingATRMult: hlPostTPTrailingATRMult}
 							if result.Signal == 0 && hlPosQty > 0 && strategyUsesTrailingTPRatchetClose(sc) {
 								applyTrailingTPRatchet(sc, stratState, result.Symbol, price, &mu, logger)
 								mu.RLock()
 								if pos, ok3 := stratState.Positions[result.Symbol]; ok3 && pos != nil {
-									hlPostTPTrailingATRMult = pos.PostTPTrailingATRMult
-									hlPosSnapshot.PostTPTrailingATRMult = hlPostTPTrailingATRMult
+									hlPosSnapshot = hyperliquidProtectionPositionSnapshot(pos)
 								}
 								mu.RUnlock()
 							}
@@ -1966,6 +2012,17 @@ func main() {
 									recordPositionOpen(stratState, sc, openTrade, pos)
 									mu.Unlock()
 								}
+							}
+							// #998: stamp the active profile on a freshly opened
+							// position (freezes it for the position's life) and commit
+							// the resolved switch state. Runs whenever the check
+							// succeeded — independent of whether a trade executed — so
+							// the flat hysteresis counter advances every cycle.
+							if hlProfileResolved {
+								mu.Lock()
+								stampPositionProfileIfOpened(stratState, result.Symbol, hlProfileActive)
+								updateStrategyProfileState(stratState, hlProfileNext)
+								mu.Unlock()
 							}
 						}
 					case "futures":
@@ -3093,13 +3150,7 @@ func runHyperliquidExecuteOrder(sc StrategyConfig, result *HyperliquidResult, pr
 	// only when there's nothing to flip into (never true here — flips always
 	// open a new side). Direction="short" + signal=-1 with orphan long is
 	// blocked by PerpsOrderSkipReason so it never reaches this code (#656).
-	pureClose := false
-	if result.Signal == -1 && posSide == "long" && !PerpsAllowsShort(sc) {
-		pureClose = true
-	}
-	if result.Signal == 1 && posSide == "short" && !PerpsAllowsLong(sc) {
-		pureClose = true
-	}
+	pureClose := perpsCloseActionSuppressesNewSL(result.Signal, posSide, PerpsAllowsLong(sc), PerpsAllowsShort(sc), result.CloseFraction)
 	// Partial close (#519): a fractional close from the open/close registry
 	// must NOT cancel the resting stop-loss — the SL is reduce-only and will
 	// continue to protect the residual position; cancelling without
@@ -3113,7 +3164,10 @@ func runHyperliquidExecuteOrder(sc StrategyConfig, result *HyperliquidResult, pr
 	// inherited a short position would otherwise see prevPosQty=posQty here
 	// while perpsLiveOrderSize sized it as a fresh open without that offset,
 	// leaving net_new_sz negative and the SL silently undersized (#421 review).
-	flipping := EffectiveDirection(sc) == DirectionBoth && posQty > 0 && ((result.Signal == 1 && posSide == "short") || (result.Signal == -1 && posSide == "long"))
+	// #1009: also require CloseFraction == 0 — a close action (any fraction > 0)
+	// is close-only, never a flip; the sizer's flip branch carries the same
+	// guard, so this mirror must too or prevPosQty diverges from the order size.
+	flipping := EffectiveDirection(sc) == DirectionBoth && posQty > 0 && result.CloseFraction == 0 && ((result.Signal == 1 && posSide == "short") || (result.Signal == -1 && posSide == "long"))
 	var cancelOID int64
 	if existingStopLossOID > 0 && posQty > 0 && !partialClose {
 		cancelOID = existingStopLossOID

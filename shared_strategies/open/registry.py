@@ -43,10 +43,16 @@ from sweep_squeeze_combo import sweep_squeeze_combo_core
 from adx_trend import adx_trend_core
 from bear_pullback_st import bear_pullback_st_core
 from donchian_breakout import donchian_breakout_core
+from funding_skew import funding_skew_core
 from momentum_pro import momentum_pro_core
 from mean_reversion_pro import mean_reversion_pro_core
+from mtf_confluence import mtf_confluence_core
+from regime_adaptive import regime_adaptive_core
+from regime_adaptive_htf import regime_adaptive_htf_core
 from session_breakout import session_breakout_core
 from vwap_rejection_st import vwap_rejection_st_core
+from vol_momentum import vol_momentum_core
+from anchored_vwap import anchored_vwap_core
 
 
 VALID_PLATFORMS: Tuple[str, ...] = ("spot", "futures")
@@ -474,7 +480,18 @@ def supertrend_strategy(df: pd.DataFrame, atr_period: int = 10, multiplier: floa
     final_lower = basic_lower.copy()
     direction = pd.Series(0, index=result.index, dtype=int)
 
-    for i in range(1, n):
+    # Seed the recursion from the first non-NaN ATR row; the rolling ATR is NaN
+    # for the first atr_period-1 bars and NaN comparisons are always False, so
+    # starting at i=1 would carry NaN bands forward forever and never emit a signal.
+    atr_valid = atr.notna().to_numpy()
+    if not atr_valid.any():
+        result["supertrend"] = np.nan
+        result["st_direction"] = direction
+        result["signal"] = 0
+        return result
+    start = int(atr_valid.argmax())
+
+    for i in range(start + 1, n):
         if basic_upper.iloc[i] < final_upper.iloc[i-1] or result["close"].iloc[i-1] > final_upper.iloc[i-1]:
             final_upper.iloc[i] = basic_upper.iloc[i]
         else:
@@ -931,6 +948,27 @@ def adx_trend_strategy(df: pd.DataFrame, **params) -> pd.DataFrame:
     return adx_trend_core(df, **params)
 
 
+# Trailing window for the delta_neutral_funding average, in days. Named "7d" in
+# the strategy description and the live scalar (avg_funding_rate_7d); kept as a
+# module constant rather than a registered param so the registry's --list-json
+# output (and Go's discoverStrategies) stays byte-identical (#988).
+_DELTA_FUNDING_WINDOW_DAYS = 7.0
+
+
+def _funding_window_bars(index: pd.Index) -> int:
+    """Bars spanning the funding window, inferred from the index spacing so the
+    average is the same ~7 days regardless of timeframe (168 1h bars, 42 4h
+    bars). Falls back to hourly when spacing can't be inferred."""
+    bar_hours = 1.0
+    if isinstance(index, pd.DatetimeIndex) and len(index) >= 2:
+        deltas = index.to_series().diff().dropna()
+        if not deltas.empty:
+            secs = deltas.median().total_seconds()
+            if secs and secs > 0:
+                bar_hours = secs / 3600.0
+    return max(1, int(round(_DELTA_FUNDING_WINDOW_DAYS * 24.0 / bar_hours)))
+
+
 @register(
     "delta_neutral_funding",
     "Delta-Neutral Funding \u2014 enter when 7d avg funding rate exceeds threshold, exit when below",
@@ -944,22 +982,70 @@ def delta_neutral_funding_strategy(df: pd.DataFrame,
                                    drift_threshold: float = 2.0,
                                    current_funding_rate: float = 0.0,
                                    avg_funding_rate_7d: float = 0.0) -> pd.DataFrame:
+    """SHORT the perp to collect funding when the trailing 7d-average funding
+    rate is rich; exit when it decays. Positive funding = longs pay shorts (#102).
+
+    Two input paths:
+
+    * **Backtest** — when a per-bar ``funding_rate`` column is attached (#988,
+      ``FUNDING_COLUMN_STRATEGIES``), the trailing average is computed from it
+      and a *per-bar* signal series is emitted, so the engine can replay
+      entries/exits across the whole window. The 7d window is converted to a
+      bar count from the index spacing (timeframe-correct) and requires a full
+      window before any signal (warmup → 0), mirroring the live 7d average.
+    * **Live / paper** — when no column is present, the scalar
+      ``avg_funding_rate_7d`` injected by ``check_hyperliquid.py`` drives a
+      single decision on the latest bar (unchanged behavior).
+    """
     result = df.copy()
+    result["delta_drift_pct"] = 0.0
+    result["rebalance_needed"] = 0.0
+
+    has_series = "funding_rate" in df.columns and pd.to_numeric(
+        df["funding_rate"], errors="coerce").notna().any()
+    if has_series:
+        funding = pd.to_numeric(df["funding_rate"], errors="coerce")
+        window_bars = _funding_window_bars(result.index)
+        avg = funding.rolling(window_bars, min_periods=window_bars).mean()
+        result["funding_rate"] = funding
+        result["avg_funding_7d"] = avg
+        result["funding_apy"] = avg * 24 * 365 * 100  # HL funding is hourly
+        sig = pd.Series(0, index=result.index, dtype=int)
+        sig[avg > entry_threshold] = -1   # enter / hold short to collect
+        sig[avg < exit_threshold] = 1     # exit short
+        sig[avg.isna()] = 0               # warmup / missing funding → no signal
+        result["signal"] = sig.values
+        return result
+
     avg = avg_funding_rate_7d
     result["funding_rate"] = current_funding_rate
     result["avg_funding_7d"] = avg
     result["funding_apy"] = avg * 3 * 365 * 100
-    result["delta_drift_pct"] = 0.0
-    result["rebalance_needed"] = 0.0
     result["signal"] = 0
     if avg == 0.0:
         return result
-    # Positive avg funding = longs pay shorts → SHORT perp to collect (#102)
     if avg > entry_threshold:
         result.iloc[-1, result.columns.get_loc("signal")] = -1  # enter short
     elif avg < exit_threshold:
         result.iloc[-1, result.columns.get_loc("signal")] = 1   # exit short
     return result
+
+
+@register(
+    "funding_skew",
+    "Funding Skew \u2014 funding-rate crowding extremes (rolling z-score) with EMA price confirmation: long crowded-short squeezes, short crowded-long breakdowns; flat when funding is unavailable",
+    {
+        "funding_window": 168,
+        "z_entry": 2.0,
+        "z_exit": 0.5,
+        "confirm_ema": 40,
+        "min_abs_rate": 0.00001,
+        "allow_short": True,
+    },
+    platforms=("futures",),
+)
+def funding_skew_strategy(df: pd.DataFrame, **params) -> pd.DataFrame:
+    return funding_skew_core(df, **params)
 
 
 @register(
@@ -1014,6 +1100,20 @@ def vwap_rejection_st_strategy(df: pd.DataFrame, **params) -> pd.DataFrame:
 
 
 @register(
+    "anchored_vwap",
+    "Anchored VWAP — single VWAP anchored to the last confirmed swing pivot as dynamic S/R; long on a buffered reclaim above, short on a buffered breakdown below",
+    {
+        "pivot_strength": 5,
+        "buffer_atr_mult": 0.25,
+        "confirm_bars": 2,
+        "atr_period": 14,
+    },
+)
+def anchored_vwap_strategy(df: pd.DataFrame, **params) -> pd.DataFrame:
+    return anchored_vwap_core(df, **params)
+
+
+@register(
     "momentum_pro",
     "Momentum Pro — trend-pullback entries in a stacked-EMA trend, ADX-confirmed, on a volume-backed resumption",
     {
@@ -1052,6 +1152,103 @@ def consolidation_range_strategy(df: pd.DataFrame, **params) -> pd.DataFrame:
 
 
 @register(
+    "mtf_confluence",
+    "MTF Confluence — higher-timeframe EMA trend gate (resampled in-frame, no extra data) over native-frame pullback resumption entries; exits when the HTF trend flips",
+    {
+        "htf_factor": 4, "htf_ema_fast": 20, "htf_ema_slow": 40,
+        "htf_sep_pct": 0.001, "ltf_ema": 20, "pullback_window": 6,
+        "pullback_touch_buffer_pct": 0.0, "allow_short": False,
+    },
+    variants={
+        "futures": {
+            "description": "MTF Confluence — bidirectional: HTF EMA trend gate over native-frame pullback resumption entries; shorts mirror the logic in HTF downtrends",
+            "default_params": {"allow_short": True},
+        },
+    },
+)
+def mtf_confluence_strategy(df: pd.DataFrame, **params) -> pd.DataFrame:
+    return mtf_confluence_core(df, **params)
+
+
+@register(
+    "vol_momentum",
+    "Vol Momentum — volatility-targeted time-series momentum: ATR-normalized N-bar net move with Kaufman efficiency-ratio trend confirmation; hysteresis exit on momentum decay or efficiency collapse",
+    {
+        "mom_window": 24, "atr_period": 14,
+        "entry_threshold": 0.30, "exit_threshold": 0.05,
+        "eff_entry": 0.35, "eff_exit": 0.15,
+        "allow_short": False,
+    },
+    variants={
+        "futures": {
+            "description": "Vol Momentum — volatility-targeted time-series momentum, bidirectional: long/short on ATR-normalized momentum with Kaufman efficiency confirmation",
+            "default_params": {"allow_short": True},
+        },
+    },
+)
+def vol_momentum_strategy(df: pd.DataFrame, **params) -> pd.DataFrame:
+    return vol_momentum_core(df, **params)
+
+
+@register(
+    "regime_adaptive",
+    "Regime Adaptive — per-bar composite regime metrics (return/range/Kaufman efficiency + ADX) switch between breakout entries in clean trends and mean-reversion fades in ranges; flat in chop",
+    {
+        "period": 20,
+        "adx_threshold": 20.0,
+        "return_eff_threshold": 0.05,
+        "range_eff_threshold": 0.03,
+        "efficiency_threshold": 0.5,
+        "breakout_lookback": 10,
+        "mr_lookback": 20,
+        "mr_entry_z": 2.0,
+        "mr_exit_z": 0.0,
+        "slow_trend_lookback": 100,
+        "slow_veto_threshold": 0.05,
+        "allow_short": False,
+    },
+    variants={
+        "futures": {"default_params": {"allow_short": True}},
+    },
+)
+def regime_adaptive_strategy(df: pd.DataFrame, **params) -> pd.DataFrame:
+    return regime_adaptive_core(df, **params)
+
+
+@register(
+    "regime_adaptive_htf",
+    "Regime Adaptive HTF — selective z-score fades gated by composite regime labels (return/range/Kaufman efficiency + ADX) classified on higher-timeframe buckets with confirmation hysteresis; optional clean-trend entry modes; flat in chop and directional grinds",
+    {
+        "htf_factor": 6,
+        "period": 14,
+        "adx_threshold": 20.0,
+        "return_eff_threshold": 0.05,
+        "range_eff_threshold": 0.03,
+        "efficiency_threshold": 0.5,
+        "confirm_buckets": 2,
+        "trend_entry": "off",
+        "trend_drift_confirm": 0.10,
+        "transition_window": 6,
+        "pullback_z": 1.0,
+        "fade_labels": "ranging",
+        "breakout_lookback": 10,
+        "mr_lookback": 20,
+        "mr_entry_z": 2.0,
+        "mr_exit_z": 0.0,
+        "slow_trend_lookback": 100,
+        "slow_veto_threshold": 0.05,
+        "allow_short": False,
+    },
+    # No bidirectional futures variant (unlike regime_adaptive/vol_momentum):
+    # allow_short=True benchmarked at OOS mean Sharpe -1.68 vs -0.32 long-only
+    # (short fades of range tops get run over by squeezes). Long/flat on
+    # perps; allow_short stays sweepable.
+)
+def regime_adaptive_htf_strategy(df: pd.DataFrame, **params) -> pd.DataFrame:
+    return regime_adaptive_htf_core(df, **params)
+
+
+@register(
     "hold",
     "Hold — always returns signal=0; used internally by type=manual strategies for the close-evaluator loop (#569)",
     {},
@@ -1075,10 +1272,11 @@ PLATFORM_ORDER: Dict[str, List[str]] = {
         "mean_reversion", "momentum", "volume_weighted", "triple_ema",
         "rsi_macd_combo", "stoch_rsi", "supertrend", "ichimoku_cloud",
         "pairs_spread", "squeeze_momentum", "atr_breakout", "amd_ifvg",
-        "heikin_ashi_ema", "order_blocks", "vwap_reversion", "chart_pattern",
+        "heikin_ashi_ema", "order_blocks", "vwap_reversion", "anchored_vwap", "chart_pattern",
         "liquidity_sweeps", "parabolic_sar", "range_scalper",
         "sweep_squeeze_combo", "adx_trend", "donchian_breakout", "tema_cross",
-        "momentum_pro", "mean_reversion_pro",
+        "momentum_pro", "mean_reversion_pro", "mtf_confluence",
+        "vol_momentum", "regime_adaptive", "regime_adaptive_htf",
         "hold",
     ],
     "futures": [
@@ -1086,11 +1284,12 @@ PLATFORM_ORDER: Dict[str, List[str]] = {
         "triple_ema", "triple_ema_bidir", "tema_cross", "tema_cross_bd", "rsi_macd_combo", "momentum",
         "mean_reversion", "rsi", "macd", "breakout", "stoch_rsi", "supertrend",
         "squeeze_momentum", "ichimoku_cloud", "atr_breakout", "amd_ifvg",
-        "heikin_ashi_ema", "order_blocks", "vwap_reversion", "chart_pattern",
+        "heikin_ashi_ema", "order_blocks", "vwap_reversion", "anchored_vwap", "chart_pattern",
         "liquidity_sweeps", "parabolic_sar", "range_scalper",
         "sweep_squeeze_combo", "adx_trend", "delta_neutral_funding",
-        "donchian_breakout", "session_breakout", "bear_pullback_st",
+        "funding_skew", "donchian_breakout", "session_breakout", "bear_pullback_st",
         "vwap_rejection_st", "momentum_pro", "mean_reversion_pro",
-        "consolidation_range", "hold",
+        "consolidation_range", "mtf_confluence", "vol_momentum",
+        "regime_adaptive", "regime_adaptive_htf", "hold",
     ],
 }

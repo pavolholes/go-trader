@@ -193,6 +193,8 @@ func (ss *StatusServer) Start(port int) {
 	mux.HandleFunc("/history", ss.handleHistory)
 	mux.HandleFunc("/dashboard", ss.handleDashboard)
 	mux.HandleFunc("/dashboard/", ss.handleDashboard)
+	mux.HandleFunc("/reports", ss.handleReports)
+	mux.HandleFunc("/reports/", ss.handleReports)
 	mux.HandleFunc("/api/strategies", ss.handleAPIStrategies)
 	mux.HandleFunc("/api/strategies/overview", ss.handleAPIStrategiesOverview)
 	mux.HandleFunc("/api/regime", ss.handleAPIRegime)
@@ -303,6 +305,7 @@ func (ss *StatusServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 		RegimeDirectionalPolicy bool                       `json:"regime_directional_policy,omitempty"` // #779: true when strategy has a policy block configured
 		EffectivePolicyRegime   string                     `json:"effective_policy_regime,omitempty"`   // #779: regime key the resolver used (pos.Regime while open, current regime when flat); shown only when policy is configured
 		RegimeDivergence        *RegimeDivergenceState     `json:"regime_divergence,omitempty"`         // #907: active window-divergence state; nil when none
+		RegimeProfile           *RegimeProfileState        `json:"regime_profile,omitempty"`            // #998: active regime-profile allocation switch state; nil when none
 	}
 
 	type StatusResp struct {
@@ -399,6 +402,7 @@ func (ss *StatusServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 			RegimeDirectionalPolicy: policyConfigured,
 			EffectivePolicyRegime:   effRegimeKey,
 			RegimeDivergence:        s.RegimeDivergence,
+			RegimeProfile:           s.RegimeProfile,
 		}
 	}
 

@@ -805,6 +805,99 @@ func TestForceCloseAllPositionsRecordsDirectionalTradeSides(t *testing.T) {
 	}
 }
 
+// #1009 (acceptance criterion folded in from PR #1008): a force-close fired on
+// a structurally-corrupt position must NOT book an inflated realized_pnl. The
+// booked Trade.RealizedPnL must reconcile (within rounding) with its
+// closed_positions row, and cash must not absorb a phantom number. Covers both
+// corruption shapes the criterion calls out: a negative quantity (the mis-sized
+// reversal residual) and a zeroed avg cost (which booked ~full notional as PnL,
+// the ~4884x rowid-54 overstatement).
+func TestForceCloseAllPositions_CorruptPositionBooksZeroPnL(t *testing.T) {
+	cases := []struct {
+		name string
+		pos  *Position
+	}{
+		{"negative qty long", &Position{Symbol: "ETH", Quantity: -0.595, AvgCost: 2000, Side: "long", Multiplier: 1, Leverage: 1}},
+		{"negative qty short", &Position{Symbol: "ETH", Quantity: -0.595, AvgCost: 2000, Side: "short", Multiplier: 1, Leverage: 1}},
+		{"zero avg cost long", &Position{Symbol: "ETH", Quantity: 0.5, AvgCost: 0, Side: "long", Multiplier: 1, Leverage: 1}},
+		{"zero avg cost spot long", &Position{Symbol: "BTC", Quantity: 0.5, AvgCost: 0, Side: "long"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			startCash := 10000.0
+			s := &StrategyState{
+				ID:              "corrupt-strat",
+				Cash:            startCash,
+				Positions:       map[string]*Position{tc.pos.Symbol: tc.pos},
+				OptionPositions: map[string]*OptionPosition{},
+				TradeHistory:    []Trade{},
+				ClosedPositions: []ClosedPosition{},
+				RiskState:       RiskState{},
+			}
+
+			// price far from avgCost so a non-zero PnL WOULD be booked if the
+			// corrupt fields were used (e.g. 0.5 * 2150 = 1075, the rowid-54
+			// magnitude). The guard must keep it at zero.
+			forceCloseAllPositions(s, map[string]float64{tc.pos.Symbol: 2150}, nil)
+
+			if len(s.TradeHistory) != 1 {
+				t.Fatalf("TradeHistory len = %d, want 1", len(s.TradeHistory))
+			}
+			tr := s.TradeHistory[0]
+			if tr.RealizedPnL != 0 {
+				t.Errorf("Trade.RealizedPnL = %g, want 0 (corrupt position must book zero PnL)", tr.RealizedPnL)
+			}
+			if tr.Quantity < 0 {
+				t.Errorf("Trade.Quantity = %g, must not be negative", tr.Quantity)
+			}
+			if len(s.ClosedPositions) != 1 {
+				t.Fatalf("ClosedPositions len = %d, want 1", len(s.ClosedPositions))
+			}
+			cp := s.ClosedPositions[0]
+			// The invariant: the trade leg and the closed_positions row agree.
+			if math.Abs(tr.RealizedPnL-cp.RealizedPnL) > 1e-9 {
+				t.Errorf("Trade.RealizedPnL %g != ClosedPosition.RealizedPnL %g (must reconcile)", tr.RealizedPnL, cp.RealizedPnL)
+			}
+			if cp.CloseReason != "circuit_breaker_corrupt" {
+				t.Errorf("CloseReason = %q, want circuit_breaker_corrupt", cp.CloseReason)
+			}
+			if s.Cash != startCash {
+				t.Errorf("Cash = %g, want %g (no phantom PnL/proceeds credited)", s.Cash, startCash)
+			}
+			if _, ok := s.Positions[tc.pos.Symbol]; ok {
+				t.Error("corrupt position should be cleared")
+			}
+		})
+	}
+}
+
+// #1009: a healthy position force-close is unchanged — books true PnL and that
+// PnL reconciles with the closed_positions row. Guards the corrupt-path change
+// from leaking into the normal path.
+func TestForceCloseAllPositions_HealthyPositionReconciles(t *testing.T) {
+	s := &StrategyState{
+		ID:              "healthy-strat",
+		Cash:            10000,
+		Positions:       map[string]*Position{"ETH": {Symbol: "ETH", Quantity: 0.5, AvgCost: 2000, Side: "long", Multiplier: 1, Leverage: 1}},
+		OptionPositions: map[string]*OptionPosition{},
+		TradeHistory:    []Trade{},
+		ClosedPositions: []ClosedPosition{},
+		RiskState:       RiskState{},
+	}
+	forceCloseAllPositions(s, map[string]float64{"ETH": 2100}, nil)
+	if len(s.TradeHistory) != 1 || len(s.ClosedPositions) != 1 {
+		t.Fatalf("history=%d closed=%d, want 1/1", len(s.TradeHistory), len(s.ClosedPositions))
+	}
+	wantPnL := 0.5 * (2100.0 - 2000.0) // 50
+	tr := s.TradeHistory[0]
+	if math.Abs(tr.RealizedPnL-wantPnL) > 1e-9 {
+		t.Errorf("Trade.RealizedPnL = %g, want %g", tr.RealizedPnL, wantPnL)
+	}
+	if math.Abs(tr.RealizedPnL-s.ClosedPositions[0].RealizedPnL) > 1e-9 {
+		t.Errorf("trade PnL %g != closed_positions PnL %g", tr.RealizedPnL, s.ClosedPositions[0].RealizedPnL)
+	}
+}
+
 // TestCheckPortfolioRisk_WarningFires verifies that drawdown at 80% of limit
 // triggers a warning on every call while the portfolio remains in the warning
 // band.
@@ -2821,5 +2914,53 @@ func TestCircuitBreakerStrategyLabel_StripsSpotQuoteSuffix(t *testing.T) {
 	}
 	if strings.Contains(got, "BTC/USDT") {
 		t.Fatalf("strategy label should not render raw spot pair: %q", got)
+	}
+}
+
+// TestForceCloseAllPositions_TradeType_PerpsVsFutures pins the trade_type
+// label for circuit-breaker / kill-switch force-closes: HL perps and OKX perps
+// carry pos.Multiplier=1 (#254/#497 perps PnL valuation convention, NOT a
+// contract multiplier), so the legacy "Multiplier>0 → futures" classifier
+// mislabeled every perps force-close as "futures". The label is operator-facing
+// only — tradeLedgerDeltaSQL ignores trade_type, so it never affected a ledger
+// sum — but an accurate label keeps display/audit surfaces honest. TopStep/legacy
+// futures keep pos.Multiplier as the real contract multiplier and keep the
+// "futures" label. Spot (Multiplier=0) stays "spot".
+func TestForceCloseAllPositions_TradeType_PerpsVsFutures(t *testing.T) {
+	cases := []struct {
+		name       string
+		platform   string
+		stratType  string
+		multiplier float64
+		want       string
+	}{
+		{"hl-perps-multiplier-1", "hyperliquid", "perps", 1, "perps"},
+		{"hl-manual-multiplier-1", "hyperliquid", "manual", 1, "perps"},
+		{"okx-perps-multiplier-1", "okx", "perps", 1, "perps"},
+		{"hl-perps-multiplier-0", "hyperliquid", "perps", 0, "spot"},
+		{"spot-multiplier-0", "binanceus", "spot", 0, "spot"},
+		{"topstep-futures-multiplier-50", "topstep", "futures", 50, "futures"},
+		{"legacy-futures-multiplier-5", "ibkr", "futures", 5, "futures"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &StrategyState{
+				ID:       "test-" + tc.name,
+				Platform: tc.platform,
+				Type:     tc.stratType,
+				Positions: map[string]*Position{
+					"BTC": {Symbol: "BTC", Quantity: 0.1, AvgCost: 50000, Side: "long", Multiplier: tc.multiplier},
+				},
+				TradeHistory: []Trade{},
+				RiskState:    RiskState{},
+			}
+			forceCloseAllPositions(s, map[string]float64{"BTC": 51000}, nil)
+			if len(s.TradeHistory) != 1 {
+				t.Fatalf("TradeHistory len = %d, want 1", len(s.TradeHistory))
+			}
+			if got := s.TradeHistory[0].TradeType; got != tc.want {
+				t.Errorf("TradeType = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }

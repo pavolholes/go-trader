@@ -368,6 +368,7 @@ type StrategyConfig struct {
 	FuturesConfig           *FuturesConfig           `json:"futures,omitempty"`
 	RegimeDirectionalPolicy *RegimeDirectionalPolicy `json:"regime_directional_policy,omitempty"` // HL perps only: regime-aware override for Direction + InvertSignal. When set, runHyperliquidCheck resolves the effective pair per-cycle from the current regime (when flat) or pos.Regime (when an open position is held — "hold until natural exit" semantics). Static Direction/InvertSignal are the base; the policy overrides per regime. Requires regime detection enabled at top-level cfg.Regime. (#779)
 	RegimeWindowDivergence  *RegimeWindowDivergence  `json:"regime_window_divergence,omitempty"`  // HL perps live only: detect divergence between two regime windows (short vs medium) and optionally override effective direction when they hard-diverge. Builds on regime_directional_policy surface (#907).
+	RegimeProfileAllocation *RegimeProfileAllocation `json:"regime_profile_allocation,omitempty"` // HL perps only: slow regime switch between two validated open_strategy param profiles. A long-window regime label (from the #879 store) selects the active profile; switching is hysteretic (confirm_bars closed bars) and flat-only. Requires regime.enabled=true. Backtester replays the switch. (#998)
 	AllowScaleIn            bool                     `json:"allow_scale_in,omitempty"`            // HL perps/manual only: opt in to scale-in / pyramiding — a same-direction signal on an open position ADDS size (blends price+size, freezes EntryATR/regime/TP geometry) instead of being skipped. Default false preserves the legacy skip-on-same-direction behavior for every strategy that does not opt in. Gated by ScaleIn caps + spacing. (#873)
 	ScaleIn                 *ScaleInConfig           `json:"scale_in,omitempty"`                  // scale-in tuning; only consulted when AllowScaleIn is true. Nil = defaults (unlimited adds/notional, no spacing, per-add size = standard open notional). (#873)
 }
@@ -1093,28 +1094,6 @@ func hasHyperliquidStopLossOwnership(sc StrategyConfig) bool {
 	return false
 }
 
-// hasHyperliquidTrailingStopOwnership reports whether sc would place a
-// trailing reduce-only HL trigger that cancels and replaces the resting OID
-// as the position moves favorably. Trailing stops are special because the
-// cancel/replace cycle races on the shared on-chain position when two peers
-// both run trailing logic — the second peer's place can land before the
-// first's cancel, briefly doubling the reduce-only quantity (#604 review #5).
-// Fixed-distance triggers (StopLossPct, StopLossMarginPct, StopLossATRMult)
-// are sized per-strategy and don't cancel/replace, so they coexist safely
-// under #601's per-strategy sized protection model.
-func hasHyperliquidTrailingStopOwnership(sc StrategyConfig) bool {
-	if sc.TrailingStopPct != nil && *sc.TrailingStopPct > 0 {
-		return true
-	}
-	if sc.TrailingStopATRMult != nil && *sc.TrailingStopATRMult > 0 {
-		return true
-	}
-	if sc.TrailingStopATRRegime != nil && !sc.TrailingStopATRRegime.IsZero() {
-		return true
-	}
-	return false
-}
-
 // hyperliquidPeerStrategyErrors returns validation messages for HL wallet
 // strategies that share a coin but disagree on MarginMode or exchange Leverage (#491/#619).
 // Returns an empty slice when no peer conflicts exist.
@@ -1147,11 +1126,10 @@ func hasHyperliquidTrailingStopOwnership(sc StrategyConfig) bool {
 // any on-chain conflict.
 func hyperliquidPeerStrategyErrors(strategies []StrategyConfig) []string {
 	type peer struct {
-		ID           string
-		Coin         string
-		MarginMode   string
-		Leverage     float64
-		OwnsTrailing bool // trailing stops cancel/replace and race on shared coin (#604 review #5)
+		ID         string
+		Coin       string
+		MarginMode string
+		Leverage   float64
 	}
 	groups := make(map[string][]peer)
 	for _, sc := range strategies {
@@ -1163,11 +1141,10 @@ func hyperliquidPeerStrategyErrors(strategies []StrategyConfig) []string {
 			continue
 		}
 		groups[coin] = append(groups[coin], peer{
-			ID:           sc.ID,
-			Coin:         coin,
-			MarginMode:   sc.MarginMode,
-			Leverage:     sc.Leverage,
-			OwnsTrailing: hasHyperliquidTrailingStopOwnership(sc),
+			ID:         sc.ID,
+			Coin:       coin,
+			MarginMode: sc.MarginMode,
+			Leverage:   sc.Leverage,
 		})
 	}
 	var errs []string
@@ -1206,24 +1183,6 @@ func hyperliquidPeerStrategyErrors(strategies []StrategyConfig) []string {
 					coin, idList))
 				break
 			}
-		}
-		// Trailing-stop peers race on the shared on-chain position because
-		// each cycle's cancel/replace is non-atomic — peer A can place its
-		// new resting OID before peer B cancels its old one, briefly
-		// doubling the reduce-only quantity. Fixed-distance triggers
-		// (StopLossPct/StopLossATRMult/StopLossMarginPct) are sized
-		// per-strategy and rest forever, so they coexist safely.
-		trailingOwners := make([]string, 0)
-		for _, p := range peers {
-			if p.OwnsTrailing {
-				trailingOwners = append(trailingOwners, p.ID)
-			}
-		}
-		if len(trailingOwners) > 1 {
-			sort.Strings(trailingOwners)
-			errs = append(errs, fmt.Sprintf(
-				"hyperliquid peers on %s have multiple trailing-stop owners (strategies %s): trailing_stop_pct/trailing_stop_atr_mult cancel and replace OIDs each cycle, racing on the shared on-chain position; at most one peer may run a trailing stop",
-				coin, strings.Join(trailingOwners, ", ")))
 		}
 	}
 	return errs
@@ -1652,6 +1611,20 @@ func validateConfig(cfg *Config, skipLiveCredentialChecks bool) error {
 			}
 			if cfg.Regime != nil && cfg.Regime.Enabled && len(cfg.Regime.Windows) < 2 {
 				errs = append(errs, fmt.Sprintf("%s: regime_window_divergence requires at least two windows in regime.windows", prefix))
+			}
+		}
+
+		// regime_profile_allocation: HL perps only (live + paper). Requires
+		// regime.enabled=true — the switch reads the global regime store, which
+		// is only populated when regime detection is on. Shape validation
+		// (param_sets count, label coverage, window existence) runs in
+		// validateStrategyRegimeVocabulary (ResolveRaw). (#998)
+		if sc.RegimeProfileAllocation.IsConfigured() {
+			if sc.Platform != "hyperliquid" || sc.Type != "perps" {
+				errs = append(errs, fmt.Sprintf("%s: regime_profile_allocation is only supported for HL perps strategies (got platform=%q type=%q)", prefix, sc.Platform, sc.Type))
+			}
+			if cfg.Regime == nil || !cfg.Regime.Enabled {
+				errs = append(errs, fmt.Sprintf("%s: regime_profile_allocation requires top-level regime.enabled=true", prefix))
 			}
 		}
 

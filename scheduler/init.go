@@ -58,10 +58,12 @@ var knownShortNames = map[string]string{
 	"ichimoku_cloud":        "ichi",
 	"order_blocks":          "ob",
 	"vwap_reversion":        "vwap",
+	"anchored_vwap":         "avwap",
 	"chart_pattern":         "cpat",
 	"liquidity_sweeps":      "liqsw",
 	"parabolic_sar":         "psar",
 	"delta_neutral_funding": "dnf",
+	"funding_skew":          "fskew",
 	"supertrend":            "st",
 	"squeeze_momentum":      "sqm",
 	"heikin_ashi_ema":       "hae",
@@ -75,6 +77,10 @@ var knownShortNames = map[string]string{
 	"momentum_pro":          "mompro",
 	"mean_reversion_pro":    "mrpro",
 	"consolidation_range":   "cr",
+	"mtf_confluence":        "mtfc",
+	"vol_momentum":          "volmom",
+	"regime_adaptive":       "regad",
+	"regime_adaptive_htf":   "rahtf",
 }
 
 // bidirectionalPerpsStrategies lists strategy IDs that emit signal=-1 as a
@@ -90,9 +96,14 @@ var bidirectionalPerpsStrategies = map[string]bool{
 	"liquidity_sweeps":    true, // emits short on stop-hunt wicks above swing highs (#649)
 	"bear_pullback_st":    true, // dedicated short-only strategy for bear-market rally rejections (#651)
 	"vwap_rejection_st":   true, // dedicated short-only strategy for VWAP/EMA rally rejections in bearish regime (#652)
+	"anchored_vwap":       true, // single-AVWAP S/R flip; emits short on a buffered breakdown below the line (#1016)
 	"momentum_pro":        true, // emits short on stacked-bearish-EMA trend-pullback breakdowns
 	"mean_reversion_pro":  true, // emits short on overbought reversion in no-trend regimes
 	"consolidation_range": true, // emits short at the top edge of a consolidation box (range-edge mean-reversion)
+	"mtf_confluence":      true, // futures variant (allow_short) shorts LTF pullback rallies in HTF downtrends (#957)
+	"vol_momentum":        true, // emits short on ATR-normalized negative momentum with efficiency confirmation (#959)
+	"funding_skew":        true, // shorts crowded-long funding extremes on EMA breakdown (#960)
+	"regime_adaptive":     true, // futures variant (allow_short) shorts clean downtrend breakouts and fades range tops (#958)
 }
 
 func isBidirectionalPerpsStrategy(id string) bool {
@@ -131,6 +142,7 @@ var defaultSpotStrategies = []stratDef{
 	{ID: "ichimoku_cloud", ShortName: "ichi"},
 	{ID: "order_blocks", ShortName: "ob"},
 	{ID: "vwap_reversion", ShortName: "vwap"},
+	{ID: "anchored_vwap", ShortName: "avwap"},
 	{ID: "chart_pattern", ShortName: "cpat"},
 	{ID: "liquidity_sweeps", ShortName: "liqsw"},
 	{ID: "parabolic_sar", ShortName: "psar"},
@@ -141,6 +153,10 @@ var defaultSpotStrategies = []stratDef{
 	{ID: "tema_cross", ShortName: "temac"},
 	{ID: "momentum_pro", ShortName: "mompro"},
 	{ID: "mean_reversion_pro", ShortName: "mrpro"},
+	{ID: "mtf_confluence", ShortName: "mtfc"},
+	{ID: "vol_momentum", ShortName: "volmom"},
+	{ID: "regime_adaptive", ShortName: "regad"},
+	{ID: "regime_adaptive_htf", ShortName: "rahtf"},
 }
 
 var defaultOptionsStrategies = []stratDef{
@@ -156,7 +172,9 @@ var defaultPerpsStrategies = []stratDef{
 	{ID: "tema_cross_bd", ShortName: "temacb"},
 	{ID: "chart_pattern", ShortName: "cpat"},
 	{ID: "liquidity_sweeps", ShortName: "liqsw"},
+	{ID: "anchored_vwap", ShortName: "avwap"},
 	{ID: "delta_neutral_funding", ShortName: "dnf"},
+	{ID: "funding_skew", ShortName: "fskew"},
 	{ID: "range_scalper", ShortName: "rs"},
 	{ID: "sweep_squeeze_combo", ShortName: "ssc"},
 	{ID: "adx_trend", ShortName: "adxt"},
@@ -164,6 +182,10 @@ var defaultPerpsStrategies = []stratDef{
 	{ID: "session_breakout", ShortName: "sbo"},
 	{ID: "momentum_pro", ShortName: "mompro"},
 	{ID: "mean_reversion_pro", ShortName: "mrpro"},
+	{ID: "mtf_confluence", ShortName: "mtfc"},
+	{ID: "vol_momentum", ShortName: "volmom"},
+	{ID: "regime_adaptive", ShortName: "regad"},
+	{ID: "regime_adaptive_htf", ShortName: "rahtf"},
 }
 
 var defaultFuturesStrategies = []stratDef{
@@ -177,10 +199,12 @@ var defaultFuturesStrategies = []stratDef{
 	{ID: "ichimoku_cloud", ShortName: "ichi"},
 	{ID: "order_blocks", ShortName: "ob"},
 	{ID: "vwap_reversion", ShortName: "vwap"},
+	{ID: "anchored_vwap", ShortName: "avwap"},
 	{ID: "chart_pattern", ShortName: "cpat"},
 	{ID: "liquidity_sweeps", ShortName: "liqsw"},
 	{ID: "parabolic_sar", ShortName: "psar"},
 	{ID: "delta_neutral_funding", ShortName: "dnf"},
+	{ID: "funding_skew", ShortName: "fskew"},
 	{ID: "range_scalper", ShortName: "rs"},
 	{ID: "sweep_squeeze_combo", ShortName: "ssc"},
 	{ID: "adx_trend", ShortName: "adxt"},
@@ -190,6 +214,10 @@ var defaultFuturesStrategies = []stratDef{
 	{ID: "tema_cross_bd", ShortName: "temacb"},
 	{ID: "momentum_pro", ShortName: "mompro"},
 	{ID: "mean_reversion_pro", ShortName: "mrpro"},
+	{ID: "mtf_confluence", ShortName: "mtfc"},
+	{ID: "vol_momentum", ShortName: "volmom"},
+	{ID: "regime_adaptive", ShortName: "regad"},
+	{ID: "regime_adaptive_htf", ShortName: "rahtf"},
 }
 
 // Supported CME futures symbols for the init wizard.

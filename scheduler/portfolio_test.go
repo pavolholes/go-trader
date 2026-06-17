@@ -106,7 +106,7 @@ func TestPartialClosePreservesInitialQuantityAndEntryATR(t *testing.T) {
 		},
 	}
 
-	applyHyperliquidCircuitCloseFill(state, "ETH", 0.4, 3100, 1, 1, "")
+	applyHyperliquidCircuitCloseFill(state, "ETH", 0.4, 3100, 1, 1, 0, "")
 	pos := state.Positions["ETH"]
 	if pos == nil {
 		t.Fatal("position should remain after partial close")
@@ -1638,11 +1638,14 @@ func TestExecutePerpsSignalLegacyCloseShortThenOpenLongUsesOpenFillFee(t *testin
 	}
 
 	closeLeg, openLeg := s.TradeHistory[0], s.TradeHistory[1]
-	if closeLeg.ExchangeOrderID != "" || closeLeg.ExchangeFee != 0 {
-		t.Errorf("legacy close leg exchange metadata = oid %q fee %g, want empty modeled-fee leg",
-			closeLeg.ExchangeOrderID, closeLeg.ExchangeFee)
+	// #954 gross convention: the modeled fee deducted from cash is ALWAYS
+	// stamped (fee_source says it's modeled); the leg still carries no OID.
+	modeledCloseFee := CalculatePlatformSpotFee("hyperliquid", 0.5*2000)
+	if closeLeg.ExchangeOrderID != "" || math.Abs(closeLeg.ExchangeFee-modeledCloseFee) > 1e-9 || closeLeg.FeeSource != FeeSourceModeled {
+		t.Errorf("legacy close leg = oid %q fee %g src %q, want no-OID modeled fee %g",
+			closeLeg.ExchangeOrderID, closeLeg.ExchangeFee, closeLeg.FeeSource, modeledCloseFee)
 	}
-	if openLeg.ExchangeOrderID != "legacy-open-oid" || openLeg.ExchangeFee != 0.42 {
+	if openLeg.ExchangeOrderID != "legacy-open-oid" || openLeg.ExchangeFee != 0.42 || openLeg.FeeSource != FeeSourceUserFills {
 		t.Errorf("legacy open leg exchange metadata = oid %q fee %g, want oid legacy-open-oid fee 0.42",
 			openLeg.ExchangeOrderID, openLeg.ExchangeFee)
 	}
@@ -1651,7 +1654,6 @@ func TestExecutePerpsSignalLegacyCloseShortThenOpenLongUsesOpenFillFee(t *testin
 		t.Fatalf("position after legacy close/open = %+v, want long qty 0.3", pos)
 	}
 
-	modeledCloseFee := CalculatePlatformSpotFee("hyperliquid", 0.5*2000)
 	wantCash := 1000.0 + (0.5*(2100-2000) - modeledCloseFee) - 0.42
 	if math.Abs(s.Cash-wantCash) > 1e-9 {
 		t.Errorf("cash = %.9f, want %.9f (close modeled fee + open real fill fee)", s.Cash, wantCash)
@@ -1660,8 +1662,9 @@ func TestExecutePerpsSignalLegacyCloseShortThenOpenLongUsesOpenFillFee(t *testin
 
 // #328 — long + signal=-1 + AllowShorts closes the long AND opens a short.
 // Mirrors the existing signal=1+short close-and-flip branch. Produces exactly
-// two Trade rows; the close leg carries the real fill fee while the open leg
-// uses modeled fee cash math so a single fill's fee isn't double-counted (#451).
+// two Trade rows sharing the flip OID; the single real fill fee apportions
+// across them by quantity share so it is neither double-counted nor padded
+// with a modeled open fee (#451, reworked by #954 for ledger accuracy).
 func TestExecutePerpsSignalFlipLongToShort(t *testing.T) {
 	lm, _ := NewLogManager("")
 	logger, _ := lm.GetStrategyLogger("test")
@@ -1701,19 +1704,21 @@ func TestExecutePerpsSignalFlipLongToShort(t *testing.T) {
 		t.Fatalf("TradeHistory len = %d, want 2", len(s.TradeHistory))
 	}
 	closeLeg, openLeg := s.TradeHistory[0], s.TradeHistory[1]
-	if closeLeg.ExchangeOrderID != "live-flip-oid" || closeLeg.ExchangeFee != 0.5 {
-		t.Errorf("close leg exchange metadata = oid %q fee %g, want oid live-flip-oid fee 0.5",
+	// Fee apportioned by qty share of the 1.0 net fill: 0.5/1.0 each.
+	if closeLeg.ExchangeOrderID != "live-flip-oid" || math.Abs(closeLeg.ExchangeFee-0.25) > 1e-9 {
+		t.Errorf("close leg exchange metadata = oid %q fee %g, want oid live-flip-oid fee 0.25",
 			closeLeg.ExchangeOrderID, closeLeg.ExchangeFee)
 	}
-	if openLeg.ExchangeOrderID != "" || openLeg.ExchangeFee != 0 {
-		t.Errorf("open leg exchange metadata = oid %q fee %g, want empty modeled-fee leg",
+	if openLeg.ExchangeOrderID != "live-flip-oid" || math.Abs(openLeg.ExchangeFee-0.25) > 1e-9 || openLeg.FeeSource != FeeSourceUserFills {
+		t.Errorf("open leg exchange metadata = oid %q fee %g, want shared OID with fee 0.25",
 			openLeg.ExchangeOrderID, openLeg.ExchangeFee)
 	}
-	// Close PnL: +$50 - $0.50 real fill fee. Open notional: 0.5 * $2000
-	// with Hyperliquid modeled taker fee 0.035% = $0.35.
-	wantCash := 1000.0 + 49.5 - 0.35
+	// One real $0.50 fee for the whole flip order: close PnL +$50 − $0.25
+	// share, open leg deducts its $0.25 share — cash moves by exactly the
+	// real fee, never real + modeled (#954).
+	wantCash := 1000.0 + 50 - 0.5
 	if math.Abs(s.Cash-wantCash) > 1e-9 {
-		t.Errorf("cash = %.9f, want %.9f (flip close real fee + open modeled fee)", s.Cash, wantCash)
+		t.Errorf("cash = %.9f, want %.9f (single real fee apportioned across flip legs)", s.Cash, wantCash)
 	}
 }
 
@@ -2054,10 +2059,15 @@ func TestExecutePerpsSignal_PartialCloseLongPaperPreservesRemainder(t *testing.T
 	}
 	// Paper mode applies ApplySlippage to the requested price; recompute
 	// expected PnL using the actual recorded price so the assertion is
-	// slippage-tolerant.
-	wantPnL := 0.2*(tr.Price-2000) - CalculatePlatformSpotFee("hyperliquid", 0.2*tr.Price)
-	if math.Abs(tr.RealizedPnL-wantPnL) > 1e-6 {
-		t.Errorf("RealizedPnL = %g, want %g (partial slice only)", tr.RealizedPnL, wantPnL)
+	// slippage-tolerant. #954: RealizedPnL stores the PRE-FEE slice PnL
+	// (PnLGross), with the modeled fee stamped; net comes via tradeNetPnL.
+	wantGross := 0.2 * (tr.Price - 2000)
+	wantFee := CalculatePlatformSpotFee("hyperliquid", 0.2*tr.Price)
+	if !tr.PnLGross || math.Abs(tr.RealizedPnL-wantGross) > 1e-6 {
+		t.Errorf("RealizedPnL = %g (gross=%v), want gross %g (partial slice only)", tr.RealizedPnL, tr.PnLGross, wantGross)
+	}
+	if math.Abs(tradeNetPnL(tr)-(wantGross-wantFee)) > 1e-6 {
+		t.Errorf("tradeNetPnL = %g, want %g (slice PnL net of modeled fee)", tradeNetPnL(tr), wantGross-wantFee)
 	}
 }
 
@@ -2200,6 +2210,165 @@ func TestExecutePerpsSignal_PartialCloseLongLiveUsesFillQty(t *testing.T) {
 	}
 	if math.Abs(s.TradeHistory[0].Quantity-0.18) > 1e-9 {
 		t.Errorf("trade.Quantity = %g, want 0.18 (live fillQty)", s.TradeHistory[0].Quantity)
+	}
+}
+
+// #1009 — a close action (closeFraction > 0) under direction="both" must NOT
+// flip-size the live order. perpsLiveOrderSize's flip branch ignored
+// closeFraction, so a fractional/full close on a "both" strategy sized the
+// order as (posQty + newSize) — a full reversal — while the executor treated
+// the same signal as close-only. The flip-sized fill then drove the close
+// leg's qty negative. The sizer must mirror closeOnlyAction: any closeFraction
+// > 0 is close-only, never a flip.
+func TestPerpsLiveOrderSize_CloseActionUnderBothDoesNotFlipSize(t *testing.T) {
+	cases := []struct {
+		name     string
+		signal   int
+		posSide  string
+		frac     float64
+		wantSize float64
+	}{
+		// long 0.4 @ 2000, sell partial 0.5 under "both" → 0.2, not a flip.
+		{"partial close long", -1, "long", 0.5, 0.2},
+		// short 0.4 @ 2000, buy partial 0.5 under "both" → 0.2, not a flip.
+		{"partial close short", 1, "short", 0.5, 0.2},
+		// final-tier full close (frac=1.0) under "both" → full posQty 0.4.
+		{"full close long", -1, "long", 1.0, 0.4},
+		{"full close short", 1, "short", 1.0, 0.4},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			size, ok, reason := perpsLiveOrderSize(tc.signal, 2000, 1000, 0.4, 2000, 1.0, 1.0, 0, tc.posSide, DirectionBoth, tc.frac)
+			if !ok {
+				t.Fatalf("expected ok, got reason=%q", reason)
+			}
+			if math.Abs(size-tc.wantSize) > 1e-9 {
+				t.Errorf("size = %g, want %g (close-only, must not flip-size posQty+newSize)", size, tc.wantSize)
+			}
+		})
+	}
+}
+
+// #1009 — a genuine flip (closeFraction == 0) under direction="both" must still
+// flip-size (posQty + newSize). Guards against the fix over-reaching and
+// breaking legitimate same-cycle reversals.
+func TestPerpsLiveOrderSize_GenuineFlipStillFlipSizes(t *testing.T) {
+	// long 0.4 @ 2000, sell reversal (frac=0) → posQty + newSize > posQty.
+	size, ok, _ := perpsLiveOrderSize(-1, 2000, 1000, 0.4, 2000, 1.0, 1.0, 0, "long", DirectionBoth, 0)
+	if !ok {
+		t.Fatal("expected ok")
+	}
+	if size <= 0.4 {
+		t.Errorf("size = %g, want > 0.4 (flip = closeQty + newSize)", size)
+	}
+}
+
+// #1009 — backstop: even if a flip-sized fill (fillQty > pos.Quantity) reaches
+// the partial-close executor, closeQty must be capped at pos.Quantity so the
+// residual never goes negative and the close-leg PnL is not overstated.
+// Without the cap, pos.Quantity -= fillQty stored a negative-quantity position
+// and booked realized_pnl against the full (over-large) fill qty.
+func TestExecutePerpsSignal_PartialCloseCapsCloseQtyAtPosQuantity(t *testing.T) {
+	cases := []struct {
+		name    string
+		signal  int
+		posSide string
+	}{
+		{"close long oversized fill", -1, "long"},
+		{"close short oversized fill", 1, "short"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pos := &Position{
+				Symbol:          "ETH",
+				TradePositionID: "etrip-cap",
+				Quantity:        0.597,
+				InitialQuantity: 0.597,
+				AvgCost:         2000,
+				Side:            tc.posSide,
+				Multiplier:      1,
+				Leverage:        1,
+			}
+			s := &StrategyState{
+				ID:              "hl-cap",
+				Cash:            990,
+				Platform:        "hyperliquid",
+				Type:            "perps",
+				Positions:       map[string]*Position{"ETH": pos},
+				OptionPositions: make(map[string]*OptionPosition),
+				TradeHistory:    []Trade{},
+				RiskState:       RiskState{PeakValue: 1000},
+			}
+			lm, _ := NewLogManager("")
+			logger, _ := lm.GetStrategyLogger("test")
+			defer logger.Close()
+
+			// fillQty 1.192 simulates a flip-sized fill landing on the
+			// partial-close path (the pre-fix corruption scenario). Close at
+			// avgCost so the closed-leg PnL is ~0 — a capped close leg books
+			// ~0, an uncapped one would book against 1.192 qty.
+			_, err := ExecutePerpsSignalWithLeverage(s, tc.signal, "ETH", 2000, 1, 1, 0, 1.192, "oid", 0, DirectionBoth, 0.5, logger)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := s.Positions["ETH"]
+			if got == nil {
+				t.Fatal("position should remain (zero or residual), not be dropped")
+			}
+			if got.Quantity < 0 {
+				t.Errorf("Quantity = %g, must never be negative (cap closeQty at pos.Quantity)", got.Quantity)
+			}
+			if got.Quantity > 1e-9 {
+				t.Errorf("Quantity = %g, want ~0 (closeQty capped at 0.597 fully closes)", got.Quantity)
+			}
+			if len(s.TradeHistory) != 1 {
+				t.Fatalf("history = %d, want 1", len(s.TradeHistory))
+			}
+			if math.Abs(s.TradeHistory[0].Quantity-0.597) > 1e-9 {
+				t.Errorf("trade.Quantity = %g, want 0.597 (capped close leg, not 1.192)", s.TradeHistory[0].Quantity)
+			}
+		})
+	}
+}
+
+// #1009 (PR #1010 review) — a full close-action (closeFraction == 1.0) under
+// direction="both" must suppress the NEW stop-loss; before this the corrected
+// flip predicate (flipping requires frac==0) flipped prev_pos_qty to 0 and a
+// fresh reduce-only stop leaked onto the just-closed position. Covers the
+// reviewer's must-survive cases on the pure SL-suppression decision.
+func TestPerpsCloseActionSuppressesNewSL(t *testing.T) {
+	cases := []struct {
+		name                    string
+		signal                  int
+		posSide                 string
+		allowsLong, allowsShort bool
+		frac                    float64
+		want                    bool
+	}{
+		// The reported regression: full close-action under "both" → suppress.
+		{"full close long under both", -1, "long", true, true, 1.0, true},
+		{"full close short under both", 1, "short", true, true, 1.0, true},
+		// Must survive (a): a genuine reversal flip (frac==0) opens a new side
+		// and MUST arm its SL → not suppressed.
+		{"flip long-to-short under both", -1, "long", true, true, 0, false},
+		{"flip short-to-long under both", 1, "short", true, true, 0, false},
+		// Must survive (c): a partial close is handled by the caller's separate
+		// partialClose guard, so the pure-close helper does NOT suppress here.
+		{"partial close under both not pureClose", -1, "long", true, true, 0.5, false},
+		// Legacy directional-gate close-only exits still suppress.
+		{"long-only sell on long", -1, "long", true, false, 0, true},
+		{"short-only buy on short", 1, "short", false, true, 0, true},
+		// A long-only fresh sell-from-flat shape (no short pos) is not a
+		// close-only here and should not suppress on its own.
+		{"both-direction long open arms SL", 1, "", true, true, 0, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := perpsCloseActionSuppressesNewSL(tc.signal, tc.posSide, tc.allowsLong, tc.allowsShort, tc.frac)
+			if got != tc.want {
+				t.Errorf("perpsCloseActionSuppressesNewSL = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 

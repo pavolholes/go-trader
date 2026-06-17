@@ -689,7 +689,7 @@ func tradeMarkers(trades []Trade) []UITradeMarker {
 			IsClose:     tr.IsClose,
 			Price:       tr.Price,
 			Quantity:    tr.Quantity,
-			RealizedPnL: tr.RealizedPnL,
+			RealizedPnL: tradeNetPnL(tr),
 			Details:     tr.Details,
 			Regime:      tr.Regime,
 		}

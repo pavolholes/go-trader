@@ -91,3 +91,214 @@ def test_run_single_backtest_threads_platform_to_backtester(monkeypatch):
         f"platform did not thread through to Backtester — got {seen}"
     )
     assert seen["capital"] == 777.0
+
+
+def test_backtester_imports_under_script_style_sys_path(tmp_path):
+    """Script-style invocation (`python backtest/run_backtest.py`) puts only
+    backtest/ on sys.path. Backtester.__init__ unconditionally loads
+    post_tp_sl.py, whose absolute `shared_strategies.close...` import needs the
+    repo root — backtester.py must insert it itself (pytest masks the gap by
+    inserting the root during shared_strategies package collection)."""
+    import os
+    import subprocess
+    import sys
+
+    backtest_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    snippet = tmp_path / "script_style_import.py"
+    snippet.write_text(
+        "import sys\n"
+        f"sys.path.insert(0, {backtest_dir!r})\n"
+        "import backtester\n"
+        "backtester.Backtester()\n"
+        "print('OK')\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, str(snippet)],
+        cwd=tmp_path, capture_output=True, text=True, timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "OK" in proc.stdout
+
+
+def test_build_parser_accepts_close_stack_flags():
+    parser = run_backtest._build_parser()
+    args = parser.parse_args([
+        "--mode", "optimize", "--strategy", "sma_crossover",
+        "--sweep-close", "--optimize-metric", "dd_adjusted_return",
+        "--direction", "long",
+    ])
+    assert args.sweep_close is True
+    assert args.optimize_metric == "dd_adjusted_return"
+    assert args.direction == "long"
+    assert args.close_stacks_json is None
+
+
+def test_build_parser_rejects_unknown_optimize_metric():
+    parser = run_backtest._build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--optimize-metric", "alpha_decay"])
+
+
+# ─── #989 review: --direction must reach every mode, not just optimize ───────
+# Invariant: every backtest CLI surface either honors the requested entry
+# direction or rejects it loudly — a requested short leg is never silently
+# scored as long/flat.
+
+
+def _spy_single(monkeypatch):
+    seen = {}
+
+    def spy(*args, **kwargs):
+        seen.setdefault("calls", []).append(kwargs)
+        return None
+
+    monkeypatch.setattr(run_backtest, "run_single_backtest", spy)
+    return seen
+
+
+def test_single_mode_threads_direction(monkeypatch):
+    seen = _spy_single(monkeypatch)
+    monkeypatch.setattr("sys.argv", [
+        "run_backtest.py", "--mode", "single",
+        "--strategy", "sma_crossover", "--direction", "short",
+    ])
+    run_backtest.main()
+    assert seen["calls"][0]["direction"] == "short"
+
+
+def test_compare_mode_threads_direction(monkeypatch):
+    seen = _spy_single(monkeypatch)
+    monkeypatch.setattr("sys.argv", [
+        "run_backtest.py", "--mode", "compare",
+        "--strategy", "sma_crossover", "--direction", "short",
+    ])
+    run_backtest.main()
+    assert seen["calls"][0]["direction"] == "short"
+
+
+def test_multi_mode_threads_direction(monkeypatch):
+    seen = _spy_single(monkeypatch)
+    monkeypatch.setattr("sys.argv", [
+        "run_backtest.py", "--mode", "multi",
+        "--strategy", "sma_crossover", "--symbols", "BTC/USDT",
+        "--direction", "short",
+    ])
+    run_backtest.main()
+    assert seen["calls"][0]["direction"] == "short"
+
+
+def test_direction_both_without_close_rejected_before_running(monkeypatch):
+    # "both" cannot run on the plain single-leg path; naive forwarding would
+    # bypass the loader's rejection and silently score long/flat.
+    seen = _spy_single(monkeypatch)
+    monkeypatch.setattr("sys.argv", [
+        "run_backtest.py", "--mode", "single",
+        "--strategy", "sma_crossover", "--direction", "both",
+    ])
+    with pytest.raises(SystemExit):
+        run_backtest.main()
+    assert "calls" not in seen
+
+
+def test_direction_both_with_close_strategy_threads_through(monkeypatch):
+    seen = _spy_single(monkeypatch)
+    monkeypatch.setattr("sys.argv", [
+        "run_backtest.py", "--mode", "single",
+        "--strategy", "sma_crossover", "--direction", "both",
+        "--close-strategy", "tiered_tp_atr",
+    ])
+    run_backtest.main()
+    assert seen["calls"][0]["direction"] == "both"
+    assert seen["calls"][0]["close_strategies"] == [
+        {"name": "tiered_tp_atr", "params": {}}]
+
+
+def test_direction_short_rejected_in_optimize_mode(monkeypatch):
+    # PR #1004 review: the walk-forward warmup seeder is long-only, so
+    # optimize mode cannot measure the short leg faithfully — reject at the
+    # CLI before any data fetch, with or without a close-stack sweep.
+    seen = {}
+    monkeypatch.setattr(run_backtest, "run_walk_forward",
+                        lambda *a, **kw: seen.setdefault("hit", True))
+    for extra in ([], ["--sweep-close"],
+                  ["--close-strategy", "tiered_tp_atr"]):
+        monkeypatch.setattr("sys.argv", [
+            "run_backtest.py", "--mode", "optimize",
+            "--strategy", "sma_crossover", "--direction", "short", *extra,
+        ])
+        with pytest.raises(SystemExit):
+            run_backtest.main()
+    assert "hit" not in seen
+
+
+def test_direction_both_with_default_sweep_grid_rejected(monkeypatch):
+    # PR #1004 review: the default --sweep-close grid always contains
+    # no-close baseline stacks, which run the plain single-leg path and
+    # cannot model "both" — reject before any data fetch instead of
+    # tracebacking inside walk_forward_optimize.
+    seen = {}
+    monkeypatch.setattr(run_backtest, "run_walk_forward",
+                        lambda *a, **kw: seen.setdefault("hit", True))
+    monkeypatch.setattr("sys.argv", [
+        "run_backtest.py", "--mode", "optimize",
+        "--strategy", "sma_crossover", "--sweep-close",
+        "--direction", "both",
+    ])
+    with pytest.raises(SystemExit):
+        run_backtest.main()
+    assert "hit" not in seen
+
+
+def test_direction_both_with_close_only_stacks_json_reaches_walk_forward(
+        monkeypatch, tmp_path):
+    # "both" is legitimate in optimize mode when every swept stack carries a
+    # close evaluator (engine path on every stack).
+    import json
+    specs = tmp_path / "stacks.json"
+    specs.write_text(json.dumps([
+        {"close": {"name": "tiered_tp_atr", "params": {}}},
+    ]))
+    seen = {}
+
+    def spy_wf(*args, **kwargs):
+        seen.update(kwargs)
+
+    monkeypatch.setattr(run_backtest, "run_walk_forward", spy_wf)
+    monkeypatch.setattr("sys.argv", [
+        "run_backtest.py", "--mode", "optimize",
+        "--strategy", "sma_crossover",
+        "--close-stacks-json", str(specs),
+        "--direction", "both",
+    ])
+    run_backtest.main()
+    assert seen["direction"] == "both"
+    assert seen["close_stack_grid"]
+    assert all(s.get("close_strategies") for s in seen["close_stack_grid"])
+
+
+def test_run_walk_forward_threads_close_stack_grid(monkeypatch):
+    """The close-stack grid, metric, and direction must reach
+    walk_forward_optimize — a dropped kwarg silently degrades #996 sweeps to
+    a fixed-close run."""
+    seen = {}
+
+    def spy_wfo(df, strategy_name, param_ranges, **kwargs):
+        seen.update(kwargs)
+        return {"error": "spy", "strategy": strategy_name}
+
+    monkeypatch.setattr(run_backtest, "walk_forward_optimize", spy_wfo)
+    monkeypatch.setattr(
+        run_backtest, "load_cached_data",
+        lambda *a, **k: pd.DataFrame(
+            {"open": [1.0] * 300, "high": [1.0] * 300, "low": [1.0] * 300,
+             "close": [1.0] * 300, "volume": [1.0] * 300},
+            index=pd.date_range("2024-01-01", periods=300, freq="D")))
+
+    grid = [{"label": "baseline", "close_strategies": [],
+             "stop_loss_atr_mult": None, "trailing_stop_atr_mult": None}]
+    run_backtest.run_walk_forward(
+        "sma_crossover", close_stack_grid=grid,
+        optimize_metric="dd_adjusted_return", direction="long")
+    assert seen["close_stack_grid"] == grid
+    assert seen["optimize_metric"] == "dd_adjusted_return"
+    assert seen["direction"] == "long"

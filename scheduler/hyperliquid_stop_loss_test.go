@@ -265,14 +265,12 @@ func TestRunHyperliquidTrailingStopUpdate_CancelThenPlaceArgs(t *testing.T) {
 	}
 }
 
-func TestRunHyperliquidTrailingStopUpdate_AlertsOnOrphanedOldOID(t *testing.T) {
+func TestRunHyperliquidTrailingStopUpdate_DefersOnCancelFailure(t *testing.T) {
 	old := runHyperliquidUpdateStopLossFunc
 	defer func() { runHyperliquidUpdateStopLossFunc = old }()
 
 	runHyperliquidUpdateStopLossFunc = func(script, symbol, side string, size, triggerPx float64, cancelStopLossOID int64) (*HyperliquidStopLossUpdateResult, string, error) {
 		return &HyperliquidStopLossUpdateResult{
-			StopLossOID:         222,
-			StopLossTriggerPx:   triggerPx,
 			CancelStopLossError: "order not found",
 		}, "", nil
 	}
@@ -288,15 +286,43 @@ func TestRunHyperliquidTrailingStopUpdate_AlertsOnOrphanedOldOID(t *testing.T) {
 		ownerID:  "owner",
 	})
 
-	_, result, ok := runHyperliquidTrailingStopUpdate(sc, "ETH", "long", 0.5, &Position{AvgCost: 100}, 110, 100, 97, 111, false, notifier, logger)
-	if !ok || result == nil || result.StopLossOID != 222 {
-		t.Fatalf("runHyperliquidTrailingStopUpdate = (%+v, %v), want placed replacement", result, ok)
+	newHighWater, result, ok := runHyperliquidTrailingStopUpdate(sc, "ETH", "long", 0.5, &Position{AvgCost: 100}, 110, 100, 97, 111, false, notifier, logger)
+	if ok || result == nil {
+		t.Fatalf("runHyperliquidTrailingStopUpdate = (%+v, %v), want deferred result", result, ok)
 	}
-	if len(mock.messages) != 1 || !strings.Contains(mock.messages[0].content, "old trigger OID 111") || !strings.Contains(mock.messages[0].content, "new trigger OID 222") {
-		t.Fatalf("broadcast messages=%+v, want orphaned old/new OID alert", mock.messages)
+	if newHighWater != 100 {
+		t.Fatalf("newHighWater=%v, want unchanged 100", newHighWater)
+	}
+	if result.StopLossOID != 0 {
+		t.Fatalf("StopLossOID=%d, want no replacement", result.StopLossOID)
+	}
+	if len(mock.messages) != 1 || !strings.Contains(mock.messages[0].content, "old trigger OID 111") || !strings.Contains(mock.messages[0].content, "not replaced") {
+		t.Fatalf("broadcast messages=%+v, want deferred cancel-failure alert", mock.messages)
 	}
 	if len(mock.dms) != 1 || !strings.Contains(mock.dms[0].content, "order not found") {
 		t.Fatalf("DMs=%+v, want owner alert with cancel error", mock.dms)
+	}
+}
+
+func TestRunHyperliquidTrailingStopUpdate_DefersOnOpenOrderCheckFailure(t *testing.T) {
+	old := runHyperliquidUpdateStopLossFunc
+	defer func() { runHyperliquidUpdateStopLossFunc = old }()
+
+	runHyperliquidUpdateStopLossFunc = func(script, symbol, side string, size, triggerPx float64, cancelStopLossOID int64) (*HyperliquidStopLossUpdateResult, string, error) {
+		return &HyperliquidStopLossUpdateResult{OpenOrderCheckError: "indexer down"}, "", nil
+	}
+
+	trail := 3.0
+	sc := StrategyConfig{ID: "hl-test", Platform: "hyperliquid", Type: "perps", Script: "shared_scripts/check_hyperliquid.py", TrailingStopPct: &trail}
+	logger := silentStrategyLogger("hl-test")
+	defer logger.Close()
+
+	newHighWater, result, ok := runHyperliquidTrailingStopUpdate(sc, "ETH", "long", 0.5, &Position{AvgCost: 100}, 110, 100, 97, 111, false, nil, logger)
+	if ok || result == nil {
+		t.Fatalf("runHyperliquidTrailingStopUpdate = (%+v, %v), want deferred result", result, ok)
+	}
+	if newHighWater != 100 {
+		t.Fatalf("newHighWater=%v, want unchanged 100", newHighWater)
 	}
 }
 
@@ -1772,6 +1798,40 @@ func TestRunHyperliquidTrailingStopPaper(t *testing.T) {
 	}
 }
 
+func TestRunHyperliquidTrailingStopPaper_RegimeSnapshotArms(t *testing.T) {
+	regimeBlock := &RegimeATRBlock{TrendRegime: map[string]RegimeATREntry{
+		"trending": {ATR: 2.0},
+		"ranging":  {ATR: 1.0},
+	}}
+	sc := StrategyConfig{
+		ID:                    "hl-regime-paper",
+		Platform:              "hyperliquid",
+		Type:                  "perps",
+		RegimeATRWindow:       "medium",
+		TrailingStopATRRegime: regimeBlock,
+	}
+	pos := &Position{
+		AvgCost:         2100,
+		EntryATR:        50,
+		RiskAnchorPrice: 2000,
+		Regime:          "ranging",
+		RegimeWindows:   map[string]string{"medium": "trending"},
+	}
+
+	incomplete := &Position{AvgCost: pos.AvgCost, EntryATR: pos.EntryATR}
+	_, gotTrig, gotBreach, gotPx := runHyperliquidTrailingStopPaper(sc, "long", incomplete, 2000, 0, 0)
+	if gotTrig != 0 || gotBreach || gotPx != 0 {
+		t.Fatalf("incomplete snapshot unexpectedly armed: trig=%v breach=%v px=%v", gotTrig, gotBreach, gotPx)
+	}
+
+	snapshot := hyperliquidProtectionPositionSnapshot(pos)
+	gotHW, gotTrig, gotBreach, gotPx := runHyperliquidTrailingStopPaper(sc, "long", snapshot, 2000, 0, 0)
+	if !approxEq(gotHW, 2000) || !approxEq(gotTrig, 1900) || gotBreach || gotPx != 0 {
+		t.Fatalf("regime snapshot paper trail = (hw=%v trig=%v breach=%v px=%v), want (2000, 1900, false, 0)",
+			gotHW, gotTrig, gotBreach, gotPx)
+	}
+}
+
 // #532: paper-mode trailing stop close must operate only on the strategy's
 // own virtual position. Two strategies on the same symbol with independent
 // StrategyState maps must remain isolated when one breaches.
@@ -2015,10 +2075,9 @@ func TestNormalizeHyperliquidPeerStopLosses_FixedATRMultOwner(t *testing.T) {
 	}
 }
 
-// #604 review #5: trailing stops still race on the shared on-chain position
-// because each cycle's cancel/replace is non-atomic. Two trailing peers must
-// be rejected even though fixed-distance peers are allowed.
-func TestHyperliquidPeerStrategyErrors_TrailingStopConflict(t *testing.T) {
+// #964: multiple same-coin trailing peers are allowed once the live trailing
+// updater serializes replacement and the reconciler attributes exact OID fills.
+func TestHyperliquidPeerStrategyErrors_TrailingStopPeersAllowed(t *testing.T) {
 	a := 0.05 // 5% trailing
 	b := 0.03
 	strategies := []StrategyConfig{
@@ -2034,24 +2093,12 @@ func TestHyperliquidPeerStrategyErrors_TrailingStopConflict(t *testing.T) {
 		},
 	}
 	errs := hyperliquidPeerStrategyErrors(strategies)
-	if len(errs) == 0 {
-		t.Fatal("expected trailing-stop peer conflict error, got none")
-	}
-	found := false
-	for _, e := range errs {
-		if strings.Contains(e, "trailing-stop owners") {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Errorf("expected error mentioning trailing-stop owners, got: %v", errs)
+	if len(errs) != 0 {
+		t.Fatalf("unexpected trailing-stop peer errors: %v", errs)
 	}
 }
 
-// #604 review #5: ATR-mult trailing stops have the same race as percentage
-// trailing — both call hyperliquidArmFixedATRStopLossLive's cancel/replace.
-func TestHyperliquidPeerStrategyErrors_TrailingATRConflict(t *testing.T) {
+func TestHyperliquidPeerStrategyErrors_TrailingATRPeersAllowed(t *testing.T) {
 	a := 1.0
 	b := 1.5
 	strategies := []StrategyConfig{
@@ -2067,8 +2114,8 @@ func TestHyperliquidPeerStrategyErrors_TrailingATRConflict(t *testing.T) {
 		},
 	}
 	errs := hyperliquidPeerStrategyErrors(strategies)
-	if len(errs) == 0 {
-		t.Fatal("expected trailing-ATR peer conflict error, got none")
+	if len(errs) != 0 {
+		t.Fatalf("unexpected trailing-ATR peer errors: %v", errs)
 	}
 }
 

@@ -54,20 +54,24 @@ decision-layer parity checks; see ``backtest/AUDIT.md`` for the full matrix):
     have no bar-level simulation.
   • **``tiered_tp_atr_live_regime_dynamic``** (#843) — rejected at
     ``run_backtest.load_strategy_config`` (on-chain regime hysteresis).
-  • **``regime_directional_policy``** (#822) — rejected at config load; use static
-    ``direction`` / ``invert_signal`` for backtests.
   • **Inline trailing SL at open** (#885) — live arms same-cycle; backtest seeds
     trailing/ratchet triggers on the bar after open (no naked-gap modeling).
 """
 
 import sys
 import os
-import json
 import math
-from datetime import datetime
-from typing import Any, Callable, Optional, Tuple
+from typing import Any, Optional, Tuple
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'shared_tools'))
+# Repo root, so `from shared_strategies.close... import` (post_tp_sl.py,
+# trailing_tp_ratchet.py — loaded unconditionally in __init__) resolves under
+# script-style invocation (`python backtest/run_backtest.py`), where only the
+# script's own directory is on sys.path. pytest masks this by inserting the
+# root during collection of the shared_strategies package tests.
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 import numpy as np
 import pandas as pd
@@ -99,6 +103,100 @@ def _load_regime():
         from regime import ensure_regime_columns as _ensure_regime_columns
         _ensure_regime_fn = _ensure_regime_columns
     return _ensure_regime_fn
+
+
+def _normalize_regime_directional_policy(policy: Optional[dict]) -> Optional[dict]:
+    """Validate and compact ``regime_directional_policy`` for replay (#1025).
+
+    Go owns vocabulary validation because labels depend on the selected regime
+    classifier/window. The backtester only mirrors the already-validated runtime
+    shape: ``trend_regime`` label -> {direction, invert_signal}.
+    """
+    if not policy:
+        return None
+    if not isinstance(policy, dict):
+        raise ValueError("regime_directional_policy must be an object")
+    raw = policy.get("trend_regime")
+    if not isinstance(raw, dict):
+        raise ValueError(
+            "regime_directional_policy must contain a trend_regime object"
+        )
+    parsed: dict[str, dict[str, object]] = {}
+    for label, entry in raw.items():
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"regime_directional_policy.{label}: must be an object"
+            )
+        direction = entry.get("direction")
+        if not isinstance(direction, str):
+            raise ValueError(
+                f"regime_directional_policy.{label}.direction: must be a string"
+            )
+        if direction not in ("long", "short", "both"):
+            raise ValueError(
+                f"regime_directional_policy.{label}.direction: must be "
+                f"'long', 'short', or 'both'"
+            )
+        invert = entry.get("invert_signal", False)
+        if not isinstance(invert, bool):
+            raise ValueError(
+                f"regime_directional_policy.{label}.invert_signal: "
+                f"must be a boolean"
+            )
+        for key in entry:
+            if key not in ("direction", "invert_signal"):
+                raise ValueError(
+                    f"regime_directional_policy.{label}: unknown key {key!r}"
+                )
+        parsed[str(label).strip()] = {
+            "direction": direction,
+            "invert_signal": invert,
+        }
+    return parsed or None
+
+
+def _resolve_regime_directional_entry(
+    policy: Optional[dict],
+    current_regime: str,
+    position_regime: str = "",
+    position_qty: float = 0.0,
+) -> Optional[dict]:
+    """Return the effective per-regime direction/invert override (#1025)."""
+    if not policy:
+        return None
+    regime = str(current_regime or "").strip()
+    if position_qty > 0 and str(position_regime or "").strip():
+        regime = str(position_regime or "").strip()
+    entry = policy.get(regime)
+    return dict(entry) if isinstance(entry, dict) else None
+
+
+def _apply_direction_invert_value(
+    signal: int,
+    uses_open_close: bool,
+    direction: Optional[str],
+    invert_signal: bool,
+) -> int:
+    """Scalar form of Backtester._apply_direction_invert (#1025)."""
+    sig = int(signal)
+    if invert_signal and sig != 0:
+        sig = -sig
+    d = (direction or "").strip().lower()
+    if uses_open_close and d in ("long", "short"):
+        if d == "long" and sig < 0:
+            return 0
+        if d == "short" and sig > 0:
+            return 0
+    return sig
+
+
+def _signal_from_open_action(action: str) -> int:
+    action = str(action or "").strip().lower()
+    if action == "long":
+        return 1
+    if action == "short":
+        return -1
+    return 0
 
 
 def _load_post_tp_sl():
@@ -202,6 +300,17 @@ def periods_per_year(timeframe: str) -> int:
     return TIMEFRAME_PERIODS_PER_YEAR.get(timeframe, 365)
 
 
+# Timeframe-independent sentinel for the risk-adjusted floor applied to blown
+# (liquidated) legs (#1005). Must be uniform across timeframes so two equally
+# dead legs tie regardless of which timeframe they busted on. The earlier floor
+# used the per-leg ``-ann_factor`` (1h ≈ -93.6, 4h ≈ -46.8), which let the SAME
+# total loss carry a ~2x different Sharpe by timeframe and perturbed mean-Sharpe
+# rankings of liquidated strategies by bust timeframe rather than severity. The
+# magnitude (100, mirroring the -100% return floor) dominates any surviving
+# leg's annualized Sharpe on the harness timeframes (1h/4h).
+LIQUIDATED_METRIC_FLOOR = 100.0
+
+
 # Taker fee rates per platform — mirrors scheduler/fees.go:CalculatePlatformSpotFee
 # and related constants. test_platform_fees.py scrapes fees.go to enforce parity.
 PLATFORM_FEE_PCT = {
@@ -226,6 +335,91 @@ def _open_action_from_signal(signal: int) -> str:
     if signal < 0:
         return "short"
     return "none"
+
+
+def _parse_profile_allocation(alloc: Optional[dict]) -> Optional[dict]:
+    """Validate and compact a regime_profile_allocation block for the engine
+    (#998). Returns None when unset; raises ValueError on a malformed block so
+    a misconfigured --config fails loudly rather than silently single-profile.
+
+    The compact form mirrors the Go RegimeProfileAllocation: profiles (label ->
+    profile name), param_sets (profile -> params), confirm_bars, initial_profile.
+    The window key and per-profile signal computation live in run_backtest.py;
+    the engine only replays the switch over the supplied ``signal__<profile>``
+    columns.
+    """
+    if not alloc:
+        return None
+    profiles = dict(alloc.get("profiles") or {})
+    param_sets = dict(alloc.get("param_sets") or {})
+    confirm_bars = int(alloc.get("confirm_bars") or 0)
+    initial_profile = str(alloc.get("initial_profile") or "").strip()
+    if len(param_sets) != 2:
+        raise ValueError(
+            f"regime_profile_allocation.param_sets must define exactly 2 "
+            f"profiles (the M4 two-profile model), got {len(param_sets)}"
+        )
+    if confirm_bars < 1:
+        raise ValueError("regime_profile_allocation.confirm_bars must be >= 1")
+    if initial_profile not in param_sets:
+        raise ValueError(
+            f"regime_profile_allocation.initial_profile={initial_profile!r} "
+            f"is not a param_sets profile {sorted(param_sets)}"
+        )
+    for lbl, prof in profiles.items():
+        if prof not in param_sets:
+            raise ValueError(
+                f"regime_profile_allocation.profiles[{lbl!r}]={prof!r} is not "
+                f"a param_sets profile {sorted(param_sets)}"
+            )
+    return {
+        "profiles": profiles,
+        "param_sets": param_sets,
+        "confirm_bars": confirm_bars,
+        "initial_profile": initial_profile,
+        "names": sorted(param_sets),
+    }
+
+
+class _ProfileSwitcher:
+    """Per-bar flat-only, confirm_bars hysteresis profile switch — the exact
+    state machine resolveRegimeProfile replays live (#998). The backtester is
+    bar-cadenced, so every ``step`` is a closed-bar advance.
+    """
+
+    def __init__(self, alloc: dict):
+        self._profiles = alloc["profiles"]
+        self._confirm_bars = alloc["confirm_bars"]
+        self.active = alloc["initial_profile"]
+        self._pending = ""
+        self._seen = 0
+
+    def step(self, label: str, flat: bool) -> str:
+        """Advance one closed bar and return the profile governing THIS bar's
+        open decision. ``flat`` is the position state at decision time (the
+        backtester's position carried into this bar)."""
+        desired = self._profiles.get((label or "").strip(), "")
+        if desired == "":
+            # Fail-open / unknown label: freeze the counter, hold active.
+            return self.active
+        if desired == self.active:
+            self._pending = ""
+            self._seen = 0
+            return self.active
+        # Desired differs from active: accrue hysteresis.
+        if self._pending == desired:
+            self._seen += 1
+        else:
+            self._pending = desired
+            self._seen = 1
+        # Commit only when flat AND the desired profile has persisted long
+        # enough. While a position is open the counter keeps growing but the
+        # switch is deferred to the first flat bar.
+        if flat and self._seen >= self._confirm_bars:
+            self.active = desired
+            self._pending = ""
+            self._seen = 0
+        return self.active
 
 
 def _close_refs_use_regime_tiered_tp(refs: list[dict]) -> bool:
@@ -276,6 +470,22 @@ class Trade:
         self.pnl = 0.0
         self.pnl_pct = 0.0
         self.shares = 0.0
+        # #997 hold telemetry — stamped at close via _stamp_hold(). Defaults
+        # keep pre-#997 callers/tests valid (a trade never stamped just reports
+        # zeros). bars_held is closed-bar count since the entry-fill bar
+        # inclusive (filled at bar N's open -> bars_held==1 at bar N's close).
+        # mfe_pct / mae_pct are signed, side-aware excursions vs entry price
+        # (mfe >= 0 favourable, mae <= 0 adverse); bars_to_* index when each
+        # extreme occurred. entry_fee / exit_fee are this leg's commissions.
+        self.bars_held = 0
+        self.mfe_pct = 0.0
+        self.mae_pct = 0.0
+        self.bars_to_mfe = 0
+        self.bars_to_mae = 0
+        self.entry_atr = 0.0
+        self.entry_fee = 0.0
+        self.exit_fee = 0.0
+        self.exit_reason = ""
 
     def close(self, exit_date, exit_price):
         self.exit_date = exit_date
@@ -296,7 +506,82 @@ class Trade:
             "shares": self.shares,
             "pnl": round(self.pnl, 2),
             "pnl_pct": round(self.pnl_pct * 100, 2),
+            # #997 hold telemetry (additive; existing consumers ignore these).
+            "bars_held": self.bars_held,
+            "mfe_pct": round(self.mfe_pct * 100, 4),
+            "mae_pct": round(self.mae_pct * 100, 4),
+            "bars_to_mfe": self.bars_to_mfe,
+            "bars_to_mae": self.bars_to_mae,
+            "entry_atr": round(self.entry_atr, 6),
+            "entry_fee": round(self.entry_fee, 6),
+            "exit_fee": round(self.exit_fee, 6),
+            "exit_reason": self.exit_reason,
         }
+
+
+class _HoldTracker:
+    """Per-position intra-hold excursion + holding-time accumulator (#997).
+
+    Output-only: feeds the exit-quality diagnostic, never a trading decision,
+    so reading the current bar's high/low at its own close is look-ahead-safe.
+    Reset at every open via ``open()``; advanced once per held bar via
+    ``step()`` (called after this bar's open-fill close/open processing so a
+    trade closed at the bar's open does not absorb that bar's range, while a
+    trade opened at the bar's open does); read at close via ``metrics()``.
+    """
+
+    __slots__ = ("bars", "high", "low", "high_bar", "low_bar",
+                 "entry_fee", "entry_price", "side")
+
+    def __init__(self):
+        self.open(0.0, "long", 0.0)
+
+    def open(self, entry_price: float, side: str, entry_fee: float) -> None:
+        self.bars = 0
+        self.high = entry_price
+        self.low = entry_price
+        self.high_bar = 0
+        self.low_bar = 0
+        self.entry_fee = entry_fee
+        self.entry_price = entry_price
+        self.side = side
+
+    def step(self, high: float, low: float) -> None:
+        self.bars += 1
+        if high > self.high:
+            self.high = high
+            self.high_bar = self.bars
+        if low < self.low:
+            self.low = low
+            self.low_bar = self.bars
+
+    def metrics(self):
+        """Return (mfe_pct, mae_pct, bars_to_mfe, bars_to_mae), side-aware."""
+        e = self.entry_price
+        if e <= 0:
+            return 0.0, 0.0, 0, 0
+        if self.side == "long":
+            return (self.high - e) / e, (self.low - e) / e, self.high_bar, self.low_bar
+        return (e - self.low) / e, (e - self.high) / e, self.low_bar, self.high_bar
+
+
+def _stamp_hold(trade, hold: "_HoldTracker", *, entry_atr: float,
+                exit_fee: float, reason: str, qty_frac: float = 1.0) -> None:
+    """Stamp #997 hold telemetry onto a closing trade leg.
+
+    ``qty_frac`` pro-rates the entry commission for a partial-close leg (each
+    leg gets its share of the single entry fee; the legs' fractions sum to 1).
+    """
+    mfe, mae, b_mfe, b_mae = hold.metrics()
+    trade.bars_held = hold.bars
+    trade.mfe_pct = mfe
+    trade.mae_pct = mae
+    trade.bars_to_mfe = b_mfe
+    trade.bars_to_mae = b_mae
+    trade.entry_atr = entry_atr
+    trade.entry_fee = hold.entry_fee * qty_frac
+    trade.exit_fee = exit_fee
+    trade.exit_reason = reason
 
 
 class Backtester:
@@ -325,7 +610,11 @@ class Backtester:
                  trailing_stop_pct: Optional[float] = None,
                  stop_loss_atr_regime: Optional[dict] = None,
                  trailing_stop_atr_regime: Optional[dict] = None,
-                 strategy_type: str = "perps"):
+                 strategy_type: str = "perps",
+                 direction: Optional[str] = None,
+                 invert_signal: bool = False,
+                 regime_directional_policy: Optional[dict] = None,
+                 profile_allocation: Optional[dict] = None):
         """
         Args:
             initial_capital: Starting portfolio value.
@@ -397,6 +686,26 @@ class Backtester:
         self.trailing_stop_atr_mult = trailing_stop_atr_mult
         self.trailing_stop_pct = trailing_stop_pct
         self.strategy_type = strategy_type
+        # #942: live strategy-level entry transforms the backtester must mirror
+        # so --config doesn't silently diverge from the daemon. ``invert_signal``
+        # flips BUY<->SELL; ``direction`` gates which side may open. Both are
+        # applied to the raw signal in ``run()`` (see _apply_direction_invert),
+        # mirroring the live order (applySignalInversion before EffectiveDirection).
+        self.direction = (str(direction).strip().lower() if direction else None)
+        self.invert_signal = bool(invert_signal)
+        self.regime_directional_policy = _normalize_regime_directional_policy(
+            regime_directional_policy,
+        )
+        if self.regime_directional_policy is not None and not self.regime_enabled:
+            raise ValueError(
+                "regime_directional_policy requires regime_enabled=True"
+            )
+        # #998: regime-profile allocation. When set, run() expects per-profile
+        # signal columns ("signal__<profile>") plus a "_profile_label" column
+        # (the long-window regime label per bar) and replays the live flat-only,
+        # confirm_bars hysteresis switch inside the per-bar loop. None = single
+        # profile (the normal path). Validated into a compact dict.
+        self._profile_alloc = _parse_profile_allocation(profile_allocation)
         self.stop_loss_atr_regime = (
             dict(stop_loss_atr_regime) if stop_loss_atr_regime else None
         )
@@ -413,6 +722,30 @@ class Backtester:
             in ("trailing_tp_ratchet", "trailing_tp_ratchet_regime")
             for r in self._close_refs
         )
+        # #997 zscore_target: the rolling z-score the evaluator reads is
+        # computed once per run from closed-bar data (same N-close -> N+1-open
+        # fill contract as ATR). Resolve the lookback here. Reject a duplicate
+        # ref outright: close_params is keyed by name (last-write-wins), so a
+        # second zscore_target with a different lookback would silently lose
+        # its window — a footgun, not a feature.
+        _zscore_refs = [
+            r for r in self._close_refs
+            if (r.get("name") or "").strip().lower() == "zscore_target"
+        ]
+        if len(_zscore_refs) > 1:
+            raise ValueError(
+                "duplicate zscore_target close refs are not supported "
+                "(close params are keyed by name; the second would silently "
+                "override the first's lookback)"
+            )
+        self._zscore_lookback = 0
+        if _zscore_refs:
+            try:
+                self._zscore_lookback = int(
+                    (_zscore_refs[0].get("params") or {}).get("lookback", 0) or 0
+                )
+            except (TypeError, ValueError):
+                self._zscore_lookback = 0
         self._ratchet_mod = None
         self._ratchet_ref: Optional[dict] = None
         self._ratchet_tiers_run: list = []
@@ -689,6 +1022,94 @@ class Backtester:
                         "stop_loss_atr_mult or stop_loss_pct."
                     )
 
+    def _apply_direction_invert(self, sig_int: pd.Series,
+                                uses_open_close: bool) -> pd.Series:
+        """Apply live ``invert_signal`` then ``direction`` gating to the raw
+        integer signal (#942).
+
+        Mirrors the live scheduler ordering: ``applySignalInversion`` flips
+        BUY<->SELL (scheduler/main.go) BEFORE ``EffectiveDirection`` /
+        ``PerpsOrderSkipReason`` gate which side may OPEN. Both are integer
+        frame transforms on ``{-1, 0, 1}``.
+
+        Direction masks the signal that would OPEN a disallowed side. The
+        signal's meaning is path-dependent, so masking is too:
+
+          - open/close path (``uses_open_close``): ``signal>0`` opens long,
+            ``signal<0`` opens short, and closes come from the close evaluator.
+            Masking the disallowed open side is exact and never suppresses a
+            close.
+          - plain signal path: structurally single-leg. Long/flat (default):
+            ``signal=1`` opens long, ``signal=-1`` only *closes* the long, so
+            ``direction="long"`` already matches live and needs no mask.
+            ``direction="short"`` (#989) flips the path's interpretation in
+            ``run()`` instead (``-1`` opens a short, ``+1`` closes it) — the
+            mask is skipped for the same reason (it would suppress closes).
+            ``"both"`` stays unmodelable here (one signal cannot open one
+            side and close the other) and is rejected at config/candidate
+            load (``run_backtest.load_strategy_config``).
+        """
+        return sig_int.map(
+            lambda s: _apply_direction_invert_value(
+                int(s), uses_open_close, self.direction, self.invert_signal,
+            )
+        ).astype(int)
+
+    def _effective_directional_entry(
+        self, current_regime: str, position_regime: str, position_qty: float,
+    ) -> tuple[str, bool]:
+        entry = _resolve_regime_directional_entry(
+            self.regime_directional_policy,
+            current_regime,
+            position_regime,
+            abs(position_qty),
+        )
+        if entry is None:
+            return self.direction or "", self.invert_signal
+        return str(entry["direction"]), bool(entry["invert_signal"])
+
+    def _normalize_profile_signals(self, df: pd.DataFrame, uses_open_close: bool) -> None:
+        """Normalize each profile's ``signal__<p>`` column exactly like the
+        single-signal path (domain check → invert/direction gate → look-ahead
+        shift) and shift ``_profile_label`` so the per-bar switch reads bar N's
+        label to govern the N+1 fill (#998). Mutates ``df`` in place.
+
+        Each profile differs only in the OPEN signal; closes come from the shared
+        close evaluator, so the engine derives ``_open_action__<p>`` from each
+        profile's signal but keeps a single (profile-independent) ``_close_fraction``.
+        """
+        for p in self._profile_alloc["names"]:
+            col = "signal__" + p
+            sig_raw = df[col].fillna(0).astype(float)
+            non_integral = sig_raw[sig_raw != sig_raw.round()]
+            if not non_integral.empty:
+                raise ValueError(
+                    f"{col} must be in {{-1, 0, 1}} — got non-integral values "
+                    f"{sorted(set(non_integral.unique().tolist()))}"
+                )
+            sig_int = sig_raw.astype(int)
+            bad = sig_int[~sig_int.isin([-1, 0, 1])]
+            if not bad.empty:
+                raise ValueError(
+                    f"{col} must be in {{-1, 0, 1}} — got unexpected values "
+                    f"{sorted(bad.unique().tolist())}"
+                )
+            if self.regime_directional_policy is None:
+                sig_int = self._apply_direction_invert(sig_int, uses_open_close)
+            if uses_open_close:
+                df["_open_action__" + p] = (
+                    sig_int.map(_open_action_from_signal).shift(1).fillna("none")
+                )
+            df[col] = sig_int.shift(1).fillna(0).astype(int)
+        # Dummy single-signal column so downstream code that references
+        # ``df["signal"]`` doesn't KeyError; the per-bar loop overrides ``signal``
+        # (and ``open_action``) from the active profile each bar.
+        df["signal"] = 0
+        if uses_open_close:
+            df["_open_action"] = "none"
+            df["_close_fraction"] = _max_close_fraction_series(df).shift(1).fillna(0.0)
+        df["_profile_label"] = df["_profile_label"].shift(1).fillna("")
+
     def run(self, df: pd.DataFrame, strategy_name: str = "Unknown",
             symbol: str = "BTC/USDT", timeframe: str = "1d",
             params: Optional[dict] = None, save: bool = True,
@@ -728,11 +1149,63 @@ class Backtester:
             or bool(_close_fraction_columns(df))
             or bool(self.close_strategies)
         )
-        if "signal" not in df.columns and not uses_open_close:
+        # #989: short/flat plain path — the exact mirror of the structural
+        # long/flat path, engaged by direction="short" with no close evaluator
+        # (live open-as-close semantics on a short-only strategy): signal=-1
+        # OPENS a short, signal=+1 CLOSES it. The open/close engine path is
+        # unaffected (direction masking there already models short opens).
+        # direction="both" remains unmodelable on the plain path (one signal
+        # cannot both open one side and close the other) — rejected at
+        # config/candidate load AND here, so API callers that bypass the
+        # loaders cannot silently score a long/flat run as "both".
+        if self.direction == "both" and not uses_open_close:
+            raise ValueError(
+                "direction='both' requires a close evaluator (open/close "
+                "engine path) — the plain single-leg path cannot open one "
+                "side and close the other, so the run would silently score "
+                "long/flat. Backtest each leg separately with "
+                "direction='long' / direction='short'."
+            )
+        if self.regime_directional_policy is not None and not uses_open_close:
+            both_labels = sorted(
+                label for label, entry in self.regime_directional_policy.items()
+                if entry.get("direction") == "both"
+            )
+            if both_labels:
+                raise ValueError(
+                    "regime_directional_policy direction='both' requires a "
+                    "close evaluator on the plain signal path; labels with "
+                    f"both: {both_labels}"
+                )
+        plain_short = (not uses_open_close) and self.direction == "short"
+        if plain_short and starting_long:
+            raise ValueError(
+                "starting_long cannot seed a direction='short' plain-path "
+                "run — the short/flat path never emits a long close, so the "
+                "seeded long would be carried untouched to end-of-data."
+            )
+        has_profile_alloc = self._profile_alloc is not None
+        if has_profile_alloc:
+            if "_profile_label" not in df.columns:
+                raise ValueError(
+                    "regime_profile_allocation backtest requires a '_profile_label' column"
+                )
+            missing = [
+                p for p in self._profile_alloc["names"]
+                if ("signal__" + p) not in df.columns
+            ]
+            if missing:
+                raise ValueError(
+                    f"regime_profile_allocation backtest is missing signal columns "
+                    f"for profiles {missing} (expected 'signal__<profile>')"
+                )
+        if "signal" not in df.columns and not uses_open_close and not has_profile_alloc:
             raise ValueError("DataFrame must have a 'signal' column or open_action/close_fraction columns")
 
         df = df.copy()
-        if "signal" in df.columns:
+        if has_profile_alloc:
+            self._normalize_profile_signals(df, uses_open_close)
+        elif "signal" in df.columns:
             # Contract: signal ∈ {-1, 0, 1}. position.diff() emits ±1.0 floats
             # and some strategies emit ints; coerce NaN → 0, reject non-integral
             # floats before casting, and then reject any out-of-domain integer.
@@ -750,13 +1223,19 @@ class Backtester:
                     f"signal column must be in {{-1, 0, 1}} — got "
                     f"unexpected values {sorted(bad.unique().tolist())}"
                 )
+            # #942: static entry transforms (invert_signal, then direction
+            # gating) apply BEFORE the look-ahead shift. #1025 regime policies
+            # are position-aware, so they replay later inside the per-bar loop
+            # where the stamped position regime is known.
+            if self.regime_directional_policy is None:
+                sig_int = self._apply_direction_invert(sig_int, uses_open_close)
             signal_for_open = sig_int
             df["signal"] = sig_int.shift(1).fillna(0).astype(int)
         else:
             signal_for_open = pd.Series(0, index=df.index)
             df["signal"] = 0
 
-        if uses_open_close:
+        if uses_open_close and not has_profile_alloc:
             if "open_action" in df.columns:
                 open_actions = df["open_action"].map(_normalize_open_action)
             else:
@@ -819,6 +1298,11 @@ class Backtester:
         initial_quantity = 0.0
         entry_atr_value = 0.0
         pending_close_fraction = 0.0
+        # #997: reason that produced the pending close, carried to the next
+        # bar's open-fill so the closed leg records WHICH mechanism exited it.
+        pending_close_reason = ""
+        # #997 hold telemetry accumulator (intra-hold excursions + bars held).
+        hold = _HoldTracker()
 
         # Post-TP SL adjustment state (#709). Only meaningful when sl_after is
         # configured; otherwise the per-bar machinery short-circuits and these
@@ -842,6 +1326,19 @@ class Backtester:
         self._run_position_regime = ""
         sl_after_active = self._sl_after_pipeline_enabled
         trailing_ratchet_active = self._uses_trailing_ratchet_close
+
+        # #997 zscore_target: rolling z of close over the ref's lookback,
+        # computed from closed-bar data. Bar N's value uses bars [N-lb+1, N]
+        # (population std, ddof=0); warmup rows are NaN and the evaluator
+        # no-ops on them. Passed to the evaluator at end-of-bar exactly like
+        # ATR, so the resulting close fills at the next bar's open.
+        zscore_series = None
+        if self._zscore_lookback > 0 and "close" in df.columns:
+            lb = self._zscore_lookback
+            closes = df["close"].astype(float)
+            roll = closes.rolling(lb)
+            std = roll.std(ddof=0)
+            zscore_series = (closes - roll.mean()) / std.replace(0.0, float("nan"))
 
         atr_series = df["atr"] if "atr" in df.columns else None
         # An ATR-multiple stop/trail needs an `atr` series to stamp entry_atr;
@@ -941,6 +1438,9 @@ class Backtester:
             current_trade.shares = position
             avg_cost = effective_entry
             initial_quantity = position
+            # #997: seed hold telemetry for the walk-forward-seeded position.
+            # bars_held starts at 0 (its true warmup hold length is unknown).
+            hold.open(effective_entry, "long", entry_commission)
             # Optional ATR for the seeded position so walk-forward folds with
             # ATR-based close evaluators (tiered_tp_atr) don't silently no-op
             # for the seeded position's lifetime. Same plausibility guard as
@@ -956,11 +1456,89 @@ class Backtester:
             if not stamp:
                 stamp = _entry_stamp(df.iloc[0])
             stamp_open_from_label(stamp)
+            # Arm the carried position's SL the same way the open block does
+            # (PR #1000 review): a seeded position never routes through the
+            # open block, so without this the fixed/trailing trigger stays at
+            # 0 for its entire lifetime and ATR stacks score as
+            # hold-to-reversal on every fold that opens already-long. The
+            # trail anchors at max(entry, seed high-water) — live would have
+            # walked the HWM through the warmup bars. Works for both paths:
+            # the plain signal path's hit check reads the same sl_trigger_px.
+            seed_hwm = starting_long.get("high_water", 0.0)
+            try:
+                seed_hwm = float(seed_hwm or 0.0)
+            except (TypeError, ValueError):
+                seed_hwm = 0.0
+            hwm_anchor = max(effective_entry, seed_hwm)
+            if sl_after_active and self._run_tp_tier_thresholds:
+                sl_trigger_px = self._initial_sl_trigger(
+                    "long", avg_cost, entry_atr_value,
+                )
+                sl_high_water_px = 0.0
+            elif trailing_ratchet_active and self._run_trailing_stop_atr_mult:
+                sl_trigger_px = _initial_trail_trigger(
+                    "long", hwm_anchor, entry_atr_value,
+                    self._run_trailing_stop_atr_mult,
+                )
+                sl_high_water_px = hwm_anchor
+            else:
+                sl_trigger_px = self._initial_sl_trigger(
+                    "long", avg_cost, entry_atr_value,
+                )
+                if sl_trigger_px <= 0 and self._run_trailing_stop_atr_mult:
+                    sl_trigger_px = _initial_trail_trigger(
+                        "long", hwm_anchor, entry_atr_value,
+                        self._run_trailing_stop_atr_mult,
+                    )
+                sl_high_water_px = hwm_anchor
+            sl_tiers_processed = 0
+            post_tp_trail_mult = None
+
+        profile_switcher = (
+            _ProfileSwitcher(self._profile_alloc) if has_profile_alloc else None
+        )
+        active_profile = ""
+
+        # #988: carry strategies (delta_neutral_funding) attach a per-bar
+        # `funding_accrual` column — the total funding rate accrued over the bar.
+        # When present, book it each bar against the position carried into the
+        # bar. Auto-detected so no construction-site plumbing is needed; other
+        # strategies' frames have no such column and are unaffected.
+        book_funding = "funding_accrual" in df.columns
+        total_funding_pnl = 0.0
 
         for i, (idx, row) in enumerate(df.iterrows()):
             fill_price = row["open"] if has_open else row["close"]
             mark_price = row["close"]
             signal = row["signal"]
+            # #998: regime-profile allocation — advance the flat-only, confirm_bars
+            # hysteresis switch and read the active profile's signal for this bar.
+            # ``flat`` is the position carried into the bar (= the position state at
+            # the decision time the shifted columns correspond to).
+            if profile_switcher is not None:
+                active_profile = profile_switcher.step(
+                    str(row.get("_profile_label", "") or ""), position == 0
+                )
+                signal = row["signal__" + active_profile]
+
+            bar_regime = str(row.get("regime", "")) if self.regime_enabled else ""
+            effective_direction = self.direction or ""
+            effective_invert = self.invert_signal
+            plain_short_for_bar = plain_short
+            if self.regime_directional_policy is not None:
+                effective_direction, effective_invert = self._effective_directional_entry(
+                    bar_regime,
+                    self._run_position_regime,
+                    abs(position),
+                )
+                if not uses_open_close:
+                    signal = _apply_direction_invert_value(
+                        int(signal),
+                        uses_open_close=False,
+                        direction=effective_direction,
+                        invert_signal=effective_invert,
+                    )
+                    plain_short_for_bar = effective_direction == "short"
 
             # Per-bar reset: when _maybe_apply_sl_after bumps the SL trigger on
             # this bar, the end-of-bar block (both the trail-walker HWM update
@@ -976,6 +1554,22 @@ class Backtester:
             # the HWM at the partial-close fill price. See #715.
             sl_after_just_applied = False
 
+            # #988: book funding carry on the position carried into this bar,
+            # over this bar's interval, before marking equity to the close. A
+            # long pays funding when the rate is positive, a short receives it:
+            #   funding_cash = -position * mark * rate
+            # (position is signed: + long, - short), which lands in `cash` and
+            # flows into the close-marked equity below. Newly opened positions
+            # this bar start accruing next bar; closed positions stop after
+            # their last full bar — the standard discrete one-bar convention.
+            if book_funding and position != 0:
+                accrual = row.get("funding_accrual", 0.0)
+                accrual = float(accrual) if accrual == accrual else 0.0  # NaN→0
+                if accrual != 0.0:
+                    funding_cash = -position * mark_price * accrual
+                    cash += funding_cash
+                    total_funding_pnl += funding_cash
+
             equity = cash + position * mark_price
             equity_curve.append({"date": idx, "equity": equity})
 
@@ -986,7 +1580,6 @@ class Backtester:
             # shift (#730) row 0 is empty — that empty label fails the
             # ``in allowed_regimes`` check and blocks the bar-0 entry, which
             # is correct (no prior-bar data, no decision).
-            bar_regime = str(row.get("regime", "")) if self.regime_enabled else ""
             regime_blocked = (
                 self.regime_enabled
                 and bool(self.allowed_regimes)
@@ -995,9 +1588,31 @@ class Backtester:
 
             if uses_open_close:
                 col_close_fraction = float(row.get("_close_fraction", 0.0))
-                close_fraction = max(col_close_fraction, pending_close_fraction)
+                # #997: attribute the exit. The column-driven fraction (open
+                # signal acting as close) wins ties; otherwise the pending
+                # reason from the prior bar's evaluator / SL hit carries.
+                if col_close_fraction >= pending_close_fraction:
+                    close_fraction = col_close_fraction
+                    close_reason = "column_close_fraction" if col_close_fraction > 0 else ""
+                else:
+                    close_fraction = pending_close_fraction
+                    close_reason = pending_close_reason
                 pending_close_fraction = 0.0
-                open_action = row.get("_open_action", "none")
+                pending_close_reason = ""
+                if profile_switcher is not None:
+                    open_action = row.get("_open_action__" + active_profile, "none")
+                else:
+                    open_action = row.get("_open_action", "none")
+                # #1025: capture the raw open-action signal now; the directional
+                # gate is applied AFTER the close leg below (see the gate just
+                # before the open block) so a same-bar close→reopen re-resolves
+                # the entry direction against the regime that applies to a flat
+                # book at this bar, not the just-closed position's frozen regime.
+                raw_open_signal = (
+                    _signal_from_open_action(open_action)
+                    if self.regime_directional_policy is not None
+                    else 0
+                )
 
                 if close_fraction > 0 and position != 0:
                     qty_to_close = abs(position) * min(close_fraction, 1.0)
@@ -1019,6 +1634,16 @@ class Backtester:
                         closed.shares = qty_to_close
                         closed.close(idx, effective_price)
                         closed.pnl -= commission
+                        # #997: stamp hold telemetry. This leg exits at THIS
+                        # bar's open, so hold reflects bars through the prior
+                        # bar (step() for this bar runs after the open-fill
+                        # block, below). Entry fee is pro-rated by the leg's
+                        # share of the original position.
+                        qty_frac = (qty_to_close / initial_quantity) if initial_quantity > 0 else 1.0
+                        _stamp_hold(closed, hold, entry_atr=entry_atr_value,
+                                    exit_fee=commission,
+                                    reason=close_reason or "close_strategy",
+                                    qty_frac=qty_frac)
                         trades.append(closed)
                         current_trade.shares -= qty_to_close
                         if current_trade.shares <= 1e-12:
@@ -1079,7 +1704,42 @@ class Backtester:
                         ):
                             sl_after_just_applied = True
 
-                if open_action == "long" and position == 0 and not regime_blocked:
+                # #1025 same-bar flip: resolve the entry direction/invert
+                # against the position state AFTER this bar's close leg. The
+                # open block below only ever fires from a flat book, so its gate
+                # must use the regime that applies to a flat book at this bar —
+                # never a regime frozen to a position that was already fully
+                # closed earlier in the same bar. When the close above fully
+                # exited the incoming position, _run_position_regime was cleared
+                # (position == 0) and _effective_directional_entry falls through
+                # to the CURRENT bar regime, matching live (which re-evaluates a
+                # fresh entry from the current regime on the next cycle). A
+                # surviving leg (partial close, or no close) keeps position != 0
+                # and its frozen regime, so the open block won't fire and the
+                # freeze is preserved unchanged.
+                if self.regime_directional_policy is not None:
+                    entry_direction, entry_invert = self._effective_directional_entry(
+                        bar_regime,
+                        self._run_position_regime,
+                        abs(position),
+                    )
+                    open_action = _open_action_from_signal(
+                        _apply_direction_invert_value(
+                            raw_open_signal,
+                            uses_open_close=True,
+                            direction=entry_direction,
+                            invert_signal=entry_invert,
+                        )
+                    )
+
+                # Entry guard (PR #1004 review): a blown short can leave
+                # flat-state cash <= 0 (buy-back cost exceeded the 2x notional
+                # held). Opening from non-positive cash computes negative
+                # shares, silently flipping the position sign against the
+                # booked trade side and inverting all subsequent PnL. The
+                # account is economically bust — skip the entry. cash == 0 is
+                # included: it would book a zero-share phantom trade.
+                if open_action == "long" and position == 0 and cash > 0 and not regime_blocked:
                     effective_price = fill_price * (1 + self.slippage_pct)
                     commission = cash * self.commission_pct
                     available = cash - commission
@@ -1092,16 +1752,17 @@ class Backtester:
                     avg_cost = effective_price
                     initial_quantity = shares
                     entry_atr_value = self._stamp_entry_atr(atr_series, idx, effective_price)
+                    hold.open(effective_price, "long", commission)
                     stamp_open_from_label(_entry_stamp(row))
-                    # #716 item 3: seed the SL trigger only when sl_after has
-                    # usable tier thresholds. Without thresholds, the post-TP
-                    # adjustment machinery never fires (`_maybe_apply_sl_after`
-                    # is gated on `self._run_tp_tier_thresholds`), so a seeded-
-                    # then-never-adjusted trigger would represent a phantom
-                    # fixed SL the rest of the engine doesn't actually
-                    # simulate. Mirrors the live shape, where the fixed SL is
-                    # placed by `runHyperliquidProtectionSync` independently
-                    # of `sl_after` configuration.
+                    # Seed the SL trigger at open. sl_after configs seed only
+                    # when usable tier thresholds exist (#716 item 3 — without
+                    # thresholds the post-TP machinery never fires); otherwise
+                    # a bare fixed/trailing stop alongside a close evaluator is
+                    # seeded here and simulated by the end-of-bar hit check
+                    # below (#996 — live arms this SL via
+                    # runHyperliquidProtectionSync / armTrailingStopAtOpenNow
+                    # independently of sl_after; pre-#996 the engine path
+                    # silently dropped it).
                     if sl_after_active and self._run_tp_tier_thresholds:
                         sl_trigger_px = self._initial_sl_trigger(
                             "long", avg_cost, entry_atr_value,
@@ -1117,7 +1778,19 @@ class Backtester:
                         sl_tiers_processed = 0
                         post_tp_trail_mult = None
                         sl_high_water_px = mark_price
-                elif open_action == "short" and position == 0 and not regime_blocked:
+                    else:
+                        sl_trigger_px = self._initial_sl_trigger(
+                            "long", avg_cost, entry_atr_value,
+                        )
+                        if sl_trigger_px <= 0 and self._run_trailing_stop_atr_mult:
+                            sl_trigger_px = _initial_trail_trigger(
+                                "long", mark_price, entry_atr_value,
+                                self._run_trailing_stop_atr_mult,
+                            )
+                        sl_tiers_processed = 0
+                        post_tp_trail_mult = None
+                        sl_high_water_px = mark_price
+                elif open_action == "short" and position == 0 and cash > 0 and not regime_blocked:
                     effective_price = fill_price * (1 - self.slippage_pct)
                     commission = cash * self.commission_pct
                     notional = cash - commission
@@ -1130,6 +1803,7 @@ class Backtester:
                     avg_cost = effective_price
                     initial_quantity = shares
                     entry_atr_value = self._stamp_entry_atr(atr_series, idx, effective_price)
+                    hold.open(effective_price, "short", commission)
                     stamp_open_from_label(_entry_stamp(row))
                     if sl_after_active and self._run_tp_tier_thresholds:
                         sl_trigger_px = self._initial_sl_trigger(
@@ -1146,17 +1820,45 @@ class Backtester:
                         sl_tiers_processed = 0
                         post_tp_trail_mult = None
                         sl_high_water_px = mark_price
+                    else:
+                        # Bare fixed/trailing stop with a close evaluator —
+                        # see the long-side comment (#996).
+                        sl_trigger_px = self._initial_sl_trigger(
+                            "short", avg_cost, entry_atr_value,
+                        )
+                        if sl_trigger_px <= 0 and self._run_trailing_stop_atr_mult:
+                            sl_trigger_px = _initial_trail_trigger(
+                                "short", mark_price, entry_atr_value,
+                                self._run_trailing_stop_atr_mult,
+                            )
+                        sl_tiers_processed = 0
+                        post_tp_trail_mult = None
+                        sl_high_water_px = mark_price
+
+                # #997: advance hold telemetry for the position held through
+                # this bar. Runs AFTER the open-fill close/open block so a leg
+                # closed at this bar's open excludes this bar's range, while a
+                # position opened (or held) at this bar's open includes it.
+                # Output-only — never feeds a decision — so reading this bar's
+                # high/low at its close is look-ahead-safe.
+                if position != 0:
+                    hold.step(
+                        float(row.get("high", mark_price) or mark_price),
+                        float(row.get("low", mark_price) or mark_price),
+                    )
 
                 # End-of-bar: evaluate close strategies against the now-current
                 # position using this bar's close as the mark. The result is
                 # applied at the NEXT bar's open (mirrors live: eval at end of
                 # bar, fill at next open).
                 if self.close_strategies and position != 0 and avg_cost > 0:
-                    pending_close_fraction = self._evaluate_close_strategies(
+                    pending_close_fraction, pending_close_reason = self._evaluate_close_strategies(
                         position, avg_cost, initial_quantity, entry_atr_value,
                         mark_price, atr_series, idx,
                         position_regime=self._run_position_regime,
                         market_regime=_bar_close_regime(row),
+                        bars_held=hold.bars,
+                        zscore_series=zscore_series,
                     )
                     if (
                         trailing_ratchet_active
@@ -1180,14 +1882,23 @@ class Backtester:
                             )
                         )
 
-                # End-of-bar: walk the trailing-stop high-water mark (only
-                # active after a TP tier transitioned the position to
-                # trail_from_here mode) and check whether the SL trigger has
-                # been hit by this bar's close. A hit produces
+                # End-of-bar: walk the trailing-stop high-water mark (for
+                # trail_from_here transitions, the ratchet, or a bare scalar
+                # trailing stop) and check whether the SL trigger has been
+                # hit by this bar's close. A hit produces
                 # pending_close_fraction=1.0 which fills at the next bar's
                 # open — same alignment as the rest of the close pipeline.
+                # #996: also runs for bare fixed/trailing/pct stops paired
+                # with a close evaluator, which live arms independently of
+                # sl_after (pre-#996 these were silently dropped here).
+                scalar_stop_active = (
+                    (self._run_stop_loss_atr_mult or 0) > 0
+                    or (self._run_trailing_stop_atr_mult or 0) > 0
+                    or (self.stop_loss_pct or 0) > 0
+                )
                 if (
-                    (sl_after_active or trailing_ratchet_active)
+                    (sl_after_active or trailing_ratchet_active
+                     or scalar_stop_active)
                     and not sl_after_just_applied
                     and position != 0
                     and avg_cost > 0
@@ -1213,6 +1924,7 @@ class Backtester:
                         side_now, mark_price, sl_trigger_px,
                     ):
                         pending_close_fraction = 1.0
+                        pending_close_reason = "sl"
                 continue
 
             # Standalone hard stop fires first: close at this bar's open before
@@ -1226,6 +1938,8 @@ class Backtester:
                 position = 0.0
                 if current_trade:
                     current_trade.close(idx, effective_price)
+                    _stamp_hold(current_trade, hold, entry_atr=entry_atr_value,
+                                exit_fee=commission, reason="signal_sl")
                     trades.append(current_trade)
                     current_trade = None
                 pending_signal_sl_close = False
@@ -1233,14 +1947,103 @@ class Backtester:
                 avg_cost = 0.0
                 entry_atr_value = 0.0
                 sl_high_water_px = 0.0
+                self._run_position_regime = ""
                 continue
 
-            # NOTE: this signal path is long/flat only — signal == 1 opens a
-            # long, signal == -1 only *closes* it; a short is never opened. So
-            # OOS validation of bidirectional strategies (momentum_pro,
-            # mean_reversion_pro, consolidation_range) exercises the LONG side
-            # only; their live short signals are not covered by backtest.
-            if signal == 1 and position == 0 and not regime_blocked:
+            # Short/flat mirror of the standalone-stop fill above: buy back
+            # the short at this bar's open (#989).
+            if pending_signal_sl_close and position < 0:
+                effective_price = fill_price * (1 + self.slippage_pct)
+                cost = abs(position) * effective_price
+                commission = cost * self.commission_pct
+                cash -= cost + commission
+                position = 0.0
+                if current_trade:
+                    current_trade.close(idx, effective_price)
+                    _stamp_hold(current_trade, hold, entry_atr=entry_atr_value,
+                                exit_fee=commission, reason="signal_sl")
+                    trades.append(current_trade)
+                    current_trade = None
+                pending_signal_sl_close = False
+                sl_trigger_px = 0.0
+                avg_cost = 0.0
+                entry_atr_value = 0.0
+                sl_high_water_px = 0.0
+                self._run_position_regime = ""
+                continue
+
+            # NOTE: this signal path runs one leg at a time. Default
+            # (long/flat): signal == 1 opens a long, signal == -1 only
+            # *closes* it; a short is never opened. With direction="short"
+            # (#989) the interpretation mirrors: signal == -1 opens a short,
+            # signal == 1 only *closes* it. Bidirectional strategies are
+            # therefore measured one leg per run — long leg by default,
+            # short leg via direction="short" — never both in one run.
+            # ``cash > 0`` on every open: a blown short leaves flat-state cash
+            # <= 0, and opening from it computes negative shares — a phantom
+            # position whose sign contradicts the booked side (PR #1004
+            # review). Bust account: entries skip until end of data. The
+            # long/flat path can't reach negative cash today, but carries the
+            # same guard so the invariant holds by construction.
+            if plain_short_for_bar and signal == -1 and position == 0 and cash > 0 and not regime_blocked:
+                # SELL — open short with full notional. Mirrors the engine
+                # path's short-open mechanics: pay commission, receive the
+                # short-sale proceeds (cash = 2 * notional).
+                effective_price = fill_price * (1 - self.slippage_pct)
+                commission = cash * self.commission_pct
+                notional = cash - commission
+                shares = notional / effective_price
+                cash = 2 * notional
+                position = -shares
+
+                current_trade = Trade(idx, effective_price, "short")
+                current_trade.shares = shares
+
+                # Standalone stop seeding — mirror of the long block below
+                # (fixed ATR mult > trailing ATR mult > fixed pct), triggers
+                # placed ABOVE the entry for a short.
+                avg_cost = effective_price
+                entry_atr_value = self._stamp_entry_atr(atr_series, idx, effective_price)
+                hold.open(effective_price, "short", commission)
+                stamp_open_from_label(_entry_stamp(row))
+                sl_trigger_px = 0.0
+                sl_high_water_px = mark_price
+                if (
+                    self.stop_loss_atr_mult is not None
+                    and self.stop_loss_atr_mult > 0
+                    and entry_atr_value > 0
+                ):
+                    sl_trigger_px = avg_cost + self.stop_loss_atr_mult * entry_atr_value
+                elif (
+                    self.trailing_stop_atr_mult is not None
+                    and self.trailing_stop_atr_mult > 0
+                    and entry_atr_value > 0
+                ):
+                    sl_trigger_px = mark_price + self.trailing_stop_atr_mult * entry_atr_value
+                elif self.stop_loss_pct is not None and self.stop_loss_pct > 0:
+                    sl_trigger_px = avg_cost * (1 + self.stop_loss_pct)
+
+            elif plain_short_for_bar and signal == 1 and position < 0:
+                # BUY — close short (buy back)
+                effective_price = fill_price * (1 + self.slippage_pct)
+                cost = abs(position) * effective_price
+                commission = cost * self.commission_pct
+                cash -= cost + commission
+                position = 0.0
+
+                if current_trade:
+                    current_trade.close(idx, effective_price)
+                    _stamp_hold(current_trade, hold, entry_atr=entry_atr_value,
+                                exit_fee=commission, reason="signal")
+                    trades.append(current_trade)
+                    current_trade = None
+                sl_trigger_px = 0.0
+                avg_cost = 0.0
+                entry_atr_value = 0.0
+                sl_high_water_px = 0.0
+                self._run_position_regime = ""
+
+            elif not plain_short_for_bar and signal == 1 and position == 0 and cash > 0 and not regime_blocked:
                 # BUY — go long with all available cash
                 effective_price = fill_price * (1 + self.slippage_pct)
                 commission = cash * self.commission_pct
@@ -1258,6 +2061,8 @@ class Backtester:
                 # open/close path's _stamp_entry_atr).
                 avg_cost = effective_price
                 entry_atr_value = self._stamp_entry_atr(atr_series, idx, effective_price)
+                hold.open(effective_price, "long", commission)
+                stamp_open_from_label(_entry_stamp(row))
                 sl_trigger_px = 0.0
                 sl_high_water_px = mark_price
                 if (
@@ -1285,12 +2090,24 @@ class Backtester:
 
                 if current_trade:
                     current_trade.close(idx, effective_price)
+                    _stamp_hold(current_trade, hold, entry_atr=entry_atr_value,
+                                exit_fee=commission, reason="signal")
                     trades.append(current_trade)
                     current_trade = None
                 sl_trigger_px = 0.0
                 avg_cost = 0.0
                 entry_atr_value = 0.0
                 sl_high_water_px = 0.0
+                self._run_position_regime = ""
+
+            # #997: advance hold telemetry for a position held through this bar
+            # (plain long/flat path). Same rationale as the open/close path:
+            # runs after the open-fill BUY/SELL block, output-only.
+            if position != 0:
+                hold.step(
+                    float(row.get("high", mark_price) or mark_price),
+                    float(row.get("low", mark_price) or mark_price),
+                )
 
             # End-of-bar: for a trailing ATR stop, ratchet the trigger up on new
             # highs; then check whether this bar's close breached the trigger.
@@ -1307,6 +2124,23 @@ class Backtester:
                     if candidate > sl_trigger_px:
                         sl_trigger_px = candidate
                 if self._sl_hit("long", mark_price, sl_trigger_px):
+                    pending_signal_sl_close = True
+            elif position < 0 and sl_trigger_px > 0:
+                # Short mirror (#989): the trail anchors on a LOW-water mark
+                # (sl_high_water_px doubles as the favourable-extreme anchor,
+                # matching _walk_trail's convention) and only ever tightens
+                # the trigger DOWN; a close at/above the trigger fires.
+                if (
+                    self.trailing_stop_atr_mult is not None
+                    and self.trailing_stop_atr_mult > 0
+                    and entry_atr_value > 0
+                ):
+                    if mark_price < sl_high_water_px:
+                        sl_high_water_px = mark_price
+                    candidate = sl_high_water_px + self.trailing_stop_atr_mult * entry_atr_value
+                    if candidate < sl_trigger_px:
+                        sl_trigger_px = candidate
+                if self._sl_hit("short", mark_price, sl_trigger_px):
                     pending_signal_sl_close = True
 
         # Close any open position at the end
@@ -1325,6 +2159,8 @@ class Backtester:
 
             if current_trade:
                 current_trade.close(df.index[-1], final_price)
+                _stamp_hold(current_trade, hold, entry_atr=entry_atr_value,
+                            exit_fee=commission, reason="end_of_data")
                 trades.append(current_trade)
 
         final_equity = cash
@@ -1348,6 +2184,7 @@ class Backtester:
             "end_date": str(df.index[-1]),
             "initial_capital": self.initial_capital,
             "final_capital": round(final_equity, 2),
+            "total_funding_pnl": round(total_funding_pnl, 4),
             "params": open_ref.get("params") or params or {},
             "open_strategy": open_ref,
             "close_strategies": [dict(r) for r in self._close_refs],
@@ -1389,10 +2226,14 @@ class Backtester:
                                    idx,
                                    *,
                                    position_regime: str = "",
-                                   market_regime: str = "") -> float:
+                                   market_regime: str = "",
+                                   bars_held: int = 0,
+                                   zscore_series: Optional[pd.Series] = None
+                                   ) -> Tuple[float, str]:
         """Run every configured close evaluator against the simulated position
-        and return the max ``close_fraction``. Same max-wins resolution as the
-        live composition flow in shared_tools/strategy_composition.py.
+        and return ``(max close_fraction, reason of the winning evaluator)``.
+        Same max-wins resolution as the live composition flow in
+        shared_tools/strategy_composition.py.
         """
         evaluate, _list_strategies = _load_close_registry()
         side = "long" if position > 0 else "short"
@@ -1403,6 +2244,10 @@ class Backtester:
             "initial_quantity": float(initial_quantity or abs(position)),
             "entry_atr": float(entry_atr_value),
             "regime": str(position_regime or ""),
+            # #997: holding-time context for time_stop. Closed-bar count since
+            # the entry-fill bar inclusive (live check scripts don't pass this
+            # yet — live wiring deferred; time_stop fails safe without it).
+            "bars_held": int(bars_held),
         }
         # Always pass ``regime`` (possibly empty) so live-regime evaluators see
         # the same key shape as live check scripts — empty/NaN bars no-op with
@@ -1429,17 +2274,30 @@ class Backtester:
             if live_atr > 0:
                 market_dict["atr"] = live_atr
 
+        # #997: rolling z-score for zscore_target. Current-bar (closed) value,
+        # same N-close -> N+1-open fill alignment as ATR above. NaN warmup
+        # rows are omitted so the evaluator no-ops on them.
+        if zscore_series is not None:
+            try:
+                z = float(zscore_series.loc[idx])
+            except (KeyError, TypeError, ValueError):
+                z = float("nan")
+            if z == z:  # not NaN
+                market_dict["zscore"] = z
+
         best = 0.0
+        best_reason = ""
         for name in self.close_strategies:
             params = self.close_params.get(name)
             result = evaluate(name, position_dict, market_dict, params)
             fraction = float(result.get("close_fraction", 0.0) or 0.0)
             if fraction > best:
                 best = fraction
+                best_reason = str(result.get("reason") or name)
                 if best >= 1.0:
                     # Full close already wins — remaining evaluators can't change the outcome.
-                    return 1.0
-        return min(max(best, 0.0), 1.0)
+                    return 1.0, best_reason
+        return min(max(best, 0.0), 1.0), best_reason
 
     def _initial_sl_trigger(self, side: str, avg_cost: float,
                             entry_atr: float) -> float:
@@ -1589,6 +2447,20 @@ class Backtester:
         equity = equity_df["equity"]
         ann_factor = math.sqrt(periods_per_year(timeframe))
 
+        # Liquidation floor (#1005): a stop-less short losing >100% drives
+        # equity negative, and pct_change over a negative base inverts return
+        # signs (a deepening blowup reads as a positive return, a recovery as
+        # negative), corrupting Sharpe/Sortino/volatility. A real account is
+        # dead at zero — floor the curve at 0 from the first bust bar onward
+        # (sticky: no resurrection if the position later recovers) and flag
+        # the run so harness consumers (eval_windows, fee_audit) can surface
+        # it. Post-bust bars contribute 0/0 = NaN returns, dropped below.
+        liquidated = bool((equity <= 0).any())
+        if liquidated:
+            bust_pos = int(np.argmax(equity.values <= 0))
+            equity = equity.copy()
+            equity.iloc[bust_pos:] = 0.0
+
         # Anchor return + drawdown at initial_capital so seeded runs (where
         # equity[0] reflects the starting_long mark-to-market, not the true
         # pre-trade balance) don't distort the baseline. For non-seeded runs
@@ -1651,6 +2523,21 @@ class Backtester:
         # Calmar ratio
         calmar = annual_return / abs(max_drawdown) if max_drawdown != 0 else 0
 
+        # Liquidation risk-adjusted floor (#1005): when the sticky floor leaves
+        # <2 surviving returns (a leg busting within 1-2 bars — the post-bust
+        # NaN tail drops out), the variance guards above collapse Sharpe/
+        # Sortino/volatility to a NEUTRAL 0.0. That reads a dead account as
+        # "fine" and ranks a fast blowup ABOVE a slow one — re-inverting the
+        # exact axis this issue fixed. Floor every blown leg to a fixed sentinel
+        # so all deaths tie below any surviving leg, mirroring the −100% floor
+        # already applied to return/DD. The sentinel is timeframe-INDEPENDENT
+        # (not -ann_factor) so two equally-dead legs tie regardless of bust
+        # timeframe, and not path-dependent so an earlier bust never out-ranks
+        # a later one.
+        if liquidated:
+            sharpe = sortino = -LIQUIDATED_METRIC_FLOOR
+            volatility = LIQUIDATED_METRIC_FLOOR
+
         return {
             "total_return_pct": round(total_return * 100, 2),
             "annual_return_pct": round(annual_return * 100, 2),
@@ -1664,6 +2551,7 @@ class Backtester:
             "total_trades": total_trades,
             "avg_win_pct": round(avg_win * 100, 2),
             "avg_loss_pct": round(avg_loss * 100, 2),
+            "liquidated": liquidated,
         }
 
 
@@ -1678,6 +2566,12 @@ def format_results(results: dict) -> str:
         f"  Period:          {results['start_date'][:10]} → {results['end_date'][:10]}",
         f"  Initial Capital: ${results['initial_capital']:,.2f}",
         f"  Final Capital:   ${results['final_capital']:,.2f}",
+    ]
+    if results.get("liquidated"):
+        lines.append(
+            "  *** LIQUIDATED: equity hit 0 — metrics floored at the bust bar ***"
+        )
+    lines += [
         f"{'─'*60}",
         f"  RETURNS",
         f"    Total Return:    {results['total_return_pct']:+.2f}%",

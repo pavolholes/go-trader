@@ -688,13 +688,24 @@ func reconcileHyperliquidPositionsWithResolver(stratState *StrategyState, sym st
 				logger.Info("hl-sync: %s SL OID %s unfilled — routing to hl_sync_external (matched oid=%d qty=%.6f)", sym, oidStr, lookup.OID, lookup.FilledQty)
 			}
 		}
-		// Close price is unknown — the fill happened off-scheduler between
-		// reconcile cycles. Record 0 in both fields; downstream analytics
+		// #954: never drop the close from the trades ledger. Book at the
+		// userFills VWAP when the lookup matched; otherwise at AvgCost (zero
+		// gross PnL, modeled fee) so a row exists for the ledger sum and
+		// `backfill trade-ledger` can repair it later. Downstream analytics
 		// that compute avg close price / slippage must filter
 		// close_reason != 'hl_sync_external' to avoid biased aggregates.
-		recordClosedPosition(stratState, statePos, 0, 0, "hl_sync_external", time.Now().UTC())
-		delete(stratState.Positions, sym)
-		clearATRMultMissingEntryATRWarningOnHLPerpsClose(stratState, sym)
+		lookupExt, useFillFeeExt := resolveFee(sym, 0, statePos.Quantity)
+		logHyperliquidReconcileFillLookup(logger, sym, 0, statePos.Quantity, lookupExt, useFillFeeExt)
+		closePx := hlReconcileExternalClosePx(0, lookupExt, useFillFeeExt)
+		if closePx <= 0 {
+			closePx = statePos.AvgCost
+			logger.Info("hl-sync: %s external close has no price source — booking at avg cost $%.4f (zero PnL)", sym, closePx)
+		}
+		if !recordPerpsExternalCloseWithFillFee(stratState, sym, closePx, lookupExt.Fee, useFillFeeExt, "", "hl_sync_external", logger) {
+			recordClosedPosition(stratState, statePos, 0, 0, "hl_sync_external", time.Now().UTC())
+			delete(stratState.Positions, sym)
+			clearATRMultMissingEntryATRWarningOnHLPerpsClose(stratState, sym)
+		}
 		changed = true
 	}
 	// If on-chain exists but NOT in this strategy's state, we skip it —
@@ -809,6 +820,8 @@ func reconcileHyperliquidAccountPositions(dueStrategies, allStrategies []Strateg
 	}
 	sharedCoins := make(map[string]bool)
 	for coin, ids := range coinStrategies {
+		sort.Strings(ids)
+		coinStrategies[coin] = ids
 		if len(ids) > 1 {
 			sharedCoins[coin] = true
 		}
@@ -925,11 +938,10 @@ func reconcileHyperliquidAccountPositions(dueStrategies, allStrategies []Strateg
 		// Covers stop-loss sweep of the aggregate position, manual close on HL UI,
 		// and kill-switch closes that finish between scheduler cycles.
 		//
-		// Detector 2 — SL owner partial close: exactly one peer holds a resting
-		// trigger (StopLossOID) and the on-chain residual matches the signed sum of
-		// all non-owner peers' virtual qty. HL trigger orders are sized to the
-		// owner's qty at arm time, so when the trigger fires the non-owner peers'
-		// portion remains on-chain untouched.
+		// Detector 2 — SL-owner partial close: one or more peers hold resting
+		// StopLossOIDs, exact OID-keyed userFills confirm which SLs fired, and
+		// the on-chain residual matches the signed virtual qty after those
+		// confirmed fills. Ambiguous multi-owner drops are left as gaps.
 		//
 		// Detector 3 — TP partial fill: on-chain qty is a same-direction nonzero
 		// subset of virtual qty, and exactly one same-side strategy has a cleared
@@ -942,16 +954,37 @@ func reconcileHyperliquidAccountPositions(dueStrategies, allStrategies []Strateg
 		if math.Abs(onChainQty) < 1e-6 && math.Abs(virtualQty) > 1e-6 {
 			// Detector 1: everything gone on-chain — close all peers.
 			//
-			// Fee-lookup caveat for the multi-peer case: a single aggregated
-			// UI close produces one userFills row sized at the *aggregate*
-			// quantity, while each non-owner peer here queries with its own
-			// per-strategy pos.Quantity. The hlReconcileFillSizeTolerance
-			// (1e-4) won't accept that mismatch, so peers fall back to the
-			// modeled fee. SL attribution additionally requires an OID-keyed
-			// userFills hit matching Position.StopLossOID (#756); otherwise the
-			// peer is closed as hl_sync_external (mark or zero PnL). Per-peer fee
-			// accuracy on external closes is only achievable when each peer's qty
-			// happens to equal the aggregate close size.
+			// Multi-peer external closes usually have one userFills row sized
+			// at the coin-level virtual quantity. Split that aggregate fill
+			// across peers by virtual qty when a per-strategy lookup misses so
+			// each Trade row carries a real fee, fill price, and OID for later
+			// ledger true-up (#1029).
+			detector1ShareDenom := 0.0
+			for _, id := range stratIDs {
+				ss := state.Strategies[id]
+				if ss == nil {
+					continue
+				}
+				pos := ss.Positions[coin]
+				if pos != nil && pos.Quantity > 0 {
+					detector1ShareDenom += pos.Quantity
+				}
+			}
+			detector1AggregateLookup, detector1AggregateUseFill := resolveFee(coin, 0, math.Abs(virtualQty))
+			detector1AggregateOID := ""
+			if detector1AggregateUseFill && detector1AggregateLookup.OID > 0 {
+				detector1AggregateOID = strconv.FormatInt(detector1AggregateLookup.OID, 10)
+			}
+			detector1AggregateShare := func(qty float64) (HLFillLookup, bool, string) {
+				if !detector1AggregateUseFill || detector1ShareDenom <= 0 {
+					return HLFillLookup{}, false, ""
+				}
+				lookup, ok := splitHyperliquidFillLookupByQty(detector1AggregateLookup, qty, detector1ShareDenom)
+				if !ok {
+					return HLFillLookup{}, false, ""
+				}
+				return lookup, true, detector1AggregateOID
+			}
 			for _, id := range stratIDs {
 				ss := state.Strategies[id]
 				if ss == nil {
@@ -1007,160 +1040,154 @@ func reconcileHyperliquidAccountPositions(dueStrategies, allStrategies []Strateg
 						} else if logger != nil {
 							logger.Info("hl-sync: %s Detector 1 SL OID %s unfilled — routing external (userFills miss)", coin, oidStr)
 						}
-						if mark, ok := prices[coin]; ok && mark > 0 {
-							lookupExt, useFillFeeExt := resolveFee(coin, 0, pos.Quantity)
-							logHyperliquidReconcileFillLookup(logger, coin, 0, pos.Quantity, lookupExt, useFillFeeExt)
-							closePx := hlReconcileExternalClosePx(mark, lookupExt, useFillFeeExt)
-							if recordPerpsExternalCloseWithFillFee(ss, coin, closePx, lookupExt.Fee, useFillFeeExt, "", "hl_sync_external", logger) {
-								changed = true
+						lookupExt, useFillFeeExt, oidExt := detector1AggregateShare(pos.Quantity)
+						if !useFillFeeExt {
+							lookupExt, useFillFeeExt = resolveFee(coin, 0, pos.Quantity)
+							if useFillFeeExt && lookupExt.OID > 0 {
+								oidExt = strconv.FormatInt(lookupExt.OID, 10)
 							}
-						} else {
-							recordClosedPosition(ss, pos, 0, 0, "hl_sync_external", now)
-							delete(ss.Positions, coin)
-							clearATRMultMissingEntryATRWarningOnHLPerpsClose(ss, coin)
+						}
+						logHyperliquidReconcileFillLookup(logger, coin, 0, pos.Quantity, lookupExt, useFillFeeExt)
+						closePx := hlReconcileExternalClosePx(prices[coin], lookupExt, useFillFeeExt)
+						if closePx <= 0 {
+							// #954: no mark and no userFills match — book at AvgCost (zero
+							// gross PnL) instead of dropping the row.
+							closePx = pos.AvgCost
 							if logger != nil {
-								logger.Info("hl-sync: %s position (%.6f %s) no longer on-chain, removing (Detector 1 external close, no mark price)", coin, pos.Quantity, pos.Side)
+								logger.Info("hl-sync: %s Detector 1 external close has no price source — booking at avg cost $%.4f (zero PnL)", coin, closePx)
 							}
+						}
+						if recordPerpsExternalCloseWithFillFee(ss, coin, closePx, lookupExt.Fee, useFillFeeExt, oidExt, "hl_sync_external", logger) {
 							changed = true
 						}
 					}
-				} else if mark, ok := prices[coin]; ok && mark > 0 {
+				} else {
 					// #584: credit s.Cash with close-based PnL so the per-strategy
 					// PortfolioValue (and the summary TOTAL) match the real HL
 					// account after an external close. When userFills matches the
 					// close (#909), hlReconcileExternalClosePx books at the fill
 					// VWAP; otherwise the cycle-start mark is an approximation that
-					// can drift from the true on-chain fill price. Do not treat
-					// the resulting Trade / ClosedPosition rows as authoritative
-					// for tax or reporting; they exist to keep cash bookkeeping
-					// in sync.
-					lookup, useFillFee := resolveFee(coin, 0, pos.Quantity)
+					// can drift from the true on-chain fill price. With neither a
+					// fill match nor a mark, #954 books at AvgCost (zero gross PnL)
+					// instead of dropping the row — the ledger display path requires
+					// every fill to land in trades. Do not treat the resulting
+					// Trade / ClosedPosition rows as authoritative for tax or
+					// reporting; they exist to keep cash bookkeeping in sync.
+					lookup, useFillFee, oidStr := detector1AggregateShare(pos.Quantity)
+					if !useFillFee {
+						lookup, useFillFee = resolveFee(coin, 0, pos.Quantity)
+						if useFillFee && lookup.OID > 0 {
+							oidStr = strconv.FormatInt(lookup.OID, 10)
+						}
+					}
 					logHyperliquidReconcileFillLookup(logger, coin, 0, pos.Quantity, lookup, useFillFee)
-					closePx := hlReconcileExternalClosePx(mark, lookup, useFillFee)
-					if recordPerpsExternalCloseWithFillFee(ss, coin, closePx, lookup.Fee, useFillFee, "", "hl_sync_external", logger) {
+					closePx := hlReconcileExternalClosePx(prices[coin], lookup, useFillFee)
+					if closePx <= 0 {
+						closePx = pos.AvgCost
+						if logger != nil {
+							logger.Info("hl-sync: %s external close has no price source — booking at avg cost $%.4f (zero PnL)", coin, closePx)
+						}
+					}
+					if recordPerpsExternalCloseWithFillFee(ss, coin, closePx, lookup.Fee, useFillFee, oidStr, "hl_sync_external", logger) {
 						changed = true
 					}
-				} else {
-					// No mark price available — fall back to recording the
-					// close with zero PnL. s.Cash will be stale until the
-					// strategy reopens; tracked for follow-up if it matters.
-					recordClosedPosition(ss, pos, 0, 0, "hl_sync_external", now)
-					delete(ss.Positions, coin)
-					clearATRMultMissingEntryATRWarningOnHLPerpsClose(ss, coin)
-					if logger != nil {
-						logger.Info("hl-sync: %s position (%.6f %s) no longer on-chain, removing (external close, no mark price)", coin, pos.Quantity, pos.Side)
-					}
-					changed = true
 				}
 			}
 			virtualQty = 0.0
 			delta = 0.0
 		} else if math.Abs(delta) > 1e-6 {
-			// Detector 2: partial drop — find the sole SL owner and check whether
-			// the on-chain residual matches the expected post-fire remainder.
-			var slOwnerID string
-			var slOwnerPos *Position
+			type confirmedSLFill struct {
+				id        string
+				ss        *StrategyState
+				pos       *Position
+				logger    *StrategyLogger
+				lookup    HLFillLookup
+				useFill   bool
+				oidStr    string
+				closeQty  float64
+				triggerPx float64
+				side      string
+			}
+			var confirmedSLFills []confirmedSLFill
+			slOwnerCount := 0
+			expectedResidual := virtualQty
+			allowPartialAttribution := true
 			for _, id := range stratIDs {
 				ss := state.Strategies[id]
 				if ss == nil {
 					continue
 				}
 				pos := ss.Positions[coin]
-				if pos == nil {
+				if pos == nil || pos.StopLossOID <= 0 || pos.StopLossTriggerPx <= 0 {
 					continue
 				}
-				if pos.StopLossOID > 0 && pos.StopLossTriggerPx > 0 {
-					if slOwnerID != "" {
-						// Multiple SL owners — ambiguous, skip both detectors.
-						slOwnerID, slOwnerPos = "", nil
-						break
-					}
-					slOwnerID, slOwnerPos = id, pos
+				slOwnerCount++
+				logger, logErr := logMgr.GetStrategyLogger(id)
+				if logErr != nil {
+					fmt.Printf("[ERROR] hl-sync: logger for %s: %v\n", id, logErr)
 				}
-			}
-			if slOwnerID != "" && slOwnerPos != nil {
-				// Expected residual = signed virtual qty minus the owner's signed qty.
-				expectedResidual := virtualQty
-				if slOwnerPos.Side == "long" {
-					expectedResidual -= slOwnerPos.Quantity
+				lookup, useFillFee := resolveFee(coin, pos.StopLossOID, pos.Quantity)
+				logHyperliquidReconcileFillLookup(logger, coin, pos.StopLossOID, pos.Quantity, lookup, useFillFee)
+				if !hlReconcileSLFillConfirmed(lookup, useFillFee, pos.StopLossOID) {
+					continue
+				}
+				closeQty := pos.Quantity
+				if lookup.FilledQty < closeQty-1e-9 {
+					closeQty = lookup.FilledQty
+				}
+				if pos.Side == "long" {
+					expectedResidual -= closeQty
 				} else {
-					expectedResidual += slOwnerPos.Quantity
+					expectedResidual += closeQty
 				}
-				if math.Abs(onChainQty-expectedResidual) < 1e-6 {
-					ownerSS := state.Strategies[slOwnerID]
-					if ownerSS != nil {
-						logger, logErr := logMgr.GetStrategyLogger(slOwnerID)
-						if logErr != nil {
-							fmt.Printf("[ERROR] hl-sync: logger for %s: %v\n", slOwnerID, logErr)
+				confirmedSLFills = append(confirmedSLFills, confirmedSLFill{
+					id:        id,
+					ss:        ss,
+					pos:       pos,
+					logger:    logger,
+					lookup:    lookup,
+					useFill:   useFillFee,
+					oidStr:    strconv.FormatInt(pos.StopLossOID, 10),
+					closeQty:  closeQty,
+					triggerPx: pos.StopLossTriggerPx,
+					side:      pos.Side,
+				})
+			}
+			if len(confirmedSLFills) > 0 && math.Abs(onChainQty-expectedResidual) < 1e-6 {
+				for _, fill := range confirmedSLFills {
+					if fill.closeQty < fill.pos.Quantity-1e-9 {
+						if fill.logger != nil {
+							fill.logger.Info("hl-sync: %s SL close qty adjusted %.6f → %.6f (actual fill from userFills)", coin, fill.pos.Quantity, fill.closeQty)
 						}
-						lookup, useFillFee := resolveFee(coin, slOwnerPos.StopLossOID, slOwnerPos.Quantity)
-						oidStr := strconv.FormatInt(slOwnerPos.StopLossOID, 10)
-						logHyperliquidReconcileFillLookup(logger, coin, slOwnerPos.StopLossOID, slOwnerPos.Quantity, lookup, useFillFee)
-						slConfirmed := hlReconcileSLFillConfirmed(lookup, useFillFee, slOwnerPos.StopLossOID)
-						if slConfirmed {
-							if lookup.FilledQty < slOwnerPos.Quantity-1e-9 {
-								if logger != nil {
-									logger.Info("hl-sync: %s SL close qty adjusted %.6f → %.6f (actual fill from userFills)", coin, slOwnerPos.Quantity, lookup.FilledQty)
-								}
-								slOwnerPos.Quantity = lookup.FilledQty
-							}
-							// Snapshot alertSide/alertQty/alertTriggerPx before
-							// recordPerpsStopLossCloseWithFillFee mutates state.
-							// lastBookedTradePnL relies on the just-completed RecordTrade
-							// inside the booker; do not insert another RecordTrade between
-							// here and pendingAlerts append.
-							alertSide := slOwnerPos.Side
-							alertQty := slOwnerPos.Quantity
-							alertTriggerPx := slOwnerPos.StopLossTriggerPx
-							if recordPerpsStopLossCloseWithFillFee(ownerSS, coin, slOwnerPos.StopLossTriggerPx, lookup.Fee, useFillFee, oidStr, "hl_sync_stop_loss", logger) {
-								changed = true
-								virtualQty = expectedResidual
-								delta = virtualQty - onChainQty
-								pendingAlerts = append(pendingAlerts, ProtectionFillAlert{
-									StrategyID:      slOwnerID,
-									Symbol:          coin,
-									Side:            alertSide,
-									FillType:        "SL",
-									IsPartial:       false,
-									FillPrice:       alertTriggerPx,
-									CloseQty:        alertQty,
-									RemainingQty:    0,
-									RealizedPnL:     lastBookedTradePnL(ownerSS),
-									HasPnL:          true,
-									ExchangeOrderID: oidStr,
-								})
-							}
-						} else {
-							if useFillFee && logger != nil {
-								logger.Info("hl-sync: %s Detector 2 SL OID %s unfilled — routing external (matched oid=%d qty=%.6f)", coin, oidStr, lookup.OID, lookup.FilledQty)
-							} else if logger != nil {
-								logger.Info("hl-sync: %s Detector 2 SL OID %s unfilled — routing external (userFills miss)", coin, oidStr)
-							}
-							if mark, ok := prices[coin]; ok && mark > 0 {
-								lookupExt, useFillFeeExt := resolveFee(coin, 0, slOwnerPos.Quantity)
-								logHyperliquidReconcileFillLookup(logger, coin, 0, slOwnerPos.Quantity, lookupExt, useFillFeeExt)
-								closePx := hlReconcileExternalClosePx(mark, lookupExt, useFillFeeExt)
-								if recordPerpsExternalCloseWithFillFee(ownerSS, coin, closePx, lookupExt.Fee, useFillFeeExt, "", "hl_sync_external", logger) {
-									changed = true
-									virtualQty = expectedResidual
-									delta = virtualQty - onChainQty
-								}
-							} else {
-								recordClosedPosition(ownerSS, slOwnerPos, 0, 0, "hl_sync_external", now)
-								delete(ownerSS.Positions, coin)
-								clearATRMultMissingEntryATRWarningOnHLPerpsClose(ownerSS, coin)
-								if logger != nil {
-									logger.Info("hl-sync: %s position (%.6f %s) no longer on-chain, removing (Detector 2 external close, no mark price)", coin, slOwnerPos.Quantity, slOwnerPos.Side)
-								}
-								changed = true
-								virtualQty = expectedResidual
-								delta = virtualQty - onChainQty
-							}
-						}
+						fill.pos.Quantity = fill.closeQty
+					}
+					if recordPerpsStopLossCloseWithFillFee(fill.ss, coin, fill.triggerPx, fill.lookup.Fee, fill.useFill, fill.oidStr, "hl_sync_stop_loss", fill.logger) {
+						changed = true
+						pendingAlerts = append(pendingAlerts, ProtectionFillAlert{
+							StrategyID:      fill.id,
+							Symbol:          coin,
+							Side:            fill.side,
+							FillType:        "SL",
+							IsPartial:       false,
+							FillPrice:       fill.triggerPx,
+							CloseQty:        fill.closeQty,
+							RemainingQty:    0,
+							RealizedPnL:     lastBookedTradePnL(fill.ss),
+							HasPnL:          true,
+							ExchangeOrderID: fill.oidStr,
+						})
 					}
 				}
+				virtualQty = expectedResidual
+				delta = virtualQty - onChainQty
+			} else if slOwnerCount > 1 && len(confirmedSLFills) == 0 {
+				fmt.Printf("[WARN] hl-sync: %s shared-coin partial drop with %d SL owners but no confirmed SL fill; leaving reconciliation gap for operator review\n", coin, slOwnerCount)
+				allowPartialAttribution = false
+			} else if len(confirmedSLFills) > 0 {
+				fmt.Printf("[WARN] hl-sync: %s confirmed SL fills do not explain residual (expected %.8f, on-chain %.8f); leaving reconciliation gap for operator review\n", coin, expectedResidual, onChainQty)
+				allowPartialAttribution = false
 			}
-			if math.Abs(delta) > 1e-6 {
+			if math.Abs(delta) > 1e-6 && allowPartialAttribution {
 				if closeSide, closeQty, ok := hyperliquidSharedPartialCloseDrift(virtualQty, onChainQty); ok {
 					var candidateID string
 					var candidateSS *StrategyState
@@ -1432,6 +1459,7 @@ func runRegimeDirectionOrphanCloses(
 		}
 
 		var fillSz, fillPx, fillFee float64
+		var fillOID int64
 		alreadyFlat := false
 		if result != nil && result.Close != nil {
 			alreadyFlat = result.Close.AlreadyFlat
@@ -1439,6 +1467,7 @@ func runRegimeDirectionOrphanCloses(
 				fillSz = result.Close.Fill.TotalSz
 				fillPx = result.Close.Fill.AvgPx
 				fillFee = result.Close.Fill.Fee
+				fillOID = result.Close.Fill.OID
 			}
 		}
 
@@ -1449,7 +1478,7 @@ func runRegimeDirectionOrphanCloses(
 					clearHyperliquidProtectionOIDsMatching(pos, job.CancelOIDs)
 				}
 				if !alreadyFlat && fillSz > 1e-15 && fillPx > 0 {
-					applyHyperliquidCircuitCloseFill(ss, sym, fillSz, fillPx, fillFee, onChainSigned, "regime_direction_flip")
+					applyHyperliquidCircuitCloseFill(ss, sym, fillSz, fillPx, fillFee, onChainSigned, fillOID, "regime_direction_flip")
 				}
 			}
 		}
@@ -2104,7 +2133,7 @@ func applyHyperliquidKillSwitchCloseFill(s *StrategyState, sc StrategyConfig, fi
 	if fillSz <= 1e-15 {
 		return false
 	}
-	applyHyperliquidCircuitCloseFill(s, coin, fillSz, fill.AvgPx, fillFee, 0, "")
+	applyHyperliquidCircuitCloseFill(s, coin, fillSz, fill.AvgPx, fillFee, 0, fill.OID, "")
 	return true
 }
 
@@ -2365,6 +2394,7 @@ func runPendingHyperliquidCircuitCloses(
 			// shared-wallet coins never overwrites virtual quantity).
 			var (
 				fillSz, fillPx, fillFee float64
+				fillOID                 int64
 				alreadyFlat             bool
 			)
 			if result != nil && result.Close != nil {
@@ -2373,6 +2403,7 @@ func runPendingHyperliquidCircuitCloses(
 					fillSz = result.Close.Fill.TotalSz
 					fillPx = result.Close.Fill.AvgPx
 					fillFee = result.Close.Fill.Fee
+					fillOID = result.Close.Fill.OID
 				}
 			}
 
@@ -2385,7 +2416,7 @@ func runPendingHyperliquidCircuitCloses(
 			if !alreadyFlat && fillSz > 1e-15 {
 				mu.Lock()
 				if ss := state.Strategies[j.stratID]; ss != nil {
-					applyHyperliquidCircuitCloseFill(ss, c.Symbol, fillSz, fillPx, fillFee, onChainSigned, "")
+					applyHyperliquidCircuitCloseFill(ss, c.Symbol, fillSz, fillPx, fillFee, onChainSigned, fillOID, "")
 				}
 				mu.Unlock()
 			}
@@ -2517,12 +2548,24 @@ func hyperliquidOnChainCloseTradeLabel(closeReason string) string {
 
 // Caller must hold mu.Lock(). closeReason is stamped on Trade / ClosedPosition
 // rows (defaults to "circuit_breaker" when empty).
-func applyHyperliquidCircuitCloseFill(s *StrategyState, symbol string, fillSz, fillPx, fillFee, onChainSigned float64, closeReason string) {
+func applyHyperliquidCircuitCloseFill(s *StrategyState, symbol string, fillSz, fillPx, fillFee, onChainSigned float64, fillOID int64, closeReason string) {
 	if closeReason == "" {
 		closeReason = "circuit_breaker"
 	}
 	closeLabel := hyperliquidOnChainCloseTradeLabel(closeReason)
 	if s == nil || fillSz <= 0 || fillPx <= 0 {
+		return
+	}
+	var oidStr string
+	if fillOID > 0 {
+		oidStr = strconv.FormatInt(fillOID, 10)
+	}
+	// #954 one-fill-one-row: when the reconciler already booked this fill
+	// (external-close detection won the race), do not insert a second row —
+	// including the defensive no-virtual-position row below, which would
+	// otherwise double-subtract the fee from the ledger sum.
+	if oidStr != "" && strategyHasCloseTradeForOID(s, oidStr) {
+		fmt.Printf("[hl-sync] %s/%s: close fill OID %s already booked — skipping duplicate (#954)\n", s.ID, symbol, oidStr)
 		return
 	}
 	now := time.Now().UTC()
@@ -2537,16 +2580,19 @@ func applyHyperliquidCircuitCloseFill(s *StrategyState, symbol string, fillSz, f
 			closeSide = "buy"
 		}
 		RecordTrade(s, Trade{
-			Timestamp:   now,
-			StrategyID:  s.ID,
-			Symbol:      symbol,
-			Side:        closeSide,
-			Quantity:    fillSz,
-			Price:       fillPx,
-			Value:       fillSz * fillPx,
-			TradeType:   "perps",
-			Details:     fmt.Sprintf("%s (no virtual position), fill=%.6f fee=$%.4f", closeLabel, fillSz, fillFee),
-			ExchangeFee: exchangeFeeForTrade(fillFee, true),
+			Timestamp:       now,
+			StrategyID:      s.ID,
+			Symbol:          symbol,
+			Side:            closeSide,
+			Quantity:        fillSz,
+			Price:           fillPx,
+			Value:           fillSz * fillPx,
+			TradeType:       "perps",
+			Details:         fmt.Sprintf("%s (no virtual position), fill=%.6f fee=$%.4f", closeLabel, fillSz, fillFee),
+			ExchangeOrderID: oidStr,
+			ExchangeFee:     fillFee,
+			FeeSource:       FeeSourceUserFills,
+			PnLGross:        true,
 			// No virtual position to derive PnL from. Still mark as a close
 			// leg so the lifetime round-trip count (#455) reflects that the
 			// exchange-side position was reduced, but leave RealizedPnL=0
@@ -2570,6 +2616,7 @@ func applyHyperliquidCircuitCloseFill(s *StrategyState, symbol string, fillSz, f
 	} else {
 		pnl = qtyClosed * (avgCost - fillPx)
 	}
+	grossPnL := pnl
 	pnl -= fillFee
 	s.Cash += pnl
 	positionID := ensurePositionTradeID(s.ID, symbol, pos)
@@ -2585,9 +2632,12 @@ func applyHyperliquidCircuitCloseFill(s *StrategyState, symbol string, fillSz, f
 		Value:             qtyClosed * fillPx,
 		TradeType:         "perps",
 		Details:           fmt.Sprintf("%s, PnL: $%.2f (fee $%.4f)", closeLabel, pnl, fillFee),
-		ExchangeFee:       exchangeFeeForTrade(fillFee, true),
+		ExchangeOrderID:   oidStr,
+		ExchangeFee:       fillFee,
+		FeeSource:         FeeSourceUserFills,
 		IsClose:           true,
-		RealizedPnL:       pnl,
+		RealizedPnL:       grossPnL,
+		PnLGross:          true,
 		Regime:            s.Regime,
 		EntryATR:          pos.EntryATR,
 		StopLossTriggerPx: pos.StopLossTriggerPx,
