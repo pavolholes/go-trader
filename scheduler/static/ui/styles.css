@@ -1044,3 +1044,33 @@ h3 {
 .overview-panel[hidden] {
   display: none;
 }
+.chart-panel {
+  max-height: calc(100vh - 140px);
+  display: flex;
+  flex-direction: column;
+  min-height: 520px;
+  overflow: hidden;
+}
+
+.chart-wrap {
+  max-height: 520px;
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 320px;
+}
+
+@media (max-width: 620px) {
+  .chart-panel {
+    min-height: 360px;
+  }
+
+  .chart-wrap {
+    min-height: 240px;
+    max-height: none;
+  }
+
+  .trade-history {
+    max-height: 180px;
+    min-height: 120px;
+  }
+}
