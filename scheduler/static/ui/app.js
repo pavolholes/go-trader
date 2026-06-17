@@ -1,6 +1,6 @@
 (function () {
   const SIDEBAR_STORAGE_KEY = "goTraderSidebarOpen";
-  const MOBILE_SIDEBAR_MQ = "(max-width: 980px)";
+  const MOBILE_SIDEBAR_MQ = "(max-width: 1200px)";
   const VIEW_MODE_KEY = "goTraderViewMode";
 
   const state = {
@@ -8,9 +8,9 @@
     overviewRows: [],
     activeID: "",
     viewMode: "detail",
-    sortKey: "id",
-    sortDir: "asc",
-    chart: null,
+    sortKey: "pnl_pct",
+    sortDir: "desc",
+chart: null,
     series: null,
     timer: 0,
     sparklines: {},
@@ -267,7 +267,10 @@
     });
     new ResizeObserver(function () {
       const rect = els.chart.getBoundingClientRect();
-      state.chart.resize(Math.max(320, rect.width), Math.max(320, rect.height));
+      const compact = window.matchMedia("(max-width: 620px)").matches;
+      const minWidth = compact ? 240 : 320;
+      const minHeight = compact ? 200 : 320;
+      state.chart.resize(Math.max(minWidth, rect.width), Math.max(minHeight, rect.height));
     }).observe(els.chart);
   }
 
