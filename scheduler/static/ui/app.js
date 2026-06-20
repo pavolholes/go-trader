@@ -870,7 +870,7 @@ chart: null,
 
 
   function sortValue(row, key) {
-    if (key === "pnl_pct" || key === "win_rate" || key === "sharpe") {
+    if (key === "pnl_pct" || key === "pnl" || key === "current_drawdown_pct" || key === "win_rate" || key === "sharpe") {
       const n = Number(row[key]);
       return Number.isFinite(n) ? n : -Infinity;
     }
@@ -880,6 +880,8 @@ chart: null,
 
   function filterValue(row, key) {
     if (key === "pnl_pct") return fmtPct(row.pnl_pct);
+    if (key === "pnl") return row.pnl !== undefined ? fmtSignedMoney(row.pnl) : "-";
+    if (key === "current_drawdown_pct") return row.current_drawdown_pct ? fmtPct(row.current_drawdown_pct) : "-";
     if (key === "win_rate") return row.win_rate ? fmtPct(row.win_rate) : "-";
     if (key === "sharpe") return row.sharpe ? fmtNumber(row.sharpe) : "-";
     return row[key] === undefined || row[key] === null ? "-" : String(row[key]);
@@ -934,11 +936,15 @@ chart: null,
     const rows = sortedOverviewRows();
     els.overviewBody.innerHTML = rows.map(function (row) {
       const pnlClassName = row.pnl_pct > 0 ? "pnl-pos" : row.pnl_pct < 0 ? "pnl-neg" : "";
+      const pnlDollarClass = row.pnl > 0 ? "pnl-pos" : row.pnl < 0 ? "pnl-neg" : "";
+      const ddClass = row.current_drawdown_pct > 0 ? "val-negative" : "";
       return '<tr class="overview-row' + (row.id === state.activeID ? " active" : "") + '" data-id="' + escapeHTML(row.id) + '">' +
         "<td>" + escapeHTML(row.id) + "</td>" +
         "<td>" + escapeHTML(row.platform || "-") + "</td>" +
         "<td>" + escapeHTML(row.symbol || "-") + "</td>" +
         '<td class="' + pnlClassName + '">' + escapeHTML(fmtPct(row.pnl_pct)) + "</td>" +
+        '<td class="' + pnlDollarClass + '">' + escapeHTML(row.pnl !== undefined ? fmtSignedMoney(row.pnl) : "-") + "</td>" +
+        '<td class="' + ddClass + '">' + escapeHTML(row.current_drawdown_pct ? fmtPct(row.current_drawdown_pct) : "-") + "</td>" +
         "<td>" + escapeHTML(row.win_rate ? fmtPct(row.win_rate) : "-") + "</td>" +
         "<td>" + escapeHTML(row.sharpe ? fmtNumber(row.sharpe) : "-") + "</td>" +
         "<td>" + escapeHTML(row.regime || "-") + "</td>" +

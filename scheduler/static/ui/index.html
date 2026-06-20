@@ -13,7 +13,7 @@
         } catch (e) {}
       })();
     </script>
-    <link rel="stylesheet" href="/dashboard/styles.css?v=20">
+    <link rel="stylesheet" href="/dashboard/styles.css?v=21">
   </head>
   <body>
     <div class="shell">
@@ -84,6 +84,8 @@
                   <th scope="col"><button type="button" class="sort-button" data-key="platform">Platform</button></th>
                   <th scope="col"><button type="button" class="sort-button" data-key="symbol">Symbol</button></th>
                   <th scope="col"><button type="button" class="sort-button" data-key="pnl_pct">PnL %</button></th>
+                  <th scope="col"><button type="button" class="sort-button" data-key="pnl">PnL $</button></th>
+                  <th scope="col"><button type="button" class="sort-button" data-key="current_drawdown_pct">Drawdown</button></th>
                   <th scope="col"><button type="button" class="sort-button" data-key="win_rate">Win Rate</button></th>
                   <th scope="col"><button type="button" class="sort-button" data-key="sharpe">Sharpe</button></th>
                   <th scope="col"><button type="button" class="sort-button" data-key="regime">Regime</button></th>
@@ -94,6 +96,8 @@
                   <td><input type="text" class="overview-filter-input" data-key="platform" placeholder="Filter Platform..."></td>
                   <td><input type="text" class="overview-filter-input" data-key="symbol" placeholder="Filter Symbol..."></td>
                   <td><input type="text" class="overview-filter-input" data-key="pnl_pct" placeholder="Filter PnL %..."></td>
+                  <td><input type="text" class="overview-filter-input" data-key="pnl" placeholder="Filter PnL $..."></td>
+                  <td><input type="text" class="overview-filter-input" data-key="current_drawdown_pct" placeholder="Filter Drawdown..."></td>
                   <td><input type="text" class="overview-filter-input" data-key="win_rate" placeholder="Filter Win Rate..."></td>
                   <td><input type="text" class="overview-filter-input" data-key="sharpe" placeholder="Filter Sharpe..."></td>
                   <td><input type="text" class="overview-filter-input" data-key="regime" placeholder="Filter Regime..."></td>
@@ -176,6 +180,6 @@
       </form>
     </dialog>
     <script src="/dashboard/lightweight-charts.standalone.production.js"></script>
-    <script src="/dashboard/app.js?v=7"></script>
+    <script src="/dashboard/app.js?v=8"></script>
   </body>
 </html>

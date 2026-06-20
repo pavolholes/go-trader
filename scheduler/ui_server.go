@@ -36,11 +36,12 @@ type UIStrategyOverview struct {
 	Sharpe           float64                `json:"sharpe,omitempty"`
 	Regime           string                 `json:"regime,omitempty"`
 	Direction        string                 `json:"direction,omitempty"`
-	PnL              float64                `json:"pnl"`
-	PortfolioValue   float64                `json:"portfolio_value"`
-	InitialCapital   float64                `json:"initial_capital"`
-	RegimeDivergence *RegimeDivergenceState `json:"regime_divergence,omitempty"` // #907: active window-divergence state; nil when none
-	RegimeConfig     *RegimeConfig              `json:"regime_config,omitempty"`        // global regime config from top-level
+	PnL                float64                `json:"pnl"`
+	PortfolioValue     float64                `json:"portfolio_value"`
+	InitialCapital     float64                `json:"initial_capital"`
+	CurrentDrawdownPct float64                `json:"current_drawdown_pct,omitempty"`
+	RegimeDivergence   *RegimeDivergenceState `json:"regime_divergence,omitempty"` // #907: active window-divergence state; nil when none
+	RegimeConfig       *RegimeConfig          `json:"regime_config,omitempty"`     // global regime config from top-level
 }
 
 type UIStrategyStatus struct {
@@ -455,18 +456,19 @@ func (ss *StatusServer) uiStrategyOverview(id string) (UIStrategyOverview, Lifet
 	}
 
 	return UIStrategyOverview{
-		ID:               id,
-		Platform:         sc.Platform,
-		Symbol:           strategyDisplaySymbol(sc),
-		PnLPct:           pnlPct,
-		WinRate:          winRate,
-		Sharpe:           sharpe,
-		Regime:           snapshot.Regime,
-		Direction:        strategyDisplayDirection(sc),
-		PnL:              pnl,
-		PortfolioValue:   pv,
-		InitialCapital:   initCap,
-		RegimeDivergence: snapshot.RegimeDivergence,
+		ID:                 id,
+		Platform:           sc.Platform,
+		Symbol:             strategyDisplaySymbol(sc),
+		PnLPct:             pnlPct,
+		WinRate:            winRate,
+		Sharpe:             sharpe,
+		Regime:             snapshot.Regime,
+		Direction:          strategyDisplayDirection(sc),
+		PnL:                pnl,
+		PortfolioValue:     pv,
+		InitialCapital:     initCap,
+		CurrentDrawdownPct: snapshot.RiskState.CurrentDrawdownPct,
+		RegimeDivergence:   snapshot.RegimeDivergence,
 	}, lifetime, true
 }
 
