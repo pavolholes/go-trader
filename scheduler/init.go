@@ -77,6 +77,7 @@ var knownShortNames = map[string]string{
 	"momentum_pro":          "mompro",
 	"mean_reversion_pro":    "mrpro",
 	"consolidation_range":   "cr",
+	"atr_band_revert":       "abr",
 	"mtf_confluence":        "mtfc",
 	"vol_momentum":          "volmom",
 	"regime_adaptive":       "regad",
@@ -100,6 +101,7 @@ var bidirectionalPerpsStrategies = map[string]bool{
 	"momentum_pro":        true, // emits short on stacked-bearish-EMA trend-pullback breakdowns
 	"mean_reversion_pro":  true, // emits short on overbought reversion in no-trend regimes
 	"consolidation_range": true, // emits short at the top edge of a consolidation box (range-edge mean-reversion)
+	"atr_band_revert":     true, // futures variant (allow_short) shorts the upper ATR band in ranging conditions
 	"mtf_confluence":      true, // futures variant (allow_short) shorts LTF pullback rallies in HTF downtrends (#957)
 	"vol_momentum":        true, // emits short on ATR-normalized negative momentum with efficiency confirmation (#959)
 	"funding_skew":        true, // shorts crowded-long funding extremes on EMA breakdown (#960)
@@ -108,6 +110,30 @@ var bidirectionalPerpsStrategies = map[string]bool{
 
 func isBidirectionalPerpsStrategy(id string) bool {
 	return bidirectionalPerpsStrategies[id]
+}
+
+// strategiesDefaultingToCompositeRangingGate maps strategy IDs that init should
+// ship pre-gated to the composite (7-state) ranging regime. atr_band_revert is a
+// ranging mean-reversion strategy whose edge depends on the regime filter, so the
+// wizard wires the gate plus a composite "medium" regime window by default rather
+// than leaving it to manual post-init editing. ranging_directional is intentionally
+// excluded — that substate carries directional pressure with no follow-through,
+// i.e. the range most likely about to break into a trend (mean reversion's worst
+// case). Operators can widen/narrow allowed_regimes post-init.
+var strategiesDefaultingToCompositeRangingGate = map[string][]string{
+	"atr_band_revert": {"ranging_quiet", "ranging_volatile"},
+}
+
+// defaultCompositeRangingGate returns a fresh copy of the default composite
+// ranging allowed_regimes for stratID, or nil when the strategy is not gated.
+func defaultCompositeRangingGate(stratID string) []string {
+	labels, ok := strategiesDefaultingToCompositeRangingGate[stratID]
+	if !ok {
+		return nil
+	}
+	out := make([]string, len(labels))
+	copy(out, labels)
+	return out
 }
 
 // deriveShortName returns a short abbreviation for a strategy ID.
@@ -146,15 +172,14 @@ var defaultSpotStrategies = []stratDef{
 	{ID: "chart_pattern", ShortName: "cpat"},
 	{ID: "liquidity_sweeps", ShortName: "liqsw"},
 	{ID: "parabolic_sar", ShortName: "psar"},
-	{ID: "range_scalper", ShortName: "rs"},
 	{ID: "sweep_squeeze_combo", ShortName: "ssc"},
 	{ID: "adx_trend", ShortName: "adxt"},
 	{ID: "donchian_breakout", ShortName: "dbo"},
 	{ID: "tema_cross", ShortName: "temac"},
 	{ID: "momentum_pro", ShortName: "mompro"},
 	{ID: "mean_reversion_pro", ShortName: "mrpro"},
+	{ID: "atr_band_revert", ShortName: "abr"},
 	{ID: "mtf_confluence", ShortName: "mtfc"},
-	{ID: "vol_momentum", ShortName: "volmom"},
 	{ID: "regime_adaptive", ShortName: "regad"},
 	{ID: "regime_adaptive_htf", ShortName: "rahtf"},
 }
@@ -175,15 +200,13 @@ var defaultPerpsStrategies = []stratDef{
 	{ID: "anchored_vwap", ShortName: "avwap"},
 	{ID: "delta_neutral_funding", ShortName: "dnf"},
 	{ID: "funding_skew", ShortName: "fskew"},
-	{ID: "range_scalper", ShortName: "rs"},
 	{ID: "sweep_squeeze_combo", ShortName: "ssc"},
 	{ID: "adx_trend", ShortName: "adxt"},
 	{ID: "donchian_breakout", ShortName: "dbo"},
-	{ID: "session_breakout", ShortName: "sbo"},
 	{ID: "momentum_pro", ShortName: "mompro"},
 	{ID: "mean_reversion_pro", ShortName: "mrpro"},
+	{ID: "atr_band_revert", ShortName: "abr"},
 	{ID: "mtf_confluence", ShortName: "mtfc"},
-	{ID: "vol_momentum", ShortName: "volmom"},
 	{ID: "regime_adaptive", ShortName: "regad"},
 	{ID: "regime_adaptive_htf", ShortName: "rahtf"},
 }
@@ -205,17 +228,15 @@ var defaultFuturesStrategies = []stratDef{
 	{ID: "parabolic_sar", ShortName: "psar"},
 	{ID: "delta_neutral_funding", ShortName: "dnf"},
 	{ID: "funding_skew", ShortName: "fskew"},
-	{ID: "range_scalper", ShortName: "rs"},
 	{ID: "sweep_squeeze_combo", ShortName: "ssc"},
 	{ID: "adx_trend", ShortName: "adxt"},
 	{ID: "donchian_breakout", ShortName: "dbo"},
-	{ID: "session_breakout", ShortName: "sbo"},
 	{ID: "tema_cross", ShortName: "temac"},
 	{ID: "tema_cross_bd", ShortName: "temacb"},
 	{ID: "momentum_pro", ShortName: "mompro"},
 	{ID: "mean_reversion_pro", ShortName: "mrpro"},
+	{ID: "atr_band_revert", ShortName: "abr"},
 	{ID: "mtf_confluence", ShortName: "mtfc"},
-	{ID: "vol_momentum", ShortName: "volmom"},
 	{ID: "regime_adaptive", ShortName: "regad"},
 	{ID: "regime_adaptive_htf", ShortName: "rahtf"},
 }
@@ -389,6 +410,7 @@ type InitOptions struct {
 	OKXDrawdown             float64
 	CapitalPct              float64 `json:"capitalPct,omitempty"` // 0-1; global capital_pct applied to all strategies
 	HTFFilter               bool    // higher-timeframe trend filter for all strategies
+	DisableCircuitBreaker   bool    `json:"disableCircuitBreaker,omitempty"` // #1048 — when true, stamp circuit_breaker:false on every generated non-manual strategy (fleet-wide opt-out of the per-strategy circuit breaker). Default false keeps the safe default (CB on). Exposed for the JSON-driven `init --json` path; the interactive wizard leaves it false (disabling an auto-protective halt at setup is a footgun — operators opt out per-strategy via config edit + SIGHUP instead).
 	// Risk settings — prompted explicitly during live-mode setup (#85) so operators
 	// don't hit the post-launch migration DM for portfolio_risk fields.
 	PortfolioMaxDrawdownPct   float64 `json:"portfolioMaxDrawdownPct,omitempty"`   // kill switch threshold; 0 → default 25
@@ -745,10 +767,53 @@ func generateConfig(opts InitOptions) *Config {
 		}
 	}
 
+	// #1048: fleet-wide circuit-breaker opt-out. Default (false) leaves
+	// CircuitBreaker nil → enabled (the safe default). When set, stamp explicit
+	// false on every non-manual strategy; manual is exempt from CheckRisk so the
+	// flag is a no-op there and is skipped to avoid implying otherwise.
+	if opts.DisableCircuitBreaker {
+		cbOff := false
+		for i := range cfg.Strategies {
+			if cfg.Strategies[i].Type == "manual" {
+				continue
+			}
+			cfg.Strategies[i].CircuitBreaker = &cbOff
+		}
+	}
+
 	// #87: Apply capital_pct to all strategies if set globally.
 	if opts.CapitalPct > 0 {
 		for i := range cfg.Strategies {
 			cfg.Strategies[i].CapitalPct = opts.CapitalPct
+		}
+	}
+
+	// Pre-gate ranging mean-reversion strategies to the composite (7-state)
+	// regime. The underlying strategy ID is Args[0] for every platform loop
+	// (check_*.py <strategy> <symbol> ...), so post-process uniformly instead of
+	// touching each loop. allowed_regimes is a no-op (and rejected) for options,
+	// so the gate is never applied there. When any gated strategy is present,
+	// enable a global composite "medium" regime window so the labels resolve —
+	// without it the gate validates against the ADX vocabulary and never matches.
+	needsCompositeRangingRegime := false
+	for i := range cfg.Strategies {
+		sc := &cfg.Strategies[i]
+		if sc.Type == "options" || len(sc.Args) == 0 || len(sc.AllowedRegimes) > 0 {
+			continue
+		}
+		if gate := defaultCompositeRangingGate(sc.Args[0]); gate != nil {
+			sc.AllowedRegimes = gate
+			needsCompositeRangingRegime = true
+		}
+	}
+	if needsCompositeRangingRegime && cfg.Regime == nil {
+		cfg.Regime = &RegimeConfig{
+			Enabled:      true,
+			Period:       14,
+			ADXThreshold: 20.0,
+			Windows: RegimeWindowsMap{
+				"medium": {Classifier: regimeClassifierComposite, Period: 20},
+			},
 		}
 	}
 

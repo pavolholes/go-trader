@@ -76,6 +76,14 @@ type RegimeConfig struct {
 	Period       int              `json:"period"`            // ADX lookback (Wilder's smoothing); default 14; legacy single-window mode
 	ADXThreshold float64          `json:"adx_threshold"`     // ADX below this is "ranging"; default 20.0
 	Windows      RegimeWindowsMap `json:"windows,omitempty"` // name -> classifier+period; bare int = ADX period (#792/#795)
+	// DisplayWindows optionally restricts which regime windows appear in the
+	// Discord/cycle summary (#1062). Display-only: it never affects regime
+	// calculation or gating. Names match window keys case-insensitively (e.g.
+	// "composite_long", "long"). Empty/omitted preserves the legacy behavior of
+	// rendering every window. When set but no configured window matches a
+	// populated label, the summary falls back to the single primary regime
+	// string (same fallback as the multi-window-disabled path).
+	DisplayWindows []string `json:"display_windows,omitempty"`
 }
 
 // CorrelationConfig controls portfolio-level directional exposure tracking.
@@ -242,6 +250,18 @@ func (c *Config) NotifyTPSLFillsEnabled() bool {
 	return *c.NotifyTPSLFills
 }
 
+// CircuitBreakerEnabled reports whether the per-strategy circuit breaker is
+// active. Nil pointer (missing field) defaults to true so existing configs keep
+// the auto-protective behavior without an explicit opt-in; an explicit false
+// disables both firing arms in CheckRisk (drawdown and consecutive-loss). Safe
+// on a nil receiver (treated as enabled). (#1048)
+func (sc *StrategyConfig) CircuitBreakerEnabled() bool {
+	if sc == nil || sc.CircuitBreaker == nil {
+		return true
+	}
+	return *sc.CircuitBreaker
+}
+
 // ParseSummaryFrequency converts a summary_frequency value to a duration.
 // Returns -1 to mean "use legacy default", 0 to mean "every channel run", or a
 // positive duration when caller should post every duration. An unrecognized
@@ -347,6 +367,7 @@ type StrategyConfig struct {
 	CapitalPct              float64                  `json:"capital_pct,omitempty"`     // 0-1; dynamic capital = wallet_balance * capital_pct (overrides capital)
 	InitialCapital          float64                  `json:"initial_capital,omitempty"` // fixed starting balance for PnL display (never overwritten by capital_pct)
 	MaxDrawdownPct          float64                  `json:"max_drawdown_pct"`
+	CircuitBreaker          *bool                    `json:"circuit_breaker,omitempty"`            // #1048 — per-strategy circuit-breaker opt-out. Nil/missing → enabled (the safe default); explicit false disables BOTH firing arms in CheckRisk (drawdown > max_drawdown_pct AND 5 consecutive losses), uniformly for live and paper (no platform/live gating). Hot-reloadable via SIGHUP including while a position is open: disabling only suppresses NEW fires — an already-latched CB and any pending circuit close still drain. No effect on type=manual (exempt from CheckRisk). Read via CircuitBreakerEnabled(), never directly.
 	IntervalSeconds         int                      `json:"interval_seconds,omitempty"`           // per-strategy override (0 = use global)
 	HTFFilter               bool                     `json:"htf_filter,omitempty"`                 // higher-timeframe trend filter
 	InvertSignal            bool                     `json:"invert_signal,omitempty"`              // HL perps/manual only: flip BUY<->SELL on a non-zero signal before execution (HOLD/0 is never flipped). Lets inverse variants reuse the same open/close refs. Composes with Direction — invert runs in the Go layer before direction interprets the resulting sign (e.g. direction="short" + invert_signal=true opens short on raw-BUY triggers, distinct from plain direction="short" which opens on raw-SELL). Rejected outside HL perps/manual.
@@ -1248,6 +1269,33 @@ func ValidateConfig(cfg *Config) error {
 	return validateConfig(cfg, false)
 }
 
+// regimeDirectionalPolicyWarnings returns one operator warning per strategy that selects
+// trade side from the regime label (regime_directional_policy, #779). #1076 validated that
+// premise — regime -> forward DIRECTION — and found it empirically false across BTC/ETH/SOL/
+// BNB/XRP and five timeframes: 0 of 2121 per-state forward-return tests survive global
+// Benjamini-Hochberg/Bonferroni correction, and a look-ahead-safe regime-timing book never
+// beats its own block-shuffled-label null (0/60 after FDR). So this surface chooses long vs
+// short on noise; its only realized effect is a change in exposure (defensive beta in a down
+// sample), not a directional forecast. The warning is advisory and NON-BREAKING — existing
+// live configs still load — because hard-rejecting the keys is the less safe option: a forced
+// disable relies on the #822 orphan auto-close, which fires only for sole-owner coins
+// (hyperliquid_balance.go), so a shared-coin live short would be stranded for manual close.
+// Operators should disable from FLAT (SIGHUP blocks the change while a position is open,
+// config_reload.go) and use the regime for ATR-scaled SL/TP sizing (#1078), its real signal.
+// Returned (not printed) so the set is unit-testable; validateConfig prints them.
+func regimeDirectionalPolicyWarnings(cfg *Config) []string {
+	if cfg == nil {
+		return nil
+	}
+	var out []string
+	for _, sc := range cfg.Strategies {
+		if sc.RegimeDirectionalPolicy.IsConfigured() {
+			out = append(out, fmt.Sprintf("[WARN] %s: regime_directional_policy selects long/short by regime, but the regime→forward-direction premise is empirically unvalidated (#1076 negative result). It is now DEFAULT-OFF / evidence-gated (#1085): the side resolves to base direction unless a per-(asset,timeframe,classifier) certification passes (none currently does). Prefer the regime for ATR-scaled SL/TP sizing (#1078); disable from flat.", sc.ID))
+		}
+	}
+	return out
+}
+
 func validateConfig(cfg *Config, skipLiveCredentialChecks bool) error {
 	var errs []string
 	seenIDs := make(map[string]bool)
@@ -1918,6 +1966,11 @@ func validateConfig(cfg *Config, skipLiveCredentialChecks bool) error {
 				fmt.Printf("[WARN] %s: allowed_regimes is set but regime.enabled=false — gate is a no-op until regime detection is enabled\n", sc.ID)
 			}
 		}
+	}
+
+	// #1076: warn on the regime→direction selection surface (premise empirically refuted).
+	for _, w := range regimeDirectionalPolicyWarnings(cfg) {
+		fmt.Println(w)
 	}
 
 	knownPlatforms := make(map[string]bool)

@@ -908,6 +908,79 @@ func TestApplyHotReloadConfigAllowsRegimeTierMultipleChangeWithoutSLAfter(t *tes
 	}
 }
 
+// #1062 — regime.display_windows is display-only and hot-reloads, but any other
+// regime field change still requires a restart.
+func TestApplyHotReloadConfigDisplayWindows(t *testing.T) {
+	regimeWith := func(display []string) *RegimeConfig {
+		return &RegimeConfig{
+			Enabled: true, Period: 14, ADXThreshold: 20,
+			Windows: RegimeWindowsMap{
+				"long":           {Period: 2160},
+				"composite_long": {Classifier: regimeClassifierComposite, Period: 2160},
+			},
+			DisplayWindows: display,
+		}
+	}
+	openState := func() *AppState {
+		return &AppState{Strategies: map[string]*StrategyState{
+			"hl-eth": {ID: "hl-eth", Positions: map[string]*Position{
+				"ETH": {Symbol: "ETH", Quantity: 0.5, AvgCost: 3000, Side: "long", Regime: "ranging"},
+			}},
+		}}
+	}
+	stratWith := func(r *RegimeConfig) *Config {
+		c := minimalReloadConfig([]StrategyConfig{{
+			ID: "hl-eth", Type: "perps", Platform: "hyperliquid", Script: "x.py",
+			Args: []string{"a", "ETH", "1h"}, Capital: 1000, MaxDrawdownPct: 10,
+			Leverage: 5, MarginMode: "isolated",
+		}})
+		c.Regime = r
+		return c
+	}
+
+	// (1) display-only change applies while a position is open.
+	t.Run("display-only change applies with open position", func(t *testing.T) {
+		cfg := stratWith(regimeWith(nil))
+		next := stratWith(regimeWith([]string{"composite_long"}))
+		changes, err := applyHotReloadConfig(cfg, next, openState(), nil, nil)
+		if err != nil {
+			t.Fatalf("display-only regime change should hot-reload, got: %v", err)
+		}
+		if len(cfg.Regime.DisplayWindows) != 1 || cfg.Regime.DisplayWindows[0] != "composite_long" {
+			t.Fatalf("DisplayWindows not applied: %v", cfg.Regime.DisplayWindows)
+		}
+		joined := strings.Join(changes, " | ")
+		if !strings.Contains(joined, "regime.display_windows") {
+			t.Fatalf("expected a display_windows change entry, got: %v", changes)
+		}
+	})
+
+	// (2) compound change (display_windows + a real regime field) still rejects.
+	t.Run("compound change still rejects", func(t *testing.T) {
+		cfg := stratWith(regimeWith(nil))
+		next := stratWith(regimeWith([]string{"composite_long"}))
+		next.Regime.ADXThreshold = 25 // a genuinely restart-required edit
+		if _, err := applyHotReloadConfig(cfg, next, openState(), nil, nil); err == nil {
+			t.Fatal("regime change compounded with display_windows must still require restart")
+		}
+		if len(cfg.Regime.DisplayWindows) != 0 {
+			t.Fatalf("rejected reload must not mutate DisplayWindows: %v", cfg.Regime.DisplayWindows)
+		}
+	})
+
+	// (3) clearing display_windows reverts to render-all without a restart.
+	t.Run("clearing reverts to render-all", func(t *testing.T) {
+		cfg := stratWith(regimeWith([]string{"composite_long"}))
+		next := stratWith(regimeWith(nil))
+		if _, err := applyHotReloadConfig(cfg, next, openState(), nil, nil); err != nil {
+			t.Fatalf("clearing display_windows should hot-reload, got: %v", err)
+		}
+		if len(cfg.Regime.DisplayWindows) != 0 {
+			t.Fatalf("DisplayWindows should be cleared, got: %v", cfg.Regime.DisplayWindows)
+		}
+	})
+}
+
 // #656 — direction change is allowed when the strategy is flat.
 func TestApplyHotReloadConfigAllowsDirectionChangeWhenFlat(t *testing.T) {
 	cfg := minimalReloadConfig([]StrategyConfig{{
@@ -1367,5 +1440,71 @@ func TestValidateHotReloadCompatible_RegimeWindowOnlyChange(t *testing.T) {
 	}})
 	if err := validateHotReloadCompatible(cfg, next); err != nil {
 		t.Fatalf("pure regime_gate_window change should be hot-reloadable: %v", err)
+	}
+}
+
+// #1048: the circuit-breaker toggle is hot-reloadable always, including while a
+// position is open — it must NOT be rejected by the reload validators, and the
+// new value must actually be applied to the running config.
+func TestApplyHotReloadConfig_CircuitBreakerToggleWhileOpen(t *testing.T) {
+	falseVal, trueVal := false, true
+	base := func(cb *bool) []StrategyConfig {
+		return []StrategyConfig{{
+			ID: "hl-eth", Type: "perps", Platform: "hyperliquid",
+			Script:  "shared_scripts/check_hyperliquid.py",
+			Args:    []string{"momentum", "ETH", "1h", "--mode=paper"},
+			Capital: 1000, MaxDrawdownPct: 10, Leverage: 2, Direction: DirectionLong,
+			CircuitBreaker: cb,
+		}}
+	}
+	openState := func() *AppState {
+		return &AppState{Strategies: map[string]*StrategyState{
+			"hl-eth": {
+				ID: "hl-eth", Cash: 900,
+				RiskState: RiskState{MaxDrawdownPct: 10},
+				Positions: map[string]*Position{
+					"ETH": {Symbol: "ETH", Quantity: 1, Side: "long", AvgCost: 3000, Leverage: 2},
+				},
+			},
+		}}
+	}
+
+	// on (nil) → off while a position is open: accepted, value applied, change logged.
+	cfg := minimalReloadConfig(base(nil))
+	next := minimalReloadConfig(base(&falseVal))
+	changes, err := applyHotReloadConfig(cfg, next, openState(), nil, nil)
+	if err != nil {
+		t.Fatalf("circuit_breaker on->off while open should be hot-reloadable: %v", err)
+	}
+	if cfg.Strategies[0].CircuitBreakerEnabled() {
+		t.Fatal("expected circuit breaker disabled after reload")
+	}
+	if !strings.Contains(strings.Join(changes, "\n"), "circuit_breaker") {
+		t.Fatalf("expected a circuit_breaker change entry, got %v", changes)
+	}
+
+	// off → on (re-arm) while a position is open: accepted, value applied.
+	cfg = minimalReloadConfig(base(&falseVal))
+	next = minimalReloadConfig(base(&trueVal))
+	if _, err := applyHotReloadConfig(cfg, next, openState(), nil, nil); err != nil {
+		t.Fatalf("circuit_breaker off->on while open should be hot-reloadable: %v", err)
+	}
+	if !cfg.Strategies[0].CircuitBreakerEnabled() {
+		t.Fatal("expected circuit breaker re-enabled after reload")
+	}
+}
+
+// #1048: a circuit_breaker-only change must not register in the restart shape
+// (else validateHotReloadCompatible would flag it as restart-required).
+func TestStrategyRestartShape_CircuitBreakerOnlyChange(t *testing.T) {
+	on, off := true, false
+	a := StrategyConfig{ID: "hl-a", CircuitBreaker: &on}
+	b := StrategyConfig{ID: "hl-a", CircuitBreaker: &off}
+	c := StrategyConfig{ID: "hl-a", CircuitBreaker: nil}
+	if !reflect.DeepEqual(strategyRestartShape(a), strategyRestartShape(b)) {
+		t.Fatal("circuit_breaker on/off change should not affect restart shape")
+	}
+	if !reflect.DeepEqual(strategyRestartShape(a), strategyRestartShape(c)) {
+		t.Fatal("circuit_breaker set-vs-nil should not affect restart shape")
 	}
 }

@@ -35,6 +35,26 @@ type Position struct {
 	Regime          string            `json:"regime,omitempty"`             // regime label stamped at position open via stampPositionRegimeIfOpened. Drives regime-aware tier/SL multipliers for the life of the position (#733). Distinct from StrategyState.Regime which tracks the most recent classifier output.
 	RegimeWindows   map[string]string `json:"regime_windows,omitempty"`     // per-window regime labels stamped at open (#792)
 	OpenProfile     string            `json:"open_profile,omitempty"`       // regime-profile allocation: profile active when this position opened, frozen for its life (hold-on-transition). Read by resolveRegimeProfile when a position is open. (#998)
+	// DirectionCertifiedAtOpen records whether regime_directional_policy was
+	// CERTIFIED (#1085) for this strategy's (asset,timeframe,classifier) at the
+	// moment the position opened. The live entry gate keys on the CURRENT
+	// certification verdict only when flat; once open, the position rides under
+	// this stamp so a later certification expiry/refresh can never silently flip
+	// its effective direction or trip the #822 orphan-close. Legacy positions
+	// (pre-#1085) default false → resolve to base direction (the intended
+	// from-flat migration; #822 auto-closes sole-owner conflicts, shared-coin
+	// conflicts are surfaced to the operator).
+	DirectionCertifiedAtOpen bool `json:"direction_certified_at_open,omitempty"`
+	// DirectionCertifiedStatesAtOpen freezes the certified PER-STATE direction
+	// map (#1085) at the moment the position opened. Per-state SIGN gating of an
+	// OPEN position (hold-on-transition AND the #822 orphan check) consults this
+	// open-time evidence — never the live artifact, which a SIGHUP/expiry could
+	// change mid-position (req 2) — so a certified cell never bets opposite the
+	// certified sign for a state, and an open position is never re-gated by a later
+	// artifact change. nil = cell uncertified at open / no policy → every state
+	// resolves to base direction. Persisted as a JSON map column (mirrors
+	// regime_windows_json).
+	DirectionCertifiedStatesAtOpen map[string]string `json:"direction_certified_states_at_open,omitempty"`
 	// #843 dynamic close: confirm-cycle state for live ATR-regime re-resolution.
 	RegimePendingLabel string `json:"regime_pending_label,omitempty"`
 	RegimePendingCount int    `json:"regime_pending_count,omitempty"`
@@ -559,7 +579,9 @@ type Trade struct {
 	PnLGross bool `json:"pnl_gross,omitempty"`
 	// FeeSource records ExchangeFee provenance: "userfills" (real exchange
 	// fee), "modeled" (taker-rate estimate; `backfill trade-ledger` repairs
-	// these from userFills), or "" (legacy row / no fee context).
+	// these from userFills), "reconcile_adjustment" (model-only virtual-state
+	// cleanup with no exchange fill to true up), or "" (legacy row / no fee
+	// context).
 	FeeSource string `json:"fee_source,omitempty"`
 
 	Regime string `json:"regime,omitempty"` // market regime label at time of trade (#482)

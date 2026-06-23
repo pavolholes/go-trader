@@ -18,6 +18,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'shared_tools')
 
 from atr import ensure_atr_indicator
 from data_fetcher import load_cached_data
+from directional_certification import (
+    config_directional_classifier,
+    load_certifications,
+    is_directional_certified,
+    certified_states,
+    backtest_classifier,
+)
 
 # Strategies whose signals read a per-bar `funding_rate` column. The column is
 # attached after the OHLCV load (Hyperliquid hourly funding, cached in SQLite,
@@ -91,7 +98,16 @@ from reporter import (
     format_multi_asset_report, format_walk_forward_report,
     generate_full_report,
 )
-from regime import compute_regime, compute_regime_composite  # noqa: E402
+from regime import (  # noqa: E402
+    compute_regime,
+    compute_regime_composite,
+    parse_regime_windows_spec_json,
+    valid_labels_for_classifier,
+    CLASSIFIER_ADX,
+    CLASSIFIER_COMPOSITE,
+    REGIME_PRIMARY_WINDOW_KEY,
+    VALID_LABELS_COMPOSITE,
+)
 
 
 def _normalize_regime_window_spec(spec) -> dict:
@@ -107,6 +123,119 @@ def _normalize_regime_window_spec(spec) -> dict:
     else:
         out["thresholds"] = dict(spec.get("thresholds") or {})
     return out
+
+
+def _resolve_regime_windows_spec(regime_cfg: dict) -> Optional[dict]:
+    """Build the normalized composite-capable windows spec the Backtester threads
+    into ``ensure_regime_columns`` (#1058), sourced from the live config's
+    ``regime.windows``.
+
+    Mirrors the Go scheduler's ``regimeWindowsSpecJSON`` + ``resolvedForEmit`` so
+    the backtester classifies the SAME primary-window (medium-first) label the
+    live regime store feeds close evaluators:
+
+      - period defaults to the window's value, else the top-level
+        ``regime.period`` (Go ``resolvedForEmit``);
+      - ADX windows: ``adx_threshold`` defaults to the window's value, else the
+        top-level ``regime.adx_threshold``, else 20.0 (Go ``adxThreshold``);
+      - composite windows: ``thresholds`` are merged over
+        ``_DEFAULT_COMPOSITE_THRESHOLDS`` downstream by ``_normalize_spec``.
+
+    Returns ``None`` when regime is disabled or no ``regime.windows`` is
+    configured. The empty-``windows`` case is left to the existing
+    ``regime_period`` / ``regime_adx_threshold`` threading, which is behaviorally
+    identical to a synthesized ``{"default": adx}`` window — so the legacy
+    single-lookback ADX backtest stays byte-identical.
+    """
+    if not regime_cfg or not regime_cfg.get("enabled"):
+        return None
+    windows = regime_cfg.get("windows") or {}
+    if not windows:
+        return None
+    top_period = int(regime_cfg.get("period", 14) or 14)
+    top_adx = float(regime_cfg.get("adx_threshold", 20.0) or 20.0)
+    raw: dict = {}
+    for name, spec in windows.items():
+        if isinstance(spec, (int, float)) and not isinstance(spec, bool):
+            entry: dict = {"classifier": "adx", "period": int(spec)}
+        else:
+            entry = dict(spec or {})
+        classifier = str(entry.get("classifier") or "adx").strip().lower() or "adx"
+        period = int(entry.get("period") or 0)
+        if period <= 0:
+            period = top_period
+        out_entry: dict = {"classifier": classifier, "period": period}
+        if classifier == "adx":
+            adx_th = float(entry.get("adx_threshold") or 0.0)
+            if adx_th <= 0:
+                adx_th = top_adx if top_adx > 0 else 20.0
+            out_entry["adx_threshold"] = adx_th
+        else:
+            th = dict(entry.get("thresholds") or {})
+            if th:
+                out_entry["thresholds"] = th
+        raw[str(name)] = out_entry
+    import json as _json
+    # parse_regime_windows_spec_json validates (period >= 2, reserved names) and
+    # normalizes to the exact shape ensure_regime_columns indexes.
+    return parse_regime_windows_spec_json(_json.dumps(raw))
+
+
+def _primary_window_classifier(spec: Optional[dict]) -> str:
+    """Classifier of the PRIMARY (medium-first) window — the one whose label the
+    backtester's single ``regime`` column carries and the entry gate reads (#1058).
+
+    Mirrors ``ensure_regime_columns`` / ``regime_from_injected_payload`` primary
+    selection (``REGIME_PRIMARY_WINDOW_KEY`` else ``sorted(keys)[0]``). ``None``
+    spec (no ``regime.windows``) is the legacy single-lookback ADX path, so the
+    gate vocabulary is the 3 ADX labels.
+    """
+    if not spec:
+        return CLASSIFIER_ADX
+    primary_key = (
+        REGIME_PRIMARY_WINDOW_KEY
+        if REGIME_PRIMARY_WINDOW_KEY in spec
+        else sorted(spec.keys())[0]
+    )
+    return str(spec[primary_key].get("classifier") or CLASSIFIER_ADX).strip().lower()
+
+
+def _validate_allowed_regimes_vocabulary(
+    allowed_regimes: Optional[List[str]],
+    windows_spec: Optional[dict],
+) -> None:
+    """Reject ``--allowed-regimes`` labels the primary window's classifier can
+    never emit (#1058 review). The entry gate compares each per-bar regime label
+    (the primary window's output) against this set, so a label outside that
+    classifier's vocabulary blocks every entry silently — exactly the divergence
+    class the live ``validateStrategyRegimeVocabulary`` guards on the Go side.
+
+    Vocabulary tracks the SUPPLIED spec's primary classifier, NOT an
+    unconditional widen: an ADX-only (or no-windows) by-name backtest still
+    rejects composite substates; a composite-primary spec still rejects bare ADX
+    labels (which its classifier never emits). On error, exits with status 1.
+    """
+    if not allowed_regimes:
+        return
+    classifier = _primary_window_classifier(windows_spec)
+    valid = valid_labels_for_classifier(classifier)
+    invalid = [lab for lab in allowed_regimes if lab not in valid]
+    if not invalid:
+        return
+    msg = (
+        f"--allowed-regimes {invalid!r}: not valid label(s) for the primary "
+        f"regime window's {classifier!r} classifier. Valid: "
+        f"{', '.join(sorted(valid))}."
+    )
+    # Most common slip: composite substates supplied without a composite spec.
+    if classifier == CLASSIFIER_ADX and any(lab in VALID_LABELS_COMPOSITE for lab in invalid):
+        msg += (
+            " (Composite 7-state labels require a composite primary window — "
+            "supply --regime-windows-spec-json with a composite classifier, or "
+            "use --config.)"
+        )
+    print(msg)
+    sys.exit(1)
 
 
 def _build_profile_label_series(df: pd.DataFrame, window_spec: dict) -> pd.Series:
@@ -272,11 +401,29 @@ def load_strategy_config(config_path: str, strategy_id: str,
     for sc in cfg.get("strategies", []) or []:
         if sc.get("id") != strategy_id:
             continue
-        open_ref = sc.get("open_strategy") or {}
-        if not isinstance(open_ref, dict) or not open_ref.get("name"):
+        open_ref = sc.get("open_strategy")
+        if not isinstance(open_ref, dict):
+            open_ref = {}
+        # #1067: mirror the live daemon's open-strategy resolution
+        # (effectiveOpenStrategy, strategy_composition.go): prefer
+        # open_strategy.name, else fall back to the positional args[0] strategy
+        # arg. `go-trader init` emits the args-form (args[0]=concept name) with an
+        # empty open_strategy.name, and the v13->v15 migration only backfills
+        # open_strategy.name for pre-v13 files — so an init-stamped v15 config
+        # (and any hand-edited args-form config) reaches here name-less. The live
+        # daemon runs these fine via this same args[0] fallback, so the backtester
+        # must resolve the identical name instead of rejecting, or backtest and
+        # live silently diverge on a config the daemon accepts.
+        open_name = str(open_ref.get("name") or "").strip()
+        if not open_name:
+            args_list = sc.get("args")
+            if isinstance(args_list, list) and args_list:
+                open_name = str(args_list[0] or "").strip()
+        if not open_name:
             raise ValueError(
-                f"{config_path}: strategy {strategy_id!r} has no open_strategy.name; "
-                f"the migrated config should always populate it."
+                f"{config_path}: strategy {strategy_id!r} has neither "
+                f"open_strategy.name nor a positional args[0] strategy arg to "
+                f"resolve the open strategy from."
             )
         regime_cfg = cfg.get("regime") or {}
         if not isinstance(regime_cfg, dict):
@@ -444,9 +591,30 @@ def load_strategy_config(config_path: str, strategy_id: str,
                 f"parity path. Gate on the default lookback (remove "
                 f"regime_gate_window) or drop allowed_regimes for backtesting."
             )
+        # #1085 parity: resolve the certification verdict using the SAME
+        # directional-window classifier the live daemon uses (not "composite if
+        # any windows spec"), so a multi-window directional config keys on the
+        # identical (asset,timeframe,classifier) cell. The verdict is a Backtester
+        # param, so the whole returned dict still spreads cleanly into Backtester.
+        cfg_args = sc.get("args") or []
+        cert_symbol = str(cfg_args[1]) if len(cfg_args) > 1 else ""
+        cert_timeframe = str(cfg_args[2]) if len(cfg_args) > 2 else ""
+        regime_directional_certified = False
+        regime_directional_certified_states = None
+        if regime_directional_policy and cert_symbol and cert_timeframe:
+            # #1085 per-state parity: resolve the certified per-state direction map
+            # (not just a cell-level bool) with the LIVE directional-window
+            # classifier, so the backtester drops the exact states the live gate
+            # drops (config contradicting the certified sign -> base).
+            _certs = load_certifications()
+            _clf = config_directional_classifier(regime_cfg, sc)
+            regime_directional_certified_states = certified_states(
+                _certs, cert_symbol, cert_timeframe, _clf,
+            )
+            regime_directional_certified = regime_directional_certified_states is not None
         return {
             "open_strategy": {
-                "name": open_ref["name"],
+                "name": open_name,
                 "params": dict(open_ref.get("params") or {}),
             },
             "close_strategies": close_refs,
@@ -462,9 +630,14 @@ def load_strategy_config(config_path: str, strategy_id: str,
             "direction": direction,
             "invert_signal": invert_signal,
             "regime_directional_policy": regime_directional_policy,
+            "regime_directional_certified": regime_directional_certified,
+            "regime_directional_certified_states": regime_directional_certified_states,
             "regime_enabled": bool(regime_cfg.get("enabled")),
             "regime_period": int(regime_cfg.get("period", 14) or 14),
             "regime_adx_threshold": float(regime_cfg.get("adx_threshold", 20.0) or 20.0),
+            # #1058: composite (7-state) regime from regime.windows. None when no
+            # windows are configured → legacy single-lookback ADX path unchanged.
+            "regime_windows_spec": _resolve_regime_windows_spec(regime_cfg),
             "allowed_regimes": allowed_regimes,
             "profile_allocation": profile_allocation,
         }
@@ -488,6 +661,7 @@ def run_single_backtest(
     regime_enabled: bool = False,
     regime_period: int = 14,
     regime_adx_threshold: float = 20.0,
+    regime_windows_spec: Optional[dict] = None,
     allowed_regimes: Optional[List[str]] = None,
     stop_loss_atr_mult: Optional[float] = None,
     stop_loss_pct: Optional[float] = None,
@@ -500,6 +674,9 @@ def run_single_backtest(
     direction: Optional[str] = None,
     invert_signal: bool = False,
     regime_directional_policy: Optional[dict] = None,
+    regime_directional_certified: Optional[bool] = None,
+    regime_directional_certified_states: Optional[dict] = None,
+    directional_cert_path: Optional[str] = None,
     profile_allocation: Optional[dict] = None,
     circuit_breaker_max_drawdown_pct: Optional[float] = None,
     save: bool = True,
@@ -586,6 +763,32 @@ def run_single_backtest(
     resolved_margin = margin_per_trade_usd if margin_per_trade_usd is not None else 10.0  # default $10 like Go
     resolved_leverage = leverage if leverage is not None else _get_leverage_for_symbol(symbol)
     print(f"  Margin: ${resolved_margin:.0f}/trade | Leverage: {resolved_leverage:.0f}x")
+
+    # #1085: resolve the directional-certification verdict for parity with live.
+    # The backtest honors regime_directional_policy only where the SAME
+    # per-(asset,timeframe,classifier) certification passes that the live daemon
+    # checks; otherwise default-off (base direction). Classifier = the one the
+    # backtester actually applies (composite if windows_spec, else ADX).
+    # #1085: when the caller (--config via load_strategy_config) already resolved
+    # the verdict with the LIVE directional-window classifier, honor it. For a
+    # by-name run, resolve here against the backtester's modeled classifier.
+    # By-name run (caller supplied no per-state map and no bool): resolve the
+    # per-state verdict here against the backtester's modeled classifier. The
+    # --config path (load_strategy_config) already resolved it with the live
+    # directional-window classifier and threaded both the map and the bool.
+    if (regime_directional_policy and regime_directional_certified_states is None
+            and regime_directional_certified is None):
+        certs = load_certifications(directional_cert_path)
+        clf = backtest_classifier(regime_windows_spec)
+        regime_directional_certified_states = certified_states(
+            certs, symbol, timeframe, clf,
+        )
+        if regime_directional_certified_states is None:
+            print(f"  [#1085] regime_directional_policy default-off: "
+                  f"({symbol},{timeframe},{clf}) not certified — base direction "
+                  f"(matches live; #1076 negative result).")
+    regime_directional_certified = bool(regime_directional_certified)
+
     bt = Backtester(
         initial_capital=capital, platform=platform,
         open_strategy={"name": strategy_name, "params": dict(strat_params or {})},
@@ -593,6 +796,7 @@ def run_single_backtest(
         regime_enabled=regime_enabled,
         regime_period=regime_period,
         regime_adx_threshold=regime_adx_threshold,
+        regime_windows_spec=regime_windows_spec,
         allowed_regimes=allowed_regimes,
         stop_loss_atr_mult=stop_loss_atr_mult,
         stop_loss_pct=stop_loss_pct,
@@ -605,6 +809,8 @@ def run_single_backtest(
         direction=direction,
         invert_signal=invert_signal,
         regime_directional_policy=regime_directional_policy,
+        regime_directional_certified=regime_directional_certified,
+        regime_directional_certified_states=regime_directional_certified_states,
         profile_allocation=profile_allocation,
         circuit_breaker_max_drawdown_pct=circuit_breaker_max_drawdown_pct,
         margin_per_trade_usd=resolved_margin,
@@ -846,11 +1052,22 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="ADX lookback period for regime detection (default: 14).")
     parser.add_argument("--regime-adx-threshold", type=float, default=20.0,
                         help="ADX threshold below which market is 'ranging' (default: 20.0).")
+    parser.add_argument("--regime-windows-spec-json", default=None,
+                        dest="regime_windows_spec_json", metavar="JSON",
+                        help="Composite (7-state) regime windows spec, same shape as the live "
+                             "--regime-windows-spec-json arg: a JSON object mapping window name "
+                             "-> {classifier,period,...} (bare int = ADX period). The PRIMARY "
+                             "window (medium-first) is classified into the per-bar regime label "
+                             "the entry gate and close evaluators read (#1058). Mutually exclusive "
+                             "with --config (the config's regime.windows owns it). Single mode only.")
     parser.add_argument("--allowed-regimes", action="append", dest="allowed_regimes",
-                        default=None, choices=["trending_up", "trending_down", "ranging"],
-                        metavar="LABEL",
+                        default=None, metavar="LABEL",
                         help="Regime label to allow entries for (repeat for multiple). "
-                             "Empty = allow all. Valid: trending_up, trending_down, ranging.")
+                             "Empty = allow all. Validated against the PRIMARY regime "
+                             "window's classifier vocabulary (#1058): ADX (default / no "
+                             "--regime-windows-spec-json) accepts trending_up, "
+                             "trending_down, ranging; a composite primary window accepts "
+                             "the 7-state substates (trending_up_clean, ranging_quiet, ...).")
     parser.add_argument("--stop-loss-atr-mult", type=float, default=None,
                         dest="stop_loss_atr_mult", metavar="MULT",
                         help="Fixed ATR-multiple stop loss (e.g. 2.0). Applied in "
@@ -921,6 +1138,34 @@ def main(argv=None):
     if args.close_strategies:
         close_refs = [_parse_close_strategy_arg(v) for v in args.close_strategies]
 
+    # #1058: parse the composite regime windows spec once. Reuses the same
+    # validator the live --regime-windows-spec-json arg uses, so a malformed
+    # spec fails loudly here rather than silently no-opping into the ADX path.
+    args.regime_windows_spec = None
+    if args.regime_windows_spec_json:
+        try:
+            args.regime_windows_spec = parse_regime_windows_spec_json(
+                args.regime_windows_spec_json)
+        except (ValueError, TypeError) as exc:
+            print(f"--regime-windows-spec-json: {exc}")
+            sys.exit(1)
+        # Only single mode threads the spec into the Backtester (compare/multi/
+        # optimize don't accept it). Reject other modes loudly rather than
+        # silently classifying with the legacy ADX path.
+        if args.mode != "single":
+            print("--regime-windows-spec-json is only valid with --mode single")
+            sys.exit(1)
+
+    # #1058 review: a composite primary window classifies 7-state substates the
+    # entry gate must be able to filter on; validate the by-name --allowed-regimes
+    # against that classifier's vocabulary so a label the classifier can never emit
+    # (which would silently block every entry) is rejected loudly. The --config
+    # path threads the live config's allowed_regimes (validated upstream by the Go
+    # validateStrategyRegimeVocabulary) and rejects the CLI flag below, so skip it.
+    if not args.config:
+        _validate_allowed_regimes_vocabulary(
+            args.allowed_regimes, args.regime_windows_spec)
+
     # #866: --defaults user only has an effect via the config's user_close_defaults.
     if args.defaults == "user" and not args.config:
         print("--defaults user requires --config (user_close_defaults lives in the config); "
@@ -965,6 +1210,14 @@ def main(argv=None):
                   "live config's `allowed_regimes` field owns the regime gate); "
                   "edit the config or backtest the strategy by name")
             sys.exit(1)
+        # #1058: the config's regime.windows owns the composite spec; a CLI
+        # --regime-windows-spec-json alongside --config would lose to it on the
+        # thread below and silently mislead. Reject loudly, like the gates above.
+        if args.regime_windows_spec is not None:
+            print("--regime-windows-spec-json is not allowed alongside --config "
+                  "(the live config's `regime.windows` owns the composite spec); "
+                  "edit the config or backtest the strategy by name")
+            sys.exit(1)
         close_refs = live_kwargs["close_strategies"]
         # Open strategy name + params come from the live config. Threading
         # params through to run_single_backtest is required — without it,
@@ -986,8 +1239,19 @@ def main(argv=None):
             "direction",
             "invert_signal",
             "regime_directional_policy",
+            # #1085 parity: the certification verdict resolved with the live
+            # directional-window classifier (a Backtester param). The per-state
+            # map drives the PER-STATE sign gate; the bool is the cell-level
+            # fallback for callers that don't supply the map.
+            "regime_directional_certified",
+            "regime_directional_certified_states",
             # #998: regime-profile allocation switch block (None when unused).
             "profile_allocation",
+            # #1058: composite (7-state) regime windows spec (None when the
+            # config has no regime.windows → legacy ADX path). Only single mode
+            # consumes live_stop_kwargs; optimize/compare/multi stay ADX, as they
+            # already drop the other config-sourced close fields here.
+            "regime_windows_spec",
         )
         live_stop_kwargs = {k: live_kwargs[k] for k in stop_keys if k in live_kwargs}
         args.regime_enabled = live_kwargs.get("regime_enabled", args.regime_enabled)
@@ -1000,12 +1264,26 @@ def main(argv=None):
         args.allowed_regimes = live_kwargs.get(
             "allowed_regimes", args.allowed_regimes,
         )
+        # #1058 review: the backtester reads the config JSON directly and never
+        # runs the Go validateStrategyRegimeVocabulary, so a hand-edited / never-
+        # daemon-loaded config that switches the primary window to composite but
+        # leaves allowed_regimes as bare ADX labels would silently block every
+        # entry (0-trade run) — the same failure the by-name guard above rejects.
+        # Validate the config-threaded pair against its own primary classifier.
+        _validate_allowed_regimes_vocabulary(
+            args.allowed_regimes, live_kwargs.get("regime_windows_spec"))
 
     # CLI ATR-stop flags apply in single mode too; --config refs win on collision.
     if args.stop_loss_atr_mult is not None:
         live_stop_kwargs.setdefault("stop_loss_atr_mult", args.stop_loss_atr_mult)
     if args.trailing_stop_atr_mult is not None:
         live_stop_kwargs.setdefault("trailing_stop_atr_mult", args.trailing_stop_atr_mult)
+
+    # #1058: by-name single backtest can supply the composite spec via the CLI.
+    # --config + this flag was rejected above, so the key can't collide. Only
+    # single mode threads live_stop_kwargs into run_single_backtest.
+    if args.regime_windows_spec is not None:
+        live_stop_kwargs["regime_windows_spec"] = args.regime_windows_spec
 
     # #989 review: --direction was parsed for every mode but forwarded only to
     # optimize — single/compare/multi silently scored the long leg of a

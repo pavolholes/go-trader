@@ -86,6 +86,16 @@ def test_platform_order_matches_platform_tags(registry):
         )
 
 
+def test_hidden_strategies_stay_registered_but_leave_discovery(registry):
+    for platform in registry.VALID_PLATFORMS:
+        visible = registry.build_registry(platform)
+        full = registry.build_registry(platform, include_hidden=True)
+        for name in registry.DISCOVERY_HIDDEN_STRATEGIES:
+            if platform in registry.STRATEGIES[name]["platforms"]:
+                assert name in full
+                assert name not in visible
+
+
 def test_build_registry_rejects_unknown_platform(registry):
     with pytest.raises(ValueError, match="Unknown platform"):
         registry.build_registry("options")
@@ -131,6 +141,67 @@ def test_shims_produce_independent_registries(spot_shim, futures_shim):
     assert "delta_neutral_funding" in futures_shim.STRATEGY_REGISTRY
     assert "triple_ema_bidir" not in spot_shim.STRATEGY_REGISTRY
     assert "triple_ema_bidir" in futures_shim.STRATEGY_REGISTRY
+
+
+def test_deprecated_range_scalper_hidden_but_loadable(spot_shim, futures_shim, conftest_helpers):
+    for shim in (spot_shim, futures_shim):
+        assert "range_scalper" not in shim.list_strategies()
+        assert "range_scalper" in shim.STRATEGY_REGISTRY
+        df = conftest_helpers.make_ohlcv(conftest_helpers.make_trending_up(80))
+        result = shim.apply_strategy("range_scalper", df)
+        assert "signal" in result.columns
+
+
+def test_deprecated_session_breakout_hidden_but_loadable(spot_shim, futures_shim, conftest_helpers):
+    # #1031: futures-only short leg deprecated. Hidden from discovery but kept
+    # registered so explicit existing configs/backtests still resolve it.
+    import pandas as pd
+    assert "session_breakout" not in futures_shim.list_strategies()
+    assert "session_breakout" in futures_shim.STRATEGY_REGISTRY
+    # session_breakout is futures-only — never present on the spot shim at all.
+    assert "session_breakout" not in spot_shim.list_strategies()
+    assert "session_breakout" not in spot_shim.STRATEGY_REGISTRY
+    # Needs a DatetimeIndex (session/hour bucketing).
+    idx = pd.date_range("2024-01-01", periods=200, freq="15min")
+    df = conftest_helpers.make_ohlcv(conftest_helpers.make_trending_up(200), index=idx)
+    result = futures_shim.apply_strategy("session_breakout", df)
+    assert "signal" in result.columns
+
+
+def test_deprecated_vol_momentum_hidden_but_loadable(spot_shim, futures_shim, conftest_helpers):
+    # #1021: static M1 failed held-out stress. Hidden from discovery but kept
+    # registered so explicit existing configs/backtests still resolve it.
+    for shim in (spot_shim, futures_shim):
+        assert "vol_momentum" not in shim.list_strategies()
+        assert "vol_momentum" in shim.STRATEGY_REGISTRY
+        df = conftest_helpers.make_ohlcv(conftest_helpers.make_trending_up(80))
+        result = shim.apply_strategy("vol_momentum", df)
+        assert "signal" in result.columns
+
+    assert spot_shim.STRATEGY_REGISTRY["vol_momentum"]["default_params"]["allow_short"] is False
+    assert futures_shim.STRATEGY_REGISTRY["vol_momentum"]["default_params"]["allow_short"] is True
+
+
+def test_deprecated_amd_ifvg_hidden_but_loadable(spot_shim, futures_shim, conftest_helpers):
+    # #1023: DST/session-timing corrected (NY-anchored ICT killzones) and
+    # rebaselined at the designed 15m timeframe; the corrected baseline passes
+    # protocol OOS but fails the 2023/2024 held-out years on both 15m and
+    # 1h/4h. Hidden from discovery but kept registered so explicit existing
+    # configs/backtests still resolve it.
+    import pandas as pd
+    # Needs a DatetimeIndex (session/hour bucketing reads index.hour).
+    idx = pd.date_range("2024-01-01", periods=200, freq="15min")
+    df = conftest_helpers.make_ohlcv(conftest_helpers.make_trending_up(200), index=idx)
+    for shim in (spot_shim, futures_shim):
+        assert "amd_ifvg" not in shim.list_strategies()
+        assert "amd_ifvg" in shim.STRATEGY_REGISTRY
+        result = shim.apply_strategy("amd_ifvg", df)
+        assert "signal" in result.columns
+    # Defaults are the canonical ICT killzones in DST-aware civil time.
+    p = spot_shim.STRATEGY_REGISTRY["amd_ifvg"]["default_params"]
+    assert p["session_tz"] == "America/New_York"
+    assert (p["asian_start_hour"], p["asian_end_hour"]) == (20, 0)
+    assert (p["london_start_hour"], p["london_end_hour"]) == (2, 5)
 
 
 def test_momentum_variant_overrides_threshold(spot_shim, futures_shim):

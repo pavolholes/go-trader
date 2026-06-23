@@ -179,22 +179,32 @@ func TestRegimeDirectionalPolicyEqualForReload(t *testing.T) {
 	}
 }
 
-func TestEffectiveDirectionForPosition(t *testing.T) {
+func TestEffectiveDirectionForPositionGated(t *testing.T) {
 	policy := &RegimeDirectionalPolicy{TrendRegime: map[string]RegimeDirectionalEntry{
 		"trending_up":   {Direction: DirectionLong},
 		"trending_down": {Direction: DirectionShort},
 		"ranging":       {Direction: DirectionLong},
 	}}
 	sc := StrategyConfig{Direction: DirectionLong, RegimeDirectionalPolicy: policy}
+	// certAll certifies every cell to its configured sign, so the gate passes the policy
+	// direction through and what's under test is the hold-on-transition regime selection
+	// (effectiveRegimeForPolicy) on the live gated resolver.
+	certAll := map[string]string{"trending_up": DirectionLong, "trending_down": DirectionShort, "ranging": DirectionLong}
 
-	if got := EffectiveDirectionForPosition(sc, "trending_up", "trending_down", 1); got != DirectionShort {
+	if got := EffectiveDirectionForPositionGated(sc, "trending_up", "trending_down", 1, certAll); got != DirectionShort {
 		t.Errorf("open position uses stamped regime: got %q want short", got)
 	}
-	if got := EffectiveDirectionForPosition(sc, "trending_up", "", 0); got != DirectionLong {
+	if got := EffectiveDirectionForPositionGated(sc, "trending_up", "", 0, certAll); got != DirectionLong {
 		t.Errorf("flat uses current regime: got %q want long", got)
 	}
-	if got := EffectiveDirectionForPosition(sc, "", "", 1); got != DirectionLong {
+	if got := EffectiveDirectionForPositionGated(sc, "", "", 1, certAll); got != DirectionLong {
 		t.Errorf("unstamped open falls back to current (empty): got %q want base long", got)
+	}
+	// Uncertified (nil) open position resolves to base regardless of stamped regime: the
+	// #1085 fail-closed default. With the ungated EffectiveDirectionForPosition deleted,
+	// no runtime path can bypass this.
+	if got := EffectiveDirectionForPositionGated(sc, "trending_up", "trending_down", 1, nil); got != DirectionLong {
+		t.Errorf("uncertified open falls to base: got %q want long", got)
 	}
 }
 
@@ -232,10 +242,15 @@ func TestApplyRegimeDirectionalPolicy(t *testing.T) {
 			"ranging":       {Direction: "long", InvertSignal: false},
 		}}
 	}
+	// #1085 per-state gate: a fully-honoring cert map (matches makePolicy's
+	// configured directions) so these resolver-semantics cases exercise the
+	// honored path; per-state contradiction/absence is covered by
+	// TestGatedDirectionalEntryPerStateSign.
+	certAll := map[string]string{"trending_up": DirectionLong, "trending_down": DirectionShort, "ranging": DirectionLong}
 
 	t.Run("flat uses current regime", func(t *testing.T) {
 		sc := StrategyConfig{Direction: "long", InvertSignal: false, RegimeDirectionalPolicy: makePolicy()}
-		entry, applied, legacy := applyRegimeDirectionalPolicy(&sc, "trending_down", "", 0)
+		entry, applied, legacy := applyRegimeDirectionalPolicy(&sc, "trending_down", "", 0, certAll)
 		if !applied {
 			t.Fatalf("expected applied")
 		}
@@ -253,7 +268,7 @@ func TestApplyRegimeDirectionalPolicy(t *testing.T) {
 	t.Run("open position uses pos.Regime (hold)", func(t *testing.T) {
 		sc := StrategyConfig{Direction: "long", InvertSignal: false, RegimeDirectionalPolicy: makePolicy()}
 		// pos opened under trending_down, current regime flipped to trending_up
-		entry, applied, legacy := applyRegimeDirectionalPolicy(&sc, "trending_up", "trending_down", 0.001)
+		entry, applied, legacy := applyRegimeDirectionalPolicy(&sc, "trending_up", "trending_down", 0.001, certAll)
 		if !applied {
 			t.Fatalf("expected applied")
 		}
@@ -272,7 +287,7 @@ func TestApplyRegimeDirectionalPolicy(t *testing.T) {
 	t.Run("flat after pos closed picks new regime", func(t *testing.T) {
 		sc := StrategyConfig{Direction: "long", InvertSignal: false, RegimeDirectionalPolicy: makePolicy()}
 		// Position closed (qty=0); current regime is trending_up
-		entry, applied, legacy := applyRegimeDirectionalPolicy(&sc, "trending_up", "trending_down", 0)
+		entry, applied, legacy := applyRegimeDirectionalPolicy(&sc, "trending_up", "trending_down", 0, certAll)
 		if !applied {
 			t.Fatalf("expected applied")
 		}
@@ -286,7 +301,7 @@ func TestApplyRegimeDirectionalPolicy(t *testing.T) {
 
 	t.Run("no policy is no-op", func(t *testing.T) {
 		sc := StrategyConfig{Direction: "long", InvertSignal: false}
-		_, applied, _ := applyRegimeDirectionalPolicy(&sc, "trending_down", "", 0)
+		_, applied, _ := applyRegimeDirectionalPolicy(&sc, "trending_down", "", 0, certAll)
 		if applied {
 			t.Fatalf("expected no-op when policy nil")
 		}
@@ -297,7 +312,7 @@ func TestApplyRegimeDirectionalPolicy(t *testing.T) {
 
 	t.Run("unknown regime is no-op", func(t *testing.T) {
 		sc := StrategyConfig{Direction: "long", InvertSignal: false, RegimeDirectionalPolicy: makePolicy()}
-		_, applied, _ := applyRegimeDirectionalPolicy(&sc, "", "", 0)
+		_, applied, _ := applyRegimeDirectionalPolicy(&sc, "", "", 0, certAll)
 		if applied {
 			t.Fatalf("empty regime should not resolve")
 		}
@@ -308,7 +323,7 @@ func TestApplyRegimeDirectionalPolicy(t *testing.T) {
 
 	t.Run("legacy position without pos.Regime falls back to current", func(t *testing.T) {
 		sc := StrategyConfig{Direction: "long", InvertSignal: false, RegimeDirectionalPolicy: makePolicy()}
-		entry, applied, legacy := applyRegimeDirectionalPolicy(&sc, "trending_up", "", 0.5)
+		entry, applied, legacy := applyRegimeDirectionalPolicy(&sc, "trending_up", "", 0.5, certAll)
 		if !applied {
 			t.Fatalf("expected applied")
 		}
@@ -488,6 +503,82 @@ func TestValidateConfigRegimeDirectionalPolicy(t *testing.T) {
 		err := ValidateConfig(&cfg)
 		if err == nil || !strings.Contains(err.Error(), "regime_directional_policy is only supported for HL perps") {
 			t.Fatalf("expected HL-perps-only error, got: %v", err)
+		}
+	})
+}
+
+// TestGatedDirectionalEntryPerStateSign is the #1085 review-finding fix: a
+// certified CELL must not let an operator place a directional bet opposite the
+// certified SIGN for a regime state on cell-level certification alone. The gate
+// is PER STATE — a state whose configured direction contradicts the certified
+// sign (or is uncertified) resolves to BASE. Covers must-survive (a)/(b)/(c)
+// plus an absent state and a nil (uncertified) map.
+func TestGatedDirectionalEntryPerStateSign(t *testing.T) {
+	policy := func() *RegimeDirectionalPolicy {
+		return &RegimeDirectionalPolicy{TrendRegime: map[string]RegimeDirectionalEntry{
+			"trending_up":   {Direction: DirectionShort, InvertSignal: true}, // operator wants SHORT
+			"trending_down": {Direction: DirectionShort},
+			"ranging":       {Direction: DirectionLong},
+		}}
+	}
+
+	// (a) certified trending_up=long, config trending_up=short -> contradiction ->
+	// NOT honored: the entry resolves to BASE (long), never the configured short.
+	t.Run("a/sign contradiction falls to base", func(t *testing.T) {
+		sc := StrategyConfig{Direction: DirectionLong, RegimeDirectionalPolicy: policy()}
+		certStates := map[string]string{"trending_up": DirectionLong, "trending_down": DirectionShort, "ranging": DirectionLong}
+		if _, honored := gatedDirectionalEntry(sc, "trending_up", certStates); honored {
+			t.Fatal("config short opposite certified long must not be honored")
+		}
+		if got := EffectiveDirectionForRegimeGated(sc, "trending_up", certStates); got != DirectionLong {
+			t.Fatalf("contradicting state must resolve to base long, got %q", got)
+		}
+		_, applied, _ := applyRegimeDirectionalPolicy(&sc, "trending_up", "", 0, certStates)
+		if applied || sc.Direction != DirectionLong || sc.InvertSignal {
+			t.Fatalf("apply must leave base config: applied=%t dir=%q invert=%t", applied, sc.Direction, sc.InvertSignal)
+		}
+	})
+
+	// (b) partial: matching states stay honored, only the contradicting one -> base.
+	t.Run("b/partial mismatch is per-state", func(t *testing.T) {
+		sc := StrategyConfig{Direction: DirectionLong, RegimeDirectionalPolicy: policy()}
+		certStates := map[string]string{"trending_up": DirectionLong, "trending_down": DirectionShort, "ranging": DirectionLong}
+		if got := EffectiveDirectionForRegimeGated(sc, "trending_down", certStates); got != DirectionShort {
+			t.Fatalf("matching short state stays honored, got %q", got)
+		}
+		if got := EffectiveDirectionForRegimeGated(sc, "ranging", certStates); got != DirectionLong {
+			t.Fatalf("matching long state stays honored, got %q", got)
+		}
+		if got := EffectiveDirectionForRegimeGated(sc, "trending_up", certStates); got != DirectionLong {
+			t.Fatalf("contradicting state must fall to base long, got %q", got)
+		}
+	})
+
+	// (c) config "both" never contradicts a directional certification -> honored.
+	t.Run("c/both never contradicts", func(t *testing.T) {
+		pol := &RegimeDirectionalPolicy{TrendRegime: map[string]RegimeDirectionalEntry{
+			"trending_up": {Direction: DirectionBoth}, "trending_down": {Direction: DirectionShort}, "ranging": {Direction: DirectionLong},
+		}}
+		sc := StrategyConfig{Direction: DirectionLong, RegimeDirectionalPolicy: pol}
+		entry, honored := gatedDirectionalEntry(sc, "trending_up", map[string]string{"trending_up": DirectionLong})
+		if !honored || entry.Direction != DirectionBoth {
+			t.Fatalf("both must be honored, got honored=%t entry=%+v", honored, entry)
+		}
+	})
+
+	// An uncertified state (cell certifies other states, not this one) -> base.
+	t.Run("absent state falls to base", func(t *testing.T) {
+		sc := StrategyConfig{Direction: DirectionLong, RegimeDirectionalPolicy: policy()}
+		if got := EffectiveDirectionForRegimeGated(sc, "ranging", map[string]string{"trending_up": DirectionShort}); got != DirectionLong {
+			t.Fatalf("uncertified state must resolve to base long, got %q", got)
+		}
+	})
+
+	// nil cert map (uncertified cell) -> base everywhere.
+	t.Run("nil map is default-off", func(t *testing.T) {
+		sc := StrategyConfig{Direction: DirectionLong, RegimeDirectionalPolicy: policy()}
+		if _, honored := gatedDirectionalEntry(sc, "trending_down", nil); honored {
+			t.Fatal("nil cert map must never honor")
 		}
 	})
 }

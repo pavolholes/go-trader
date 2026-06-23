@@ -175,6 +175,10 @@ class ParityConfig:
     direction: Optional[str] = None
     invert_signal: bool = False
     regime_directional_policy: Optional[dict] = None
+    # #1085: the certified PER-STATE direction map (None when uncertified). Fed to
+    # the Backtester so it applies the SAME per-state sign gate the live daemon
+    # does — a state whose config contradicts the certified sign resolves to base.
+    regime_directional_certified_states: Optional[dict] = None
 
     def __post_init__(self):
         self.regime_directional_policy = _normalize_regime_directional_policy(
@@ -204,6 +208,24 @@ def config_from_live_config(config_path: str, strategy_id: str,
     regime = raw.get("regime") or entry.get("regime") or {}
     open_ref = loaded["open_strategy"]
     stype = str(entry.get("type", "spot"))
+    symbol = str(args[1]) if len(args) > 1 else "BTC/USDT"
+    timeframe = str(args[2]) if len(args) > 2 else "1h"
+    # #1085: apply the same evidence gate the live daemon and backtester do. We
+    # resolve the certified PER-STATE direction map (not just a cell-level bool)
+    # and hand it to the Backtester, which drops each state whose configured side
+    # contradicts the certified sign (or is uncertified) to base direction — so
+    # parity_diff reflects the gated per-state runtime, not the ungated config.
+    rdp = loaded.get("regime_directional_policy")
+    rdp_cert_states = None
+    if rdp:
+        from directional_certification import (
+            load_certifications, certified_states,
+            config_directional_classifier,
+        )
+        certs = load_certifications()
+        # Resolve the directional window's classifier exactly as live (#1085).
+        clf = config_directional_classifier(regime, entry)
+        rdp_cert_states = certified_states(certs, symbol, timeframe, clf)
     return ParityConfig(
         strategy_name=open_ref["name"],
         params=dict(open_ref.get("params") or {}),
@@ -213,8 +235,8 @@ def config_from_live_config(config_path: str, strategy_id: str,
             or str(entry.get("platform") or "").strip().lower()
             or ("hyperliquid" if stype in ("perps", "manual") else "binanceus")
         ),
-        symbol=str(args[1]) if len(args) > 1 else "BTC/USDT",
-        timeframe=str(args[2]) if len(args) > 2 else "1h",
+        symbol=symbol,
+        timeframe=timeframe,
         close_refs=loaded.get("close_strategies") or None,
         regime_enabled=bool(loaded.get("regime_enabled", regime.get("enabled"))),
         regime_period=int(loaded.get("regime_period", regime.get("period", 14)) or 14),
@@ -223,7 +245,8 @@ def config_from_live_config(config_path: str, strategy_id: str,
         ),
         direction=loaded.get("direction"),
         invert_signal=bool(loaded.get("invert_signal")),
-        regime_directional_policy=loaded.get("regime_directional_policy"),
+        regime_directional_policy=rdp,
+        regime_directional_certified_states=rdp_cert_states,
     )
 
 
@@ -767,6 +790,7 @@ def extract_fills(df: pd.DataFrame, cfg: ParityConfig) -> list:
         direction=cfg.direction,
         invert_signal=cfg.invert_signal,
         regime_directional_policy=cfg.regime_directional_policy,
+        regime_directional_certified_states=cfg.regime_directional_certified_states,
     )
     metrics = bt.run(
         work,

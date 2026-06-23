@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
+	"sync"
 	"time"
 )
 
@@ -1254,7 +1256,7 @@ func forceCloseAllPositions(s *StrategyState, prices map[string]float64, logger 
 			value = pos.Quantity * price
 		}
 		if details == "" {
-			details = fmt.Sprintf("Circuit breaker close %s, PnL: $%.2f", pos.Side, pnl)
+			details = fmt.Sprintf("Circuit breaker close %s, PnL: $%.2f (model-only reconciliation adjustment; no exchange fill)", pos.Side, pnl)
 		}
 		if logger != nil {
 			logger.Warn("Circuit breaker: force-closing %s %s @ $%.2f (PnL: $%.2f)", pos.Side, symbol, price, pnl)
@@ -1273,7 +1275,8 @@ func forceCloseAllPositions(s *StrategyState, prices map[string]float64, logger 
 			Details:           details,
 			IsClose:           true,
 			RealizedPnL:       pnl,
-			PnLGross:          true, // no fee modeled on paper force-close: gross == net
+			PnLGross:          true, // model-only adjustment has no exchange fee: gross == net
+			FeeSource:         FeeSourceReconcileAdjustment,
 			Regime:            s.Regime,
 			EntryATR:          pos.EntryATR,
 			StopLossTriggerPx: pos.StopLossTriggerPx,
@@ -1316,7 +1319,8 @@ func forceCloseAllPositions(s *StrategyState, prices map[string]float64, logger 
 			Details:     fmt.Sprintf("Circuit breaker force-close, PnL: $%.2f", pnl),
 			IsClose:     true,
 			RealizedPnL: pnl,
-			PnLGross:    true, // no fee modeled on paper force-close: gross == net
+			PnLGross:    true, // model-only adjustment has no exchange fee: gross == net
+			FeeSource:   FeeSourceReconcileAdjustment,
 			Regime:      s.Regime,
 		}
 		RecordTrade(s, trade)
@@ -1395,6 +1399,28 @@ const (
 	RiskReasonConsecutiveLosses    = "5 consecutive losses"
 )
 
+// circuitBreakerPermitsManagement reports whether a CheckRisk block should still
+// run existing-position management (trailing SL ratchet, TP ratchet, protection
+// sync) for an open position instead of skipping the strategy outright. A
+// per-strategy circuit breaker exists to block NEW entries; it must not freeze
+// the stop-loss on a position that is already open — e.g. a shared-coin residual
+// the CB cannot force-close (shouldForceCloseAllPositionsOnCircuitBreaker is
+// false when the coin is shared), which then sits with a stale trailing SL for
+// the whole latch window and fails to lock in favorable movement (#1046).
+//
+// Scoped to the latched reason and to HL perps: only that path runs the
+// trailing-SL/TP-ratchet walker. Manual strategies are exempt from CheckRisk
+// entirely (returns allowed early), and other platforms/types have no equivalent
+// in-loop SL ratchet, so they keep the plain skip. The first-fire cycle (reason
+// "max drawdown exceeded" / "5 consecutive losses") is deliberately excluded:
+// that is the cycle that force-closes / enqueues the reduce-only drain, so the
+// position state is mid-transition; management resumes on the next (latched)
+// cycle, which is ~the entire latch window.
+func circuitBreakerPermitsManagement(reason, platform, stratType string, posQty float64) bool {
+	return reason == RiskReasonCircuitBreakerActive &&
+		platform == "hyperliquid" && stratType == "perps" && posQty > 0
+}
+
 // CheckRisk evaluates risk state and returns whether trading is allowed.
 // sc is the strategy config for this state (nil in some tests — platform
 // pending logic is skipped). assist carries pre-fetched per-platform state
@@ -1418,6 +1444,22 @@ func CheckRisk(sc *StrategyConfig, s *StrategyState, portfolioValue float64, pri
 		}
 		r.CircuitBreaker = false
 		r.ConsecutiveLosses = 0
+	}
+
+	// #1048: per-strategy circuit-breaker opt-out. When explicitly disabled, both
+	// firing arms below are suppressed so the strategy never latches a NEW circuit
+	// break. The gate sits BELOW the latch check and the drawdown computation on
+	// purpose: an already-latched CB still blocks/drains (the latch check above is
+	// ungated), and CurrentDrawdownPct/peak still update for the status UI. Manual
+	// is already exempt via the early return at the top of CheckRisk.
+	cbEnabled := sc.CircuitBreakerEnabled()
+	if cbEnabled {
+		// Clear any sticky suppression-warning throttle eagerly: while the
+		// breaker is enabled the warning never applies, and an enabled+breached
+		// cycle fires (returning before recordCircuitBreakerSuppression below),
+		// so this is the only place a re-enable reliably resets the throttle —
+		// ensuring a later re-disable warns afresh. (#1048)
+		circuitBreakerSuppressedWarned.Delete(s.ID)
 	}
 
 	// Update peak
@@ -1468,7 +1510,7 @@ func CheckRisk(sc *StrategyConfig, s *StrategyState, portfolioValue float64, pri
 		} else {
 			r.CurrentDrawdownPct = 0
 		}
-		if r.CurrentDrawdownPct > r.MaxDrawdownPct {
+		if r.CurrentDrawdownPct > r.MaxDrawdownPct && cbEnabled {
 			r.CircuitBreaker = true
 			r.CircuitBreakerUntil = now.Add(24 * time.Hour)
 			setHyperliquidCircuitBreakerPending(sc, s, assist)
@@ -1486,7 +1528,7 @@ func CheckRisk(sc *StrategyConfig, s *StrategyState, portfolioValue float64, pri
 	}
 
 	// Consecutive losses circuit breaker (5 in a row → pause 1h, close positions)
-	if r.ConsecutiveLosses >= 5 {
+	if r.ConsecutiveLosses >= 5 && cbEnabled {
 		r.CircuitBreaker = true
 		r.CircuitBreakerUntil = now.Add(1 * time.Hour)
 		setHyperliquidCircuitBreakerPending(sc, s, assist)
@@ -1501,7 +1543,59 @@ func CheckRisk(sc *StrategyConfig, s *StrategyState, portfolioValue float64, pri
 		return false, RiskReasonConsecutiveLosses
 	}
 
+	// #1048: if the circuit breaker is disabled and a halt threshold was just
+	// crossed, the two arms above fell through silently. Leave a runtime trace
+	// (a WARNING, not a halt) so the missing auto-protection is observable in
+	// logs at the cycle it matters — not only at startup / on-demand inspect.
+	recordCircuitBreakerSuppression(s, cbEnabled, logger)
+
 	return true, ""
+}
+
+// circuitBreakerSuppressedWarned throttles the "circuit breaker disabled but a
+// halt threshold was crossed" warning to once per strategy per suppression
+// episode. The key is cleared by recordCircuitBreakerSuppression when the
+// breaker is re-enabled or the breach clears, so a fresh crossing — or a later
+// re-disable — warns again. (#1048)
+var circuitBreakerSuppressedWarned sync.Map
+
+// recordCircuitBreakerSuppression emits a one-shot WARNING when a strategy with
+// the circuit breaker explicitly disabled (circuit_breaker:false) crosses a
+// halt threshold that WOULD have fired. It makes the absence of the
+// auto-protective halt observable at the cycle it matters, not only via the
+// startup summary / inspect surfaces. It is a warning, never a halt: nothing is
+// closed and trading continues. The notice is deduped to once per suppression
+// episode and cleared when the breaker is re-enabled or all thresholds clear —
+// so a later genuine fire (once re-enabled) still alerts through the normal
+// circuit-breaker path, and a subsequent re-disable warns afresh. (#1048)
+func recordCircuitBreakerSuppression(s *StrategyState, cbEnabled bool, logger *StrategyLogger) {
+	if s == nil {
+		return
+	}
+	r := &s.RiskState
+	// Mirror the drawdown arm's condition exactly (risk.go ~1470) so the warning
+	// stays in sync if that gate is later edited — the PeakValue>0 guard is
+	// implicit there (CurrentDrawdownPct is 0 when PeakValue is 0). (#1048)
+	drawdownBreached := r.CurrentDrawdownPct > r.MaxDrawdownPct
+	lossBreached := r.ConsecutiveLosses >= 5
+	if cbEnabled || (!drawdownBreached && !lossBreached) {
+		circuitBreakerSuppressedWarned.Delete(s.ID)
+		return
+	}
+	if _, loaded := circuitBreakerSuppressedWarned.LoadOrStore(s.ID, struct{}{}); loaded {
+		return // already warned this episode — do not repeat every cycle
+	}
+	var reasons []string
+	if drawdownBreached {
+		reasons = append(reasons, fmt.Sprintf("drawdown %.1f%% > %.1f%%", r.CurrentDrawdownPct, r.MaxDrawdownPct))
+	}
+	if lossBreached {
+		reasons = append(reasons, fmt.Sprintf("%d consecutive losses", r.ConsecutiveLosses))
+	}
+	if logger != nil {
+		logger.Warn("WARNING: circuit breaker is DISABLED (circuit_breaker:false) and a halt threshold was crossed (%s) — NO circuit breaker fired. This strategy is trading WITHOUT the drawdown/consecutive-loss auto-halt and positions are NOT being auto-closed on this condition. This is a warning only (nothing was closed); re-enable circuit_breaker to restore protection.",
+			strings.Join(reasons, "; "))
+	}
 }
 
 // RecordTradeResult updates risk state with realized PnL for daily limits and

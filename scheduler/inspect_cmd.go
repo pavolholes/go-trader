@@ -36,6 +36,11 @@ func runInspect(args []string) int {
 		fmt.Fprintf(os.Stderr, "inspect: failed to load config %s: %v\n", *configPath, err)
 		return 1
 	}
+	// #1085: load the directional-certification artifact so inspect reports the
+	// real evidence-gate status (not the empty default store). Fail-closed.
+	setDirectionalCertStore(LoadDirectionalCertSetFailClosed(directionalCertPath(), func(f string, a ...interface{}) {
+		fmt.Fprintf(os.Stderr, f+"\n", a...)
+	}))
 	explicit, err := loadStrategyExplicitKeys(*configPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "inspect: failed to read raw config for explicit-key detection: %v\n", err)
@@ -496,6 +501,12 @@ func formatStrategyInspection(sc StrategyConfig, explicit map[string]bool, cfg *
 	}
 
 	fmt.Fprintf(&b, "  max_drawdown_pct:    %g%s\n", sc.MaxDrawdownPct, markIfDefault(explicit, "max_drawdown_pct"))
+	// #1048: circuit-breaker state (skip manual — exempt from CheckRisk). Surface
+	// only when explicitly disabled so the unprotected case is visible; the
+	// default-on state stays uncluttered.
+	if sc.Type != "manual" && !sc.CircuitBreakerEnabled() {
+		fmt.Fprintf(&b, "  circuit_breaker:     off (explicit) — drawdown + consecutive-loss halt disabled\n")
+	}
 	if sc.IntervalSeconds > 0 {
 		fmt.Fprintf(&b, "  interval_seconds:    %d\n", sc.IntervalSeconds)
 	} else if cfg != nil {
@@ -548,6 +559,13 @@ func formatStrategySummaryLine(sc StrategyConfig, explicit map[string]bool) stri
 			parts = append(parts, "tp=none")
 		}
 	}
+	// #1048: surface an explicitly disabled circuit breaker so a strategy
+	// trading live without the auto-protective drawdown/loss-streak halt is not
+	// silently unprotected. Manual is exempt from CheckRisk, so the flag is a
+	// no-op there and not shown.
+	if sc.Type != "manual" && !sc.CircuitBreakerEnabled() {
+		parts = append(parts, "cb=off")
+	}
 	return fmt.Sprintf("[config] %s: %s", sc.ID, strings.Join(parts, " "))
 }
 
@@ -578,6 +596,12 @@ func buildStrategyInspectionJSON(sc StrategyConfig, explicit map[string]bool, cf
 		"close_strategy_explicit":   explicit["close_strategy"],
 		"max_drawdown_pct":          sc.MaxDrawdownPct,
 		"max_drawdown_pct_explicit": explicit["max_drawdown_pct"],
+	}
+	// #1048: circuit-breaker enable state. Manual is exempt from CheckRisk, so
+	// the flag is meaningless there and omitted.
+	if sc.Type != "manual" {
+		out["circuit_breaker_enabled"] = sc.CircuitBreakerEnabled()
+		out["circuit_breaker_explicit"] = explicit["circuit_breaker"]
 	}
 	if cfg != nil && cfg.Regime != nil && len(cfg.Regime.Windows) > 0 {
 		out["regime_windows"] = cfg.Regime.Windows
@@ -716,13 +740,17 @@ func appendDirectionInspectLines(b *strings.Builder, sc StrategyConfig, explicit
 	}
 	if policyConfigured {
 		fmt.Fprintf(b, "  regime_directional_policy:\n")
+		// #1085: surface the evidence gate. The per-label rows below are the
+		// CONFIGURED mapping; it is only honored when the cell is certified.
+		certStatus, certCell := directionalCertInspectStatus(sc, cfg)
+		fmt.Fprintf(b, "    certification:     %s %s (#1085)\n", certStatus, certCell)
 		for _, label := range canonicalTrendRegimeLabels {
 			dir := EffectiveDirectionForRegime(sc, label)
 			inv := false
 			if entry, ok := sc.RegimeDirectionalPolicy.Resolve(label); ok {
 				inv = entry.InvertSignal
 			}
-			fmt.Fprintf(b, "    %s: direction=%s invert_signal=%v\n", label, dir, inv)
+			fmt.Fprintf(b, "    %s: direction=%s invert_signal=%v (configured)\n", label, dir, inv)
 		}
 	}
 	var stratState *StrategyState
@@ -749,12 +777,18 @@ func appendDirectionInspectLines(b *strings.Builder, sc StrategyConfig, explicit
 			}
 			posDirRegime := positionDirectionalRegimeLabel(pos, sc)
 			effRegime := effectiveRegimeForPolicy(currentDirRegime, posDirRegime, pos.Quantity)
-			effDir := EffectiveDirectionForPosition(sc, currentDirRegime, posDirRegime, pos.Quantity)
+			// #1085: gate by the open stamp so the reported effective direction is
+			// what the runtime actually uses (base for uncertified/legacy).
+			effDir := EffectiveDirectionForPositionGated(sc, currentDirRegime, posDirRegime, pos.Quantity, pos.DirectionCertifiedStatesAtOpen)
 			regimeSrc := "stamped at open"
 			if strings.TrimSpace(posDirRegime) == "" {
 				regimeSrc = "current cycle (position regime unknown)"
 			}
-			fmt.Fprintf(b, "  position %s:         side=%s effective_direction=%s (regime=%s, %s)\n", sym, pos.Side, effDir, effRegime, regimeSrc)
+			certSrc := "uncertified at open → base"
+			if pos.DirectionCertifiedAtOpen {
+				certSrc = "certified at open → policy"
+			}
+			fmt.Fprintf(b, "  position %s:         side=%s effective_direction=%s (regime=%s, %s; %s)\n", sym, pos.Side, effDir, effRegime, regimeSrc, certSrc)
 			if len(pos.RegimeWindows) > 0 {
 				fmt.Fprintf(b, "    regime_windows:    %v\n", pos.RegimeWindows)
 			}
@@ -780,6 +814,12 @@ func directionInspectJSON(sc StrategyConfig, cfg *Config, state *AppState) map[s
 			byRegime[label] = entry
 		}
 		out["regime_directional_policy"] = byRegime
+		// #1085: the evidence gate status for this strategy's cell.
+		certStatus, certCell := directionalCertInspectStatus(sc, cfg)
+		out["regime_directional_certification"] = map[string]interface{}{
+			"status": certStatus,
+			"cell":   certCell,
+		}
 	}
 	var stratState *StrategyState
 	if state != nil {
@@ -799,13 +839,14 @@ func directionInspectJSON(sc StrategyConfig, cfg *Config, state *AppState) map[s
 			}
 			posDirRegime := positionDirectionalRegimeLabel(pos, sc)
 			positions = append(positions, map[string]interface{}{
-				"symbol":                  sym,
-				"side":                    pos.Side,
-				"quantity":                pos.Quantity,
-				"regime":                  pos.Regime,
-				"regime_windows":          pos.RegimeWindows,
-				"effective_direction":     EffectiveDirectionForPosition(sc, currentDirRegime, posDirRegime, pos.Quantity),
-				"effective_policy_regime": effectiveRegimeForPolicy(currentDirRegime, posDirRegime, pos.Quantity),
+				"symbol":                      sym,
+				"side":                        pos.Side,
+				"quantity":                    pos.Quantity,
+				"regime":                      pos.Regime,
+				"regime_windows":              pos.RegimeWindows,
+				"effective_direction":         EffectiveDirectionForPositionGated(sc, currentDirRegime, posDirRegime, pos.Quantity, pos.DirectionCertifiedStatesAtOpen),
+				"effective_policy_regime":     effectiveRegimeForPolicy(currentDirRegime, posDirRegime, pos.Quantity),
+				"direction_certified_at_open": pos.DirectionCertifiedAtOpen,
 			})
 		}
 		if len(positions) > 0 {

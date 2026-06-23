@@ -24,9 +24,12 @@ var knownSubcommands = []string{
 	"manual-add",
 	"manual-close",
 	"manual-cancel",
+	"manual-update-sl",
+	"manual-cancel-sl",
 	"backfill",
 	"probe",
 	"inspect",
+	"agent-info",
 	"version",
 }
 
@@ -65,12 +68,18 @@ func main() {
 			os.Exit(runManualClose(os.Args[2:]))
 		case "manual-cancel":
 			os.Exit(runManualCancel(os.Args[2:]))
+		case "manual-update-sl":
+			os.Exit(runManualUpdateSL(os.Args[2:]))
+		case "manual-cancel-sl":
+			os.Exit(runManualCancelSL(os.Args[2:]))
 		case "backfill":
 			os.Exit(runBackfill(os.Args[2:]))
 		case "probe":
 			os.Exit(runProbe(os.Args[2:]))
 		case "inspect":
 			os.Exit(runInspect(os.Args[2:]))
+		case "agent-info":
+			os.Exit(runAgentInfo(os.Args[2:]))
 		case "version", "--version", "-version":
 			fmt.Println(Version)
 			os.Exit(0)
@@ -96,6 +105,17 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Printf("Loaded config: %d strategies, interval=%ds\n", len(cfg.Strategies), cfg.IntervalSeconds)
+
+	// #1085: load the directional-certification artifact (SSoT for the
+	// regime->direction edge gate). Fail-closed — a missing/malformed artifact
+	// runs every regime_directional_policy strategy DEFAULT-OFF (base
+	// direction), never a wrong-side bet, and never crashes the daemon.
+	setDirectionalCertStore(LoadDirectionalCertSetFailClosed(directionalCertPath(), func(f string, a ...interface{}) {
+		fmt.Fprintf(os.Stderr, f+"\n", a...)
+	}))
+	for _, line := range directionalCertStartupSummary(cfg) {
+		fmt.Println(line)
+	}
 
 	// #704: emit a one-line resolved summary per strategy so operators can
 	// audit close/SL/TP wiring without grepping the JSON. Best-effort — a
@@ -519,6 +539,18 @@ func main() {
 		tickSeconds = schedulerTickSeconds(cfg)
 		drawdownWarnThresholdPct = configuredDrawdownWarnThresholdPct(cfg)
 		mu.Unlock()
+
+		// #1085: refresh the directional-certification artifact on SIGHUP so a
+		// re-run of regime_1076_certify.py takes effect without a restart.
+		// Fail-closed on error (keeps default-off). Certification status changes
+		// never disturb an OPEN position — the entry gate keys on the live
+		// verdict only when flat; open positions ride under their open stamp.
+		setDirectionalCertStore(LoadDirectionalCertSetFailClosed(directionalCertPath(), func(f string, a ...interface{}) {
+			fmt.Fprintf(os.Stderr, "[reload] "+f+"\n", a...)
+		}))
+		for _, line := range directionalCertStartupSummary(cfg) {
+			fmt.Printf("[reload] %s\n", line)
+		}
 
 		if len(changes) == 0 {
 			fmt.Println("[reload] Config reload applied: no hot-reloadable changes")
@@ -1078,26 +1110,27 @@ func main() {
 				mu.RUnlock()
 
 				inputs := KillSwitchCloseInputs{
-					HLAddr:          hlAddr,
-					HLStateFetched:  hlStateFetched,
-					HLPositions:     hlPositions,
-					HLLiveAll:       hlLiveAll,
-					HLCloser:        defaultHyperliquidLiveCloser,
-					HLFetcher:       defaultHLStateFetcher,
-					HLStopLossOIDs:  hlSLOIDs,
-					OKXLiveAllPerps: okxLivePerps,
-					OKXLiveAllSpot:  okxLiveSpot,
-					OKXCloser:       defaultOKXLiveCloser,
-					OKXFetcher:      defaultOKXPositionsFetcher,
-					RHLiveCrypto:    rhLiveCrypto,
-					RHLiveOptions:   rhLiveOptions,
-					RHCloser:        defaultRobinhoodLiveCloser,
-					RHFetcher:       defaultRobinhoodPositionsFetcher,
-					TSLiveAll:       tsLiveAll,
-					TSCloser:        defaultTopStepLiveCloser,
-					TSFetcher:       defaultTopStepPositionsFetcher,
-					PortfolioReason: portfolioReason,
-					CloseTimeout:    90 * time.Second,
+					HLAddr:            hlAddr,
+					HLStateFetched:    hlStateFetched,
+					HLPositions:       hlPositions,
+					HLLiveAll:         hlLiveAll,
+					HLCloser:          defaultHyperliquidLiveCloser,
+					HLFetcher:         defaultHLStateFetcher,
+					HLNoFillRecoverer: defaultHLKillSwitchNoFillRecoverer,
+					HLStopLossOIDs:    hlSLOIDs,
+					OKXLiveAllPerps:   okxLivePerps,
+					OKXLiveAllSpot:    okxLiveSpot,
+					OKXCloser:         defaultOKXLiveCloser,
+					OKXFetcher:        defaultOKXPositionsFetcher,
+					RHLiveCrypto:      rhLiveCrypto,
+					RHLiveOptions:     rhLiveOptions,
+					RHCloser:          defaultRobinhoodLiveCloser,
+					RHFetcher:         defaultRobinhoodPositionsFetcher,
+					TSLiveAll:         tsLiveAll,
+					TSCloser:          defaultTopStepLiveCloser,
+					TSFetcher:         defaultTopStepPositionsFetcher,
+					PortfolioReason:   portfolioReason,
+					CloseTimeout:      90 * time.Second,
 					// Per-platform overrides: each platform gets its own
 					// independent context.WithTimeout so a slow platform
 					// cannot starve the others. Robinhood adds TOTP login
@@ -1557,16 +1590,31 @@ func main() {
 						cbSnapshot = snapshotPerStrategyCircuitBreaker(stratState, prices)
 					}
 					mu.Unlock()
+					// #1046: a latched per-strategy circuit breaker on an HL perps
+					// strategy with an open position falls through in manage-only
+					// mode rather than skipping — the dispatch below forces the
+					// signal to hold (0), which suppresses every entry/add/flip/
+					// close path while still running the Signal==0 trailing-SL/TP
+					// management so a stranded (e.g. shared-coin) position keeps
+					// ratcheting its stop-loss. All other blocks skip as before.
+					cbManageOnly := false
 					if !allowed {
 						notifyPerStrategyCircuitBreakerWithSnapshot(sc, cbSnapshot, reason, pv, totalPV, stateDB, notifier, killSwitchFired)
 						logger.Warn("Risk block: %s (portfolio=$%.2f)", reason, pv)
-						logger.Close()
-						lastRun[sc.ID] = time.Now()
-						continue
+						if circuitBreakerPermitsManagement(reason, sc.Platform, sc.Type, hlPosQty) {
+							cbManageOnly = true
+							logger.Info("Circuit breaker latched — suppressing new entries but continuing trailing-SL/TP management for open position (#1046)")
+						} else {
+							logger.Close()
+							lastRun[sc.ID] = time.Now()
+							continue
+						}
 					}
 
-					// #42: Notional cap blocks new trades for this strategy.
-					if notionalBlocked {
+					// #42: Notional cap blocks new trades for this strategy. Under
+					// manage-only the position is never grown anyway, so let the
+					// trailing-SL/TP management run instead of skipping.
+					if !cbManageOnly && notionalBlocked {
 						logger.Warn("Notional cap exceeded — skipping new trades")
 						logger.Close()
 						lastRun[sc.ID] = time.Now()
@@ -1739,7 +1787,13 @@ func main() {
 								// resolves from storeRegime, which the gate already used.
 								currentDirRegime := regimeDirectionalLabel(sc, regimePayloadValue(result.Regime), cfg.Regime)
 								posDirRegime := blofinPosCtx.DirectionalRegime
-								if entry, applied, legacyFallback := applyRegimeDirectionalPolicy(&sc, currentDirRegime, posDirRegime, blofinPosQty); applied {
+								var dirCertStates map[string]string
+								if blofinPosQty > 0 {
+									dirCertStates = blofinPosCtx.DirectionCertifiedStatesAtOpen
+								} else {
+									dirCertStates, _ = strategyDirectionalCertified(sc, cfg.Regime, time.Now().UTC())
+								}
+								if entry, applied, legacyFallback := applyRegimeDirectionalPolicy(&sc, currentDirRegime, posDirRegime, blofinPosQty, dirCertStates); applied {
 									regimeKey := effectiveRegimeForPolicy(currentDirRegime, posDirRegime, blofinPosQty)
 									logger.Info("Regime directional policy: regime=%s -> direction=%q invert_signal=%t",
 										regimeKey, entry.Direction, entry.InvertSignal)
@@ -1767,6 +1821,15 @@ func main() {
 							}
 						} else if result, signalStr, price, ok := runHyperliquidCheck(&sc, prices, hlPosCtx, cfg.Regime, notifier, logger); ok {
 							prices[result.Symbol] = price
+							// #1046: circuit breaker latched — force hold so no entry/
+							// add/flip/close executes (every execution path below gates
+							// on Signal != 0, and executePerpsSignalWithLeverage returns
+							// early on signal==0). The Signal==0 trailing-SL/TP-ratchet
+							// management blocks below still run, keeping the open
+							// position's stop-loss ratcheting through the latch window.
+							if cbManageOnly {
+								result.Signal = 0
+							}
 							// #879: single-source regime — read the global store for this
 							// strategy's signature instead of the check output, and point
 							// result.Regime at it so stamp-at-open inside execute* shares it.
@@ -2709,6 +2772,7 @@ func executeSpotResult(sc StrategyConfig, s *StrategyState, db *StateDB, result 
 	trades := exec.TradesExecuted
 	stampEntryATRIfOpened(s, result.Symbol, result.Indicators)
 	stampPositionRegimeIfOpened(s, result.Symbol, regimePayloadValue(result.Regime), sc, regime)
+	stampDirectionCertifiedAtOpenIfOpened(s, result.Symbol, exec.OpenTrade != nil, sc, regime)
 	if pos, ok := s.Positions[result.Symbol]; ok {
 		recordPositionOpen(s, sc, exec.OpenTrade, pos)
 	}
@@ -3017,7 +3081,21 @@ func runHyperliquidCheck(sc *StrategyConfig, prices map[string]float64, posCtx P
 	// to its natural exit under the policy that opened it.
 	currentDirRegime := regimeDirectionalLabel(*sc, regimePayloadValue(result.Regime), regime)
 	posDirRegime := posCtx.DirectionalRegime
-	if entry, applied, legacyFallback := applyRegimeDirectionalPolicy(sc, currentDirRegime, posDirRegime, posCtx.Quantity); applied {
+	// #1085: evidence gate (PER STATE). When FLAT, key the entry side on the LIVE
+	// certified per-state direction map for this strategy's (asset,timeframe,classifier).
+	// When a position is OPEN, ride under the map frozen at open so an artifact
+	// expiry/refresh never re-gates it mid-position; a state whose configured side
+	// contradicts the certified sign (or is uncertified) resolves to base, so a
+	// certified cell can never bet opposite the evidence. Then per-position:
+	var dirCertStates map[string]string
+	if sc.RegimeDirectionalPolicy.IsConfigured() {
+		if posCtx.Quantity > 0 {
+			dirCertStates = posCtx.DirectionCertifiedStatesAtOpen
+		} else {
+			dirCertStates, _ = strategyDirectionalCertified(*sc, regime, time.Now().UTC())
+		}
+	}
+	if entry, applied, legacyFallback := applyRegimeDirectionalPolicy(sc, currentDirRegime, posDirRegime, posCtx.Quantity, dirCertStates); applied {
 		regimeKey := effectiveRegimeForPolicy(currentDirRegime, posDirRegime, posCtx.Quantity)
 		logger.Info("Regime directional policy: regime=%s -> direction=%q invert_signal=%t",
 			regimeKey, entry.Direction, entry.InvertSignal)
@@ -3362,6 +3440,7 @@ func executeHyperliquidResultDeferredOpen(sc StrategyConfig, s *StrategyState, r
 	openTrade := exec.OpenTrade
 	stampEntryATRIfOpened(s, result.Symbol, result.Indicators)
 	stampPositionRegimeIfOpened(s, result.Symbol, regimePayloadValue(result.Regime), sc, regime)
+	stampDirectionCertifiedAtOpenIfOpened(s, result.Symbol, openTrade != nil, sc, regime)
 	if pos, ok := s.Positions[result.Symbol]; ok {
 		stampPositionProtectionSnapshot(pos, sc)
 	}
@@ -3630,6 +3709,7 @@ func executeTopStepResult(sc StrategyConfig, s *StrategyState, db *StateDB, resu
 	trades := exec.TradesExecuted
 	stampEntryATRIfOpened(s, result.Symbol, result.Indicators)
 	stampPositionRegimeIfOpened(s, result.Symbol, regimePayloadValue(result.Regime), sc, regime)
+	stampDirectionCertifiedAtOpenIfOpened(s, result.Symbol, exec.OpenTrade != nil, sc, regime)
 	if pos, ok := s.Positions[result.Symbol]; ok {
 		recordPositionOpen(s, sc, exec.OpenTrade, pos)
 	}
@@ -3800,6 +3880,7 @@ func executeRobinhoodResult(sc StrategyConfig, s *StrategyState, db *StateDB, re
 	trades := exec.TradesExecuted
 	stampEntryATRIfOpened(s, result.Symbol, result.Indicators)
 	stampPositionRegimeIfOpened(s, result.Symbol, regimePayloadValue(result.Regime), sc, regime)
+	stampDirectionCertifiedAtOpenIfOpened(s, result.Symbol, exec.OpenTrade != nil, sc, regime)
 	if pos, ok := s.Positions[result.Symbol]; ok {
 		recordPositionOpen(s, sc, exec.OpenTrade, pos)
 	}
@@ -4018,6 +4099,7 @@ func executeOKXResult(sc StrategyConfig, s *StrategyState, db *StateDB, result *
 	trades := exec.TradesExecuted
 	stampEntryATRIfOpened(s, result.Symbol, result.Indicators)
 	stampPositionRegimeIfOpened(s, result.Symbol, regimePayloadValue(result.Regime), sc, regime)
+	stampDirectionCertifiedAtOpenIfOpened(s, result.Symbol, exec.OpenTrade != nil, sc, regime)
 	if pos, ok := s.Positions[result.Symbol]; ok {
 		recordPositionOpen(s, sc, exec.OpenTrade, pos)
 	}

@@ -161,9 +161,69 @@ def test_regime_directional_policy_opens_inverse_short():
         close_strategies=_NEVER_FIRES_CLOSE,
         regime_enabled=True,
         regime_directional_policy=_REGIME_POLICY,
+        regime_directional_certified=True,  # #1085: test the resolver under certification
     )
     res = bt.run(df, save=False)
     assert [t["side"] for t in res["trades"]] == ["short"]
+
+
+def test_regime_directional_policy_default_off_when_uncertified():
+    # #1085: without certification the policy is inert → base direction governs.
+    # The same setup that opens SHORT under certification opens LONG default-off
+    # (the +1 signal, no invert, no direction gate).
+    df = _ohlc([1, 0, 0, 0])
+    df["regime"] = "trending_down"
+    bt = Backtester(
+        initial_capital=1000,
+        commission_pct=0.0,
+        slippage_pct=0.0,
+        close_strategies=_NEVER_FIRES_CLOSE,
+        regime_enabled=True,
+        regime_directional_policy=_REGIME_POLICY,
+        regime_directional_certified=False,
+    )
+    res = bt.run(df, save=False)
+    assert [t["side"] for t in res["trades"]] == ["long"]
+
+
+def test_regime_directional_policy_per_state_certified_states_honors_match():
+    # #1085 per-state parity: a certified states map whose sign MATCHES the
+    # configured side honors the policy (opens short, same as the legacy bool).
+    df = _ohlc([1, 0, 0, 0])
+    df["regime"] = "trending_down"
+    bt = Backtester(
+        initial_capital=1000,
+        commission_pct=0.0,
+        slippage_pct=0.0,
+        close_strategies=_NEVER_FIRES_CLOSE,
+        regime_enabled=True,
+        regime_directional_policy=_REGIME_POLICY,
+        regime_directional_certified_states={"trending_down": "short"},
+    )
+    res = bt.run(df, save=False)
+    assert [t["side"] for t in res["trades"]] == ["short"]
+
+
+def test_regime_directional_policy_per_state_sign_contradiction_falls_to_base():
+    # #1085 review-finding parity: a certified states map whose sign CONTRADICTS
+    # the configured side (config short, certified long) must NOT trade the
+    # configured short — it falls to BASE (the +1 signal opens long), exactly as
+    # the live per-state gate (gatedDirectionalEntry) does. Parity guard for the
+    # gap the fix closes: certification of a CELL must never place a bet opposite
+    # the certified sign for a state.
+    df = _ohlc([1, 0, 0, 0])
+    df["regime"] = "trending_down"
+    bt = Backtester(
+        initial_capital=1000,
+        commission_pct=0.0,
+        slippage_pct=0.0,
+        close_strategies=_NEVER_FIRES_CLOSE,
+        regime_enabled=True,
+        regime_directional_policy=_REGIME_POLICY,
+        regime_directional_certified_states={"trending_down": "long"},  # contradicts config short
+    )
+    res = bt.run(df, save=False)
+    assert [t["side"] for t in res["trades"]] == ["long"]
 
 
 def test_regime_directional_policy_holds_open_position_regime_plain_path():
@@ -179,6 +239,7 @@ def test_regime_directional_policy_holds_open_position_regime_plain_path():
         slippage_pct=0.0,
         regime_enabled=True,
         regime_directional_policy=_REGIME_POLICY,
+        regime_directional_certified=True,  # #1085: test the resolver under certification
     )
     res = bt.run(df, save=False)
     assert [t["side"] for t in res["trades"]] == ["short"]
@@ -220,6 +281,7 @@ def _run_oc_flip(open_action, close_fraction, regime):
     bt = Backtester(
         initial_capital=1000, commission_pct=0.0, slippage_pct=0.0,
         regime_enabled=True, regime_directional_policy=_REGIME_POLICY,
+        regime_directional_certified=True,  # #1085: test the resolver under certification
     )
     return bt.run(_oc_flip_df(open_action, close_fraction, regime), save=False)
 

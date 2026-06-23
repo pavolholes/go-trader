@@ -8,11 +8,12 @@ per-platform ``description`` / ``default_params`` overrides.
 ``shared_strategies/open/futures/strategies.py``
 are thin shims that call ``build_registry("spot")`` / ``build_registry("futures")``
 to materialize a platform-filtered view with the same shape as the legacy
-``STRATEGY_REGISTRY`` dict.
+``STRATEGY_REGISTRY`` dict. Deprecated strategies may stay registered so
+explicit existing configs remain loadable while discovery/list-json hides them.
 
 Per-platform ordering is explicit in ``PLATFORM_ORDER`` at the bottom of this
-file — it must match the legacy registration order in each shim so
-``--list-json`` output stays byte-identical.
+file. ``DISCOVERY_HIDDEN_STRATEGIES`` entries keep that canonical order for
+explicit loads but are omitted from ``--list-json`` discovery.
 """
 
 import os
@@ -39,6 +40,7 @@ from chart_patterns import chart_pattern_core
 from liquidity_sweeps import liquidity_sweep_core
 from range_scalper import range_scalper_core
 from consolidation_range import consolidation_range_core
+from atr_band_revert import atr_band_revert_core
 from sweep_squeeze_combo import sweep_squeeze_combo_core
 from adx_trend import adx_trend_core
 from bear_pullback_st import bear_pullback_st_core
@@ -59,6 +61,15 @@ VALID_PLATFORMS: Tuple[str, ...] = ("spot", "futures")
 
 # name -> {fn, description, default_params, platforms, variants}
 STRATEGIES: Dict[str, Dict[str, Any]] = {}
+
+# Strategies kept loadable for existing configs/backtests but hidden from
+# discovery surfaces such as --list-json and generated defaults.
+DISCOVERY_HIDDEN_STRATEGIES = frozenset({
+    "amd_ifvg",
+    "range_scalper",
+    "session_breakout",
+    "vol_momentum",
+})
 
 
 def register(
@@ -105,7 +116,7 @@ def register(
     return decorator
 
 
-def build_registry(platform: str) -> Dict[str, Dict[str, Any]]:
+def build_registry(platform: str, *, include_hidden: bool = False) -> Dict[str, Dict[str, Any]]:
     """Return a fresh ``{name: {fn, description, default_params}}`` dict
     filtered to ``platform`` and in the order declared in ``PLATFORM_ORDER``.
 
@@ -117,7 +128,8 @@ def build_registry(platform: str) -> Dict[str, Dict[str, Any]]:
             f"Unknown platform {platform!r}; expected one of {VALID_PLATFORMS}"
         )
     order = PLATFORM_ORDER[platform]
-    expected = {n for n, e in STRATEGIES.items() if platform in e["platforms"]}
+    tagged = {n for n, e in STRATEGIES.items() if platform in e["platforms"]}
+    expected = set(tagged)
     missing_from_order = expected - set(order)
     if missing_from_order:
         raise RuntimeError(
@@ -132,6 +144,8 @@ def build_registry(platform: str) -> Dict[str, Dict[str, Any]]:
 
     out: Dict[str, Dict[str, Any]] = {}
     for name in order:
+        if not include_hidden and name in DISCOVERY_HIDDEN_STRATEGIES:
+            continue
         entry = STRATEGIES[name]
         variant = entry["variants"].get(platform, {})
         out[name] = {
@@ -675,9 +689,13 @@ def atr_breakout_strategy(df: pd.DataFrame, atr_period: int = 14, multiplier: fl
     "amd_ifvg",
     "AMD+IFVG \u2014 ICT Accumulation-Manipulation-Distribution with Implied Fair Value Gap (15m, session-aware)",
     {
-        "asian_start_hour": 0, "asian_end_hour": 8,
-        "london_start_hour": 8, "london_end_hour": 12,
+        # Canonical ICT killzones in civil (DST-aware) time, anchored to
+        # session_tz: Asian range 20:00-00:00 ET (accumulation), London open
+        # kill zone 02:00-05:00 ET (manipulation). See amd_ifvg.py.
+        "asian_start_hour": 20, "asian_end_hour": 0,
+        "london_start_hour": 2, "london_end_hour": 5,
         "min_ifvg_pct": 0.05, "sweep_threshold_pct": 0.01,
+        "session_tz": "America/New_York",
     },
 )
 def amd_ifvg_strategy(df: pd.DataFrame, **params) -> pd.DataFrame:
@@ -1152,6 +1170,21 @@ def consolidation_range_strategy(df: pd.DataFrame, **params) -> pd.DataFrame:
 
 
 @register(
+    "atr_band_revert",
+    "ATR Band Reversion — ranging-market mean reversion: fade ATR-scaled bands around an SMA (long below mid-k*ATR; short above mid+k*ATR on futures). Entries only — pair with allowed_regimes=ranging and tiered_tp_atr / stop_loss_atr_mult for the take-profit-at-mid and range-break exit (see atr_band_revert.py)",
+    {"period": 20, "atr_period": 14, "k_entry": 1.5, "allow_short": False},
+    variants={
+        "futures": {
+            "description": "ATR Band Reversion — bidirectional ranging mean reversion: fade ATR-scaled bands around an SMA (long below mid-k*ATR, short above mid+k*ATR). Entries only — pair with allowed_regimes=ranging and tiered_tp_atr / stop_loss_atr_mult for exit",
+            "default_params": {"allow_short": True},
+        },
+    },
+)
+def atr_band_revert_strategy(df: pd.DataFrame, **params) -> pd.DataFrame:
+    return atr_band_revert_core(df, **params)
+
+
+@register(
     "mtf_confluence",
     "MTF Confluence — higher-timeframe EMA trend gate (resampled in-frame, no extra data) over native-frame pullback resumption entries; exits when the HTF trend flips",
     {
@@ -1262,8 +1295,8 @@ def hold_strategy(df: pd.DataFrame) -> pd.DataFrame:
 
 # ─────────────────────────────────────────────
 # Per-platform display order.
-# These lists MUST match the legacy registration order in each shim so
-# ``--list-json`` output stays byte-identical (agent tooling depends on it).
+# These lists preserve canonical registration order. Deprecated strategies may
+# remain here when hidden from discovery, so explicit configs keep resolving.
 # ─────────────────────────────────────────────
 
 PLATFORM_ORDER: Dict[str, List[str]] = {
@@ -1275,7 +1308,7 @@ PLATFORM_ORDER: Dict[str, List[str]] = {
         "heikin_ashi_ema", "order_blocks", "vwap_reversion", "anchored_vwap", "chart_pattern",
         "liquidity_sweeps", "parabolic_sar", "range_scalper",
         "sweep_squeeze_combo", "adx_trend", "donchian_breakout", "tema_cross",
-        "momentum_pro", "mean_reversion_pro", "mtf_confluence",
+        "momentum_pro", "mean_reversion_pro", "atr_band_revert", "mtf_confluence",
         "vol_momentum", "regime_adaptive", "regime_adaptive_htf",
         "hold",
     ],
@@ -1289,7 +1322,7 @@ PLATFORM_ORDER: Dict[str, List[str]] = {
         "sweep_squeeze_combo", "adx_trend", "delta_neutral_funding",
         "funding_skew", "donchian_breakout", "session_breakout", "bear_pullback_st",
         "vwap_rejection_st", "momentum_pro", "mean_reversion_pro",
-        "consolidation_range", "mtf_confluence", "vol_momentum",
+        "consolidation_range", "atr_band_revert", "mtf_confluence", "vol_momentum",
         "regime_adaptive", "regime_adaptive_htf", "hold",
     ],
 }
