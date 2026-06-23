@@ -1577,8 +1577,8 @@ func validateConfig(cfg *Config, skipLiveCredentialChecks bool) error {
 		// distinct from plain direction="short" which opens short on
 		// raw-SELL. Both are valid (#775).
 		if sc.InvertSignal {
-			if sc.Platform != "hyperliquid" || (sc.Type != "perps" && sc.Type != "manual") {
-				errs = append(errs, fmt.Sprintf("%s: invert_signal is only supported for HL perps/manual strategies (got platform=%q type=%q)", prefix, sc.Platform, sc.Type))
+			if sc.Type != "perps" && sc.Type != "manual" {
+				errs = append(errs, fmt.Sprintf("%s: invert_signal is only supported for perps/manual strategies (got platform=%q type=%q)", prefix, sc.Platform, sc.Type))
 			}
 		}
 
@@ -1589,8 +1589,8 @@ func validateConfig(cfg *Config, skipLiveCredentialChecks bool) error {
 		// static base config, which silently defeats the policy. Reject the
 		// asymmetric config at startup so the operator sees the gap. (#779)
 		if sc.RegimeDirectionalPolicy.IsConfigured() {
-			if sc.Platform != "hyperliquid" || sc.Type != "perps" {
-				errs = append(errs, fmt.Sprintf("%s: regime_directional_policy is only supported for HL perps strategies (got platform=%q type=%q)", prefix, sc.Platform, sc.Type))
+			if sc.Type != "perps" {
+				errs = append(errs, fmt.Sprintf("%s: regime_directional_policy is only supported for perps strategies (got platform=%q type=%q)", prefix, sc.Platform, sc.Type))
 			}
 			if cfg.Regime == nil || !cfg.Regime.Enabled {
 				errs = append(errs, fmt.Sprintf("%s: regime_directional_policy requires top-level regime.enabled=true", prefix))

@@ -26,6 +26,12 @@ def test_build_parser_rejects_unknown_platform():
         parser.parse_args(["--platform", "mystery-exchange"])
 
 
+def test_build_parser_accepts_blofin_platform():
+    parser = run_backtest._build_parser()
+    args = parser.parse_args(["--platform", "blofin", "--mode", "single"])
+    assert args.platform == "blofin"
+
+
 def test_build_parser_rejects_unknown_registry():
     parser = run_backtest._build_parser()
     with pytest.raises(SystemExit):

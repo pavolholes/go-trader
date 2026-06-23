@@ -43,6 +43,15 @@ func TestCalculatePlatformSpotFeeOKXPerps(t *testing.T) {
 	}
 }
 
+func TestCalculatePlatformSpotFeeBloFin(t *testing.T) {
+	// BloFin perps: 0.035%
+	fee := CalculatePlatformSpotFee("blofin", 1000.0)
+	expected := 1000.0 * BloFinTakerFeePct
+	if fee != expected {
+		t.Errorf("BloFin perps fee: got %f, want %f", fee, expected)
+	}
+}
+
 func TestCalculatePlatformFuturesFee(t *testing.T) {
 	// With FuturesConfig
 	sc := StrategyConfig{

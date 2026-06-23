@@ -1732,6 +1732,24 @@ func main() {
 								mu.Lock()
 								syncStrategyRegimeState(stratState, storeRegime, cfg.Regime)
 								mu.Unlock()
+
+								// #779: regime-directional policy — mutate sc.Direction/InvertSignal
+								// based on the current cycle regime (flat) or the position's stamped
+								// regime (hold-on-transition). Runs after Regime gate so the policy
+								// resolves from storeRegime, which the gate already used.
+								currentDirRegime := regimeDirectionalLabel(sc, regimePayloadValue(result.Regime), cfg.Regime)
+								posDirRegime := blofinPosCtx.DirectionalRegime
+								if entry, applied, legacyFallback := applyRegimeDirectionalPolicy(&sc, currentDirRegime, posDirRegime, blofinPosQty); applied {
+									regimeKey := effectiveRegimeForPolicy(currentDirRegime, posDirRegime, blofinPosQty)
+									logger.Info("Regime directional policy: regime=%s -> direction=%q invert_signal=%t",
+										regimeKey, entry.Direction, entry.InvertSignal)
+									if legacyFallback {
+										if _, loaded := regimeDirectionalLegacyWarned.LoadOrStore(sc.ID, struct{}{}); !loaded {
+											logger.Warn("Regime directional policy: open position has no stamped regime (legacy pre-#741); resolving against current regime=%q. Hold-on-transition not guaranteed for this position; self-heals on next entry.", regimeKey)
+										}
+									}
+								}
+								
 								var execResult *BloFinExecuteResult
 								liveExecFailed := false
 								if blofinIsLive(sc.Args) && result.Signal != 0 {
@@ -3335,7 +3353,7 @@ func executeHyperliquidResultDeferredOpen(sc StrategyConfig, s *StrategyState, r
 		fillFee = fill.Fee
 	}
 
-	exec, err := ExecutePerpsSignalWithLeverageDeferredOpen(s, result.Signal, result.Symbol, fillPrice, sizingLeverage, exchangeLeverage, marginPerTradeUSD, fillQty, fillOID, fillFee, EffectiveDirection(sc), result.CloseFraction, logger)
+	exec, err := ExecutePerpsSignalWithLeverageDeferredOpen(s, result.Signal, result.Symbol, fillPrice, sizingLeverage, exchangeLeverage, marginPerTradeUSD, fillQty, fillOID, fillFee, EffectiveDirection(sc), result.CloseFraction, "signal", logger)
 	if err != nil {
 		logger.Error("Trade execution failed: %v", err)
 		return 0, "", nil
@@ -3989,7 +4007,7 @@ func executeOKXResult(sc StrategyConfig, s *StrategyState, db *StateDB, result *
 	var exec SignalExecutionResult
 	var err error
 	if sc.Type == "perps" {
-		exec, err = ExecutePerpsSignalWithLeverageDeferredOpen(s, result.Signal, result.Symbol, fillPrice, EffectiveSizingLeverage(sc), EffectiveExchangeLeverage(sc), EffectiveMarginPerTradeUSD(sc), fillQty, fillOID, fillFee, EffectiveDirection(sc), result.CloseFraction, logger)
+		exec, err = ExecutePerpsSignalWithLeverageDeferredOpen(s, result.Signal, result.Symbol, fillPrice, EffectiveSizingLeverage(sc), EffectiveExchangeLeverage(sc), EffectiveMarginPerTradeUSD(sc), fillQty, fillOID, fillFee, EffectiveDirection(sc), result.CloseFraction, "signal", logger)
 	} else {
 		exec, err = ExecuteSpotSignalWithFillFeeDeferredOpen(s, result.Signal, result.Symbol, fillPrice, fillQty, fillFee, fillOID, result.CloseFraction, logger)
 	}
@@ -4332,7 +4350,11 @@ func executeBloFinResult(sc StrategyConfig, s *StrategyState, db *StateDB, resul
 		logger.Info("SL hit for %s: sl_price=$.2f atr_value=%.2f", result.Symbol, result.StopLossPrice, result.ATRValue)
 	}
 
-	exec, err := ExecutePerpsSignalWithLeverageDeferredOpen(s, result.Signal, result.Symbol, fillPrice, EffectiveSizingLeverage(sc), EffectiveExchangeLeverage(sc), EffectiveMarginPerTradeUSD(sc), fillQty, fillOID, fillFee, EffectiveDirection(sc), result.CloseFraction, logger)
+	closeReason := "signal"
+	if result.StopLossPrice > 0 && result.CloseFraction > 0 {
+		closeReason = "stop_loss"
+	}
+	exec, err := ExecutePerpsSignalWithLeverageDeferredOpen(s, result.Signal, result.Symbol, fillPrice, EffectiveSizingLeverage(sc), EffectiveExchangeLeverage(sc), EffectiveMarginPerTradeUSD(sc), fillQty, fillOID, fillFee, EffectiveDirection(sc), result.CloseFraction, closeReason, logger)
 	if err != nil {
 		logger.Error("Trade execution failed: %v", err)
 		return 0, ""

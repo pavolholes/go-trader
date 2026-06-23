@@ -1089,14 +1089,14 @@ func ExecutePerpsSignal(s *StrategyState, signal int, symbol string, price float
 //
 // Empty direction is treated as "long" for safety.
 func ExecutePerpsSignalWithLeverage(s *StrategyState, signal int, symbol string, price float64, sizingLeverage, exchangeLeverage, marginPerTradeUSD float64, fillQty float64, fillOID string, fillFee float64, direction string, closeFraction float64, logger *StrategyLogger) (int, error) {
-	return executePerpsSignalWithLeverage(s, signal, symbol, price, sizingLeverage, exchangeLeverage, marginPerTradeUSD, fillQty, fillOID, fillFee, direction, closeFraction, logger, func(trade Trade) {
+	return executePerpsSignalWithLeverage(s, signal, symbol, price, sizingLeverage, exchangeLeverage, marginPerTradeUSD, fillQty, fillOID, fillFee, direction, closeFraction, "signal", logger, func(trade Trade) {
 		RecordTrade(s, trade)
 	})
 }
 
-func ExecutePerpsSignalWithLeverageDeferredOpen(s *StrategyState, signal int, symbol string, price float64, sizingLeverage, exchangeLeverage, marginPerTradeUSD float64, fillQty float64, fillOID string, fillFee float64, direction string, closeFraction float64, logger *StrategyLogger) (SignalExecutionResult, error) {
+func ExecutePerpsSignalWithLeverageDeferredOpen(s *StrategyState, signal int, symbol string, price float64, sizingLeverage, exchangeLeverage, marginPerTradeUSD float64, fillQty float64, fillOID string, fillFee float64, direction string, closeFraction float64, closeReason string, logger *StrategyLogger) (SignalExecutionResult, error) {
 	var result SignalExecutionResult
-	trades, err := executePerpsSignalWithLeverage(s, signal, symbol, price, sizingLeverage, exchangeLeverage, marginPerTradeUSD, fillQty, fillOID, fillFee, direction, closeFraction, logger, func(trade Trade) {
+	trades, err := executePerpsSignalWithLeverage(s, signal, symbol, price, sizingLeverage, exchangeLeverage, marginPerTradeUSD, fillQty, fillOID, fillFee, direction, closeFraction, closeReason, logger, func(trade Trade) {
 		t := trade
 		result.OpenTrade = &t
 	})
@@ -1104,7 +1104,7 @@ func ExecutePerpsSignalWithLeverageDeferredOpen(s *StrategyState, signal int, sy
 	return result, err
 }
 
-func executePerpsSignalWithLeverage(s *StrategyState, signal int, symbol string, price float64, sizingLeverage, exchangeLeverage, marginPerTradeUSD float64, fillQty float64, fillOID string, fillFee float64, direction string, closeFraction float64, logger *StrategyLogger, recordOpen func(Trade)) (int, error) {
+func executePerpsSignalWithLeverage(s *StrategyState, signal int, symbol string, price float64, sizingLeverage, exchangeLeverage, marginPerTradeUSD float64, fillQty float64, fillOID string, fillFee float64, direction string, closeFraction float64, closeReason string, logger *StrategyLogger, recordOpen func(Trade)) (int, error) {
 	if direction == "" {
 		direction = DirectionLong
 	}
@@ -1113,6 +1113,9 @@ func executePerpsSignalWithLeverage(s *StrategyState, signal int, symbol string,
 	bidirectional := direction == DirectionBoth // flip semantics retained only for "both"
 	if signal == 0 {
 		return 0, nil
+	}
+	if closeReason == "" {
+		closeReason = "signal"
 	}
 	if sizingLeverage <= 0 {
 		sizingLeverage = 1
@@ -1243,7 +1246,7 @@ func executePerpsSignalWithLeverage(s *StrategyState, signal int, symbol string,
 				pos.Quantity -= closeQty
 				logger.Info("Partial-close short %s: %.6f (remaining %.6f) @ $%.2f (fee $%.2f) | PnL: $%.2f", symbol, closeQty, pos.Quantity, execPrice, fee, pnl)
 			} else {
-				recordClosedPosition(s, pos, execPrice, pnl, "signal", now)
+				recordClosedPosition(s, pos, execPrice, pnl, closeReason, now)
 				delete(s.Positions, symbol)
 				clearATRMultMissingEntryATRWarningOnHLPerpsClose(s, symbol)
 				logger.Info("Closed short %s @ $%.2f (fee $%.2f) | PnL: $%.2f", symbol, execPrice, fee, pnl)
@@ -1448,7 +1451,7 @@ func executePerpsSignalWithLeverage(s *StrategyState, signal int, symbol string,
 				pos.Quantity -= closeQty
 				logger.Info("Partial-close long %s: %.6f (remaining %.6f) @ $%.2f (fee $%.2f) | PnL: $%.2f", symbol, closeQty, pos.Quantity, execPrice, fee, pnl)
 			} else {
-				recordClosedPosition(s, pos, execPrice, pnl, "signal", now)
+				recordClosedPosition(s, pos, execPrice, pnl, closeReason, now)
 				delete(s.Positions, symbol)
 				clearATRMultMissingEntryATRWarningOnHLPerpsClose(s, symbol)
 				logger.Info("SELL %s: %.6f @ $%.2f (fee $%.2f) | PnL: $%.2f", symbol, closeQty, execPrice, fee, pnl)
@@ -1586,6 +1589,7 @@ func executeSpotSignalWithFillFee(s *StrategyState, signal int, symbol string, p
 	if signal == 0 {
 		return 0, nil
 	}
+	closeReason := "signal"
 	tradesExecuted := 0
 	feePlatform := s.Platform
 	if s.Platform == "okx" && s.Type == "perps" {
@@ -1661,7 +1665,7 @@ func executeSpotSignalWithFillFee(s *StrategyState, signal int, symbol string, p
 				pos.Quantity -= closeQty
 				logger.Info("Partial-close short %s: %.6f (remaining %.6f) @ $%.2f (fee $%.2f) | PnL: $%.2f", symbol, closeQty, pos.Quantity, execPrice, fee, pnl)
 			} else {
-				recordClosedPosition(s, pos, execPrice, pnl, "signal", now)
+				recordClosedPosition(s, pos, execPrice, pnl, closeReason, now)
 				delete(s.Positions, symbol)
 				logger.Info("Closed short %s @ $%.2f (fee $%.2f) | PnL: $%.2f", symbol, execPrice, fee, pnl)
 			}
@@ -1795,7 +1799,7 @@ func executeSpotSignalWithFillFee(s *StrategyState, signal int, symbol string, p
 				pos.Quantity -= closeQty
 				logger.Info("Partial-close long %s: %.6f (remaining %.6f) @ $%.2f (fee $%.2f) | PnL: $%.2f", symbol, closeQty, pos.Quantity, execPrice, fee, pnl)
 			} else {
-				recordClosedPosition(s, pos, execPrice, pnl, "signal", now)
+				recordClosedPosition(s, pos, execPrice, pnl, closeReason, now)
 				delete(s.Positions, symbol)
 				logger.Info("SELL %s: %.6f @ $%.2f (fee $%.2f) | PnL: $%.2f", symbol, closeQty, execPrice, fee, pnl)
 			}
@@ -1840,6 +1844,7 @@ func executeFuturesSignalWithFillFee(s *StrategyState, signal int, symbol string
 	if signal == 0 {
 		return 0, nil
 	}
+	closeReason := "signal"
 	tradesExecuted := 0
 	multiplier := spec.Multiplier
 	fillMetadataUsed := false
@@ -1920,7 +1925,7 @@ func executeFuturesSignalWithFillFee(s *StrategyState, signal int, symbol string
 				pos.Quantity -= float64(contracts)
 				logger.Info("Partial-close short %s %d contracts (remaining %d) @ $%.2f (fee $%.2f) | PnL: $%.2f", symbol, contracts, int(pos.Quantity), execPrice, fee, pnl)
 			} else {
-				recordClosedPosition(s, pos, execPrice, pnl, "signal", now)
+				recordClosedPosition(s, pos, execPrice, pnl, closeReason, now)
 				delete(s.Positions, symbol)
 				logger.Info("Closed short %s %d contracts @ $%.2f (fee $%.2f) | PnL: $%.2f", symbol, contracts, execPrice, fee, pnl)
 			}
@@ -2071,7 +2076,7 @@ func executeFuturesSignalWithFillFee(s *StrategyState, signal int, symbol string
 				pos.Quantity -= float64(contracts)
 				logger.Info("Partial-close long %s %d contracts (remaining %d) @ $%.2f (fee $%.2f) | PnL: $%.2f", symbol, contracts, int(pos.Quantity), execPrice, fee, pnl)
 			} else {
-				recordClosedPosition(s, pos, execPrice, pnl, "signal", now)
+				recordClosedPosition(s, pos, execPrice, pnl, closeReason, now)
 				delete(s.Positions, symbol)
 				logger.Info("SELL %s: %d contracts @ $%.2f (fee $%.2f) | PnL: $%.2f", symbol, contracts, execPrice, fee, pnl)
 			}

@@ -37,6 +37,23 @@ FUNDING_COLUMN_STRATEGIES = {"funding_skew", "delta_neutral_funding"}
 FUNDING_ACCRUAL_STRATEGIES = {"delta_neutral_funding"}
 
 
+_SYMBOL_LEVERAGE_MAP = {
+    "BTC/USDT": 150, "ETH/USDT": 150, "SOL/USDT": 125, "BNB/USDT": 125,
+    "HYPE/USDT": 75, "1000BONK/USDT": 75, "SPX6900/USDT": 75,
+    "XAU/USDT": 100, "USO/USDT": 20,
+    "AAPL/USDT": 50, "NVDA/USDT": 50, "META/USDT": 50, "MSFT/USDT": 50,
+    "AMZN/USDT": 50, "GOOGL/USDT": 50, "TSLA/USDT": 50,
+    "SPY/USDT": 50, "QQQ/USDT": 50,
+    "USELESS/USDT": 75, "ZEC/USDT": 75, "WLD/USDT": 75,
+    "BEAT/USDT": 75, "MAGIC/USDT": 75,
+    "SPCX/USDT": 50, "SPCE/USDT": 50,
+}
+
+
+def _get_leverage_for_symbol(symbol: str) -> float:
+    return _SYMBOL_LEVERAGE_MAP.get(symbol, 75)
+
+
 def _attach_funding_if_needed(df, strategy_name, symbol, since):
     if strategy_name not in FUNDING_COLUMN_STRATEGIES or df.empty:
         return df
@@ -441,6 +458,7 @@ def load_strategy_config(config_path: str, strategy_id: str,
             "stop_loss_atr_regime": sc.get("stop_loss_atr_regime"),
             "trailing_stop_atr_regime": sc.get("trailing_stop_atr_regime"),
             "strategy_type": strategy_type,
+            "platform": str(sc.get("platform") or "").strip().lower(),
             "direction": direction,
             "invert_signal": invert_signal,
             "regime_directional_policy": regime_directional_policy,
@@ -483,13 +501,18 @@ def run_single_backtest(
     invert_signal: bool = False,
     regime_directional_policy: Optional[dict] = None,
     profile_allocation: Optional[dict] = None,
+    circuit_breaker_max_drawdown_pct: Optional[float] = None,
+    save: bool = True,
+    margin_per_trade_usd: Optional[float] = None,
+    leverage: Optional[float] = None,
 ) -> Optional[dict]:
     """Run a single backtest and print results.
 
     ``registry`` selects the strategy registry (``"spot"`` or ``"futures"``).
     ``platform`` selects the exchange fee model (``"binanceus"``,
-    ``"hyperliquid"``, ``"robinhood"``, ``"luno"``, ``"okx"``,
-    ``"okx-perps"``), matching ``scheduler/fees.go:CalculatePlatformSpotFee``.
+    ``"hyperliquid"``, ``"blofin"``, ``"robinhood"``, ``"luno"``,
+    ``"okx"``, ``"okx-perps"``), matching
+    ``scheduler/fees.go:CalculatePlatformSpotFee``.
     ``close_strategies`` is an optional list of co-located close-evaluator
     refs (``[{"name": str, "params": dict}, ...]``) from the close registry
     (#511, #641); each runs per-bar against the simulated position. Backtest
@@ -507,10 +530,14 @@ def run_single_backtest(
     print(f"\n▶ Strategy: {strat['description']}")
     print(f"  Params: {strat_params}")
     print(f"  Symbol: {symbol} | Timeframe: {timeframe} | Since: {since}")
+    # Inject Go-compatible defaults when tp_enabled is not explicitly set
     if close_strategies:
+        for cr in close_strategies:
+            cr_params = cr.setdefault("params", {})
+            cr_params.setdefault("tp_enabled", False)
         print(f"  Close strategies: {[r.get('name') for r in close_strategies]}")
 
-    df = load_cached_data(symbol, timeframe, start_date=since)
+    df = load_cached_data(symbol, timeframe, exchange_id=platform, start_date=since)
     if df.empty:
         print("No data available!")
         return None
@@ -556,6 +583,9 @@ def run_single_backtest(
         df_signals = _apply_htf_filter_to_df(df_signals, symbol, timeframe)
         print(f"  HTF filter: applied (HTF={get_default_htf(timeframe)})")
 
+    resolved_margin = margin_per_trade_usd if margin_per_trade_usd is not None else 10.0  # default $10 like Go
+    resolved_leverage = leverage if leverage is not None else _get_leverage_for_symbol(symbol)
+    print(f"  Margin: ${resolved_margin:.0f}/trade | Leverage: {resolved_leverage:.0f}x")
     bt = Backtester(
         initial_capital=capital, platform=platform,
         open_strategy={"name": strategy_name, "params": dict(strat_params or {})},
@@ -576,6 +606,9 @@ def run_single_backtest(
         invert_signal=invert_signal,
         regime_directional_policy=regime_directional_policy,
         profile_allocation=profile_allocation,
+        circuit_breaker_max_drawdown_pct=circuit_breaker_max_drawdown_pct,
+        margin_per_trade_usd=resolved_margin,
+        leverage=resolved_leverage,
     )
     results = bt.run(
         df_signals,
@@ -583,6 +616,7 @@ def run_single_backtest(
         symbol=symbol,
         timeframe=timeframe,
         params=strat_params,
+        save=save,
     )
 
     print(format_single_report(results))
@@ -604,6 +638,9 @@ def run_all_strategies(
     regime_adx_threshold: float = 20.0,
     allowed_regimes: Optional[List[str]] = None,
     direction: Optional[str] = None,
+    circuit_breaker_max_drawdown_pct: Optional[float] = None,
+    margin_per_trade_usd: Optional[float] = None,
+    leverage: Optional[float] = None,
 ) -> list:
     """Run multiple strategies on one asset and compare."""
     reg = load_registry(registry)
@@ -723,7 +760,7 @@ def run_walk_forward(
             print(f"[warn] '{strategy_name}' has no default_params either — skipping.")
             return None
 
-    df = load_cached_data(symbol, timeframe, start_date=since)
+    df = load_cached_data(symbol, timeframe, exchange_id=platform, start_date=since)
     if df.empty:
         print("No data available!")
         return None
@@ -761,7 +798,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--registry", choices=["spot", "futures"], default="spot",
                         help="Strategy registry to load (spot or futures)")
     parser.add_argument("--platform",
-                        choices=["binanceus", "hyperliquid", "robinhood",
+                        choices=["binanceus", "hyperliquid", "blofin", "robinhood",
                                  "luno", "okx", "okx-perps"],
                         default="binanceus",
                         help="Exchange fee model (matches fees.go)")
@@ -873,8 +910,12 @@ def _parse_close_strategy_arg(raw: str) -> dict:
     return {"name": name, "params": dict(ref.get("params") or {})}
 
 
-def main():
-    args = _build_parser().parse_args()
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    platform_explicit = any(
+        a == "--platform" or str(a).startswith("--platform=") for a in argv
+    )
+    args = _build_parser().parse_args(argv)
 
     close_refs = None
     if args.close_strategies:
@@ -897,6 +938,10 @@ def main():
             sys.exit(1)
         live_kwargs = load_strategy_config(args.config, args.strategy,
                                            inject_user_defaults=(args.defaults == "user"))
+        if not platform_explicit:
+            live_platform = str(live_kwargs.get("platform") or "").strip().lower()
+            if live_platform:
+                args.platform = live_platform
         # Live config refs take precedence; --close-strategy on top is rejected
         # to avoid silent overrides.
         if close_refs:

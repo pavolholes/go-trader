@@ -208,8 +208,11 @@ def config_from_live_config(config_path: str, strategy_id: str,
         strategy_name=open_ref["name"],
         params=dict(open_ref.get("params") or {}),
         registry="futures" if stype in ("perps", "futures", "manual") else "spot",
-        platform=platform or ("hyperliquid" if stype in ("perps", "manual")
-                              else "binanceus"),
+        platform=(
+            platform
+            or str(entry.get("platform") or "").strip().lower()
+            or ("hyperliquid" if stype in ("perps", "manual") else "binanceus")
+        ),
         symbol=str(args[1]) if len(args) > 1 else "BTC/USDT",
         timeframe=str(args[2]) if len(args) > 2 else "1h",
         close_refs=loaded.get("close_strategies") or None,

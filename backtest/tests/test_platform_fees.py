@@ -17,6 +17,7 @@ FEES_GO = Path(__file__).resolve().parents[2] / "scheduler" / "fees.go"
 EXPECTED_RATES = {
     "binanceus":   0.001,
     "hyperliquid": 0.00035,
+    "blofin":      0.00035,
     "robinhood":   0.0,
     "luno":        0.01,
     "okx":         0.001,
@@ -30,7 +31,7 @@ def _scrape_fees_go_constants() -> dict:
     silently drifting from the Go source."""
     text = FEES_GO.read_text()
     const_pattern = re.compile(
-        r"^\s*(BinanceSpotFeePct|HyperliquidTakerFeePct|LunoTakerFeePct|"
+        r"^\s*(BinanceSpotFeePct|HyperliquidTakerFeePct|BloFinTakerFeePct|LunoTakerFeePct|"
         r"OKXSpotTakerFeePct|OKXPerpsTakerFeePct)\s*=\s*([0-9.]+)",
         re.MULTILINE,
     )
@@ -49,6 +50,7 @@ def test_platform_fee_table_matches_fees_go():
     # Only check constants we actually mirror — not all of fees.go is spot.
     assert go_rates["BinanceSpotFeePct"] == PLATFORM_FEE_PCT["binanceus"]
     assert go_rates["HyperliquidTakerFeePct"] == PLATFORM_FEE_PCT["hyperliquid"]
+    assert go_rates["BloFinTakerFeePct"] == PLATFORM_FEE_PCT["blofin"]
     assert go_rates["LunoTakerFeePct"] == PLATFORM_FEE_PCT["luno"]
     assert go_rates["OKXSpotTakerFeePct"] == PLATFORM_FEE_PCT["okx"]
     assert go_rates["OKXPerpsTakerFeePct"] == PLATFORM_FEE_PCT["okx-perps"]
@@ -96,6 +98,7 @@ def _one_trade_df():
     [
         ("binanceus",   0.001),
         ("hyperliquid", 0.00035),
+        ("blofin",      0.00035),
         ("robinhood",   0.0),
         ("luno",        0.01),
         ("okx",         0.001),

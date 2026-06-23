@@ -16,6 +16,9 @@ const (
 	// Hyperliquid perps taker fee
 	HyperliquidTakerFeePct = 0.00035 // 0.035% taker fee
 
+	// BloFin perps taker fee
+	BloFinTakerFeePct = 0.00035 // 0.035% taker fee
+
 	// Luno spot taker fee (base rate; volume-tiered down to 0.03%)
 	LunoTakerFeePct = 0.01 // 1.00% taker fee
 
@@ -48,11 +51,18 @@ func CalculateHyperliquidFee(notionalUSD float64) float64 {
 	return notionalUSD * HyperliquidTakerFeePct
 }
 
+// CalculateBloFinFee calculates trading fee for BloFin perps.
+func CalculateBloFinFee(notionalUSD float64) float64 {
+	return notionalUSD * BloFinTakerFeePct
+}
+
 // CalculatePlatformSpotFee dispatches spot fee calculation based on platform.
 func CalculatePlatformSpotFee(platform string, value float64) float64 {
 	switch platform {
 	case "hyperliquid":
 		return CalculateHyperliquidFee(value)
+	case "blofin":
+		return CalculateBloFinFee(value)
 	case "luno":
 		return value * LunoTakerFeePct
 	case "robinhood":

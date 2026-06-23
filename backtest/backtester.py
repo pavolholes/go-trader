@@ -316,6 +316,7 @@ LIQUIDATED_METRIC_FLOOR = 100.0
 PLATFORM_FEE_PCT = {
     "binanceus":   0.001,    # BinanceSpotFeePct
     "hyperliquid": 0.00035,  # HyperliquidTakerFeePct
+    "blofin":      0.00035,  # BloFin perps currently mirror HL taker fee
     "robinhood":   0.0,      # RobinhoodCryptoFeePct (no commission)
     "luno":        0.01,     # LunoTakerFeePct
     "okx":         0.001,    # OKXSpotTakerFeePct
@@ -327,6 +328,14 @@ def fee_pct_for_platform(platform: str) -> float:
     """Return taker fee rate for ``platform``; defaults to BinanceUS spot rate
     (0.1%) to match ``scheduler/fees.go:CalculateSpotFee``."""
     return PLATFORM_FEE_PCT.get(platform, PLATFORM_FEE_PCT["binanceus"])
+
+
+def _bar_duration_minutes(df, direction="long"):
+    idx = df.index
+    if len(idx) < 2:
+        return 60
+    diff = idx[1] - idx[0]
+    return int(diff.total_seconds() // 60) or 1
 
 
 def _open_action_from_signal(signal: int) -> str:
@@ -614,7 +623,10 @@ class Backtester:
                  direction: Optional[str] = None,
                  invert_signal: bool = False,
                  regime_directional_policy: Optional[dict] = None,
-                 profile_allocation: Optional[dict] = None):
+                 profile_allocation: Optional[dict] = None,
+                 circuit_breaker_max_drawdown_pct: Optional[float] = None,
+                 margin_per_trade_usd: Optional[float] = None,
+                 leverage: float = 1.0):
         """
         Args:
             initial_capital: Starting portfolio value.
@@ -706,6 +718,18 @@ class Backtester:
         # confirm_bars hysteresis switch inside the per-bar loop. None = single
         # profile (the normal path). Validated into a compact dict.
         self._profile_alloc = _parse_profile_allocation(profile_allocation)
+        self.circuit_breaker_max_drawdown_pct = (
+            float(circuit_breaker_max_drawdown_pct)
+            if circuit_breaker_max_drawdown_pct is not None
+            else None
+        )
+        self._margin_per_trade_usd = (
+            float(margin_per_trade_usd) if margin_per_trade_usd is not None else None
+        )
+        self._leverage = float(leverage) if leverage else 1.0
+        self._margin_locked = 0.0
+        self._notional = 0.0
+        self._close_reason_counts = {}
         self.stop_loss_atr_regime = (
             dict(stop_loss_atr_regime) if stop_loss_atr_regime else None
         )
@@ -1319,6 +1343,10 @@ class Backtester:
         # hit is detected at bar close and fills at the next bar's open, matching
         # the engine's N→N+1 fill convention.
         pending_signal_sl_close = False
+        # Circuit breaker state (matches Go engine's per-strategy max_drawdown_pct)
+        self._cb_active = False
+        self._cb_peak_equity = self.initial_capital
+        self._cb_cooldown_bars = 0  # bars remaining in cooldown
         self._active_sl_after_rules = self._sl_after_rules_static
         self._run_tp_tier_thresholds = list(self._tp_tier_thresholds_static)
         self._run_stop_loss_atr_mult: Optional[float] = None
@@ -1570,8 +1598,28 @@ class Backtester:
                     cash += funding_cash
                     total_funding_pnl += funding_cash
 
-            equity = cash + position * mark_price
+            if self._margin_per_trade_usd and self._margin_locked > 0:
+                unrealized_pnl = position * (mark_price - avg_cost)
+                equity = cash + self._margin_locked + unrealized_pnl - (self._notional if position < 0 else 0)
+            else:
+                equity = cash + position * mark_price
             equity_curve.append({"date": idx, "equity": equity})
+
+            # Circuit breaker: track peak equity and manage cooldown
+            if self.circuit_breaker_max_drawdown_pct is not None:
+                if equity > self._cb_peak_equity:
+                    self._cb_peak_equity = equity
+                if self._cb_cooldown_bars > 0:
+                    self._cb_cooldown_bars -= 1
+                    if self._cb_cooldown_bars <= 0:
+                        self._cb_active = False
+                if not self._cb_active and self._cb_peak_equity > 0:
+                    dd_pct = (self._cb_peak_equity - equity) / self._cb_peak_equity * 100
+                    if dd_pct >= self.circuit_breaker_max_drawdown_pct:
+                        self._cb_active = True
+                        bar_minutes = _bar_duration_minutes(df, self.direction)
+                        cooldown_minutes = max(bar_minutes, 1)
+                        self._cb_cooldown_bars = max(1, int(24 * 60 / cooldown_minutes))
 
             # Regime gate: block new entries when the prior bar's regime
             # isn't in the allowed set. Existing positions are always managed
@@ -1620,13 +1668,23 @@ class Backtester:
                         effective_price = fill_price * (1 - self.slippage_pct)
                         proceeds = qty_to_close * effective_price
                         commission = proceeds * self.commission_pct
-                        cash += proceeds - commission
+                        if self._margin_per_trade_usd and self._margin_locked > 0:
+                            realized_pnl = qty_to_close * (effective_price - avg_cost)
+                            margin_return = self._margin_locked * (qty_to_close / position)
+                            cash += margin_return + realized_pnl - commission
+                        else:
+                            cash += proceeds - commission
                         position -= qty_to_close
                     else:
                         effective_price = fill_price * (1 + self.slippage_pct)
                         cost = qty_to_close * effective_price
                         commission = cost * self.commission_pct
-                        cash -= cost + commission
+                        if self._margin_per_trade_usd and self._margin_locked > 0:
+                            realized_pnl = qty_to_close * (avg_cost - effective_price)
+                            margin_return = self._margin_locked * (qty_to_close / abs(position))
+                            cash += margin_return - cost - commission
+                        else:
+                            cash -= cost + commission
                         position += qty_to_close
 
                     if current_trade:
@@ -1644,6 +1702,7 @@ class Backtester:
                                     exit_fee=commission,
                                     reason=close_reason or "close_strategy",
                                     qty_frac=qty_frac)
+                        self._close_reason_counts[close_reason or "close_strategy"] = self._close_reason_counts.get(close_reason or "close_strategy", 0) + 1
                         trades.append(closed)
                         current_trade.shares -= qty_to_close
                         if current_trade.shares <= 1e-12:
@@ -1656,6 +1715,8 @@ class Backtester:
                         entry_atr_value = 0.0
                         # Reset post-TP SL state on full close so the next
                         # open starts clean.
+                        self._margin_locked = 0.0
+                        self._notional = 0.0
                         sl_trigger_px = 0.0
                         sl_tiers_processed = 0
                         post_tp_trail_mult = None
@@ -1739,14 +1800,22 @@ class Backtester:
                 # booked trade side and inverting all subsequent PnL. The
                 # account is economically bust — skip the entry. cash == 0 is
                 # included: it would book a zero-share phantom trade.
-                if open_action == "long" and position == 0 and cash > 0 and not regime_blocked:
+                if open_action == "long" and position == 0 and cash > 0 and not regime_blocked and not self._cb_active and (atr_series is None or self._stamp_entry_atr(atr_series, idx, fill_price) > 0):
                     effective_price = fill_price * (1 + self.slippage_pct)
-                    commission = cash * self.commission_pct
-                    available = cash - commission
-                    shares = available / effective_price
+                    if self._margin_per_trade_usd:
+                        margin = min(self._margin_per_trade_usd, cash)
+                        notional = margin * self._leverage
+                        commission = notional * self.commission_pct
+                        cash -= margin + commission
+                        self._margin_locked = margin
+                        self._notional = notional
+                        shares = notional / effective_price
+                    else:
+                        commission = cash * self.commission_pct
+                        available = cash - commission
+                        shares = available / effective_price
+                        cash = 0.0
                     position = shares
-                    cash = 0.0
-
                     current_trade = Trade(idx, effective_price, "long")
                     current_trade.shares = shares
                     avg_cost = effective_price
@@ -1790,18 +1859,29 @@ class Backtester:
                         sl_tiers_processed = 0
                         post_tp_trail_mult = None
                         sl_high_water_px = mark_price
-                elif open_action == "short" and position == 0 and cash > 0 and not regime_blocked:
+                elif open_action == "short" and position == 0 and cash > 0 and not regime_blocked and not self._cb_active and (atr_series is None or self._stamp_entry_atr(atr_series, idx, fill_price) > 0):
                     effective_price = fill_price * (1 - self.slippage_pct)
-                    commission = cash * self.commission_pct
-                    notional = cash - commission
-                    shares = notional / effective_price
-                    cash = 2 * notional  # pay commission, receive short-sale proceeds
-                    position = -shares
-
+                    if self._margin_per_trade_usd:
+                        margin = min(self._margin_per_trade_usd, cash)
+                        notional = margin * self._leverage
+                        commission = notional * self.commission_pct
+                        cash -= margin + commission
+                        # Short-sale proceeds: receive notional in cash
+                        cash += notional
+                        self._margin_locked = margin
+                        self._notional = notional
+                        shares = notional / effective_price
+                        position = -shares
+                    else:
+                        commission = cash * self.commission_pct
+                        n = cash - commission
+                        shares = n / effective_price
+                        cash = 2 * n
+                        position = -shares
                     current_trade = Trade(idx, effective_price, "short")
-                    current_trade.shares = shares
+                    current_trade.shares = abs(shares) if isinstance(shares, (int,float)) else abs(position)
                     avg_cost = effective_price
-                    initial_quantity = shares
+                    initial_quantity = abs(shares) if isinstance(shares, (int,float)) else abs(position)
                     entry_atr_value = self._stamp_entry_atr(atr_series, idx, effective_price)
                     hold.open(effective_price, "short", commission)
                     stamp_open_from_label(_entry_stamp(row))
@@ -1925,6 +2005,22 @@ class Backtester:
                     ):
                         pending_close_fraction = 1.0
                         pending_close_reason = "sl"
+                # Margin-based circuit breaker (per-trade drawdown, matches Go engine)
+                if (self._margin_per_trade_usd is not None
+                    and self._margin_locked > 0
+                    and position != 0
+                    and avg_cost > 0
+                    and self.circuit_breaker_max_drawdown_pct is not None):
+                    unrealized_pnl = position * (mark_price - avg_cost)
+                    if unrealized_pnl < 0:
+                        margin_dd_pct = (abs(unrealized_pnl) / self._margin_locked) * 100
+                        if margin_dd_pct >= self.circuit_breaker_max_drawdown_pct:
+                            pending_close_fraction = 1.0
+                            pending_close_reason = "circuit_breaker"
+                # Equity-level circuit breaker override (existing logic)
+                if self._cb_active and position != 0 and pending_close_fraction <= 0:
+                    pending_close_fraction = 1.0
+                    pending_close_reason = "circuit_breaker"
                 continue
 
             # Standalone hard stop fires first: close at this bar's open before
@@ -1934,7 +2030,11 @@ class Backtester:
                 effective_price = fill_price * (1 - self.slippage_pct)
                 proceeds = position * effective_price
                 commission = proceeds * self.commission_pct
-                cash = proceeds - commission
+                if self._margin_per_trade_usd and self._margin_locked > 0:
+                    realized_pnl = position * (effective_price - avg_cost)
+                    cash += self._margin_locked + realized_pnl - commission
+                else:
+                    cash = proceeds - commission
                 position = 0.0
                 if current_trade:
                     current_trade.close(idx, effective_price)
@@ -1944,6 +2044,8 @@ class Backtester:
                     current_trade = None
                 pending_signal_sl_close = False
                 sl_trigger_px = 0.0
+                self._margin_locked = 0.0
+                self._notional = 0.0
                 avg_cost = 0.0
                 entry_atr_value = 0.0
                 sl_high_water_px = 0.0
@@ -1956,7 +2058,11 @@ class Backtester:
                 effective_price = fill_price * (1 + self.slippage_pct)
                 cost = abs(position) * effective_price
                 commission = cost * self.commission_pct
-                cash -= cost + commission
+                if self._margin_per_trade_usd and self._margin_locked > 0:
+                    realized_pnl = abs(position) * (avg_cost - effective_price)
+                    cash += self._margin_locked - cost - commission
+                else:
+                    cash -= cost + commission
                 position = 0.0
                 if current_trade:
                     current_trade.close(idx, effective_price)
@@ -1966,6 +2072,8 @@ class Backtester:
                     current_trade = None
                 pending_signal_sl_close = False
                 sl_trigger_px = 0.0
+                self._margin_locked = 0.0
+                self._notional = 0.0
                 avg_cost = 0.0
                 entry_atr_value = 0.0
                 sl_high_water_px = 0.0
@@ -1985,7 +2093,7 @@ class Backtester:
             # review). Bust account: entries skip until end of data. The
             # long/flat path can't reach negative cash today, but carries the
             # same guard so the invariant holds by construction.
-            if plain_short_for_bar and signal == -1 and position == 0 and cash > 0 and not regime_blocked:
+            if plain_short_for_bar and signal == -1 and position == 0 and cash > 0 and not regime_blocked and not self._cb_active and (atr_series is None or self._stamp_entry_atr(atr_series, idx, fill_price) > 0):
                 # SELL — open short with full notional. Mirrors the engine
                 # path's short-open mechanics: pay commission, receive the
                 # short-sale proceeds (cash = 2 * notional).
@@ -2028,22 +2136,28 @@ class Backtester:
                 effective_price = fill_price * (1 + self.slippage_pct)
                 cost = abs(position) * effective_price
                 commission = cost * self.commission_pct
-                cash -= cost + commission
+                if self._margin_per_trade_usd and self._margin_locked > 0:
+                    realized_pnl = abs(position) * (avg_cost - effective_price)
+                    cash += self._margin_locked - cost - commission
+                else:
+                    cash -= cost + commission
                 position = 0.0
-
                 if current_trade:
                     current_trade.close(idx, effective_price)
                     _stamp_hold(current_trade, hold, entry_atr=entry_atr_value,
                                 exit_fee=commission, reason="signal")
+                    self._close_reason_counts["signal"] = self._close_reason_counts.get("signal", 0) + 1
                     trades.append(current_trade)
                     current_trade = None
                 sl_trigger_px = 0.0
+                self._margin_locked = 0.0
+                self._notional = 0.0
                 avg_cost = 0.0
                 entry_atr_value = 0.0
                 sl_high_water_px = 0.0
                 self._run_position_regime = ""
 
-            elif not plain_short_for_bar and signal == 1 and position == 0 and cash > 0 and not regime_blocked:
+            elif not plain_short_for_bar and signal == 1 and position == 0 and cash > 0 and not regime_blocked and not self._cb_active and (atr_series is None or self._stamp_entry_atr(atr_series, idx, fill_price) > 0):
                 # BUY — go long with all available cash
                 effective_price = fill_price * (1 + self.slippage_pct)
                 commission = cash * self.commission_pct
@@ -2085,16 +2199,22 @@ class Backtester:
                 effective_price = fill_price * (1 - self.slippage_pct)
                 proceeds = position * effective_price
                 commission = proceeds * self.commission_pct
-                cash = proceeds - commission
+                if self._margin_per_trade_usd and self._margin_locked > 0:
+                    realized_pnl = position * (effective_price - avg_cost)
+                    cash += self._margin_locked + realized_pnl - commission
+                else:
+                    cash = proceeds - commission
                 position = 0.0
-
                 if current_trade:
                     current_trade.close(idx, effective_price)
                     _stamp_hold(current_trade, hold, entry_atr=entry_atr_value,
                                 exit_fee=commission, reason="signal")
+                    self._close_reason_counts["signal"] = self._close_reason_counts.get("signal", 0) + 1
                     trades.append(current_trade)
                     current_trade = None
                 sl_trigger_px = 0.0
+                self._margin_locked = 0.0
+                self._notional = 0.0
                 avg_cost = 0.0
                 entry_atr_value = 0.0
                 sl_high_water_px = 0.0
@@ -2142,6 +2262,9 @@ class Backtester:
                         sl_trigger_px = candidate
                 if self._sl_hit("short", mark_price, sl_trigger_px):
                     pending_signal_sl_close = True
+            # Circuit breaker override (highest priority)
+            if self._cb_active and position != 0 and not pending_signal_sl_close:
+                pending_signal_sl_close = True
 
         # Close any open position at the end
         if position != 0:
@@ -2149,18 +2272,26 @@ class Backtester:
                 final_price = df["close"].iloc[-1] * (1 - self.slippage_pct)
                 proceeds = position * final_price
                 commission = proceeds * self.commission_pct
-                cash += proceeds - commission
+                if self._margin_per_trade_usd and self._margin_locked > 0:
+                    realized_pnl = position * (final_price - avg_cost)
+                    cash += self._margin_locked + realized_pnl - commission
+                else:
+                    cash += proceeds - commission
             else:
                 final_price = df["close"].iloc[-1] * (1 + self.slippage_pct)
                 cost = abs(position) * final_price
                 commission = cost * self.commission_pct
-                cash -= cost + commission
+                if self._margin_per_trade_usd and self._margin_locked > 0:
+                    realized_pnl = abs(position) * (avg_cost - final_price)
+                    cash += self._margin_locked - cost - commission
+                else:
+                    cash -= cost + commission
             position = 0.0
-
             if current_trade:
                 current_trade.close(df.index[-1], final_price)
                 _stamp_hold(current_trade, hold, entry_atr=entry_atr_value,
                             exit_fee=commission, reason="end_of_data")
+                self._close_reason_counts["end_of_data"] = self._close_reason_counts.get("end_of_data", 0) + 1
                 trades.append(current_trade)
 
         final_equity = cash
@@ -2551,6 +2682,7 @@ class Backtester:
             "total_trades": total_trades,
             "avg_win_pct": round(avg_win * 100, 2),
             "avg_loss_pct": round(avg_loss * 100, 2),
+            "close_reason_counts": dict(self._close_reason_counts),
             "liquidated": liquidated,
         }
 

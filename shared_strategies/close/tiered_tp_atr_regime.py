@@ -123,6 +123,10 @@ def evaluate(position: dict, market: dict, params: dict) -> dict:
                 "atr_value": entry_atr,
             }
 
+    tp_enabled = params.get("tp_enabled", True)
+    if not tp_enabled:
+        return {"close_fraction": 0.0, "reason": "noop:tp_disabled"}
+
     tiers, errs = _resolve_tiers_for_regime(params, regime)
     if errs or not tiers:
         return {"close_fraction": 0.0, "reason": "noop:tier_resolution_failed"}

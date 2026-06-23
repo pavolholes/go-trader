@@ -86,7 +86,28 @@ def _normalize_result(name: str, result: Optional[dict]) -> dict:
         close_fraction = 0.0
     close_fraction = min(max(close_fraction, 0.0), 1.0)
     reason = str(result.get("reason") or f"{name}:no_reason")
-    return {"close_fraction": close_fraction, "reason": reason}
+
+    out = {"close_fraction": close_fraction, "reason": reason}
+
+    sl_raw = result.get("sl_price")
+    if sl_raw is not None:
+        try:
+            sl_price = float(sl_raw)
+        except (TypeError, ValueError):
+            sl_price = 0.0
+        if sl_price > 0:
+            out["sl_price"] = sl_price
+
+    atr_raw = result.get("atr_value")
+    if atr_raw is not None:
+        try:
+            atr_value = float(atr_raw)
+        except (TypeError, ValueError):
+            atr_value = 0.0
+        if atr_value > 0:
+            out["atr_value"] = atr_value
+
+    return out
 
 
 def _rewrite_deprecated_close(name: str, params: Optional[dict]) -> tuple[str, dict]:

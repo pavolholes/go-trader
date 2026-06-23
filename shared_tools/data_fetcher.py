@@ -7,6 +7,8 @@ import time
 from typing import Optional
 from datetime import datetime
 
+import os
+import requests
 import ccxt
 import pandas as pd
 
@@ -162,6 +164,90 @@ def fetch_full_history(
     return df
 
 
+
+def fetch_blofin_full_history(
+    symbol: str = "BTC/USDT",
+    timeframe: str = "1d",
+    since: str = "2020-01-01",
+    exchange_id: str = "blofin",
+    store: bool = True,
+) -> pd.DataFrame:
+    """Fetch complete historical OHLCV data from BloFin REST API with pagination."""
+    blofin_symbol = symbol.replace("/", "-")
+    if "-USDT" not in blofin_symbol:
+        parts = blofin_symbol.split("-")
+        blofin_symbol = parts[0] + "-USDT"
+
+    bar_map = {
+        "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m",
+        "1h": "1H", "2h": "2H", "4h": "4H",
+        "1d": "1D", "1w": "1W", "1M": "1M",
+    }
+    bar = bar_map.get(timeframe, "1H")
+
+    base_url = os.environ.get("BLOFIN_BASE_URL", "https://demo-trading-openapi.blofin.com")
+    since_ts = int(pd.Timestamp(since).timestamp() * 1000)
+    limit = 1440
+    all_candles = []
+    after = None
+
+    print(f"Fetching BloFin {blofin_symbol} {timeframe} from {since}...")
+    net_retries = 0
+    while True:
+        params = {"instId": blofin_symbol, "bar": bar, "limit": str(limit)}
+        if after is not None:
+            params["after"] = str(after)
+        try:
+            resp = requests.get(base_url + "/api/v1/market/candles", params=params, timeout=30)
+            net_retries = 0
+        except requests.RequestException as e:
+            net_retries += 1
+            if net_retries >= 5:
+                print(f"Network error after {net_retries} retries: {e}")
+                break
+            time.sleep(5)
+            continue
+        data = resp.json()
+        if data.get("code") != "0":
+            print(f"BloFin API error: {data.get("msg")}")
+            break
+        candles = data.get("data", [])
+        if not candles:
+            break
+        for c in candles:
+            try:
+                ts = int(c[0])
+                if ts < since_ts:
+                    continue
+                all_candles.append([ts, float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[5])])
+            except (IndexError, ValueError, TypeError):
+                continue
+        oldest_ts = min(int(c[0]) for c in candles)
+        if after is not None and oldest_ts >= after:
+            break
+        after = oldest_ts
+        if oldest_ts <= since_ts:
+            break
+        time.sleep(0.2)
+
+    if not all_candles:
+        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+
+    df = pd.DataFrame(all_candles, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df.drop_duplicates(subset=["timestamp"], inplace=True)
+    df.sort_values("timestamp", inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    start = pd.to_datetime(df["timestamp"].iloc[0], unit="ms")
+    end = pd.to_datetime(df["timestamp"].iloc[-1], unit="ms")
+    print(f"Fetched {len(df)} candles from {start} to {end}")
+
+    if store:
+        store_ohlcv(df, exchange_id, symbol, timeframe)
+
+    df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms")
+    df.set_index("datetime", inplace=True)
+    return df
+
 def load_cached_data(
     symbol: str = "BTC/USDT",
     timeframe: str = "1d",
@@ -184,7 +270,10 @@ def load_cached_data(
     if df.empty:
         print(f"No cached data for {symbol} {timeframe}, fetching from exchange...")
         since = start_date or "2020-01-01"
-        df = fetch_full_history(symbol, timeframe, since, exchange_id, store=True)
+        if exchange_id == "blofin":
+            df = fetch_blofin_full_history(symbol, timeframe, since, exchange_id, store=True)
+        else:
+            df = fetch_full_history(symbol, timeframe, since, exchange_id, store=True)
 
     return df
 
