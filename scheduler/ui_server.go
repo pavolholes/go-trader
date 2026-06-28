@@ -28,14 +28,17 @@ type UIStrategy struct {
 }
 
 type UIStrategyOverview struct {
-	ID               string                 `json:"id"`
-	Platform         string                 `json:"platform"`
-	Symbol           string                 `json:"symbol"`
-	PnLPct           float64                `json:"pnl_pct"`
-	WinRate          float64                `json:"win_rate,omitempty"`
-	Sharpe           float64                `json:"sharpe,omitempty"`
-	Regime           string                 `json:"regime,omitempty"`
-	Direction        string                 `json:"direction,omitempty"`
+	ID                 string                 `json:"id"`
+	Platform           string                 `json:"platform"`
+	Symbol             string                 `json:"symbol"`
+	Timeframe          string                 `json:"timeframe"`
+	TradeCount         int                    `json:"trade_count"`
+	ActiveTradesNow    int                    `json:"active_trades_now"`
+	PnLPct             float64                `json:"pnl_pct"`
+	WinRate            float64                `json:"win_rate,omitempty"`
+	Sharpe             float64                `json:"sharpe,omitempty"`
+	Regime             string                 `json:"regime,omitempty"`
+	Direction          string                 `json:"direction,omitempty"`
 	PnL                float64                `json:"pnl"`
 	PortfolioValue     float64                `json:"portfolio_value"`
 	InitialCapital     float64                `json:"initial_capital"`
@@ -455,10 +458,18 @@ func (ss *StatusServer) uiStrategyOverview(id string) (UIStrategyOverview, Lifet
 		winRate = float64(lifetime.Wins) / float64(lifetime.Wins+lifetime.Losses) * 100
 	}
 
+	activeTradesNow := len(snapshot.Positions) + len(snapshot.OptionPositions)
+	if activeTradesNow < 0 {
+		activeTradesNow = 0
+	}
+
 	return UIStrategyOverview{
 		ID:                 id,
 		Platform:           sc.Platform,
 		Symbol:             strategyDisplaySymbol(sc),
+		Timeframe:          strategyDisplayTimeframe(sc),
+		TradeCount:         len(snapshot.TradeHistory),
+		ActiveTradesNow:    activeTradesNow,
 		PnLPct:             pnlPct,
 		WinRate:            winRate,
 		Sharpe:             sharpe,

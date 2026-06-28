@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <rect width="32" height="32" rx="6" fill="#1a1a2e"/>
+  <!-- candle 1 (red) -->
+  <line x1="7" y1="8" x2="7" y2="24" stroke="#c23b3b" stroke-width="1.2"/>
+  <rect x="5" y="10" width="4" height="8" rx="0.5" fill="#c23b3b"/>
+  <!-- candle 2 (green, tall) -->
+  <line x1="16" y1="4" x2="16" y2="28" stroke="#0f8a5f" stroke-width="1.2"/>
+  <rect x="14" y="6" width="4" height="18" rx="0.5" fill="#0f8a5f"/>
+  <!-- candle 3 (red) -->
+  <line x1="25" y1="10" x2="25" y2="26" stroke="#c23b3b" stroke-width="1.2"/>
+  <rect x="23" y="12" width="4" height="10" rx="0.5" fill="#c23b3b"/>
+</svg>

@@ -12,6 +12,7 @@
     sortDir: "desc",
 chart: null,
     series: null,
+    summaryLoaded: false,
     timer: 0,
     sparklines: {},
     tuner: {
@@ -57,6 +58,10 @@ chart: null,
     sidebarBackdrop: document.getElementById("sidebar-backdrop"),
     workspace: document.querySelector(".workspace"),
     overviewPanel: document.getElementById("overview-panel"),
+    summaryPanel: document.getElementById("summary-panel"),
+    summaryContent: document.getElementById("summary-content"),
+    summaryLoading: document.getElementById("summary-loading"),
+    summaryDailyPnlChart: document.getElementById("summary-today-pnl-chart"),
     overviewBody: document.getElementById("overview-body"),
     detailPanel: document.getElementById("detail-panel"),
     tunerPanel: document.getElementById("tuner-panel"),
@@ -175,14 +180,24 @@ chart: null,
   }
 
   async function getJSON(url) {
-    const res = await fetch(url, { headers: authHeaders() });
-    if (!res.ok) {
-      const text = await res.text();
-      const err = new Error(text || res.statusText);
-      err.status = res.status;
-      throw err;
+    const controller = new AbortController();
+    const timer = setTimeout(function() { controller.abort(); }, 30000);
+    try {
+      const res = await fetch(url, { headers: authHeaders(), signal: controller.signal });
+      clearTimeout(timer);
+      if (!res.ok) {
+        const text = await res.text();
+        const err = new Error(text || res.statusText);
+        err.status = res.status;
+        throw err;
+      }
+      const json = await res.json();
+      return json;
+    } catch (e) {
+      clearTimeout(timer);
+      console.error("[DEBUG] getJSON FAILED:", url, e.message ? e.message : String(e));
+      throw e;
     }
-    return res.json();
   }
 
   function isDarkMode() {
@@ -227,9 +242,10 @@ chart: null,
   }
 
 
-  function loadViewMode() {
+    function loadViewMode() {
     const saved = window.localStorage.getItem(VIEW_MODE_KEY);
-    return saved === "table" ? "table" : "detail";
+    if (saved === "table" || saved === "summary") return saved;
+    return "summary";
   }
 
   function saveViewMode(mode) {
@@ -237,16 +253,43 @@ chart: null,
   }
 
   function applyViewMode() {
-    const tableMode = state.viewMode === "table";
-    els.overviewPanel.hidden = !tableMode;
-    els.detailPanel.hidden = tableMode;
-    els.viewMode.textContent = tableMode ? "Detail" : "Table";
-    els.viewMode.setAttribute("aria-pressed", tableMode ? "true" : "false");
-    document.querySelector(".content").classList.toggle("content-table", tableMode);
+    const isTable = state.viewMode === "table";
+    const isSummary = state.viewMode === "summary";
+    els.overviewPanel.hidden = !isTable;
+    els.summaryPanel.hidden = !isSummary;
+    els.detailPanel.hidden = isTable || isSummary;
+    document.querySelector(".content").classList.toggle("content-table", isTable);
+    document.querySelector(".content").classList.toggle("content-summary", isSummary);
+    updateTopbarHeading();
+    if (isSummary) {
+      els.viewMode.textContent = "Table";
+    } else if (isTable) {
+      els.viewMode.textContent = "Summary";
+    } else {
+      els.viewMode.textContent = "Table";
+    }
+  }
+
+  function updateTopbarHeading() {
+    if (state.viewMode === "table") {
+      els.title.textContent = "All Strategies";
+      els.subtitle.textContent = "Overview — Table";
+    } else if (state.viewMode === "summary") {
+      els.title.textContent = "Summary";
+      els.subtitle.textContent = "Aggregated Metrics";
+    } else {
+      const strategy = activeStrategy();
+      if (strategy) {
+        els.title.textContent = strategy.id;
+        els.subtitle.textContent = [strategy.platform, strategy.symbol, strategy.timeframe].filter(Boolean).join(" / ");
+      }
+    }
   }
 
   function toggleViewMode() {
-    state.viewMode = state.viewMode === "table" ? "detail" : "table";
+    if (state.viewMode === "detail") state.viewMode = "table";
+    else if (state.viewMode === "table") state.viewMode = "summary";
+    else state.viewMode = "table";
     saveViewMode(state.viewMode);
     applyViewMode();
     refreshAll().catch(handleRefreshError);
@@ -400,16 +443,13 @@ chart: null,
     updateRegimeBadge("");
     updateDivergenceBadge(null);
     const strategy = activeStrategy();
-    if (strategy) {
-      els.title.textContent = strategy.id;
-      els.subtitle.textContent = [strategy.platform, strategy.symbol, strategy.timeframe].filter(Boolean).join(" / ");
-    }
     renderStrategies();
     if (opts.switchToDetail) {
       state.viewMode = "detail";
       saveViewMode(state.viewMode);
       applyViewMode();
     }
+    updateTopbarHeading();
     if (isMobileSidebar()) {
       setSidebarOpen(false);
     }
@@ -870,7 +910,7 @@ chart: null,
 
 
   function sortValue(row, key) {
-    if (key === "pnl_pct" || key === "pnl" || key === "current_drawdown_pct" || key === "win_rate" || key === "sharpe") {
+    if (key === "trade_count" || key === "active_trades_now" || key === "pnl_pct" || key === "pnl" || key === "current_drawdown_pct" || key === "win_rate" || key === "sharpe") {
       const n = Number(row[key]);
       return Number.isFinite(n) ? n : -Infinity;
     }
@@ -879,6 +919,9 @@ chart: null,
   }
 
   function filterValue(row, key) {
+    if (key === "trade_count") return row.trade_count !== undefined ? String(row.trade_count) : "-";
+    if (key === "active_trades_now") return row.active_trades_now !== undefined ? String(row.active_trades_now) : "-";
+    if (key === "timeframe") return row.timeframe || "-";
     if (key === "pnl_pct") return fmtPct(row.pnl_pct);
     if (key === "pnl") return row.pnl !== undefined ? fmtSignedMoney(row.pnl) : "-";
     if (key === "current_drawdown_pct") return row.current_drawdown_pct ? fmtPct(row.current_drawdown_pct) : "-";
@@ -942,6 +985,9 @@ chart: null,
         "<td>" + escapeHTML(row.id) + "</td>" +
         "<td>" + escapeHTML(row.platform || "-") + "</td>" +
         "<td>" + escapeHTML(row.symbol || "-") + "</td>" +
+        "<td>" + escapeHTML(row.timeframe || "-") + "</td>" +
+        "<td>" + escapeHTML(row.trade_count !== undefined ? String(row.trade_count) : "-") + "</td>" +
+        "<td>" + escapeHTML(row.active_trades_now !== undefined ? String(row.active_trades_now) : "-") + "</td>" +
         '<td class="' + pnlClassName + '">' + escapeHTML(fmtPct(row.pnl_pct)) + "</td>" +
         '<td class="' + pnlDollarClass + '">' + escapeHTML(row.pnl !== undefined ? fmtSignedMoney(row.pnl) : "-") + "</td>" +
         '<td class="' + ddClass + '">' + escapeHTML(row.current_drawdown_pct ? fmtPct(row.current_drawdown_pct) : "-") + "</td>" +
@@ -976,6 +1022,10 @@ chart: null,
 
   async function refreshAll() {
     try {
+      if (state.viewMode === "summary") {
+        await refreshSummary();
+        return;
+      }
       if (state.viewMode === "table") {
         await refreshOverview();
         return;
@@ -1005,7 +1055,7 @@ chart: null,
 
   function fmtMoney(value) {
     const n = Number(value || 0);
-    return "$" + n.toLocaleString(undefined, { maximumFractionDigits: 2 });
+    return n.toLocaleString(undefined, { maximumFractionDigits: 2 }) + " $";
   }
 
   function fmtSignedMoney(value) {
@@ -1016,6 +1066,12 @@ chart: null,
   function fmtPct(value) {
     if (value === undefined || value === null || Number.isNaN(Number(value))) return "-";
     return Number(value).toFixed(2) + "%";
+  }
+
+  function fmtCapitalPct(pnl, strategyCount) {
+    const capital = Number(strategyCount || 0) * 1000;
+    if (!capital || Number.isNaN(Number(pnl))) return "-";
+    return fmtPct((Number(pnl) / capital) * 100);
   }
 
   function fmtNumber(value) {
@@ -1098,6 +1154,11 @@ chart: null,
     if (!row || !row.dataset.id) return;
     selectStrategy(row.dataset.id, { switchToDetail: true }).catch(handleRefreshError);
   });
+  document.querySelector(".summary-panel").addEventListener("click", function (event) {
+    const row = event.target.closest(".summary-row");
+    if (!row || !row.dataset.id) return;
+    selectStrategy(row.dataset.id, { switchToDetail: true }).catch(handleRefreshError);
+  });
   document.querySelectorAll(".sort-button").forEach(function (button) {
     button.addEventListener("click", function () {
       const key = button.dataset.key;
@@ -1142,4 +1203,231 @@ chart: null,
     els.statusGrid.innerHTML = "<dt>API</dt><dd>Unauthorized</dd>";
     els.authToken.focus();
   }
+// --- Summary view ---
+
+async function refreshSummary() {
+  let resp;
+  const firstLoad = !state.summaryLoaded;
+  if (firstLoad && els.summaryLoading) {
+    els.summaryLoading.textContent = "Loading summary...";
+    els.summaryLoading.hidden = false;
+  }
+  if (firstLoad && els.summaryContent) {
+    els.summaryContent.hidden = true;
+  }
+  try {
+    resp = await getJSON("/api/summary");
+  } catch (e) {
+    console.error("[DEBUG] refreshSummary: getJSON FAILED:", e.message ? e.message : String(e));
+    if (els.summaryLoading && !state.summaryLoaded) {
+      els.summaryLoading.textContent = "Summary failed to load.";
+      els.summaryLoading.hidden = false;
+    }
+    return;
+  }
+
+  // Cards
+  document.getElementById("summary-total-strategies").textContent = String(resp.total_strategies);
+  document.getElementById("summary-with-trades").textContent = String(resp.with_trades);
+  document.getElementById("summary-open-positions").textContent = String(resp.open_positions);
+  document.getElementById("summary-total-pnl").textContent = fmtSignedMoney(resp.total_pnl);
+  document.getElementById("summary-total-pnl").className = pnlClass(resp.total_pnl) ? "summary-card-value " + pnlClass(resp.total_pnl) : "summary-card-value";
+  document.getElementById("summary-today-pnl").textContent = fmtSignedMoney(resp.today_pnl);
+  document.getElementById("summary-today-pnl").className = pnlClass(resp.today_pnl) ? "summary-card-value " + pnlClass(resp.today_pnl) : "summary-card-value";
+  document.getElementById("summary-today-trades").textContent = String(resp.today_trades);
+  document.getElementById("summary-today-wl").textContent = resp.today_wins + "/" + resp.today_losses;
+  document.getElementById("summary-long-pnl").textContent = fmtSignedMoney(resp.long_pnl);
+  document.getElementById("summary-short-pnl").textContent = fmtSignedMoney(resp.short_pnl);
+
+  // Top by PnL
+  renderSummaryTable("summary-top-pnl", resp.top_by_pnl, ["pnl_pct", "win_rate", "sharpe", "total_trades"]);
+  renderSummaryTable("summary-bottom-pnl", resp.bottom_by_pnl, ["pnl_pct", "win_rate", "sharpe", "total_trades"]);
+  renderSummaryTable("summary-top-wr", resp.top_by_winrate, ["pnl_pct", "win_rate", "sharpe", "total_trades"]);
+  renderSummaryTable("summary-top-trades", resp.top_by_trades, ["pnl_pct", "win_rate", "sharpe", "total_trades"]);
+  renderSummaryTypeTable("summary-by-type", resp.by_type);
+  renderSummarySymbolTable("summary-by-symbol", resp.by_symbol);
+  renderDailyPnlChart(resp.today_pnl_history);
+  renderSummaryPairTable("summary-by-strategy-symbol", resp.by_strategy_symbol);
+  renderSummaryPairTable("summary-by-strategy-timeframe", resp.by_strategy_timeframe);
+
+  els.statusDot.className = "status-dot ok";
+  els.statusLabel.textContent = "Summary live";
+  els.statusGrid.innerHTML = "<dt>Generated</dt><dd>" + escapeHTML(new Date(resp.generated_at * 1000).toLocaleString()) + "</dd>" +
+    "<dt>Strategies</dt><dd>" + escapeHTML(String(resp.total_strategies)) + "</dd>" +
+    "<dt>With trades</dt><dd>" + escapeHTML(String(resp.with_trades)) + "</dd>" +
+    "<dt>Total PnL</dt><dd>" + escapeHTML(fmtSignedMoney(resp.total_pnl)) + "</dd>" +
+    "<dt>Today PnL</dt><dd>" + escapeHTML(fmtSignedMoney(resp.today_pnl)) + "</dd>";
+  els.positions.innerHTML = '<div class="position-row"><span>Summary view</span><span>Select a strategy for detail</span></div>';
+  state.summaryLoaded = true;
+  if (els.summaryLoading) {
+    els.summaryLoading.hidden = true;
+  }
+  if (els.summaryContent) {
+    els.summaryContent.hidden = false;
+  }
+
+}
+
+
+function renderDailyPnlChart(rows) {
+  const el = els.summaryDailyPnlChart;
+  if (!el) return;
+  const data = (rows || []).slice(-14);
+  if (!data.length) {
+    el.innerHTML = '<div class="summary-chart-empty">No data</div>';
+    return;
+  }
+  const values = data.map(function (r) { return Number(r.pnl || 0); });
+  const maxAbs = Math.max(1, values.reduce(function (m, v) { return Math.max(m, Math.abs(v)); }, 0));
+  const bars = data.map(function (r) {
+    const pnl = Number(r.pnl || 0);
+    const pct = Math.max(2, Math.min(48, Math.abs(pnl) / maxAbs * 48));
+    const isPos = pnl >= 0;
+    const day = String(r.date || "").slice(5);
+    const valueLabel = fmtSignedMoney(pnl);
+    return '<div class="summary-chart-bar">' +
+      '<div class="summary-chart-bar-fill' + (isPos ? '' : ' negative') + '" style="' + (isPos ? 'bottom: 50%;' : 'top: 50%;') + 'height: ' + pct + '%;"></div>' +
+      '<div class="summary-chart-bar-value ' + (isPos ? 'positive' : 'negative') + '">' + escapeHTML(valueLabel) + '</div>' +
+      '<div class="summary-chart-bar-label">' + escapeHTML(day) + '</div>' +
+      '</div>';
+  }).join('');
+  el.innerHTML = '<div class="summary-chart-grid"></div><div class="summary-chart-bars">' + bars + '</div>';
+}
+
+function renderSummaryTable(tableId, rows, extraFields) {
+  const tbody = document.getElementById(tableId);
+  if (!rows || !rows.length) {
+    tbody.innerHTML = '<tr><td colspan="9">No data</td></tr>';
+    return;
+  }
+  tbody.innerHTML = rows.map(function (r) {
+    const pnlCls = r.pnl > 0 ? "pnl-pos" : r.pnl < 0 ? "pnl-neg" : "";
+    const wrCls = r.win_rate > 50 ? "pnl-pos" : r.win_rate > 0 ? "" : "";
+    return '<tr class="summary-row" data-id="' + escapeHTML(r.id) + '">' +
+      "<td>" + escapeHTML(r.strategy) + "</td>" +
+      "<td>" + escapeHTML(r.symbol) + "</td>" +
+      "<td>" + escapeHTML(r.timeframe) + "</td>" +
+      "<td>" + escapeHTML(r.direction) + "</td>" +
+      '<td class="' + pnlCls + '">' + escapeHTML(fmtSignedMoney(r.pnl)) + "</td>" +
+      "<td>" + escapeHTML(fmtPct(r.pnl_pct)) + "</td>" +
+      '<td class="' + wrCls + '">' + escapeHTML(fmtPct(r.win_rate)) + "</td>" +
+      "<td>" + escapeHTML(String(r.total_trades)) + "</td>" +
+      "<td>" + escapeHTML(r.sharpe ? fmtNumber(r.sharpe) : "-") + "</td>" +
+      "</tr>";
+  }).join("");
+}
+
+function renderSummaryPairTable(tableId, rows) {
+  const tbody = document.getElementById(tableId);
+  const limited = rows ? rows.slice(0, 30) : [];
+  if (!limited.length) {
+    tbody.innerHTML = '<tr><td colspan="8">No data</td></tr>';
+    return;
+  }
+  tbody.innerHTML = limited.map(function (r) {
+    const pnlCls = r.total_pnl > 0 ? "pnl-pos" : r.total_pnl < 0 ? "pnl-neg" : "";
+    return '<tr class="summary-row">' +
+      "<td>" + escapeHTML(r.strategy) + "</td>" +
+      "<td>" + escapeHTML(r.secondary) + "</td>" +
+      "<td>" + escapeHTML(String(r.total)) + "</td>" +
+      "<td>" + escapeHTML(String(r.with_trades)) + "</td>" +
+      '<td class="' + pnlCls + '">' + escapeHTML(fmtSignedMoney(r.total_pnl)) + "</td>" +
+      "<td>" + escapeHTML(fmtPct(r.pnl_pct)) + "</td>" +
+      "<td>" + escapeHTML(String(r.total_trades)) + "</td>" +
+      "<td>" + escapeHTML(fmtPct(r.win_rate)) + "</td>" +
+      "</tr>";
+  }).join("");
+}
+
+function renderSummaryWrTable(tableId, rows) {
+  const tbody = document.getElementById(tableId);
+  if (!rows || !rows.length) {
+    tbody.innerHTML = '<tr><td colspan="8">No data</td></tr>';
+    return;
+  }
+  tbody.innerHTML = rows.map(function (r) {
+    const pnlCls = r.pnl > 0 ? "pnl-pos" : r.pnl < 0 ? "pnl-neg" : "";
+    const wrCls = r.win_rate > 50 ? "pnl-pos" : "";
+    return '<tr class="summary-row" data-id="' + escapeHTML(r.id) + '">' +
+      "<td>" + escapeHTML(r.strategy) + "</td>" +
+      "<td>" + escapeHTML(r.symbol) + "</td>" +
+      "<td>" + escapeHTML(r.timeframe) + "</td>" +
+      '<td class="' + wrCls + '">' + escapeHTML(fmtPct(r.win_rate)) + "</td>" +
+      "<td>" + escapeHTML(String(r.total_trades)) + "</td>" +
+      '<td class="' + pnlCls + '">' + escapeHTML(fmtSignedMoney(r.pnl)) + "</td>" +
+      "<td>" + escapeHTML(fmtPct(r.pnl_pct)) + "</td>" +
+      "<td>" + escapeHTML(r.sharpe ? fmtNumber(r.sharpe) : "-") + "</td>" +
+      "</tr>";
+  }).join("");
+}
+
+function renderSummaryActiveTable(tableId, rows) {
+  const tbody = document.getElementById(tableId);
+  if (!rows || !rows.length) {
+    tbody.innerHTML = '<tr><td colspan="7">No data</td></tr>';
+    return;
+  }
+  tbody.innerHTML = rows.map(function (r) {
+    const pnlCls = r.pnl > 0 ? "pnl-pos" : r.pnl < 0 ? "pnl-neg" : "";
+    return '<tr class="summary-row" data-id="' + escapeHTML(r.id) + '">' +
+      "<td>" + escapeHTML(r.strategy) + "</td>" +
+      "<td>" + escapeHTML(r.symbol) + "</td>" +
+      "<td>" + escapeHTML(r.timeframe) + "</td>" +
+      "<td>" + escapeHTML(String(r.total_trades)) + "</td>" +
+      '<td class="' + pnlCls + '">' + escapeHTML(fmtSignedMoney(r.pnl)) + "</td>" +
+      "<td>" + escapeHTML(fmtPct(r.pnl_pct)) + "</td>" +
+      "<td>" + escapeHTML(fmtPct(r.win_rate)) + "</td>" +
+      "</tr>";
+  }).join("");
+}
+
+function renderSummaryTypeTable(tableId, rows) {
+  const tbody = document.getElementById(tableId);
+  if (!rows || !rows.length) {
+    tbody.innerHTML = '<tr><td colspan="10">No data</td></tr>';
+    return;
+  }
+  tbody.innerHTML = rows.map(function (r) {
+    const pnlCls = r.total_pnl > 0 ? "pnl-pos" : r.total_pnl < 0 ? "pnl-neg" : "";
+    const lCls = r.long_pnl > 0 ? "pnl-pos" : r.long_pnl < 0 ? "pnl-neg" : "";
+    const sCls = r.short_pnl > 0 ? "pnl-pos" : r.short_pnl < 0 ? "pnl-neg" : "";
+    return "<tr>" +
+      "<td>" + escapeHTML(r.type) + "</td>" +
+      "<td>" + escapeHTML(String(r.total)) + "</td>" +
+      "<td>" + escapeHTML(String(r.with_trades)) + "</td>" +
+      '<td class="' + pnlCls + '">' + escapeHTML(fmtSignedMoney(r.total_pnl)) + "</td>" +
+      "<td>" + escapeHTML(fmtCapitalPct(r.total_pnl, r.total)) + "</td>" +
+      "<td>" + escapeHTML(String(r.total_trades)) + "</td>" +
+      '<td class="' + lCls + '">' + escapeHTML(fmtSignedMoney(r.long_pnl)) + "</td>" +
+      "<td>" + escapeHTML(fmtCapitalPct(r.long_pnl, r.total)) + "</td>" +
+      '<td class="' + sCls + '">' + escapeHTML(fmtSignedMoney(r.short_pnl)) + "</td>" +
+      "<td>" + escapeHTML(fmtCapitalPct(r.short_pnl, r.total)) + "</td>" +
+      "</tr>";
+  }).join("");
+}
+
+function renderSummarySymbolTable(tableId, rows) {
+  const tbody = document.getElementById(tableId);
+  if (!rows || !rows.length) {
+    tbody.innerHTML = '<tr><td colspan="10">No data</td></tr>';
+    return;
+  }
+  tbody.innerHTML = rows.map(function (r) {
+    const pnlCls = r.total_pnl > 0 ? "pnl-pos" : r.total_pnl < 0 ? "pnl-neg" : "";
+    const lCls = r.long_pnl > 0 ? "pnl-pos" : r.long_pnl < 0 ? "pnl-neg" : "";
+    const sCls = r.short_pnl > 0 ? "pnl-pos" : r.short_pnl < 0 ? "pnl-neg" : "";
+    return "<tr>" +
+      "<td>" + escapeHTML(r.symbol) + "</td>" +
+      "<td>" + escapeHTML(String(r.total)) + "</td>" +
+      "<td>" + escapeHTML(String(r.with_trades)) + "</td>" +
+      '<td class="' + pnlCls + '">' + escapeHTML(fmtSignedMoney(r.total_pnl)) + "</td>" +
+      "<td>" + escapeHTML(fmtCapitalPct(r.total_pnl, r.total)) + "</td>" +
+      "<td>" + escapeHTML(String(r.total_trades)) + "</td>" +
+      '<td class="' + lCls + '">' + escapeHTML(fmtSignedMoney(r.long_pnl)) + "</td>" +
+      "<td>" + escapeHTML(fmtCapitalPct(r.long_pnl, r.total)) + "</td>" +
+      '<td class="' + sCls + '">' + escapeHTML(fmtSignedMoney(r.short_pnl)) + "</td>" +
+      "<td>" + escapeHTML(fmtCapitalPct(r.short_pnl, r.total)) + "</td>" +
+      "</tr>";
+  }).join("");
+}
 })();
