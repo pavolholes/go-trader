@@ -919,6 +919,10 @@ func main() {
 			// walletBalances is declared at cycle scope (above) and populated here.
 			var hlPositions []HLPosition
 			var hlStateFetched bool
+			// hlSnapshotAt stamps when the accountValue/uPnL snapshot below was
+			// taken; the #1100 cash-flow journal bounds its settled-event
+			// ingestion to this instant so an in-flight fill cannot read as drift.
+			var hlSnapshotAt time.Time
 			// Fetch clearinghouseState whenever any live HL strategy exists (#356
 			// per-strategy circuit closes need fresh positions even if no HL
 			// strategy is due this cycle).
@@ -928,6 +932,7 @@ func main() {
 					fmt.Printf("[WARN] hyperliquid clearinghouseState fetch failed: %v — falling back to per-wallet max and skipping position sync this cycle\n", err)
 				} else {
 					hlStateFetched = true
+					hlSnapshotAt = time.Now().UTC()
 					hlPositions = pos
 					if hlShared {
 						walletBalances[hlKey] = bal
@@ -956,6 +961,12 @@ func main() {
 			_, okxShared := sharedWallets[okxKey]
 			var okxPositions []OKXPosition
 			var okxStateFetched bool
+			// okxBalanceFetched / okxSnapshotAt mirror hlStateFetched / hlSnapshotAt:
+			// the #1105 OKX cash-flow journal bounds its bill ingestion to the eq
+			// snapshot instant so an in-flight bill cannot read as drift.
+			var okxBalanceFetched bool
+			var okxSnapshotUPnL float64
+			var okxSnapshotAt time.Time
 			if okxHasCreds && len(okxLivePerps) > 0 {
 				pos, err := defaultOKXPositionsFetcher()
 				if err != nil {
@@ -970,10 +981,18 @@ func main() {
 			// an API key. Independent subprocess so a fetch_positions outage
 			// doesn't starve the balance read.
 			if okxHasCreds && okxShared {
-				if bal, err := defaultSharedWalletBalance("okx"); err != nil {
+				// #1105: one fetch_balance read yields a COHERENT (eq, uPnL) pair —
+				// eq feeds the #918 split (walletBalances) unchanged, and the same
+				// snapshot's uPnL (eq − cashBal) feeds the cash-flow journal, so its
+				// expected-equity and reconciled eq cancel the uPnL term exactly
+				// (no jitter from a separately-timed fetch_positions read).
+				if eq, upnl, err := defaultOKXEquitySnapshot(); err != nil {
 					fmt.Printf("[WARN] okx balance fetch failed: %v — falling back to per-wallet max this cycle\n", err)
 				} else {
-					walletBalances[okxKey] = bal
+					walletBalances[okxKey] = eq
+					okxBalanceFetched = true
+					okxSnapshotUPnL = upnl
+					okxSnapshotAt = time.Now().UTC()
 				}
 			}
 			// #362: Fetch TopStep positions once per cycle when any live TS
@@ -992,6 +1011,33 @@ func main() {
 				} else {
 					tsStateFetched = true
 					tsPositions = pos
+				}
+			}
+			// #1106 phase 4 of #1100: fetch the TopStep account equity for the
+			// shared-wallet cash-flow journal when 2+ live TopStep futures strategies
+			// share an account. One fetch_topstep_balance.py read yields a COHERENT
+			// (equity, uPnL) pair — both feed the SHADOW journal only.
+			//
+			// Unlike the HL/OKX blocks, the equity is NOT written into walletBalances:
+			// the TopStep /v1/account/balance feed is unverified, and routing it into
+			// computeTotalPortfolioValue would put it on the live all-platform kill
+			// switch (CheckPortfolioRisk) behind only a >0 check. The journal uses its
+			// own detectTopStepSharedWallet grouping (not the kill-switch sharedWallets
+			// map), so portfolio risk stays on the pre-PR per-strategy member-PV path
+			// until Phase 4b verifies the feed and promotes it.
+			tsKey, tsShared := detectTopStepSharedWallet(cfg.Strategies)
+			var tsBalanceFetched bool
+			var tsSnapshotEquity float64
+			var tsSnapshotUPnL float64
+			var tsSnapshotAt time.Time
+			if tsShared {
+				if eq, upnl, err := defaultTopStepEquitySnapshot(); err != nil {
+					fmt.Printf("[WARN] topstep balance fetch failed: %v — shadow cash-flow journal skipped this cycle\n", err)
+				} else {
+					tsBalanceFetched = true
+					tsSnapshotEquity = eq
+					tsSnapshotUPnL = upnl
+					tsSnapshotAt = time.Now().UTC()
 				}
 			}
 
@@ -1065,7 +1111,56 @@ func main() {
 			driftResults := reconcileSharedWalletDisplayValues(cfg.Strategies, state, stateDB, sharedWallets, walletBalances, hlPositions, okxPositions, okxStateFetched)
 			mu.Unlock()
 
-			// Fire throttled drift alarms outside the lock (notifier I/O).
+			// #1100: switch the HL shared-wallet drift alarm onto the
+			// exchange-sourced cash-flow journal — the wallet TOTAL is
+			// reconstructed from on-chain fills + funding + transfers instead of
+			// the internal trade ledger, so modeled-fee / fallback-price / model-
+			// only-cleanup rows no longer read as drift. Fails closed to the
+			// trade-ledger drift when the journal is not usable (incomplete,
+			// fetch miss, or operator opt-out via GO_TRADER_CASHFLOW_JOURNAL_ALARM).
+			// Runs outside the lock: HTTP fetch + DB-only journal writes, no
+			// StrategyState mutation. Reuses the reconcile's coherent accountValue
+			// / position snapshot (walletBalances[hlKey] + hlPositions @
+			// hlSnapshotAt) and bounds the journal to that snapshot. OKX/TopStep
+			// keep the trade-ledger / capital-weight path untouched.
+			if hlShared && hlStateFetched {
+				rec := reconcileCashflowJournal(stateDB, hlKey, walletBalances[hlKey], sumHLAccountUPnL(hlPositions), hlSnapshotAt)
+				applyCashflowJournalDriftBasis(driftResults, hlKey, rec, cashflowJournalAlarmEnabled())
+			}
+
+			// #1105: OKX cash-flow journal — SHADOW phase (Phase 3a of #1100). The
+			// wallet TOTAL is reconstructed from OKX's account-bills feed (every
+			// settled-cash movement is a bill carrying balChg) and reconciled
+			// against eq, exactly as the HL journal does, but it ONLY logs the
+			// journal-vs-capital-weight comparison each cycle — it never drives the
+			// OKX drift alarm, which stays on the #918 capital-weight split.
+			// Flipping the OKX alarm onto the journal is Phase 3b, gated on this
+			// shadow log proving the OKX bills feed / eq field in production. Runs
+			// outside the lock (subprocess fetch + DB-only writes) and is bounded to
+			// the COHERENT eq/uPnL snapshot from the single balance read above
+			// (walletBalances[okxKey] + okxSnapshotUPnL @ okxSnapshotAt) — no
+			// positions dependency, so eq and uPnL share one instant.
+			if okxShared && okxBalanceFetched {
+				okxRec := reconcileOKXCashflowJournal(stateDB, okxKey, walletBalances[okxKey], okxSnapshotUPnL, okxSnapshotAt)
+				logOKXCashflowJournalShadow(driftResults, okxKey, okxRec)
+			}
+
+			// #1106 phase 4 of #1100: TopStep cash-flow journal — SHADOW phase. The
+			// wallet equity is reconstructed from TopStep's settled fills (gross realized
+			// PnL − commission per fill) and reconciled against the account equity, exactly
+			// as the HL/OKX journals do, but it ONLY logs each cycle — there is no live
+			// TopStep shared-wallet alarm to drive (TopStep is display-skipped). Flipping a
+			// TopStep alarm onto the journal is Phase 4b, gated on this shadow log proving
+			// the feed/equity field AND the TopStepX endpoint contracts in production. Runs
+			// outside the lock (subprocess fetch + DB-only writes), bounded to the COHERENT
+			// equity/uPnL snapshot from the single balance read above.
+			if tsShared && tsBalanceFetched {
+				tsRec := reconcileTopStepCashflowJournal(stateDB, tsKey, tsSnapshotEquity, tsSnapshotUPnL, tsSnapshotAt)
+				logTopStepCashflowJournalShadow(driftResults, tsKey, tsRec)
+			}
+
+			// Fire throttled drift alarms outside the lock (notifier I/O). For HL
+			// this keys off the journal drift when the switch above applied it.
 			reportSharedWalletDrift(notifier, driftResults)
 
 			// #341 / #345 / #346 / #347: Submit market closes to
@@ -1849,7 +1944,8 @@ func main() {
 							var execResult *HyperliquidExecuteResult
 							liveExecFailed := false
 							if result.Signal == 0 && hlPosQty > 0 && strategyUsesTrailingTPRatchetClose(sc) {
-								applyTrailingTPRatchet(sc, stratState, result.Symbol, price, &mu, logger)
+								ratchetAlert := applyTrailingTPRatchet(sc, stratState, result.Symbol, price, &mu, logger)
+								notifyRatchetTrigger(notifier, sc.NotifyRatchetTriggersEnabled(cfg), ratchetAlert)
 								mu.RLock()
 								if pos, ok3 := stratState.Positions[result.Symbol]; ok3 && pos != nil {
 									hlPosSnapshot = hyperliquidProtectionPositionSnapshot(pos)
@@ -1888,6 +1984,7 @@ func main() {
 										}
 										if newTrigger > 0 {
 											pos.StopLossTriggerPx = newTrigger
+											pos.RatchetFallbackNormalizePending = false
 											logger.Info("Paper trailing SL trigger updated @ $%.4f (high_water=$%.4f)", newTrigger, newHighWater)
 										}
 									}
@@ -2040,12 +2137,17 @@ func main() {
 							if !liveExecFailed {
 								mu.Lock()
 								var openTrade *Trade
+								var ratchetAlert *RatchetTriggerAlert
 								if scaleInAddQty > 0 {
 									trades, detail, openTrade = executeHyperliquidScaleInDeferredOpen(sc, stratState, result, execResult, signalStr, price, scaleInAddQty, logger)
 								} else {
-									trades, detail, openTrade = executeHyperliquidResultDeferredOpen(sc, stratState, result, execResult, signalStr, price, cfg.Regime, logger)
+									trades, detail, openTrade, ratchetAlert = executeHyperliquidResultDeferredOpen(sc, stratState, result, execResult, signalStr, price, cfg.Regime, logger)
 								}
 								mu.Unlock()
+								// #1110: deliver any ratchet-tighten DM after releasing the lock
+								// (Discord/Telegram HTTP must not run under mu). Nil-safe no-op
+								// for the scale-in branch and when no tier tightened.
+								notifyRatchetTrigger(notifier, sc.NotifyRatchetTriggersEnabled(cfg), ratchetAlert)
 								if execResult != nil && trades > 0 {
 									runHyperliquidProtectionSync(sc, stratState, stateDB, result.Symbol, &mu, notifier, logger, "HL protection synced after trade", hlReconcileFillHintsJSON)
 									runPostTPStopLossAdjustment(sc, stratState, result.Symbol, price, cfg, &mu, notifier, logger, hlOnChainAbsQty)
@@ -2190,6 +2292,29 @@ func main() {
 							stampPositionRegimeIfOpened(stratState, sc.Symbol, manualRegime, sc, cfg.Regime)
 							mu.Unlock()
 						}
+						// #1115: alert (once per strategy/symbol) when an open manual
+						// position drifted across a close-evaluator default flip — opened
+						// under a tiered-TP close (resting TP OIDs) but the strategy now
+						// resolves to the ratchet (no on-chain TP). The SL stays protected
+						// (regime trail re-arms), but the stale TPs are no longer managed
+						// by the close evaluator, so surface it rather than silently
+						// changing the position's protection surface across a reload.
+						mu.RLock()
+						driftPos := stratState.Positions[sc.Symbol]
+						drifted := manualCloseEvaluatorDriftedFromTPs(sc, driftPos)
+						var staleTPOIDs []int64
+						if drifted {
+							staleTPOIDs = cloneInt64s(driftPos.TPOIDs)
+						}
+						mu.RUnlock()
+						if drifted {
+							if _, loaded := manualCloseEvaluatorDriftWarned.LoadOrStore(sc.ID+"|"+sc.Symbol, struct{}{}); !loaded {
+								logger.Error("manual close-evaluator drift for %s/%s: opened with tiered on-chain TP OIDs=%v but close now resolves to %s (no on-chain TP)", sc.ID, sc.Symbol, staleTPOIDs, trailingTPRatchetRegimeCloseName)
+								if notifier != nil {
+									notifier.SendOwnerDM(fmt.Sprintf("**MANUAL CLOSE-EVALUATOR DRIFT** [%s] %s was opened under a tiered-TP close (resting TP OIDs=%v) but the strategy now resolves to %s, which places no on-chain TPs. The stop-loss is still protected (the regime trail re-arms), but those TP orders are no longer managed by the close evaluator — they still rest on-chain and cancel on a full/manual close, but can fire mid-position under this let-it-ride config. Pin close_strategy=tiered_tp_atr_live and restart to keep the original exit, or cancel the stale TPs on the HL UI to fully adopt the ratchet.", sc.ID, sc.Symbol, staleTPOIDs, trailingTPRatchetRegimeCloseName))
+								}
+							}
+						}
 						if pos != nil && hyperliquidIsLive(sc.Args) {
 							// Manual ratchet + trailing walker run live-only by design
 							// (gated on hyperliquidIsLive): manual is a live trading
@@ -2201,7 +2326,8 @@ func main() {
 							runPostTPStopLossAdjustment(sc, stratState, sc.Symbol, prices[sc.Symbol], cfg, &mu, notifier, logger, hlOnChainAbsQty)
 							mark := prices[sc.Symbol]
 							if mark > 0 && strategyUsesTrailingTPRatchetClose(sc) {
-								applyTrailingTPRatchet(sc, stratState, sc.Symbol, mark, &mu, logger)
+								ratchetAlert := applyTrailingTPRatchet(sc, stratState, sc.Symbol, mark, &mu, logger)
+								notifyRatchetTrigger(notifier, sc.NotifyRatchetTriggersEnabled(cfg), ratchetAlert)
 							}
 							mu.RLock()
 							pos = stratState.Positions[sc.Symbol]
@@ -3388,7 +3514,7 @@ func isHLOpenOrderCapRejection(errStr string) bool {
 }
 
 func executeHyperliquidResult(sc StrategyConfig, s *StrategyState, result *HyperliquidResult, execResult *HyperliquidExecuteResult, signalStr string, price float64, regime *RegimeConfig, logger *StrategyLogger) (int, string) {
-	trades, detail, openTrade := executeHyperliquidResultDeferredOpen(sc, s, result, execResult, signalStr, price, regime, logger)
+	trades, detail, openTrade, _ := executeHyperliquidResultDeferredOpen(sc, s, result, execResult, signalStr, price, regime, logger)
 	if openTrade != nil {
 		var pos *Position
 		if p, ok := s.Positions[result.Symbol]; ok {
@@ -3403,7 +3529,7 @@ func executeHyperliquidResult(sc StrategyConfig, s *StrategyState, result *Hyper
 // Must be called under Lock. execResult is non-nil for successful live orders;
 // nil for paper mode. Live open trades are returned so the caller can run
 // same-cycle protection sync before the single INSERT.
-func executeHyperliquidResultDeferredOpen(sc StrategyConfig, s *StrategyState, result *HyperliquidResult, execResult *HyperliquidExecuteResult, signalStr string, price float64, regime *RegimeConfig, logger *StrategyLogger) (int, string, *Trade) {
+func executeHyperliquidResultDeferredOpen(sc StrategyConfig, s *StrategyState, result *HyperliquidResult, execResult *HyperliquidExecuteResult, signalStr string, price float64, regime *RegimeConfig, logger *StrategyLogger) (int, string, *Trade, *RatchetTriggerAlert) {
 	fillPrice := price
 	var fillQty float64
 	if execResult != nil && execResult.Execution != nil && execResult.Execution.Fill != nil && execResult.Execution.Fill.AvgPx > 0 {
@@ -3434,7 +3560,7 @@ func executeHyperliquidResultDeferredOpen(sc StrategyConfig, s *StrategyState, r
 	exec, err := ExecutePerpsSignalWithLeverageDeferredOpen(s, result.Signal, result.Symbol, fillPrice, sizingLeverage, exchangeLeverage, marginPerTradeUSD, fillQty, fillOID, fillFee, EffectiveDirection(sc), result.CloseFraction, "signal", logger)
 	if err != nil {
 		logger.Error("Trade execution failed: %v", err)
-		return 0, "", nil
+		return 0, "", nil, nil
 	}
 	trades := exec.TradesExecuted
 	openTrade := exec.OpenTrade
@@ -3444,9 +3570,12 @@ func executeHyperliquidResultDeferredOpen(sc StrategyConfig, s *StrategyState, r
 	if pos, ok := s.Positions[result.Symbol]; ok {
 		stampPositionProtectionSnapshot(pos, sc)
 	}
+	var ratchetAlert *RatchetTriggerAlert
 	if trades > 0 {
 		if pos, ok := s.Positions[result.Symbol]; ok {
-			applyTrailingTPRatchetToPosition(sc, pos, result.Symbol, price, logger)
+			// #1110: capture the tighten snapshot here (under the caller's lock) and
+			// return it so the caller can DM the owner after releasing mu.
+			_, ratchetAlert = applyTrailingTPRatchetToPosition(sc, pos, result.Symbol, price, logger)
 		}
 	}
 	if trades > 0 && fillOID != "" {
@@ -3519,7 +3648,7 @@ func executeHyperliquidResultDeferredOpen(sc StrategyConfig, s *StrategyState, r
 			openTrade = nil
 		}
 	}
-	return trades, detail, openTrade
+	return trades, detail, openTrade, ratchetAlert
 }
 
 // topstepIsLive reports whether --mode=live appears in strategy args.

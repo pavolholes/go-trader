@@ -112,7 +112,7 @@ func TestApplyTrailingTPRatchetToPosition_AfterScaleOut(t *testing.T) {
 		Symbol: "ETH", Side: "long", Quantity: 0.7, InitialQuantity: 1,
 		AvgCost: 100, EntryATR: 10,
 	}
-	if !applyTrailingTPRatchetToPosition(sc, pos, "ETH", 110, nil) {
+	if tightened, _ := applyTrailingTPRatchetToPosition(sc, pos, "ETH", 110, nil); !tightened {
 		t.Fatal("expected scale-out tier to tighten residual trail")
 	}
 	if pos.PostTPTrailingATRMult == nil || *pos.PostTPTrailingATRMult != 1.0 {
@@ -398,8 +398,8 @@ func TestValidateTrailingTPRatchetClose_CompositeVocabulary(t *testing.T) {
 		return tbl
 	}
 	composite := regimeLabelsForClassifier(regimeClassifierComposite)
-	if len(composite) != 7 {
-		t.Fatalf("expected 7 composite labels, got %d", len(composite))
+	if len(composite) != 9 {
+		t.Fatalf("expected 9 composite labels, got %d", len(composite))
 	}
 
 	// #870: the regime variant's opening trail / SL owner is the per-regime
@@ -445,7 +445,7 @@ func ratchetTestState(pos *Position) *StrategyState {
 }
 
 func TestApplyTrailingStopUpdateResult_RestingReplacement(t *testing.T) {
-	s := ratchetTestState(&Position{Symbol: "ETH", Side: "long", Quantity: 1, AvgCost: 100, EntryATR: 5, StopLossOID: 7})
+	s := ratchetTestState(&Position{Symbol: "ETH", Side: "long", Quantity: 1, AvgCost: 100, EntryATR: 5, StopLossOID: 7, RatchetFallbackNormalizePending: true})
 	upd := &HyperliquidStopLossUpdateResult{StopLossOID: 42, StopLossTriggerPx: 95}
 	fill, px := applyTrailingStopUpdateResult(s, "ETH", "long", 7, 0, false, upd, nil)
 	if fill || px != 0 {
@@ -454,6 +454,9 @@ func TestApplyTrailingStopUpdateResult_RestingReplacement(t *testing.T) {
 	p := s.Positions["ETH"]
 	if p.StopLossOID != 42 || p.StopLossTriggerPx != 95 {
 		t.Fatalf("resting replacement OID/trigger = %d/%v want 42/95", p.StopLossOID, p.StopLossTriggerPx)
+	}
+	if p.RatchetFallbackNormalizePending {
+		t.Fatal("resting replacement must clear ratchet fallback normalize marker")
 	}
 }
 
@@ -470,7 +473,7 @@ func TestApplyTrailingStopUpdateResult_ImmediateFillBooksClose(t *testing.T) {
 }
 
 func TestApplyTrailingStopUpdateResult_CancelWithoutRestClearsStaleOID(t *testing.T) {
-	s := ratchetTestState(&Position{Symbol: "ETH", Side: "long", Quantity: 1, AvgCost: 100, EntryATR: 5, StopLossOID: 7, StopLossTriggerPx: 96})
+	s := ratchetTestState(&Position{Symbol: "ETH", Side: "long", Quantity: 1, AvgCost: 100, EntryATR: 5, StopLossOID: 7, StopLossTriggerPx: 96, RatchetFallbackNormalizePending: true})
 	upd := &HyperliquidStopLossUpdateResult{CancelStopLossSucceeded: true}
 	fill, _ := applyTrailingStopUpdateResult(s, "ETH", "long", 7, 0, false, upd, nil)
 	if fill {
@@ -479,6 +482,9 @@ func TestApplyTrailingStopUpdateResult_CancelWithoutRestClearsStaleOID(t *testin
 	p := s.Positions["ETH"]
 	if p.StopLossOID != 0 || p.StopLossTriggerPx != 0 {
 		t.Fatalf("stale OID/trigger not cleared: %d/%v want 0/0", p.StopLossOID, p.StopLossTriggerPx)
+	}
+	if !p.RatchetFallbackNormalizePending {
+		t.Fatal("cancel-without-rest must leave normalize marker set for retry")
 	}
 }
 
@@ -756,6 +762,21 @@ func TestDefaultTrailingRatchetTiersForRegime(t *testing.T) {
 	if defaultTrailingRatchetTiersForRegime("") != nil {
 		t.Error("empty regime must resolve to nil")
 	}
+	// #1124: the directional-drift substates must resolve to the SAME 4-tier
+	// ranging_directional ladder — never nil. A nil here would mean the ratchet
+	// (auto-protective exit) silently never arms for a ranging_directional_up/
+	// _down position.
+	for _, label := range []string{"ranging_directional_up", "ranging_directional_down"} {
+		got := defaultTrailingRatchetTiersForRegime(label)
+		if len(got) != len(dir) {
+			t.Fatalf("%s want %d tiers (parity with ranging_directional), got %+v", label, len(dir), got)
+		}
+		for i := range dir {
+			if got[i] != dir[i] {
+				t.Fatalf("%s tier[%d] = %+v, want %+v (ranging_directional ladder)", label, i, got[i], dir[i])
+			}
+		}
+	}
 }
 
 // TestRatchetCloseDefaultGroup covers #1059: the ratchet-only resolver
@@ -770,6 +791,9 @@ func TestRatchetCloseDefaultGroup(t *testing.T) {
 		{"ranging_quiet", "ranging_quiet", true},
 		{"ranging_volatile", "ranging_volatile", true},
 		{"ranging_directional", "ranging_directional", true},
+		// #1124: directional-drift substates share the ranging_directional ladder.
+		{"ranging_directional_up", "ranging_directional", true},
+		{"ranging_directional_down", "ranging_directional", true},
 		{"ranging", "ranging_quiet", true}, // bare ADX → quiet ladder
 		{"trending_up_clean", "clean", true},
 		{"trending_up_choppy", "choppy", true},

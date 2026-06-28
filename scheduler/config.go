@@ -156,6 +156,7 @@ type Config struct {
 	RiskFreeRate           *float64                   `json:"risk_free_rate,omitempty"`             // #397 — annualized risk-free rate used in Sharpe-ratio calculations (e.g. 0.02 for 2%). Nil/missing falls back to DefaultAnnualRiskFreeRate; an explicit 0 is respected so backtest comparisons can pin to a 0% benchmark.
 	DefaultStopLossATRMult *float64                   `json:"default_stop_loss_atr_mult,omitempty"` // #605 — top-level default applied to HL perps/manual strategies that omit all stop_loss_* / trailing_stop_* fields. Nil/missing falls back to 1.0; explicit values let operators tune the ATR stop without recompiling.
 	NotifyTPSLFills        *bool                      `json:"notify_tp_sl_fills,omitempty"`         // #661 — owner DM when HL on-chain TP/SL fills are detected by the reconciler. Nil/missing → enabled; explicit false disables.
+	NotifyRatchetTriggers  *bool                      `json:"notify_ratchet_triggers,omitempty"`    // #1110 — owner DM when a trailing_tp_ratchet* tier clears and tightens the trail. Nil/missing → enabled; explicit false disables.
 	ManualDefaults         *ManualDefaultsConfig      `json:"manual_defaults,omitempty"`            // #696 — operator-tunable defaults for `manual-open` CLI and `type=manual` strategy auto-config. Each field optional; absent values fall back to the hardcoded defaults.
 	TradingViewExport      TradingViewExportConfig    `json:"tradingview_export,omitempty"`         // #3 — optional symbol overrides for TradingView portfolio CSV exports
 	UserCloseDefaults      CloseDefaultsMap           `json:"user_close_defaults,omitempty"`        // #866 — operator override layer for close-evaluator default tier ladders. Keyed by close evaluator name → {"tp_tiers": <list|regime-map>}. Injected into any close ref that omits tp_tiers at load; per-strategy tp_tiers still wins, and an absent entry falls through to the system default.
@@ -176,9 +177,19 @@ type CloseDefaultsMap map[string]map[string]interface{}
 // globally, including for manual strategies (#696).
 type ManualDefaultsConfig struct {
 	MarginUSD       *float64       `json:"margin_usd,omitempty"`         // implicit --margin (USD) when manual-open is invoked without --size/--notional/--margin (live mode only; --record-only still requires --size). Nil → 50.0.
-	StopLossATRMult *float64       `json:"stop_loss_atr_mult,omitempty"` // implicit stop_loss_atr_mult applied to type=manual strategies that omit all five HL stop fields. Nil → 1.5; explicit 0 opts manual strategies out without affecting non-manual perps.
+	StopLossATRMult *float64       `json:"stop_loss_atr_mult,omitempty"` // implicit stop_loss_atr_mult applied to type=manual strategies that omit all five HL stop fields. Nil → 2.0; explicit 0 opts scalar manual strategies out without affecting non-manual perps. Ratchet fallback ignores 0 to preserve no-naked protection.
 	Side            string         `json:"side,omitempty"`               // implicit --side for manual-open. Lowercase "long" or "short". Empty → "long".
 	TPTiers         []ManualTPTier `json:"tp_tiers,omitempty"`           // implicit `tiers` params for tiered_tp_atr / tiered_tp_atr_live close strategies on type=manual. Nil/omitted → [{2.0, 0.5}, {3.0, 1.0}]; empty array is rejected so operators can't accidentally fall back to defaults by zeroing the list.
+
+	// #1115: implicit per-regime opening trail / SL block applied to type=manual
+	// strategies that DEFAULT to trailing_tp_ratchet_regime (regime enabled, no
+	// explicit close_strategy). Omitted → a use_defaults baseline keyed to the
+	// strategy's active classifier vocabulary; an explicit block lets operators
+	// tune the per-regime trail widths. Resolved per-strategy at validateConfig
+	// against that strategy's classifier labels (never resolved standalone, so a
+	// malformed block surfaces its error only on a strategy that actually adopts
+	// it). Mirrors the stop_loss_atr_mult / tp_tiers knobs above.
+	TrailingStopATRRegime *RegimeATRBlock `json:"trailing_stop_atr_regime,omitempty"`
 }
 
 // ManualTPTier is one entry of ManualDefaultsConfig.TPTiers. Matches the JSON
@@ -211,9 +222,21 @@ func (c *Config) resolveManualSide() string {
 
 // resolveManualStopLossATRMult returns the implicit stop_loss_atr_mult for
 // type=manual strategies that omit all five HL stop fields. Operator config
-// wins; the 1.5× hardcoded fallback is preserved when absent.
+// wins; the 2.0× hardcoded fallback is preserved when absent.
 func (c *Config) resolveManualStopLossATRMult() float64 {
 	if c != nil && c.ManualDefaults != nil && c.ManualDefaults.StopLossATRMult != nil {
+		return *c.ManualDefaults.StopLossATRMult
+	}
+	return defaultManualStopLossATRMult
+}
+
+// resolveManualRatchetFallbackATRMult returns the protective fallback used when
+// manual-open cannot resolve the current per-regime ratchet trail. It is always
+// strictly positive so a regime-read failure cannot intentionally or accidentally
+// open a naked manual position; manual_defaults.stop_loss_atr_mult=0 only opts out
+// the scalar manual default.
+func (c *Config) resolveManualRatchetFallbackATRMult() float64 {
+	if c != nil && c.ManualDefaults != nil && c.ManualDefaults.StopLossATRMult != nil && *c.ManualDefaults.StopLossATRMult > 0 {
 		return *c.ManualDefaults.StopLossATRMult
 	}
 	return defaultManualStopLossATRMult
@@ -240,6 +263,84 @@ func (c *Config) resolveManualTPTiers() []interface{} {
 	}
 }
 
+// resolveManualRatchetRegimeTrailBlock decides whether a type=manual strategy
+// with no explicit close_strategy should default to trailing_tp_ratchet_regime
+// (#1115) and, if so, returns the per-regime opening trail / SL block to attach.
+// It returns (block, true) only when (a) regime detection is enabled and (b)
+// every label in the strategy's active ATR-window classifier vocabulary resolves
+// to a default opening trail — otherwise (nil, false), so the caller keeps the
+// historical tiered_tp_atr_live default and a regime-less or unmappable config is
+// unchanged. The returned block is fresh per call (its raw shape is resolved
+// per-strategy during validateConfig, which mutates UseDefaults/TrendRegime), so
+// the caller can safely assign it to one strategy's sc.TrailingStopATRRegime
+// without aliasing another's.
+func (c *Config) resolveManualRatchetRegimeTrailBlock(sc StrategyConfig) (*RegimeATRBlock, bool) {
+	if c == nil || c.Regime == nil || !c.Regime.Enabled {
+		return nil, false
+	}
+	// Honor explicit operator stop-field overrides: trailing_tp_ratchet_regime
+	// forbids every scalar/regime stop field, so if the operator set one (with no
+	// close_strategy) selecting the ratchet would turn a previously-valid config
+	// into a validation error. Fall back to tiered_tp_atr_live (compatible with a
+	// scalar stop) so their intent is preserved. Mirrors the manual scalar-SL
+	// default predicate below. IsConfigured() is the raw-aware check (this runs
+	// before ResolveSurface populates the typed regime fields, review #735.1).
+	if sc.StopLossATRMult != nil || sc.StopLossPct != nil || sc.StopLossMarginPct != nil ||
+		sc.TrailingStopPct != nil || sc.TrailingStopATRMult != nil ||
+		sc.StopLossATRRegime.IsConfigured() || sc.TrailingStopATRRegime.IsConfigured() {
+		return nil, false
+	}
+	labels := regimeLabelsForStrategyWindow(sc, c.Regime, "atr")
+	if len(labels) == 0 {
+		return nil, false
+	}
+	// Operator override: manual_defaults.trailing_stop_atr_regime supplies the
+	// per-regime opening trail (mirrors the stop_loss_atr_mult / tp_tiers knobs).
+	// Clone its raw shape so each adopting strategy resolves an independent copy.
+	if c.ManualDefaults != nil && c.ManualDefaults.TrailingStopATRRegime.IsConfigured() {
+		if block := cloneRegimeATRBlock(c.ManualDefaults.TrailingStopATRRegime); block != nil {
+			return block, true
+		}
+	}
+	// Default: synthesize a use_defaults block, but only when every active label
+	// maps onto the baseline opening-trail family — else the ratchet would carry
+	// a per-regime hole and we must not silently default into an un-resolvable
+	// close (fail back to tiered_tp_atr_live instead).
+	for _, label := range labels {
+		if _, ok := mapRegimeToBaselineFamily(regimeATRDefaults.Trailing, label); !ok {
+			return nil, false
+		}
+	}
+	return &RegimeATRBlock{raw: map[string]interface{}{"use_defaults": true}}, true
+}
+
+// cloneRegimeATRBlock deep-copies a RegimeATRBlock so an operator-supplied
+// manual_defaults block can be attached to multiple strategies independently
+// (#1115). The raw shape is the source of truth before validateConfig resolves
+// it, so it is JSON-round-tripped; the typed fields are copied too for blocks
+// that were already resolved. Returns nil for a nil input.
+func cloneRegimeATRBlock(b *RegimeATRBlock) *RegimeATRBlock {
+	if b == nil {
+		return nil
+	}
+	out := &RegimeATRBlock{UseDefaults: b.UseDefaults}
+	if b.raw != nil {
+		if blob, err := json.Marshal(b.raw); err == nil {
+			var cp map[string]interface{}
+			if json.Unmarshal(blob, &cp) == nil {
+				out.raw = cp
+			}
+		}
+	}
+	if len(b.TrendRegime) > 0 {
+		out.TrendRegime = make(map[string]RegimeATREntry, len(b.TrendRegime))
+		for k, v := range b.TrendRegime {
+			out.TrendRegime[k] = v
+		}
+	}
+	return out
+}
+
 // NotifyTPSLFillsEnabled reports whether reconciler-detected TP/SL fills should
 // trigger an owner DM. Nil pointer (missing field) defaults to true so existing
 // configs get the alert without an explicit opt-in.
@@ -248,6 +349,29 @@ func (c *Config) NotifyTPSLFillsEnabled() bool {
 		return true
 	}
 	return *c.NotifyTPSLFills
+}
+
+// NotifyRatchetTriggersEnabled reports whether a trailing_tp_ratchet* tier
+// clearing (and tightening the trail) should trigger an owner DM. Nil pointer
+// (missing field) defaults to true so existing configs get the alert without an
+// explicit opt-in (mirrors NotifyTPSLFillsEnabled).
+func (c *Config) NotifyRatchetTriggersEnabled() bool {
+	if c == nil || c.NotifyRatchetTriggers == nil {
+		return true
+	}
+	return *c.NotifyRatchetTriggers
+}
+
+// NotifyRatchetTriggersEnabled reports whether THIS strategy's ratchet-tighten
+// owner DM (#1110) is enabled, using a two-layer resolve: the per-strategy
+// notify_ratchet_triggers (#1118) wins when set, else it inherits the global
+// Config.NotifyRatchetTriggersEnabled(). A nil strategy field therefore
+// preserves existing behavior for anyone who never sets it.
+func (sc *StrategyConfig) NotifyRatchetTriggersEnabled(cfg *Config) bool {
+	if sc != nil && sc.NotifyRatchetTriggers != nil {
+		return *sc.NotifyRatchetTriggers
+	}
+	return cfg.NotifyRatchetTriggersEnabled()
 }
 
 // CircuitBreakerEnabled reports whether the per-strategy circuit breaker is
@@ -368,6 +492,7 @@ type StrategyConfig struct {
 	InitialCapital          float64                  `json:"initial_capital,omitempty"` // fixed starting balance for PnL display (never overwritten by capital_pct)
 	MaxDrawdownPct          float64                  `json:"max_drawdown_pct"`
 	CircuitBreaker          *bool                    `json:"circuit_breaker,omitempty"`            // #1048 — per-strategy circuit-breaker opt-out. Nil/missing → enabled (the safe default); explicit false disables BOTH firing arms in CheckRisk (drawdown > max_drawdown_pct AND 5 consecutive losses), uniformly for live and paper (no platform/live gating). Hot-reloadable via SIGHUP including while a position is open: disabling only suppresses NEW fires — an already-latched CB and any pending circuit close still drain. No effect on type=manual (exempt from CheckRisk). Read via CircuitBreakerEnabled(), never directly.
+	NotifyRatchetTriggers   *bool                    `json:"notify_ratchet_triggers,omitempty"`    // #1118 — per-strategy override of the global notify_ratchet_triggers (#1110) ratchet-tighten owner DM. Nil/missing → inherit the global Config.NotifyRatchetTriggersEnabled(); explicit value wins. Notification-only (never affects position/order state), so SIGHUP hot-reloads it unconditionally even while a position is open. Read via NotifyRatchetTriggersEnabled(cfg), never directly.
 	IntervalSeconds         int                      `json:"interval_seconds,omitempty"`           // per-strategy override (0 = use global)
 	HTFFilter               bool                     `json:"htf_filter,omitempty"`                 // higher-timeframe trend filter
 	InvertSignal            bool                     `json:"invert_signal,omitempty"`              // HL perps/manual only: flip BUY<->SELL on a non-zero signal before execution (HOLD/0 is never flipped). Lets inverse variants reuse the same open/close refs. Composes with Direction — invert runs in the Go layer before direction interprets the resulting sign (e.g. direction="short" + invert_signal=true opens short on raw-BUY triggers, distinct from plain direction="short" which opens on raw-SELL). Rejected outside HL perps/manual.
@@ -999,7 +1124,29 @@ func loadConfig(path string, skipLiveCredentialChecks bool) (*Config, error) {
 			sc.MarginMode = "isolated"
 		}
 		if sc.CloseStrategy == nil {
-			sc.CloseStrategy = &StrategyRef{Name: "tiered_tp_atr_live"}
+			// #1115: when regime detection is enabled and the active classifier's
+			// vocabulary maps cleanly onto the default per-regime opening-trail
+			// baseline, default manual closes to the regime-adaptive trailing
+			// take-profit ratchet (trailing_tp_ratchet_regime) so the trail width
+			// tracks volatility per regime. The synthesized trailing_stop_atr_regime
+			// block becomes the SL owner — the scalar stop_loss_atr_mult default
+			// below then self-suppresses via its !TrailingStopATRRegime.IsConfigured()
+			// guard, so it MUST be attached here (before that check runs). Falls back
+			// to today's tiered_tp_atr_live whenever regime is off or any label can't
+			// resolve, leaving a regime-less config unchanged. The choice is logged
+			// (never silently divergent in a protection path).
+			if block, ok := cfg.resolveManualRatchetRegimeTrailBlock(*sc); ok {
+				sc.CloseStrategy = &StrategyRef{Name: trailingTPRatchetRegimeCloseName}
+				sc.TrailingStopATRRegime = block
+				fmt.Printf("[INFO] %s: manual close defaulted to %s (regime enabled; trailing_stop_atr_regime owns the per-regime trail/SL)\n", sc.ID, trailingTPRatchetRegimeCloseName)
+			} else {
+				sc.CloseStrategy = &StrategyRef{Name: "tiered_tp_atr_live"}
+				if cfg.Regime != nil && cfg.Regime.Enabled {
+					fmt.Printf("[INFO] %s: manual close defaulted to tiered_tp_atr_live (regime enabled, but kept the scalar default — an explicit stop field is set or the classifier vocabulary has no default per-regime trail)\n", sc.ID)
+				} else {
+					fmt.Printf("[INFO] %s: manual close defaulted to tiered_tp_atr_live (regime disabled)\n", sc.ID)
+				}
+			}
 		}
 		// #691/#696: type=manual gets its own SL default (1.5× ATR by default,
 		// overridable via manual_defaults.stop_loss_atr_mult) so non-manual
@@ -1088,31 +1235,6 @@ func loadConfig(path string, skipLiveCredentialChecks bool) (*Config, error) {
 // shared-coin HL perps strategies now place per-strategy sized reduce-only
 // protection orders, so omitted stop fields should keep normal defaulting.
 func normalizeHyperliquidPeerStopLosses(strategies []StrategyConfig) {
-}
-
-// hasHyperliquidStopLossOwnership reports whether sc would place a reduce-only
-// HL trigger at any point in its lifecycle. It is the peer-conflict predicate
-// rather than the runtime price-% predicate: TrailingStopATRMult arms an
-// initial trigger only on the cycle after the position opens (EntryATR must be
-// stamped first), so EffectiveStopLossPct returns 0 at order-placement time.
-// Peer validation must still treat that strategy as the trigger owner.
-func hasHyperliquidStopLossOwnership(sc StrategyConfig) bool {
-	if EffectiveStopLossPct(sc) > 0 {
-		return true
-	}
-	if sc.TrailingStopATRMult != nil && *sc.TrailingStopATRMult > 0 {
-		return true
-	}
-	if sc.StopLossATRMult != nil && *sc.StopLossATRMult > 0 {
-		return true
-	}
-	if sc.StopLossATRRegime != nil && !sc.StopLossATRRegime.IsZero() {
-		return true
-	}
-	if sc.TrailingStopATRRegime != nil && !sc.TrailingStopATRRegime.IsZero() {
-		return true
-	}
-	return false
 }
 
 // hyperliquidPeerStrategyErrors returns validation messages for HL wallet
@@ -1854,7 +1976,11 @@ func validateConfig(cfg *Config, skipLiveCredentialChecks bool) error {
 			}
 			// #870: the regime ratchet owns its trail via trailing_stop_atr_regime
 			// rather than the scalar trailing_stop_atr_mult, so accept that too.
-			regimeTrail := sc.TrailingStopATRRegime != nil && !sc.TrailingStopATRRegime.IsZero()
+			// #1111: use IsConfigured (raw-aware), NOT !IsZero() — this check runs
+			// before validateRegimeATRConfig resolves the raw block, and IsZero()
+			// reports true on an unresolved-but-configured block (see its doc), so
+			// !IsZero() would wrongly reject a strategy that did set the regime trail.
+			regimeTrail := sc.TrailingStopATRRegime.IsConfigured()
 			if fixedTrailingPct <= 0 && atrMult <= 0 && !regimeTrail {
 				errs = append(errs, fmt.Sprintf("%s: trailing_stop_min_move_pct requires trailing_stop_pct > 0, trailing_stop_atr_mult > 0, or trailing_stop_atr_regime", prefix))
 			}

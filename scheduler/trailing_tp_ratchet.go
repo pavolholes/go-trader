@@ -125,6 +125,15 @@ func ratchetCloseDefaultGroup(label string) (string, bool) {
 	switch l {
 	case "ranging_quiet", "ranging_volatile", "ranging_directional":
 		return l, true
+	case "ranging_directional_up", "ranging_directional_down":
+		// #1124: the directional-drift substates share the ranging_directional
+		// scale-out ladder (the geometry is direction-agnostic — the SL side
+		// carries direction, the TP scale-out does not). Map them to that group
+		// explicitly; otherwise they fall through to regimeCloseDefaultGroup's
+		// "ranging" key, which has NO ratchet ladder in ratchetTierGroupDefaults
+		// → defaultTrailingRatchetTiersForRegime returns nil → silent never-arm
+		// of the auto-protective ratchet exit (money path).
+		return "ranging_directional", true
 	case "ranging":
 		return "ranging_quiet", true
 	}
@@ -263,9 +272,18 @@ func trailingRatchetTiersForRegime(sc StrategyConfig, regime string) []trailingR
 			if !ok || strings.TrimSpace(regime) == "" {
 				return nil
 			}
-			block, ok := table[strings.TrimSpace(regime)]
+			key := strings.TrimSpace(regime)
+			block, ok := table[key]
 			if !ok {
-				return nil
+				// #1124: sub-label stamp falls back to the bare
+				// ranging_directional tier ladder (exact key wins first, so an
+				// explicit sub key still overrides bare).
+				if regimeDirectionalSubs[key] {
+					block, ok = table[regimeDirectionalBare]
+				}
+				if !ok {
+					return nil
+				}
 			}
 			tiers, _ := parseTrailingRatchetTierList(block, ref.Name+".tp_tiers."+regime)
 			return tiers
@@ -409,9 +427,16 @@ func validateTrailingTPRatchetClose(sc StrategyConfig, labels []string, regimeEn
 					errs = append(errs, fmt.Sprintf("%s.tp_tiers: unknown regime key %q (valid: %s)", sub, key, strings.Join(labels, ", ")))
 				}
 			}
+			bareDirectional := table[regimeDirectionalBare] != nil
 			for _, key := range labels {
 				block, ok := table[key]
 				if !ok {
+					// #1124 family rule: bare ranging_directional covers the
+					// _up/_down sub-labels for exhaustiveness (the explicit
+					// tp_tiers resolver falls back bare→sub at runtime).
+					if regimeLabelFamilyCovered(key, bareDirectional) {
+						continue
+					}
 					errs = append(errs, fmt.Sprintf("%s.tp_tiers: missing required regime key %q", sub, key))
 					continue
 				}
@@ -539,35 +564,43 @@ func applyTrailingTPRatchet(
 	mark float64,
 	mu *sync.RWMutex,
 	logger *StrategyLogger,
-) {
+) *RatchetTriggerAlert {
 	if !strategyUsesTrailingTPRatchetClose(sc) || stratState == nil || symbol == "" || mark <= 0 {
-		return
+		return nil
 	}
 	mu.Lock()
+	var alert *RatchetTriggerAlert
 	pos, ok := stratState.Positions[symbol]
 	if ok {
-		applyTrailingTPRatchetToPosition(sc, pos, symbol, mark, logger)
+		_, alert = applyTrailingTPRatchetToPosition(sc, pos, symbol, mark, logger)
 	}
 	mu.Unlock()
+	return alert
 }
 
 // applyTrailingTPRatchetToPosition applies the same ratchet logic while the
-// caller already owns the state lock.
-func applyTrailingTPRatchetToPosition(sc StrategyConfig, pos *Position, symbol string, mark float64, logger *StrategyLogger) bool {
+// caller already owns the state lock. Returns (true, *RatchetTriggerAlert) ONLY
+// when a tier newly advances the watermark AND tightens the trail — the alert
+// snapshot carries the immutable details the owner DM needs, so the caller can
+// deliver it (notifyRatchetTrigger) after releasing the lock (#1110). Every
+// non-tightening path returns (false, nil), including a watermark-only advance
+// (tier cleared but the resulting trail is not tighter), so an already-processed
+// or no-tighten tier never alerts.
+func applyTrailingTPRatchetToPosition(sc StrategyConfig, pos *Position, symbol string, mark float64, logger *StrategyLogger) (bool, *RatchetTriggerAlert) {
 	if !strategyUsesTrailingTPRatchetClose(sc) || pos == nil || symbol == "" || mark <= 0 {
-		return false
+		return false, nil
 	}
 	if pos.Quantity <= 0 || pos.AvgCost <= 0 || pos.EntryATR <= 0 {
-		return false
+		return false, nil
 	}
 	side := strings.ToLower(strings.TrimSpace(pos.Side))
 	if side != "long" && side != "short" {
-		return false
+		return false, nil
 	}
 	regime := protectionATRRegimeLabel(pos, sc)
 	tiers := trailingRatchetTiersForRegime(sc, regime)
 	if len(tiers) == 0 {
-		return false
+		return false, nil
 	}
 	// #873: ratchet tier-clearing measures ATR profit distance from the FROZEN
 	// entry (riskAnchorPrice), not the blended AvgCost, so a scale-in keeps the
@@ -580,7 +613,7 @@ func applyTrailingTPRatchetToPosition(sc StrategyConfig, pos *Position, symbol s
 	atrProfit := profitDistance / pos.EntryATR
 	clearedIdx, clearedOK := findHighestMarkClearedRatchetTier(tiers, atrProfit, pos.SLAdjustedTiersProcessed)
 	if !clearedOK {
-		return false
+		return false, nil
 	}
 	newMult := tiers[clearedIdx].TrailingMultAfter
 	current := effectiveTrailingRatchetMult(pos, sc)
@@ -588,7 +621,7 @@ func applyTrailingTPRatchetToPosition(sc StrategyConfig, pos *Position, symbol s
 		if pos.SLAdjustedTiersProcessed <= clearedIdx {
 			pos.SLAdjustedTiersProcessed = clearedIdx + 1
 		}
-		return false
+		return false, nil
 	}
 	mult := newMult
 	pos.PostTPTrailingATRMult = &mult
@@ -597,7 +630,103 @@ func applyTrailingTPRatchetToPosition(sc StrategyConfig, pos *Position, symbol s
 		logger.Info("trailing_tp_ratchet: %s tier %d cleared — trail tightened to %.4g×ATR (from %.4g×ATR)",
 			symbol, clearedIdx, newMult, current)
 	}
-	return true
+	alert := buildRatchetTriggerAlert(sc, pos, symbol, side, regime, mark, anchor, atrProfit, tiers, clearedIdx, current, newMult)
+	return true, alert
+}
+
+// buildRatchetTriggerAlert assembles the immutable #1110 alert snapshot at the
+// instant a ratchet tier tightens the trail. All inputs are read while the
+// caller holds the state lock; the result carries no pointers into pos so it is
+// safe to hand to a post-unlock notifier. anchor / atrProfit are passed through
+// from the caller so the snapshot matches the exact values the tightening
+// decision used.
+func buildRatchetTriggerAlert(sc StrategyConfig, pos *Position, symbol, side, regime string, mark, anchor, atrProfit float64, tiers []trailingRatchetTier, clearedIdx int, oldMult, newMult float64) *RatchetTriggerAlert {
+	entryATR := pos.EntryATR
+	contractMult := 1.0
+	if pos.Multiplier > 0 {
+		contractMult = pos.Multiplier
+	}
+	profitDistance := mark - anchor
+	if side == "short" {
+		profitDistance = anchor - mark
+	}
+	// Effective HWM for the intended-SL display: the best mark seen while open,
+	// floored to the current mark so a stale/unset StopLossHighWaterPx (e.g. the
+	// walker hasn't run yet this open) still yields a sensible computed trigger.
+	hwm := pos.StopLossHighWaterPx
+	if side == "long" {
+		if hwm <= 0 || mark > hwm {
+			hwm = mark
+		}
+	} else {
+		if hwm <= 0 || mark < hwm {
+			hwm = mark
+		}
+	}
+	intendedSL := 0.0
+	if entryATR > 0 && hwm > 0 && newMult > 0 {
+		if side == "long" {
+			intendedSL = hwm - newMult*entryATR
+		} else {
+			intendedSL = hwm + newMult*entryATR
+		}
+		if intendedSL <= 0 {
+			intendedSL = 0
+		}
+	}
+	a := &RatchetTriggerAlert{
+		StrategyID:           sc.ID,
+		Symbol:               symbol,
+		Side:                 side,
+		TierIdx:              clearedIdx,
+		TotalTiers:           len(tiers),
+		TierATRMultiple:      tiers[clearedIdx].ATRMultiple,
+		TierTriggerPx:        atrTierTriggerPx(side, anchor, entryATR, tiers[clearedIdx].ATRMultiple),
+		MarkPrice:            mark,
+		AnchorPrice:          anchor,
+		EntryATR:             entryATR,
+		ProfitATR:            atrProfit,
+		ProfitUSD:            profitDistance * pos.Quantity * contractMult,
+		OldTrailMult:         oldMult,
+		NewTrailMult:         newMult,
+		HighWaterMark:        hwm,
+		IntendedSLTriggerPx:  intendedSL,
+		RegimeLabel:          regime,
+		PositionRegimeAtOpen: pos.Regime,
+	}
+	if clearedIdx+1 < len(tiers) {
+		nt := tiers[clearedIdx+1]
+		a.HasNextTier = true
+		a.NextTierATRMultiple = nt.ATRMultiple
+		a.NextTierTrailAfter = nt.TrailingMultAfter
+		a.NextTierTriggerPx = atrTierTriggerPx(side, anchor, entryATR, nt.ATRMultiple)
+	}
+	return a
+}
+
+// manualCloseEvaluatorDriftWarned dedupes the #1115 close-evaluator drift alert
+// to once per (strategy, symbol) per process — keyed "id|symbol". Never reset:
+// the operator only needs to see it once after the upgrade+restart that flipped
+// the default; pinning close_strategy and restarting re-derives the tiered close
+// (no drift, no warning).
+var manualCloseEvaluatorDriftWarned sync.Map
+
+// manualCloseEvaluatorDriftedFromTPs reports whether an open manual position was
+// opened under a tiered-TP close evaluator (it carries resting on-chain TP OIDs)
+// while the strategy's CURRENT close evaluator is the trailing ratchet, which
+// places no on-chain TPs (#1115). This is the cross-evaluator drift that occurs
+// when the manual close DEFAULT flips from tiered_tp_atr_live to
+// trailing_tp_ratchet_regime across a binary upgrade + restart for a position
+// opened pre-upgrade: SL ownership moves to the regime trail and the
+// previously-placed TP1/TP2 orders are no longer managed by the close evaluator.
+// They still rest on-chain (reduce-only) and are cancelled on a full / manual
+// close (extraCancelOIDs) — and auto-cancel when the SL flattens the position —
+// but can fire mid-life under what is now a let-it-ride config, so the operator
+// must be alerted. A ratchet-opened position never carries TP OIDs (the ratchet
+// path skips inline TP placement), so this reliably keys off the tiered-open
+// fingerprint. Pure so the detection is unit-tested.
+func manualCloseEvaluatorDriftedFromTPs(sc StrategyConfig, pos *Position) bool {
+	return pos != nil && len(pos.TPOIDs) > 0 && strategyUsesTrailingTPRatchetClose(sc)
 }
 
 func trailingRatchetRulesEqualForReload(a, b StrategyConfig) bool {

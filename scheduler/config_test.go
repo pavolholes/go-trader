@@ -1088,9 +1088,9 @@ func TestLoadConfigHLPerpsSingleStrategyAutoDerivesStopLoss(t *testing.T) {
 	}
 }
 
-// #691: type=manual HL strategies default to stop_loss_atr_mult=1.5 (wider
+// #691/#1121: type=manual HL strategies default to stop_loss_atr_mult=2.0 (wider
 // than the 1.0× HL perps default) when no stop fields are configured.
-func TestLoadConfigManualDefaultsStopLossATRMultTo1Point5(t *testing.T) {
+func TestLoadConfigManualDefaultsStopLossATRMultTo2Point0(t *testing.T) {
 	dir := t.TempDir()
 	cfgJSON := `{
 		"strategies": [{
@@ -1111,7 +1111,7 @@ func TestLoadConfigManualDefaultsStopLossATRMultTo1Point5(t *testing.T) {
 	}
 	sc := cfg.Strategies[0]
 	if sc.StopLossATRMult == nil {
-		t.Fatal("StopLossATRMult = nil, want 1.5 default applied")
+		t.Fatal("StopLossATRMult = nil, want 2.0 default applied")
 	}
 	if got := *sc.StopLossATRMult; got != defaultManualStopLossATRMult {
 		t.Errorf("StopLossATRMult = %g, want %g", got, defaultManualStopLossATRMult)
@@ -1149,7 +1149,7 @@ func TestLoadConfigManualOptsOutWhenGlobalDefaultIsZero(t *testing.T) {
 }
 
 // #691: explicit stop_loss_atr_mult on a manual strategy is preserved
-// verbatim — the 1.5× default must not overwrite operator intent.
+// verbatim — the hardcoded default must not overwrite operator intent.
 func TestLoadConfigManualExplicitATRMultPreserved(t *testing.T) {
 	dir := t.TempDir()
 	cfgJSON := `{
@@ -1179,7 +1179,7 @@ func TestLoadConfigManualExplicitATRMultPreserved(t *testing.T) {
 	}
 }
 
-// #696: manual_defaults.stop_loss_atr_mult overrides the hardcoded 1.5× fallback.
+// #696: manual_defaults.stop_loss_atr_mult overrides the hardcoded fallback.
 func TestLoadConfigManualDefaultsStopLossATRMultOverride(t *testing.T) {
 	dir := t.TempDir()
 	cfgJSON := `{
@@ -1336,9 +1336,8 @@ func TestLoadConfigManualDefaultsTPTiersDoesNotOverrideExplicit(t *testing.T) {
 	}
 }
 
-// #696: absent manual_defaults block preserves the hardcoded 1.5× SL and
-// 1×/2× tier defaults exactly as before — guards against accidental
-// behavior change for operators who don't opt into the new config block.
+// #696/#1121: absent manual_defaults block uses the hardcoded 2.0× SL and
+// 1×/2× tier defaults.
 func TestLoadConfigManualDefaultsAbsentPreservesHardcodedDefaults(t *testing.T) {
 	dir := t.TempDir()
 	cfgJSON := `{
@@ -1431,6 +1430,9 @@ func TestConfigResolveManualHelpersFallback(t *testing.T) {
 	if got := cfg.resolveManualStopLossATRMult(); got != defaultManualStopLossATRMult {
 		t.Errorf("resolveManualStopLossATRMult = %g, want %g", got, defaultManualStopLossATRMult)
 	}
+	if got := cfg.resolveManualRatchetFallbackATRMult(); got != defaultManualStopLossATRMult {
+		t.Errorf("resolveManualRatchetFallbackATRMult = %g, want %g", got, defaultManualStopLossATRMult)
+	}
 	tiers := cfg.resolveManualTPTiers()
 	if len(tiers) != 2 {
 		t.Fatalf("resolveManualTPTiers length = %d, want 2", len(tiers))
@@ -1462,6 +1464,9 @@ func TestConfigResolveManualHelpersFromConfig(t *testing.T) {
 	if got := cfg.resolveManualStopLossATRMult(); got != 2.0 {
 		t.Errorf("resolveManualStopLossATRMult = %g, want 2.0", got)
 	}
+	if got := cfg.resolveManualRatchetFallbackATRMult(); got != 2.0 {
+		t.Errorf("resolveManualRatchetFallbackATRMult = %g, want 2.0", got)
+	}
 	tiers := cfg.resolveManualTPTiers()
 	if len(tiers) != 3 {
 		t.Fatalf("resolveManualTPTiers length = %d, want 3", len(tiers))
@@ -1469,6 +1474,17 @@ func TestConfigResolveManualHelpersFromConfig(t *testing.T) {
 	mid := tiers[1].(map[string]interface{})
 	if mid["atr_multiple"].(float64) != 2.0 || mid["close_fraction"].(float64) != 0.7 {
 		t.Errorf("tier[1] = %+v, want {2.0, 0.7}", mid)
+	}
+}
+
+func TestConfigResolveManualRatchetFallbackIgnoresZeroScalarOptOut(t *testing.T) {
+	slMult := 0.0
+	cfg := Config{ManualDefaults: &ManualDefaultsConfig{StopLossATRMult: &slMult}}
+	if got := cfg.resolveManualStopLossATRMult(); got != 0 {
+		t.Errorf("resolveManualStopLossATRMult = %g, want 0 scalar opt-out", got)
+	}
+	if got := cfg.resolveManualRatchetFallbackATRMult(); got != defaultManualStopLossATRMult {
+		t.Errorf("resolveManualRatchetFallbackATRMult = %g, want %g no-naked fallback", got, defaultManualStopLossATRMult)
 	}
 }
 
@@ -2696,5 +2712,33 @@ func TestCircuitBreakerEnabled_DefaultsToTrue(t *testing.T) {
 	sc.CircuitBreaker = &tr
 	if !sc.CircuitBreakerEnabled() {
 		t.Fatal("explicit true should report enabled")
+	}
+}
+
+func TestStrategyNotifyRatchetTriggersEnabled_TwoLayerResolve(t *testing.T) {
+	tr := true
+	f := false
+	globalFalse := &Config{NotifyRatchetTriggers: &f}
+	globalTrue := &Config{NotifyRatchetTriggers: &tr}
+	globalDefault := &Config{} // nil field → global resolves to true
+
+	cases := []struct {
+		name     string
+		sc       *StrategyConfig
+		cfg      *Config
+		expected bool
+	}{
+		{"nil strategy field inherits global default (true)", &StrategyConfig{}, globalDefault, true},
+		{"nil strategy field inherits global false", &StrategyConfig{}, globalFalse, false},
+		{"nil strategy field inherits global true", &StrategyConfig{}, globalTrue, true},
+		{"strategy false overrides global true", &StrategyConfig{NotifyRatchetTriggers: &f}, globalTrue, false},
+		{"strategy true overrides global false", &StrategyConfig{NotifyRatchetTriggers: &tr}, globalFalse, true},
+		{"nil receiver inherits global false", nil, globalFalse, false},
+		{"nil receiver inherits global default (true)", nil, globalDefault, true},
+	}
+	for _, c := range cases {
+		if got := c.sc.NotifyRatchetTriggersEnabled(c.cfg); got != c.expected {
+			t.Errorf("%s: got %v, want %v", c.name, got, c.expected)
+		}
 	}
 }
