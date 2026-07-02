@@ -23,6 +23,7 @@ var knownSubcommands = []string{
 	"manual-open",
 	"manual-add",
 	"manual-close",
+	"force-close",
 	"manual-cancel",
 	"manual-update-sl",
 	"manual-cancel-sl",
@@ -30,6 +31,7 @@ var knownSubcommands = []string{
 	"probe",
 	"inspect",
 	"agent-info",
+	"diagnostics",
 	"version",
 }
 
@@ -66,6 +68,8 @@ func main() {
 			os.Exit(runManualAdd(os.Args[2:]))
 		case "manual-close":
 			os.Exit(runManualClose(os.Args[2:]))
+		case "force-close":
+			os.Exit(runForceClose(os.Args[2:]))
 		case "manual-cancel":
 			os.Exit(runManualCancel(os.Args[2:]))
 		case "manual-update-sl":
@@ -80,6 +84,8 @@ func main() {
 			os.Exit(runInspect(os.Args[2:]))
 		case "agent-info":
 			os.Exit(runAgentInfo(os.Args[2:]))
+		case "diagnostics":
+			os.Exit(runDiagnostics(os.Args[2:]))
 		case "version", "--version", "-version":
 			fmt.Println(Version)
 			os.Exit(0)
@@ -113,7 +119,8 @@ func main() {
 	setDirectionalCertStore(LoadDirectionalCertSetFailClosed(directionalCertPath(), func(f string, a ...interface{}) {
 		fmt.Fprintf(os.Stderr, f+"\n", a...)
 	}))
-	for _, line := range directionalCertStartupSummary(cfg) {
+	directionalCertSummaryLines := directionalCertStartupSummary(cfg)
+	for _, line := range directionalCertSummaryLines {
 		fmt.Println(line)
 	}
 
@@ -287,6 +294,17 @@ func main() {
 	// cleanupNotifier in LIFO order) waits for in-flight side-effecting
 	// subprocesses and persists state before the notifier flushes.
 	initShutdownContexts()
+
+	// #1147 trade-quality diagnostics: eager row insert on every full close
+	// (hook fires inside recordClosedPosition, under mu — same cost class as
+	// the tradeRecorder insert), async MFE/MAE enrichment outside mu. The
+	// worker's candle fetches ride runPythonReadOnly, so they cancel on drain.
+	diagWorker := newTradeDiagnosticsWorker(FetchUICandles, stateDB.UpdateTradeDiagnosticsMetrics)
+	diagWorker.UpdateStrategies(cfg.Strategies)
+	tradeDiagnosticsRecorder = stateDB.InsertTradeDiagnostics
+	tradeDiagnosticsEnqueue = diagWorker.Enqueue
+	go diagWorker.run(shutdownReadOnlyCtx)
+
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
@@ -380,6 +398,9 @@ func main() {
 			notifier.SendOwnerDM("[state] " + msg)
 		}
 	}
+
+	// #1157: surface uncertified/expired directional policy to owner DM at startup.
+	notifyDirectionalCertStartupSummary(notifier, directionalCertSummaryLines)
 
 	// #339: Forward the missing-state-DB warning to the owner. Captured before
 	// OpenStateDB ran (which would have created an empty DB), surfaced here
@@ -540,6 +561,10 @@ func main() {
 		drawdownWarnThresholdPct = configuredDrawdownWarnThresholdPct(cfg)
 		mu.Unlock()
 
+		// #1147: refresh the diagnostics worker's strategy-ID → config
+		// snapshot so post-reload closes resolve the right fetch metadata.
+		diagWorker.UpdateStrategies(cfg.Strategies)
+
 		// #1085: refresh the directional-certification artifact on SIGHUP so a
 		// re-run of regime_1076_certify.py takes effect without a restart.
 		// Fail-closed on error (keeps default-off). Certification status changes
@@ -548,9 +573,11 @@ func main() {
 		setDirectionalCertStore(LoadDirectionalCertSetFailClosed(directionalCertPath(), func(f string, a ...interface{}) {
 			fmt.Fprintf(os.Stderr, "[reload] "+f+"\n", a...)
 		}))
-		for _, line := range directionalCertStartupSummary(cfg) {
+		reloadCertLines := directionalCertStartupSummary(cfg)
+		for _, line := range reloadCertLines {
 			fmt.Printf("[reload] %s\n", line)
 		}
+		notifyDirectionalCertStartupSummary(notifier, reloadCertLines)
 
 		if len(changes) == 0 {
 			fmt.Println("[reload] Config reload applied: no hot-reloadable changes")
@@ -1340,9 +1367,10 @@ func main() {
 			// Kill switch reset goroutine: prompt owner to reset via DM.
 			if killSwitchFired && notifier.HasOwner() && !resetGoroutineRunning {
 				resetGoroutineRunning = true
+				resetPrompt := formatKillSwitchResetPrompt(killSwitchInstanceLabel(*configPath), hlAddr, plan)
 				go func() {
 					defer func() { resetGoroutineRunning = false }()
-					resp, err := notifier.AskOwnerDM("Kill switch active. Reply 'reset' to resume trading.", 30*time.Minute)
+					resp, err := notifier.AskOwnerDM(resetPrompt, 30*time.Minute)
 					if err != nil {
 						fmt.Printf("[update] Kill switch reset DM timed out or failed: %v\n", err)
 						return
@@ -1733,6 +1761,13 @@ func main() {
 									logger.Info("Regime gate: open signal blocked (regime=%s)", gateRegime)
 									result.Signal = 0
 								}
+								// #1150: paused — hold position-increasing signals (fresh open, add,
+								// flip); position-reducing actions pass so open positions ride their
+								// natural exit. The Signal==0 manage path below keeps running.
+								if sc.Paused && pausedBlocksSignal(result.Signal, result.CloseFraction, okxPosQty, okxPosSide, true, false) {
+									logger.Info("Paused: %s signal suppressed — position-increasing actions held while paused (#1150)", signalStr)
+									result.Signal = 0
+								}
 								mu.Lock()
 								syncStrategyRegimeState(stratState, storeRegime, cfg.Regime)
 								mu.Unlock()
@@ -1763,6 +1798,13 @@ func main() {
 									logger.Info("Regime gate: open signal blocked (regime=%s)", gateRegime)
 									result.Signal = 0
 								}
+								// #1150: paused — hold position-increasing signals (fresh open, add,
+								// flip); position-reducing actions pass so open positions ride their
+								// natural exit. The Signal==0 manage path below keeps running.
+								if sc.Paused && pausedBlocksSignal(result.Signal, result.CloseFraction, rhPosQty, rhPosSide, true, false) {
+									logger.Info("Paused: %s signal suppressed — position-increasing actions held while paused (#1150)", signalStr)
+									result.Signal = 0
+								}
 								mu.Lock()
 								syncStrategyRegimeState(stratState, storeRegime, cfg.Regime)
 								mu.Unlock()
@@ -1791,6 +1833,13 @@ func main() {
 								logger.Info("Regime gate: open signal blocked (regime=%s)", gateRegime)
 								result.Signal = 0
 							}
+							// #1150: paused — hold position-increasing signals (fresh open, add,
+							// flip); position-reducing actions pass so open positions ride their
+							// natural exit. The Signal==0 manage path below keeps running.
+							if sc.Paused && pausedBlocksSignal(result.Signal, result.CloseFraction, spotPosCtx.Quantity, spotPosCtx.Side, true, false) {
+								logger.Info("Paused: %s signal suppressed — position-increasing actions held while paused (#1150)", signalStr)
+								result.Signal = 0
+							}
 							mu.Lock()
 							syncStrategyRegimeState(stratState, storeRegime, cfg.Regime)
 							trades, detail = executeSpotResult(sc, stratState, stateDB, result, signalStr, price, cfg.Regime, logger)
@@ -1798,6 +1847,16 @@ func main() {
 						}
 					case "options":
 						if result, signalStr, ok := runOptionsCheck(sc, posJSON, notifier, logger); ok {
+							// #1150: paused — drop open actions ("buy"/"sell" both OPEN
+							// option legs); "close" actions and the theta-harvest walker
+							// below still manage existing positions.
+							if sc.Paused {
+								kept, dropped := pausedOptionsActions(result.Actions)
+								if dropped > 0 {
+									logger.Info("Paused: %d option open action(s) dropped — close actions still execute (#1150)", dropped)
+								}
+								result.Actions = kept
+							}
 							// #879: options regime now comes from the global store's
 							// (underlying, 4h, ADX-default) bundle instead of the
 							// check script's inline fetch; the injected payload keeps
@@ -1843,6 +1902,13 @@ func main() {
 								result.Regime = &storeRegime
 								if gateRegime, regimeBlocked := applyRegimeGate(sc, storeRegime, cfg.Regime, okxPosQty); regimeBlocked {
 									logger.Info("Regime gate: open signal blocked (regime=%s)", gateRegime)
+									result.Signal = 0
+								}
+								// #1150: paused — hold position-increasing signals (fresh open, add,
+								// flip); position-reducing actions pass so open positions ride their
+								// natural exit. The Signal==0 manage path below keeps running.
+								if sc.Paused && pausedBlocksSignal(result.Signal, result.CloseFraction, okxPosQty, okxPosSide, PerpsAllowsLong(sc), PerpsAllowsShort(sc)) {
+									logger.Info("Paused: %s signal suppressed — position-increasing actions held while paused (#1150)", signalStr)
 									result.Signal = 0
 								}
 								mu.Lock()
@@ -1932,6 +1998,13 @@ func main() {
 							result.Regime = &storeRegime
 							if gateRegime, regimeBlocked := applyRegimeGate(sc, storeRegime, cfg.Regime, hlPosQty); regimeBlocked {
 								logger.Info("Regime gate: open signal blocked (regime=%s)", gateRegime)
+								result.Signal = 0
+							}
+							// #1150: paused — hold position-increasing signals (fresh open, add,
+							// flip); position-reducing actions pass so open positions ride their
+							// natural exit. The Signal==0 manage path below keeps running.
+							if sc.Paused && pausedBlocksSignal(result.Signal, result.CloseFraction, hlPosQty, hlPosSide, PerpsAllowsLong(sc), PerpsAllowsShort(sc)) {
+								logger.Info("Paused: %s signal suppressed — position-increasing actions held while paused (#1150)", signalStr)
 								result.Signal = 0
 							}
 							mu.Lock()
@@ -2220,6 +2293,19 @@ func main() {
 								logger.Info("Regime gate: open signal blocked (regime=%s)", gateRegime)
 								result.Signal = 0
 							}
+							// #1150: paused — hold position-increasing signals (fresh open, add,
+							// flip); position-reducing actions pass so open positions ride their
+							// natural exit. The Signal==0 manage path below keeps running.
+							// allowsLong=allowsShort=true: ExecuteFuturesSignal is
+							// unconditionally bidirectional — a sell on a long (closeFraction
+							// 0) closes AND opens a fresh short ("Open short … after closing
+							// long"), and a buy on a short mirrors it — so an opposite-side
+							// signal is never a pure close; only close-registry actions
+							// (closeFraction>0) reduce without reopening.
+							if sc.Paused && pausedBlocksSignal(result.Signal, result.CloseFraction, tsContracts, tsPosSide, true, true) {
+								logger.Info("Paused: %s signal suppressed — position-increasing actions held while paused (#1150)", signalStr)
+								result.Signal = 0
+							}
 							mu.Lock()
 							syncStrategyRegimeState(stratState, storeRegime, cfg.Regime)
 							mu.Unlock()
@@ -2492,7 +2578,7 @@ func main() {
 					pv = displayStrategyValue(stratState, prices)
 					posCount := len(stratState.Positions) + len(stratState.OptionPositions)
 					cash := stratState.Cash
-					regimeLabel := stratState.Regime
+					regimeLabel := strategyDisplayRegimeLabel(stratState, sc, cfg.Regime)
 					mu.RUnlock()
 
 					logger.Info("%s", formatStatusLine(cash, posCount, pv, trades, regimeLabel))

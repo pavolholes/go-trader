@@ -169,10 +169,23 @@ func (b *RegimeATRBlock) ResolveSurfaceWithLabels(ctxLabel string, surface regim
 	return nil
 }
 
-// EqualForReload reports whether two blocks have the same shape for
-// hot-reload state-compat purposes. Compares the resolved fields; the raw
-// shape is informational only.
+// EqualForReload reports whether two blocks have the same reload representation.
+// The raw JSON shape is informational only; use_defaults provenance is retained
+// so flat/effectively-safe reloads still copy the operator's latest form.
 func (b *RegimeATRBlock) EqualForReload(other *RegimeATRBlock) bool {
+	if !b.EqualEffectiveForReload(other) {
+		return false
+	}
+	if b == nil || b.IsZero() {
+		return true
+	}
+	return b.UseDefaults == other.UseDefaults
+}
+
+// EqualEffectiveForReload reports whether two blocks resolve to the same runtime
+// ATR map for hot-reload state-compat checks. Representation-only edits such as
+// explicit defaults -> use_defaults do not alter already-armed triggers.
+func (b *RegimeATRBlock) EqualEffectiveForReload(other *RegimeATRBlock) bool {
 	aZero := b == nil || b.IsZero()
 	bZero := other == nil || other.IsZero()
 	if aZero != bZero {
@@ -180,9 +193,6 @@ func (b *RegimeATRBlock) EqualForReload(other *RegimeATRBlock) bool {
 	}
 	if aZero {
 		return true
-	}
-	if b.UseDefaults != other.UseDefaults {
-		return false
 	}
 	if len(b.TrendRegime) != len(other.TrendRegime) {
 		return false
@@ -267,26 +277,26 @@ var regimeATRDefaults = struct {
 		"ranging":       {ATR: 1.5},
 	},
 	// #870: the regime ratchet/trailing opening trail. ADX labels keep their
-	// pre-#870 values; composite labels resolve per quality group (clean=2.0,
-	// choppy=2.0, ranging=1.0) so a trailing_stop_atr_regime use_defaults block
-	// differentiates trend groups from ranges (tight).
+	// pre-#870 values; composite labels resolve per quality group (#1120 retune:
+	// clean=2.5, choppy=2.25, ranging_quiet=1.0, ranging_volatile=1.25,
+	// ranging_directional*=1.5).
 	Trailing: map[string]RegimeATREntry{
 		"trending_up":          {ATR: 2.5},
 		"trending_down":        {ATR: 2.5},
 		"ranging":              {ATR: 2.0},
-		"trending_up_clean":    {ATR: 2.0},
-		"trending_down_clean":  {ATR: 2.0},
-		"trending_up_choppy":   {ATR: 2.0},
-		"trending_down_choppy": {ATR: 2.0},
+		"trending_up_clean":    {ATR: 2.5},
+		"trending_down_clean":  {ATR: 2.5},
+		"trending_up_choppy":   {ATR: 2.25},
+		"trending_down_choppy": {ATR: 2.25},
 		"ranging_quiet":        {ATR: 1.0},
-		"ranging_volatile":     {ATR: 1.0},
-		"ranging_directional":  {ATR: 1.0},
-		// #1124: directional-drift substates inherit the tight ranging_directional
-		// opening trail (1.0). Explicit entries keep parity with the bare label —
+		"ranging_volatile":     {ATR: 1.25},
+		"ranging_directional":  {ATR: 1.5},
+		// #1124: directional-drift substates inherit the ranging_directional
+		// opening trail (1.5). Explicit entries keep parity with the bare label —
 		// without them mapRegimeToBaselineFamily would fall the _up/_down labels
 		// back to the wider "ranging" family (2.0), silently loosening the trail.
-		"ranging_directional_up":   {ATR: 1.0},
-		"ranging_directional_down": {ATR: 1.0},
+		"ranging_directional_up":   {ATR: 1.5},
+		"ranging_directional_down": {ATR: 1.5},
 	},
 }
 

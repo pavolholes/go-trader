@@ -35,24 +35,26 @@ func applyHotReloadConfig(cfg, next *Config, state *AppState, notifier *MultiNot
 		addChange("default_stop_loss_atr_mult: %s -> %s (applies to strategies opened after restart; existing StopLossATRMult on currently-loaded strategies is unchanged)", formatFloatPtr(cfg.DefaultStopLossATRMult), formatFloatPtr(next.DefaultStopLossATRMult))
 		cfg.DefaultStopLossATRMult = next.DefaultStopLossATRMult
 	}
-	// #696: manual_defaults flows through hot-reload so SIGHUP edits to
-	// margin_usd / side propagate to subsequent manual-open invocations and
-	// stop_loss_atr_mult / tp_tiers shape new type=manual strategy opens. The
-	// CLI loads fresh each invocation so it would already pick up changes from
-	// disk; the in-process cfg keeps parity for any code that reads via
-	// cfg.ManualDefaults / cfg.resolveManual* helpers.
-	if !reflect.DeepEqual(cfg.ManualDefaults, next.ManualDefaults) {
-		addChange("manual_defaults: %s -> %s", formatManualDefaults(cfg.ManualDefaults), formatManualDefaults(next.ManualDefaults))
-		cfg.ManualDefaults = cloneManualDefaults(next.ManualDefaults)
+	// #1135: user_defaults flows through hot-reload so SIGHUP edits to the
+	// operator-default layer shape subsequent manual-open invocations, new
+	// type=manual defaults, and close-default injection. The CLI loads fresh
+	// each invocation, but the in-process cfg keeps parity for code that reads
+	// via cfg.resolveManual* helpers and the injected close defaults.
+	if !reflect.DeepEqual(cfg.UserDefaults, next.UserDefaults) {
+		addChange("user_defaults: %s -> %s", formatUserDefaults(cfg.UserDefaults), formatUserDefaults(next.UserDefaults))
+		cfg.UserDefaults = cloneUserDefaults(next.UserDefaults)
 	}
 
-	// #1062: regime.display_windows hot-reloads (display-only summary filter).
-	// validateHotReloadCompatible masked it but rejects any other regime change,
-	// so reaching here means display_windows is the only regime difference.
-	// Clearing it (next nil/empty) reverts to render-all without a restart.
+	// #1062/#1139: selected top-level regime fields hot-reload. display_windows
+	// is display-only; timeframe is state-shifting and validateHotReloadStateCompatible
+	// rejects it while affected strategies are open.
 	if cfg.Regime != nil && next.Regime != nil && !reflect.DeepEqual(cfg.Regime.DisplayWindows, next.Regime.DisplayWindows) {
 		addChange("regime.display_windows: %v -> %v", cfg.Regime.DisplayWindows, next.Regime.DisplayWindows)
 		cfg.Regime.DisplayWindows = append([]string(nil), next.Regime.DisplayWindows...)
+	}
+	if cfg.Regime != nil && next.Regime != nil && normalizeRegimeTimeframe(cfg.Regime.Timeframe) != normalizeRegimeTimeframe(next.Regime.Timeframe) {
+		addChange("regime.timeframe: %q -> %q", normalizeRegimeTimeframe(cfg.Regime.Timeframe), normalizeRegimeTimeframe(next.Regime.Timeframe))
+		cfg.Regime.Timeframe = normalizeRegimeTimeframe(next.Regime.Timeframe)
 	}
 
 	nextByID := strategyConfigByID(next.Strategies)
@@ -87,6 +89,15 @@ func applyHotReloadConfig(cfg, next *Config, state *AppState, notifier *MultiNot
 		if !boolPtrEqual(sc.NotifyRatchetTriggers, ns.NotifyRatchetTriggers) {
 			addChange("strategy[%s].notify_ratchet_triggers: %s -> %s", sc.ID, formatNotifyRatchetTriggers(sc.NotifyRatchetTriggers), formatNotifyRatchetTriggers(ns.NotifyRatchetTriggers))
 			sc.NotifyRatchetTriggers = ns.NotifyRatchetTriggers
+		}
+		// #1150: per-strategy pause is hot-reloadable always, including while a
+		// position is open — pausing only holds position-increasing signals from
+		// the next cycle (closes, trailing SL, ratchet, and protection sync keep
+		// running), and resuming just lets entries flow again. The dispatch reads
+		// sc.Paused from the reloaded config, so no state mutation is needed.
+		if sc.Paused != ns.Paused {
+			addChange("strategy[%s].paused: %t -> %t", sc.ID, sc.Paused, ns.Paused)
+			sc.Paused = ns.Paused
 		}
 		if sc.CapitalPct == 0 && sc.Capital != ns.Capital {
 			addChange("strategy[%s].capital: $%.2f -> $%.2f", sc.ID, sc.Capital, ns.Capital)
@@ -170,6 +181,14 @@ func applyHotReloadConfig(cfg, next *Config, state *AppState, notifier *MultiNot
 			if ns.StopLossATRMult == nil || *ns.StopLossATRMult <= 0 {
 				clearATRMultMissingEntryATRWarningsForStrategy(sc.ID)
 			}
+		}
+		if !sc.StopLossATRRegime.EqualForReload(ns.StopLossATRRegime) {
+			addChange("strategy[%s].stop_loss_atr_regime: shape updated", sc.ID)
+			sc.StopLossATRRegime = cloneRegimeATRBlock(ns.StopLossATRRegime)
+		}
+		if !sc.TrailingStopATRRegime.EqualForReload(ns.TrailingStopATRRegime) {
+			addChange("strategy[%s].trailing_stop_atr_regime: shape updated", sc.ID)
+			sc.TrailingStopATRRegime = cloneRegimeATRBlock(ns.TrailingStopATRRegime)
 		}
 		if !floatPtrEqual(sc.TrailingStopMinMovePct, ns.TrailingStopMinMovePct) {
 			addChange("strategy[%s].trailing_stop_min_move_pct: %s -> %s", sc.ID, formatFloatPtrPct(sc.TrailingStopMinMovePct), formatFloatPtrPct(ns.TrailingStopMinMovePct))
@@ -304,18 +323,20 @@ func applyHotReloadConfig(cfg, next *Config, state *AppState, notifier *MultiNot
 	return changes, nil
 }
 
-// regimeConfigEqualIgnoringDisplayWindows reports whether two regime configs are
-// identical except possibly for DisplayWindows (#1062) — the display-only field
-// that hot-reloads. nil-vs-non-nil counts as a difference (regime add/remove is
-// restart-required). Copies the structs before zeroing the slice header so the
-// live configs are untouched; Windows (a map) is only read by DeepEqual.
-func regimeConfigEqualIgnoringDisplayWindows(a, b *RegimeConfig) bool {
+// regimeConfigEqualIgnoringReloadableFields reports whether two regime configs
+// are identical except for hot-reloadable fields (#1062/#1139). nil-vs-non-nil
+// counts as a difference (regime add/remove is restart-required). Copies the
+// structs before zeroing fields so the live configs are untouched; Windows (a
+// map) is only read by DeepEqual.
+func regimeConfigEqualIgnoringReloadableFields(a, b *RegimeConfig) bool {
 	if a == nil || b == nil {
 		return a == b
 	}
 	ac, bc := *a, *b
 	ac.DisplayWindows = nil
 	bc.DisplayWindows = nil
+	ac.Timeframe = ""
+	bc.Timeframe = ""
 	return reflect.DeepEqual(ac, bc)
 }
 
@@ -342,12 +363,9 @@ func validateHotReloadCompatible(cfg, next *Config) error {
 	if !reflect.DeepEqual(cfg.Correlation, next.Correlation) {
 		errs = append(errs, "correlation changed (restart required)")
 	}
-	// #1062: regime.display_windows is a display-only summary filter (no effect
-	// on calculation, gating, or persisted state), so it hot-reloads — masked
-	// out of this comparison and applied in applyHotReloadConfig. Any OTHER
-	// regime field change (alone or compounded with a display_windows edit)
-	// still rejects, because the mask only zeroes DisplayWindows before DeepEqual.
-	if !regimeConfigEqualIgnoringDisplayWindows(cfg.Regime, next.Regime) {
+	// #1062/#1139: mask top-level regime fields with explicit apply paths.
+	// Any OTHER regime field change still rejects.
+	if !regimeConfigEqualIgnoringReloadableFields(cfg.Regime, next.Regime) {
 		errs = append(errs, "regime changed (restart required)")
 	}
 	if !reflect.DeepEqual(cfg.LeaderboardSummaries, next.LeaderboardSummaries) {
@@ -420,6 +438,14 @@ func validateHotReloadStateCompatible(cfg, next *Config, state *AppState) error 
 		if !ok {
 			continue
 		}
+		if cfg.Regime != nil && next.Regime != nil && sc.Type != "options" && strategyHasOpenPositions(stateStrategy(state, sc.ID)) {
+			_, oldTF := strategyRegimeSymbolTimeframe(sc.Args, cfg.Regime)
+			_, newTF := strategyRegimeSymbolTimeframe(ns.Args, next.Regime)
+			if oldTF != "" && newTF != "" && oldTF != newTF {
+				errs = append(errs, fmt.Sprintf("strategy[%s] regime.timeframe changed with open positions (%q -> %q; flatten first or restart after close)",
+					sc.ID, oldTF, newTF))
+			}
+		}
 		if sc.Type == "perps" && sc.Leverage != ns.Leverage && strategyHasOpenPositions(stateStrategy(state, sc.ID)) {
 			errs = append(errs, fmt.Sprintf("strategy[%s] leverage changed with open positions (%.2fx -> %.2fx; flatten first or restart after close)",
 				sc.ID, sc.Leverage, ns.Leverage))
@@ -463,17 +489,17 @@ func validateHotReloadStateCompatible(cfg, next *Config, state *AppState) error 
 			errs = append(errs, fmt.Sprintf("strategy[%s] margin_mode changed with open positions (%q -> %q; flatten first or restart after close)",
 				sc.ID, sc.MarginMode, ns.MarginMode))
 		}
-		if sc.Type == "perps" && sc.Platform == "hyperliquid" && strategyHasOpenPositions(stateStrategy(state, sc.ID)) {
+		if hyperliquidManagedStopReloadGuard(sc) && strategyHasOpenPositions(stateStrategy(state, sc.ID)) {
 			oldTrailing := sc.TrailingStopPct != nil && *sc.TrailingStopPct > 0
 			newTrailing := ns.TrailingStopPct != nil && *ns.TrailingStopPct > 0
 			if oldTrailing != newTrailing {
 				errs = append(errs, fmt.Sprintf("strategy[%s] trailing_stop_pct mode changed with open positions (flatten first or restart after close)",
 					sc.ID))
 			}
-			// #505: ATR-derived trailing stop pct is computed once per
-			// position from the entry ATR; toggling the mode mid-position
-			// would mix two distance regimes against the same on-chain
-			// trigger. Treat exactly like trailing_stop_pct.
+			// #505/#1115: ATR-derived trailing stop pct is computed once per
+			// position from the entry ATR; toggling the mode mid-position would
+			// mix two distance regimes against the same on-chain trigger. Applies
+			// to both HL perps and HL manual protection.
 			oldATR := sc.TrailingStopATRMult != nil && *sc.TrailingStopATRMult > 0
 			newATR := ns.TrailingStopATRMult != nil && *ns.TrailingStopATRMult > 0
 			if oldATR != newATR {
@@ -503,7 +529,7 @@ func validateHotReloadStateCompatible(cfg, next *Config, state *AppState) error 
 			if oldFixedRegime != newFixedRegime {
 				errs = append(errs, fmt.Sprintf("strategy[%s] stop_loss_atr_regime mode changed with open positions (flatten first or restart after close)",
 					sc.ID))
-			} else if oldFixedRegime && !sc.StopLossATRRegime.EqualForReload(ns.StopLossATRRegime) {
+			} else if oldFixedRegime && !sc.StopLossATRRegime.EqualEffectiveForReload(ns.StopLossATRRegime) {
 				errs = append(errs, fmt.Sprintf("strategy[%s] stop_loss_atr_regime shape changed with open positions (flatten first or restart after close)",
 					sc.ID))
 			}
@@ -512,7 +538,7 @@ func validateHotReloadStateCompatible(cfg, next *Config, state *AppState) error 
 			if oldTrailingRegime != newTrailingRegime {
 				errs = append(errs, fmt.Sprintf("strategy[%s] trailing_stop_atr_regime mode changed with open positions (flatten first or restart after close)",
 					sc.ID))
-			} else if oldTrailingRegime && !sc.TrailingStopATRRegime.EqualForReload(ns.TrailingStopATRRegime) {
+			} else if oldTrailingRegime && !sc.TrailingStopATRRegime.EqualEffectiveForReload(ns.TrailingStopATRRegime) {
 				errs = append(errs, fmt.Sprintf("strategy[%s] trailing_stop_atr_regime shape changed with open positions (flatten first or restart after close)",
 					sc.ID))
 			}
@@ -630,6 +656,7 @@ func strategyRestartShape(sc StrategyConfig) StrategyConfig {
 	sc.MaxDrawdownPct = 0
 	sc.CircuitBreaker = nil        // #1048: hot-reloadable always, including while open. No state-compat guard — disabling only suppresses new fires; an already-latched CB and pending close still drain, and re-enabling just resumes evaluation on the next cycle.
 	sc.NotifyRatchetTriggers = nil // #1118: hot-reloadable always, including while open — notification preference only, never touches position/order state. Masked here so a pure notify_ratchet_triggers toggle isn't flagged "restart required"; applied in applyHotReloadConfig.
+	sc.Paused = false              // #1150: hot-reloadable always, including while open. Pausing only holds position-increasing signals from the next cycle — closes, trailing SL, ratchet, and protection sync keep running — so toggling mid-position never strands protection. Applied in applyHotReloadConfig.
 	sc.Capital = 0
 	sc.Leverage = 0
 	sc.SizingLeverage = 0
@@ -762,6 +789,10 @@ func stateStrategy(state *AppState, id string) *StrategyState {
 	return state.Strategies[id]
 }
 
+func hyperliquidManagedStopReloadGuard(sc StrategyConfig) bool {
+	return sc.Platform == "hyperliquid" && (sc.Type == "perps" || sc.Type == "manual")
+}
+
 func strategyHasOpenPositions(s *StrategyState) bool {
 	if s == nil {
 		return false
@@ -824,7 +855,39 @@ func cloneManualDefaults(md *ManualDefaultsConfig) *ManualDefaultsConfig {
 	if len(md.TPTiers) > 0 {
 		cp.TPTiers = append([]ManualTPTier(nil), md.TPTiers...)
 	}
+	cp.TrailingStopATRRegime = cloneRegimeATRBlock(md.TrailingStopATRRegime)
 	return &cp
+}
+
+func cloneUserDefaults(ud *UserDefaultsConfig) *UserDefaultsConfig {
+	if ud == nil {
+		return nil
+	}
+	return &UserDefaultsConfig{
+		Close:     cloneCloseDefaultsMap(ud.Close),
+		RegimeATR: cloneInterfaceMap(ud.RegimeATR),
+		Manual:    cloneManualDefaults(ud.Manual),
+	}
+}
+
+func formatUserDefaults(ud *UserDefaultsConfig) string {
+	if ud == nil {
+		return "(unset)"
+	}
+	parts := []string{}
+	if len(ud.Close) > 0 {
+		parts = append(parts, fmt.Sprintf("close=%d", len(ud.Close)))
+	}
+	if len(ud.RegimeATR) > 0 {
+		parts = append(parts, fmt.Sprintf("regime_atr=%d", len(ud.RegimeATR)))
+	}
+	if ud.Manual != nil {
+		parts = append(parts, "manual="+formatManualDefaults(ud.Manual))
+	}
+	if len(parts) == 0 {
+		return "{}"
+	}
+	return "{" + strings.Join(parts, ", ") + "}"
 }
 
 func formatManualDefaults(md *ManualDefaultsConfig) string {
@@ -843,6 +906,9 @@ func formatManualDefaults(md *ManualDefaultsConfig) string {
 	}
 	if len(md.TPTiers) > 0 {
 		parts = append(parts, fmt.Sprintf("tp_tiers=%d", len(md.TPTiers)))
+	}
+	if md.TrailingStopATRRegime.IsConfigured() {
+		parts = append(parts, "trailing_stop_atr_regime=configured")
 	}
 	if len(parts) == 0 {
 		return "{}"

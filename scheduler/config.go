@@ -73,9 +73,10 @@ type PlatformConfig struct {
 // Default disabled; strategies opt in via AllowedRegimes or by reading params["regime"].
 type RegimeConfig struct {
 	Enabled      bool             `json:"enabled"`
-	Period       int              `json:"period"`            // ADX lookback (Wilder's smoothing); default 14; legacy single-window mode
-	ADXThreshold float64          `json:"adx_threshold"`     // ADX below this is "ranging"; default 20.0
-	Windows      RegimeWindowsMap `json:"windows,omitempty"` // name -> classifier+period; bare int = ADX period (#792/#795)
+	Period       int              `json:"period"`              // ADX lookback (Wilder's smoothing); default 14; legacy single-window mode
+	ADXThreshold float64          `json:"adx_threshold"`       // ADX below this is "ranging"; default 20.0
+	Timeframe    string           `json:"timeframe,omitempty"` // optional candle timeframe for non-options regime bundles; empty = strategy args[2]
+	Windows      RegimeWindowsMap `json:"windows,omitempty"`   // name -> classifier+period; bare int = ADX period (#792/#795)
 	// DisplayWindows optionally restricts which regime windows appear in the
 	// Discord/cycle summary (#1062). Display-only: it never affects regime
 	// calculation or gating. Names match window keys case-insensitively (e.g.
@@ -84,6 +85,30 @@ type RegimeConfig struct {
 	// populated label, the summary falls back to the single primary regime
 	// string (same fallback as the multi-window-disabled path).
 	DisplayWindows []string `json:"display_windows,omitempty"`
+}
+
+var regimeTimeframeAllowSet = map[string]bool{
+	"1m": true, "2m": true, "3m": true, "5m": true, "15m": true, "30m": true,
+	"60m": true, "90m": true,
+	"1h": true, "2h": true, "4h": true, "6h": true, "8h": true, "12h": true,
+	"1d": true, "3d": true, "5d": true, "1w": true, "1mo": true, "3mo": true,
+}
+
+func normalizeRegimeTimeframe(tf string) string {
+	return strings.ToLower(strings.TrimSpace(tf))
+}
+
+func validRegimeTimeframe(tf string) bool {
+	return regimeTimeframeAllowSet[normalizeRegimeTimeframe(tf)]
+}
+
+func validRegimeTimeframes() []string {
+	out := make([]string, 0, len(regimeTimeframeAllowSet))
+	for tf := range regimeTimeframeAllowSet {
+		out = append(out, tf)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // CorrelationConfig controls portfolio-level directional exposure tracking.
@@ -157,16 +182,43 @@ type Config struct {
 	DefaultStopLossATRMult *float64                   `json:"default_stop_loss_atr_mult,omitempty"` // #605 — top-level default applied to HL perps/manual strategies that omit all stop_loss_* / trailing_stop_* fields. Nil/missing falls back to 1.0; explicit values let operators tune the ATR stop without recompiling.
 	NotifyTPSLFills        *bool                      `json:"notify_tp_sl_fills,omitempty"`         // #661 — owner DM when HL on-chain TP/SL fills are detected by the reconciler. Nil/missing → enabled; explicit false disables.
 	NotifyRatchetTriggers  *bool                      `json:"notify_ratchet_triggers,omitempty"`    // #1110 — owner DM when a trailing_tp_ratchet* tier clears and tightens the trail. Nil/missing → enabled; explicit false disables.
-	ManualDefaults         *ManualDefaultsConfig      `json:"manual_defaults,omitempty"`            // #696 — operator-tunable defaults for `manual-open` CLI and `type=manual` strategy auto-config. Each field optional; absent values fall back to the hardcoded defaults.
 	TradingViewExport      TradingViewExportConfig    `json:"tradingview_export,omitempty"`         // #3 — optional symbol overrides for TradingView portfolio CSV exports
-	UserCloseDefaults      CloseDefaultsMap           `json:"user_close_defaults,omitempty"`        // #866 — operator override layer for close-evaluator default tier ladders. Keyed by close evaluator name → {"tp_tiers": <list|regime-map>}. Injected into any close ref that omits tp_tiers at load; per-strategy tp_tiers still wins, and an absent entry falls through to the system default.
+	UserDefaults           *UserDefaultsConfig        `json:"user_defaults,omitempty"`              // #1135 — canonical operator override layer for defaults. close → close-evaluator tier ladders; regime_atr → standalone use_defaults-only *_atr_regime owners; manual → manual-open/type=manual defaults. Legacy user_close_defaults/manual_defaults are migrated to this tree at load.
 }
 
-// CloseDefaultsMap is the #866 user_close_defaults block: close-evaluator name →
+// UserDefaultsConfig is the canonical #1135 operator defaults block.
+type UserDefaultsConfig struct {
+	Close     CloseDefaultsMap       `json:"close,omitempty"`      // #866/#1133 — close-evaluator name → params object carrying tp_tiers, and trailing_tp_ratchet_regime may also carry trailing_stop_atr_regime.
+	RegimeATR map[string]interface{} `json:"regime_atr,omitempty"` // #1134 — optional stop_loss_atr_regime / trailing_stop_atr_regime maps for standalone use_defaults-only strategy owners.
+	Manual    *ManualDefaultsConfig  `json:"manual,omitempty"`     // #696/#1115 — operator-tunable defaults for manual-open and type=manual strategy auto-config.
+}
+
+// CloseDefaultsMap is the #866 user_defaults.close block: close-evaluator name →
 // params object carrying tp_tiers (a scalar tier list, or a regime-keyed map for
 // the *_regime evaluators). The inner values are left as decoded interface{}s so
 // they can be injected straight into a close ref's Params at load.
 type CloseDefaultsMap map[string]map[string]interface{}
+
+func (c *Config) userDefaultsClose() CloseDefaultsMap {
+	if c == nil || c.UserDefaults == nil {
+		return nil
+	}
+	return c.UserDefaults.Close
+}
+
+func (c *Config) userDefaultsRegimeATR() map[string]interface{} {
+	if c == nil || c.UserDefaults == nil {
+		return nil
+	}
+	return c.UserDefaults.RegimeATR
+}
+
+func (c *Config) userDefaultsManual() *ManualDefaultsConfig {
+	if c == nil || c.UserDefaults == nil {
+		return nil
+	}
+	return c.UserDefaults.Manual
+}
 
 // ManualDefaultsConfig holds operator-tunable defaults for the manual-open CLI
 // and type=manual strategy auto-config. All fields are optional; missing values
@@ -205,8 +257,8 @@ type ManualTPTier struct {
 // invoked without any sizing flag. Operator config wins; hardcoded constant is
 // the fallback.
 func (c *Config) resolveManualMarginUSD() float64 {
-	if c != nil && c.ManualDefaults != nil && c.ManualDefaults.MarginUSD != nil {
-		return *c.ManualDefaults.MarginUSD
+	if md := c.userDefaultsManual(); md != nil && md.MarginUSD != nil {
+		return *md.MarginUSD
 	}
 	return defaultManualMarginUSD
 }
@@ -214,8 +266,8 @@ func (c *Config) resolveManualMarginUSD() float64 {
 // resolveManualSide returns the implicit --side for manual-open. Operator
 // config wins; "long" is the fallback.
 func (c *Config) resolveManualSide() string {
-	if c != nil && c.ManualDefaults != nil && c.ManualDefaults.Side != "" {
-		return c.ManualDefaults.Side
+	if md := c.userDefaultsManual(); md != nil && md.Side != "" {
+		return md.Side
 	}
 	return "long"
 }
@@ -224,8 +276,8 @@ func (c *Config) resolveManualSide() string {
 // type=manual strategies that omit all five HL stop fields. Operator config
 // wins; the 2.0× hardcoded fallback is preserved when absent.
 func (c *Config) resolveManualStopLossATRMult() float64 {
-	if c != nil && c.ManualDefaults != nil && c.ManualDefaults.StopLossATRMult != nil {
-		return *c.ManualDefaults.StopLossATRMult
+	if md := c.userDefaultsManual(); md != nil && md.StopLossATRMult != nil {
+		return *md.StopLossATRMult
 	}
 	return defaultManualStopLossATRMult
 }
@@ -233,11 +285,11 @@ func (c *Config) resolveManualStopLossATRMult() float64 {
 // resolveManualRatchetFallbackATRMult returns the protective fallback used when
 // manual-open cannot resolve the current per-regime ratchet trail. It is always
 // strictly positive so a regime-read failure cannot intentionally or accidentally
-// open a naked manual position; manual_defaults.stop_loss_atr_mult=0 only opts out
-// the scalar manual default.
+// open a naked manual position; user_defaults.manual.stop_loss_atr_mult=0 only
+// opts out the scalar manual default.
 func (c *Config) resolveManualRatchetFallbackATRMult() float64 {
-	if c != nil && c.ManualDefaults != nil && c.ManualDefaults.StopLossATRMult != nil && *c.ManualDefaults.StopLossATRMult > 0 {
-		return *c.ManualDefaults.StopLossATRMult
+	if md := c.userDefaultsManual(); md != nil && md.StopLossATRMult != nil && *md.StopLossATRMult > 0 {
+		return *md.StopLossATRMult
 	}
 	return defaultManualStopLossATRMult
 }
@@ -247,9 +299,9 @@ func (c *Config) resolveManualRatchetFallbackATRMult() float64 {
 // inline [{2×, 0.5}, {3×, 1.0}] literal is preserved when absent. Returns a
 // fresh slice so callers can stamp it onto Params without aliasing.
 func (c *Config) resolveManualTPTiers() []interface{} {
-	if c != nil && c.ManualDefaults != nil && len(c.ManualDefaults.TPTiers) > 0 {
-		tiers := make([]interface{}, len(c.ManualDefaults.TPTiers))
-		for i, t := range c.ManualDefaults.TPTiers {
+	if md := c.userDefaultsManual(); md != nil && len(md.TPTiers) > 0 {
+		tiers := make([]interface{}, len(md.TPTiers))
+		for i, t := range md.TPTiers {
 			tiers[i] = map[string]interface{}{
 				"atr_multiple":   t.ATRMultiple,
 				"close_fraction": t.CloseFraction,
@@ -294,13 +346,20 @@ func (c *Config) resolveManualRatchetRegimeTrailBlock(sc StrategyConfig) (*Regim
 	if len(labels) == 0 {
 		return nil, false
 	}
-	// Operator override: manual_defaults.trailing_stop_atr_regime supplies the
-	// per-regime opening trail (mirrors the stop_loss_atr_mult / tp_tiers knobs).
+	// Operator override: user_defaults.manual.trailing_stop_atr_regime supplies
+	// the per-regime opening trail (mirrors the stop_loss_atr_mult / tp_tiers
+	// knobs).
 	// Clone its raw shape so each adopting strategy resolves an independent copy.
-	if c.ManualDefaults != nil && c.ManualDefaults.TrailingStopATRRegime.IsConfigured() {
-		if block := cloneRegimeATRBlock(c.ManualDefaults.TrailingStopATRRegime); block != nil {
+	if md := c.userDefaultsManual(); md != nil && md.TrailingStopATRRegime.IsConfigured() {
+		if block := cloneRegimeATRBlock(md.TrailingStopATRRegime); block != nil {
 			return block, true
 		}
+	}
+	// #1133: the fleet-wide ratchet package can also provide the coupled
+	// per-regime opening trail. Manual-specific defaults still win above; this
+	// user_defaults.close layer wins over the system use_defaults baseline below.
+	if block, ok := userCloseDefaultTrailingStopATRRegime(c.userDefaultsClose()); ok {
+		return block, true
 	}
 	// Default: synthesize a use_defaults block, but only when every active label
 	// maps onto the baseline opening-trail family — else the ratchet would carry
@@ -315,7 +374,7 @@ func (c *Config) resolveManualRatchetRegimeTrailBlock(sc StrategyConfig) (*Regim
 }
 
 // cloneRegimeATRBlock deep-copies a RegimeATRBlock so an operator-supplied
-// manual_defaults block can be attached to multiple strategies independently
+// user_defaults.manual block can be attached to multiple strategies independently
 // (#1115). The raw shape is the source of truth before validateConfig resolves
 // it, so it is JSON-round-tripped; the typed fields are copied too for blocks
 // that were already resolved. Returns nil for a nil input.
@@ -493,6 +552,7 @@ type StrategyConfig struct {
 	MaxDrawdownPct          float64                  `json:"max_drawdown_pct"`
 	CircuitBreaker          *bool                    `json:"circuit_breaker,omitempty"`            // #1048 — per-strategy circuit-breaker opt-out. Nil/missing → enabled (the safe default); explicit false disables BOTH firing arms in CheckRisk (drawdown > max_drawdown_pct AND 5 consecutive losses), uniformly for live and paper (no platform/live gating). Hot-reloadable via SIGHUP including while a position is open: disabling only suppresses NEW fires — an already-latched CB and any pending circuit close still drain. No effect on type=manual (exempt from CheckRisk). Read via CircuitBreakerEnabled(), never directly.
 	NotifyRatchetTriggers   *bool                    `json:"notify_ratchet_triggers,omitempty"`    // #1118 — per-strategy override of the global notify_ratchet_triggers (#1110) ratchet-tighten owner DM. Nil/missing → inherit the global Config.NotifyRatchetTriggersEnabled(); explicit value wins. Notification-only (never affects position/order state), so SIGHUP hot-reloads it unconditionally even while a position is open. Read via NotifyRatchetTriggersEnabled(cfg), never directly.
+	Paused                  bool                     `json:"paused,omitempty"`                     // #1150 — per-strategy pause. The strategy stays in dueStrategies and runs its full cycle (manage-only, mirroring the #1046 latched-CB shape), but position-INCREASING signals are forced to hold via pausedBlocksSignal: fresh opens, scale-in adds, and bidirectional flips. Position-REDUCING actions pass through — close-registry actions (closeFraction>0) and pure-close directional exits — so an open position rides its natural exit; trailing SL, ratchet, protection sync, and paper SL/TP simulation all keep running on the Signal==0 manage path. Hot-reloadable via SIGHUP unconditionally, including while a position is open (pausing never strands protection). No effect on type=manual (no open signal to suppress; the manual dispatch is pure management).
 	IntervalSeconds         int                      `json:"interval_seconds,omitempty"`           // per-strategy override (0 = use global)
 	HTFFilter               bool                     `json:"htf_filter,omitempty"`                 // higher-timeframe trend filter
 	InvertSignal            bool                     `json:"invert_signal,omitempty"`              // HL perps/manual only: flip BUY<->SELL on a non-zero signal before execution (HOLD/0 is never flipped). Lets inverse variants reuse the same open/close refs. Composes with Direction — invert runs in the Go layer before direction interprets the resulting sign (e.g. direction="short" + invert_signal=true opens short on raw-BUY triggers, distinct from plain direction="short" which opens on raw-SELL). Rejected outside HL perps/manual.
@@ -884,6 +944,18 @@ func loadConfig(path string, skipLiveCredentialChecks bool) (*Config, error) {
 			return nil, fmt.Errorf("read config after v15 migration: %w", err)
 		}
 	}
+	// #1135: v16 consolidates operator defaults under user_defaults and rewrites
+	// the legacy top-level user_close_defaults/manual_defaults aliases on disk so
+	// the runtime has exactly one operator-defaults tree.
+	if needsV16UserDefaultsMigration(data) {
+		if err := MigrateConfig(path, nil, nil); err != nil {
+			return nil, fmt.Errorf("v16 user-defaults migration: %w", err)
+		}
+		data, err = os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("read config after v16 user-defaults migration: %w", err)
+		}
+	}
 	var cfg Config
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
@@ -891,7 +963,9 @@ func loadConfig(path string, skipLiveCredentialChecks bool) (*Config, error) {
 	// #704: flag unknown per-strategy fields (typos like `take_profit_atr_mult`)
 	// before applying defaults; json.Unmarshal silently drops them and would
 	// otherwise produce a struct indistinguishable from "no protection configured".
-	if unknownErrs := validateStrategyJSONKeys(data); len(unknownErrs) > 0 {
+	unknownErrs := validateStrategyJSONKeys(data)
+	unknownErrs = append(unknownErrs, validateUserDefaultsJSONKeys(data)...)
+	if len(unknownErrs) > 0 {
 		return nil, fmt.Errorf("config validation errors:\n  %s", strings.Join(unknownErrs, "\n  "))
 	}
 	if cfg.IntervalSeconds <= 0 {
@@ -914,30 +988,29 @@ func loadConfig(path string, skipLiveCredentialChecks bool) (*Config, error) {
 		return nil, fmt.Errorf("default_stop_loss_atr_mult must be >= 0, got %g", *cfg.DefaultStopLossATRMult)
 	}
 
-	if cfg.ManualDefaults != nil {
-		md := cfg.ManualDefaults
+	if md := cfg.userDefaultsManual(); md != nil {
 		if md.MarginUSD != nil && *md.MarginUSD <= 0 {
-			return nil, fmt.Errorf("manual_defaults.margin_usd must be > 0, got %g", *md.MarginUSD)
+			return nil, fmt.Errorf("user_defaults.manual.margin_usd must be > 0, got %g", *md.MarginUSD)
 		}
 		if md.StopLossATRMult != nil && *md.StopLossATRMult < 0 {
-			return nil, fmt.Errorf("manual_defaults.stop_loss_atr_mult must be >= 0, got %g", *md.StopLossATRMult)
+			return nil, fmt.Errorf("user_defaults.manual.stop_loss_atr_mult must be >= 0, got %g", *md.StopLossATRMult)
 		}
 		if md.Side != "" && md.Side != "long" && md.Side != "short" {
-			return nil, fmt.Errorf("manual_defaults.side must be lowercase \"long\" or \"short\", got %q", md.Side)
+			return nil, fmt.Errorf("user_defaults.manual.side must be lowercase \"long\" or \"short\", got %q", md.Side)
 		}
 		// Reject empty tp_tiers array: omitting the field falls back to the
 		// hardcoded default, but writing `"tp_tiers": []` looks intentional
 		// (operator trying to disable tiered TPs) and would silently revert
 		// to the default — surface the misuse loudly instead.
 		if md.TPTiers != nil && len(md.TPTiers) == 0 {
-			return nil, fmt.Errorf("manual_defaults.tp_tiers must have at least one tier (omit the field to use defaults)")
+			return nil, fmt.Errorf("user_defaults.manual.tp_tiers must have at least one tier (omit the field to use defaults)")
 		}
 		for i, t := range md.TPTiers {
 			if t.ATRMultiple <= 0 {
-				return nil, fmt.Errorf("manual_defaults.tp_tiers[%d].atr_multiple must be > 0, got %g", i, t.ATRMultiple)
+				return nil, fmt.Errorf("user_defaults.manual.tp_tiers[%d].atr_multiple must be > 0, got %g", i, t.ATRMultiple)
 			}
 			if t.CloseFraction <= 0 || t.CloseFraction > 1 {
-				return nil, fmt.Errorf("manual_defaults.tp_tiers[%d].close_fraction must be in (0, 1], got %g", i, t.CloseFraction)
+				return nil, fmt.Errorf("user_defaults.manual.tp_tiers[%d].close_fraction must be in (0, 1], got %g", i, t.CloseFraction)
 			}
 		}
 	}
@@ -1074,6 +1147,12 @@ func loadConfig(path string, skipLiveCredentialChecks bool) (*Config, error) {
 		}
 	}
 
+	// #1133: user_defaults.close["trailing_tp_ratchet_regime"] may carry the
+	// coupled strategy-level trailing_stop_atr_regime owner. Apply it before the
+	// generic scalar ATR-stop default below so eligible ratchet-regime perps do not
+	// first acquire stop_loss_atr_mult and then fail the single-owner validation.
+	applyUserCloseDefaultRatchetRegimeTrails(&cfg)
+
 	// #562/#601/#605: Default HL perps strategies with no explicit stop-loss /
 	// trailing-stop fields to the configurable top-level
 	// default_stop_loss_atr_mult (1.0× ATR by default). Volatility-adjusted
@@ -1148,8 +1227,8 @@ func loadConfig(path string, skipLiveCredentialChecks bool) (*Config, error) {
 				}
 			}
 		}
-		// #691/#696: type=manual gets its own SL default (1.5× ATR by default,
-		// overridable via manual_defaults.stop_loss_atr_mult) so non-manual
+		// #691/#696: type=manual gets its own SL default (2.0× ATR by default,
+		// overridable via user_defaults.manual.stop_loss_atr_mult) so non-manual
 		// perps strategies stay on the fleet-wide default_stop_loss_atr_mult
 		// (typically 1.0×). Skip if any explicit stop field is set so peers
 		// and operator overrides still win. Honor the fleet-wide
@@ -1165,14 +1244,14 @@ func loadConfig(path string, skipLiveCredentialChecks bool) (*Config, error) {
 			}
 		}
 		// #696: Default TP tiers for manual strategies onto the close ref,
-		// overridable via manual_defaults.tp_tiers. Only the tiered_tp_atr*
+		// overridable via user_defaults.manual.tp_tiers. Only the tiered_tp_atr*
 		// close evaluators consume `tp_tiers`; if the operator overrode
 		// close_strategy to something else, leave it alone.
 		if cs := sc.CloseStrategy; cs != nil && isTieredTPATRCloseName(cs.Name) &&
 			cs.Name != "tiered_tp_atr_regime" && cs.Name != "tiered_tp_atr_live_regime" &&
 			cs.Name != dynamicCloseStrategyName {
 			// Regime-aware variants resolve their own tier list from the
-			// trend_regime block / use_defaults shortcut — manual_defaults
+			// trend_regime block / use_defaults shortcut — user_defaults.manual
 			// tier seeding doesn't apply.
 			if cs.Params == nil {
 				cs.Params = map[string]interface{}{}
@@ -1202,6 +1281,7 @@ func loadConfig(path string, skipLiveCredentialChecks bool) (*Config, error) {
 	if cfg.Regime == nil {
 		cfg.Regime = &RegimeConfig{Enabled: false}
 	}
+	cfg.Regime.Timeframe = normalizeRegimeTimeframe(cfg.Regime.Timeframe)
 	if cfg.Regime.Enabled {
 		if cfg.Regime.Period == 0 {
 			cfg.Regime.Period = 14
@@ -1218,11 +1298,17 @@ func loadConfig(path string, skipLiveCredentialChecks bool) (*Config, error) {
 		cfg.Correlation.MaxSameDirectionPct = 75
 	}
 
-	// #866: inject user_close_defaults into close refs that omit tp_tiers, after
+	// #866: inject user_defaults.close into close refs that omit tp_tiers, after
 	// all per-strategy close-ref normalization/auto-config is complete. The
 	// strategy layer (explicit tp_tiers) still wins; refs with no matching entry
 	// fall through to the evaluator's system default.
 	applyUserCloseDefaults(&cfg)
+
+	// #1134: inject user_defaults.regime_atr into standalone
+	// stop_loss_atr_regime / trailing_stop_atr_regime owners that are
+	// use_defaults-only. Runs after manual auto-config and close-ref
+	// injection; skips ratchet/manual strategies.
+	applyUserCloseDefaultRegimeATRs(&cfg)
 
 	if err := validateConfig(&cfg, skipLiveCredentialChecks); err != nil {
 		return nil, err
@@ -1429,10 +1515,10 @@ func validateConfig(cfg *Config, skipLiveCredentialChecks bool) error {
 		}
 	}
 
-	// #866: validate the user_close_defaults block shape (known evaluator names,
-	// tp_tiers present, no stray keys). Tier *contents* are validated per-strategy
-	// below once injected, against each consuming strategy's regime vocabulary.
-	errs = append(errs, validateUserCloseDefaults(cfg.UserCloseDefaults)...)
+	// #866/#1135: validate the user_defaults block shape. Tier *contents* are
+	// validated per-strategy below once injected, against each consuming strategy's
+	// regime vocabulary.
+	errs = append(errs, validateUserDefaults(cfg.UserDefaults)...)
 
 	for i, sc := range cfg.Strategies {
 		prefix := fmt.Sprintf("strategy[%d]", i)
@@ -2078,6 +2164,9 @@ func validateConfig(cfg *Config, skipLiveCredentialChecks bool) error {
 		}
 		if cfg.Regime.ADXThreshold <= 0 || cfg.Regime.ADXThreshold > 100 {
 			errs = append(errs, fmt.Sprintf("regime.adx_threshold must be in (0, 100], got %g", cfg.Regime.ADXThreshold))
+		}
+		if tf := normalizeRegimeTimeframe(cfg.Regime.Timeframe); tf != "" && !validRegimeTimeframe(tf) {
+			errs = append(errs, fmt.Sprintf("regime.timeframe must be one of %s, got %q", strings.Join(validRegimeTimeframes(), ", "), cfg.Regime.Timeframe))
 		}
 	}
 	errs = append(errs, validateRegimeWindowsConfig(cfg)...)

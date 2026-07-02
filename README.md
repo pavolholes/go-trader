@@ -85,7 +85,7 @@ Python provides quant libraries (pandas, numpy, scipy, CCXT); Go provides memory
 
 ## Strategies & Platforms
 
-Strategies are auto-discovered from `shared_strategies/` at `go-trader init` time. Common picks: spot entries include `sma_crossover`, `ema_crossover`, `momentum`, `rsi`, `bollinger_bands`, `macd`, `mean_reversion`, `triple_ema`, `tema_cross`, `pairs_spread`, `chart_pattern`, `anchored_vwap`, `liquidity_sweeps`, `donchian_breakout`; futures/perps also include `triple_ema_bidir`, `bear_pullback_st`, `vwap_rejection_st`, `delta_neutral_funding`, `funding_skew`, `momentum_pro`, `mean_reversion_pro`, `consolidation_range`, `atr_band_revert`, `mtf_confluence`, `regime_adaptive`, `regime_adaptive_htf`. Options use `vol_mean_reversion`, `momentum_options`, `protective_puts`, `covered_calls` (plus `wheel` and `butterfly` on Robinhood); new trades are scored vs. existing positions (strike distance, expiry spread, Greek balance). Max 4 positions per options strategy; min score 0.3 to execute.
+Strategies are auto-discovered from `shared_strategies/` at `go-trader init` time. Common picks: spot entries include `sma_crossover`, `ema_crossover`, `momentum`, `rsi`, `bollinger_bands`, `macd`, `mean_reversion`, `triple_ema`, `tema_cross`, `pairs_spread`, `chart_pattern`, `anchored_vwap`, `anchored_vwap_channel`, `anchored_vwap_reversion`, `liquidity_sweeps`; futures/perps also include `triple_ema_bidir`, `bear_pullback_st`, `vwap_rejection_st`, `delta_neutral_funding`, `funding_skew`, `momentum_pro`, `mean_reversion_pro`, `consolidation_range`, `atr_band_revert`, `mtf_confluence`, `regime_adaptive`, `regime_adaptive_htf`. Options use `vol_mean_reversion`, `momentum_options`, `protective_puts`, `covered_calls` (plus `wheel` and `butterfly` on Robinhood); new trades are scored vs. existing positions (strike distance, expiry spread, Greek balance). Max 4 positions per options strategy; min score 0.3 to execute.
 
 | Platform | Type | Assets | Live env vars | Paper data |
 |---|---|---|---|---|
@@ -99,7 +99,7 @@ Strategies are auto-discovered from `shared_strategies/` at `go-trader init` tim
 | OKX | Spot + Perps + Options | BTC, ETH, SOL | `OKX_API_KEY` / `_SECRET` / `_PASSPHRASE` (`OKX_SANDBOX=1` for demo) | CCXT public |
 | Luno | Spot | BTC, ETH, … | Luno creds | CCXT public |
 
-**Hyperliquid perps direction** — per-strategy `direction: "long" | "short" | "both"`. `long` (default) opens longs only; `short` opens shorts only; `both` flips on reversals. Bidirectional/short-focused strategies (`triple_ema_bidir`, `bear_pullback_st`, `vwap_rejection_st`, `donchian_breakout`, `chart_pattern`, `anchored_vwap`, `liquidity_sweeps`, `momentum_pro`, `mean_reversion_pro`, `consolidation_range`, `atr_band_revert`, `mtf_confluence`, `funding_skew`, `regime_adaptive`) require `"short"` or `"both"`. Legacy `allow_shorts` migrates automatically.
+**Hyperliquid perps direction** — per-strategy `direction: "long" | "short" | "both"`. `long` (default) opens longs only; `short` opens shorts only; `both` flips on reversals. Bidirectional/short-focused strategies (`triple_ema_bidir`, `bear_pullback_st`, `vwap_rejection_st`, `chart_pattern`, `anchored_vwap`, `anchored_vwap_channel`, `anchored_vwap_reversion`, `liquidity_sweeps`, `momentum_pro`, `mean_reversion_pro`, `consolidation_range`, `atr_band_revert`, `mtf_confluence`, `funding_skew`, `regime_adaptive`) require `"short"` or `"both"`. Legacy `allow_shorts` migrates automatically. `donchian_breakout` is deprecated (hidden from discovery, still loadable via explicit config).
 
 **Coin sharing on Hyperliquid** — multiple HL strategies (including `type: "manual"`) can share a coin/wallet with per-strategy SQLite bookkeeping over one on-chain position. Peers must share `margin_mode` + `leverage`; reduce-only SL/TP are sized per strategy. Sub-accounts are the only path to fully independent direction/leverage/margin.
 
@@ -113,7 +113,7 @@ Generate via `./go-trader init` or `--json`. Skeleton:
 
 ```json
 {
-  "config_version": 15,
+  "config_version": 16,
   "interval_seconds": 3600,
   "db_file": "scheduler/state.db",
   "log_dir": "logs",
@@ -273,13 +273,14 @@ Hand-placed positions (or TradingView alerts) tracked for P&L, stops/TPs, and Di
 ./go-trader manual-update-sl hl-manual-btc --trigger 66000
 ./go-trader manual-cancel-sl hl-manual-btc
 ./go-trader manual-close hl-manual-btc [--qty 0.025]
+./go-trader force-close hl-tcross-eth-live [--qty 0.025]                 # live HL perps strategy close
 ```
 
 Sizing: mutually exclusive `--size` / `--notional` / `--margin` (default `--margin 50` when omitted). `--side` defaults to `long`. Omitting `--atr` auto-fetches ATR(14); leverage-aware fallback if fetch fails. SL + tiered TPs placed inline so the position is never naked.
 
-**Close defaults (#1115):** with `regime.enabled` and a resolvable per-regime trail, manual defaults to `trailing_tp_ratchet_regime` (regime trail owns the SL); otherwise `tiered_tp_atr_live` + scalar **2.0×ATR** SL (#1121). Override via `close_strategy`, stop fields, or top-level `manual_defaults` (hot-reloadable via SIGHUP).
+**Close defaults (#1115/#1135):** with `regime.enabled` and a resolvable per-regime trail, manual defaults to `trailing_tp_ratchet_regime` (regime trail owns the SL); otherwise `tiered_tp_atr_live` + scalar **2.0×ATR** SL (#1121). Override via `close_strategy`, stop fields, or `user_defaults.manual` (hot-reloadable via SIGHUP). Fleet close ladders live under `user_defaults.close`; standalone `*_atr_regime` defaults live under `user_defaults.regime_atr`.
 
-`manual-update-sl` / `manual-cancel-sl` queue daemon-side cancel-then-place edits — rejected when automated ATR/regime/trailing protection would re-pin next cycle. `--dry-run` previews without exchange calls. Limit opens are post-only (ALO) by default or GTC with `--tif Gtc`; scheduler polls fills each cycle.
+`manual-update-sl` / `manual-cancel-sl` queue daemon-side cancel-then-place edits — rejected when automated ATR/regime/trailing protection would re-pin next cycle. `force-close` is for live Hyperliquid `type=perps` strategy positions; it submits the reduce-only close and queues the fill for the scheduler to adopt into state/trades. `--dry-run` previews without exchange calls. Limit opens are post-only (ALO) by default or GTC with `--tif Gtc`; scheduler polls fills each cycle.
 
 ---
 
@@ -341,7 +342,7 @@ tailscale serve --bg --https=8444 http://127.0.0.1:8100   # paper instance (8100
 
 Open `https://<node>.tailnet.ts.net:8443/dashboard`. `status_token` still applies.
 
-`inspect` is read-only against live deploys — shows which stop field won, resolved TP tiers, and direction provenance. Discord summaries: columns `Init | Value | PnL | PnL% | DD | Wallet% | Tf | Int | #T | W/L` plus Book Sharpe footer.
+`inspect` is read-only against live deploys — shows which stop field won, resolved TP tiers, and direction provenance. Discord summaries: header shows aggregate initial capital; table columns `Value | PnL | PnL% | DD | Wallet% | Tf | Int | #T | W/L` plus Book Sharpe footer.
 
 ---
 

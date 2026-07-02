@@ -55,6 +55,8 @@ from session_breakout import session_breakout_core
 from vwap_rejection_st import vwap_rejection_st_core
 from vol_momentum import vol_momentum_core
 from anchored_vwap import anchored_vwap_core
+from anchored_vwap_channel import anchored_vwap_channel_core
+from anchored_vwap_reversion import anchored_vwap_reversion_core
 
 
 VALID_PLATFORMS: Tuple[str, ...] = ("spot", "futures")
@@ -66,6 +68,7 @@ STRATEGIES: Dict[str, Dict[str, Any]] = {}
 # discovery surfaces such as --list-json and generated defaults.
 DISCOVERY_HIDDEN_STRATEGIES = frozenset({
     "amd_ifvg",
+    "donchian_breakout",
     "range_scalper",
     "session_breakout",
     "vol_momentum",
@@ -845,7 +848,14 @@ def vwap_reversion_strategy(df: pd.DataFrame, entry_std: float = 1.5, exit_std: 
 @register(
     "chart_pattern",
     "Chart Pattern \u2014 detects Double Top/Bottom, H&S, Flags, Triangles with volume confirmation",
-    {"pivot_lookback": 5, "tolerance": 0.03, "vol_multiplier": 1.5, "vol_period": 20},
+    {
+        "pivot_lookback": 5, "tolerance": 0.03, "vol_multiplier": 1.5,
+        "vol_period": 20,
+        # #982 HTF trend gate \u2014 default-off (0 disables; >1 gates pattern
+        # signals against the resampled-in-frame HTF EMA trend).
+        "htf_gate_factor": 0, "htf_gate_mode": "veto",
+        "htf_gate_ema_fast": 20, "htf_gate_ema_slow": 40,
+    },
 )
 def chart_pattern_strategy(df: pd.DataFrame, **params) -> pd.DataFrame:
     return chart_pattern_core(df, **params)
@@ -1125,10 +1135,42 @@ def vwap_rejection_st_strategy(df: pd.DataFrame, **params) -> pd.DataFrame:
         "buffer_atr_mult": 0.25,
         "confirm_bars": 2,
         "atr_period": 14,
+        "gate_rsi_period": 0, "gate_rsi_level": 50.0,
+        "gate_ema_period": 0,
     },
 )
 def anchored_vwap_strategy(df: pd.DataFrame, **params) -> pd.DataFrame:
     return anchored_vwap_core(df, **params)
+
+
+@register(
+    "anchored_vwap_channel",
+    "Anchored VWAP Channel — dual VWAPs anchored to the last confirmed swing low (support) and swing high (resistance); long a buffered bounce off the lower line, short a buffered rejection off the upper",
+    {
+        "pivot_strength": 5,
+        "buffer_atr_mult": 0.25,
+        "confirm_bars": 2,
+        "min_width_atr_mult": 1.5,
+        "atr_period": 14,
+    },
+)
+def anchored_vwap_channel_strategy(df: pd.DataFrame, **params) -> pd.DataFrame:
+    return anchored_vwap_channel_core(df, **params)
+
+
+@register(
+    "anchored_vwap_reversion",
+    "Anchored VWAP Reversion — fades an ATR-measured stretch beyond the pivot-anchored VWAP; long a buffered snap-back from below the band, short the mirror above",
+    {
+        "pivot_strength": 5,
+        "entry_atr_mult": 1.5,
+        "buffer_atr_mult": 0.25,
+        "confirm_bars": 2,
+        "atr_period": 14,
+    },
+)
+def anchored_vwap_reversion_strategy(df: pd.DataFrame, **params) -> pd.DataFrame:
+    return anchored_vwap_reversion_core(df, **params)
 
 
 @register(
@@ -1153,6 +1195,9 @@ def momentum_pro_strategy(df: pd.DataFrame, **params) -> pd.DataFrame:
         "adx_period": 14, "adx_max": 25.0,
         "rsi_period": 14, "rsi_oversold": 30.0, "rsi_overbought": 70.0,
         "confirm_window": 3,
+        # #981 additional entry triggers — default-off (1 enables; both stay
+        # behind the ADX no-trend gate + RSI-extreme evidence).
+        "touch_entry": 0, "turn_entry": 0,
     },
 )
 def mean_reversion_pro_strategy(df: pd.DataFrame, **params) -> pd.DataFrame:
@@ -1305,7 +1350,8 @@ PLATFORM_ORDER: Dict[str, List[str]] = {
         "mean_reversion", "momentum", "volume_weighted", "triple_ema",
         "rsi_macd_combo", "stoch_rsi", "supertrend", "ichimoku_cloud",
         "pairs_spread", "squeeze_momentum", "atr_breakout", "amd_ifvg",
-        "heikin_ashi_ema", "order_blocks", "vwap_reversion", "anchored_vwap", "chart_pattern",
+        "heikin_ashi_ema", "order_blocks", "vwap_reversion", "anchored_vwap",
+        "anchored_vwap_channel", "anchored_vwap_reversion", "chart_pattern",
         "liquidity_sweeps", "parabolic_sar", "range_scalper",
         "sweep_squeeze_combo", "adx_trend", "donchian_breakout", "tema_cross",
         "momentum_pro", "mean_reversion_pro", "atr_band_revert", "mtf_confluence",
@@ -1317,7 +1363,8 @@ PLATFORM_ORDER: Dict[str, List[str]] = {
         "triple_ema", "triple_ema_bidir", "tema_cross", "tema_cross_bd", "rsi_macd_combo", "momentum",
         "mean_reversion", "rsi", "macd", "breakout", "stoch_rsi", "supertrend",
         "squeeze_momentum", "ichimoku_cloud", "atr_breakout", "amd_ifvg",
-        "heikin_ashi_ema", "order_blocks", "vwap_reversion", "anchored_vwap", "chart_pattern",
+        "heikin_ashi_ema", "order_blocks", "vwap_reversion", "anchored_vwap",
+        "anchored_vwap_channel", "anchored_vwap_reversion", "chart_pattern",
         "liquidity_sweeps", "parabolic_sar", "range_scalper",
         "sweep_squeeze_combo", "adx_trend", "delta_neutral_funding",
         "funding_skew", "donchian_breakout", "session_breakout", "bear_pullback_st",

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"reflect"
 	"strings"
 	"sync"
@@ -981,6 +982,89 @@ func TestApplyHotReloadConfigDisplayWindows(t *testing.T) {
 	})
 }
 
+// #1139 — regime.timeframe is live reloadable only while affected non-options
+// strategies are flat. It changes the regime bundle/certification key, so open
+// positions must preserve their original regime-timeframe interpretation.
+func TestApplyHotReloadConfigRegimeTimeframe(t *testing.T) {
+	regimeWith := func(tf string) *RegimeConfig {
+		return &RegimeConfig{Enabled: true, Period: 14, ADXThreshold: 20, Timeframe: tf}
+	}
+	stratWith := func(r *RegimeConfig) *Config {
+		c := minimalReloadConfig([]StrategyConfig{{
+			ID: "hl-eth", Type: "perps", Platform: "hyperliquid", Script: "x.py",
+			Args: []string{"a", "ETH", "1h"}, Capital: 1000, MaxDrawdownPct: 10,
+			Leverage: 5, MarginMode: "isolated",
+		}})
+		c.Regime = r
+		return c
+	}
+
+	t.Run("applies while flat", func(t *testing.T) {
+		cfg := stratWith(regimeWith(""))
+		next := stratWith(regimeWith(" 1D "))
+		state := &AppState{Strategies: map[string]*StrategyState{
+			"hl-eth": {ID: "hl-eth", Positions: map[string]*Position{}},
+		}}
+
+		changes, err := applyHotReloadConfig(cfg, next, state, nil, nil)
+		if err != nil {
+			t.Fatalf("flat regime.timeframe change should hot-reload, got: %v", err)
+		}
+		if cfg.Regime.Timeframe != "1d" {
+			t.Fatalf("Timeframe = %q, want normalized 1d", cfg.Regime.Timeframe)
+		}
+		if joined := strings.Join(changes, " | "); !strings.Contains(joined, "regime.timeframe") {
+			t.Fatalf("expected a regime.timeframe change entry, got: %v", changes)
+		}
+	})
+
+	t.Run("rejects while open", func(t *testing.T) {
+		cfg := stratWith(regimeWith(""))
+		next := stratWith(regimeWith("1d"))
+		state := &AppState{Strategies: map[string]*StrategyState{
+			"hl-eth": {ID: "hl-eth", Positions: map[string]*Position{
+				"ETH": {Symbol: "ETH", Quantity: 0.5, AvgCost: 3000, Side: "long"},
+			}},
+		}}
+
+		_, err := applyHotReloadConfig(cfg, next, state, nil, nil)
+		if err == nil {
+			t.Fatal("expected open-position regime.timeframe change to be rejected")
+		}
+		if !strings.Contains(err.Error(), "regime.timeframe changed with open positions") {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.Regime.Timeframe != "" {
+			t.Fatalf("rejected reload mutated Timeframe: %q", cfg.Regime.Timeframe)
+		}
+	})
+
+	t.Run("options ignore open-position guard", func(t *testing.T) {
+		cfg := minimalReloadConfig([]StrategyConfig{{
+			ID: "deribit-theta", Type: "options", Platform: "deribit", Script: "shared_scripts/check_options.py",
+			Args: []string{"theta_harvest", "BTC"}, Capital: 1000, MaxDrawdownPct: 10,
+		}})
+		cfg.Regime = regimeWith("")
+		next := minimalReloadConfig([]StrategyConfig{{
+			ID: "deribit-theta", Type: "options", Platform: "deribit", Script: "shared_scripts/check_options.py",
+			Args: []string{"theta_harvest", "BTC"}, Capital: 1000, MaxDrawdownPct: 10,
+		}})
+		next.Regime = regimeWith("1d")
+		state := &AppState{Strategies: map[string]*StrategyState{
+			"deribit-theta": {ID: "deribit-theta", Positions: map[string]*Position{
+				"BTC": {Symbol: "BTC", Quantity: 1, AvgCost: 1000, Side: "long"},
+			}},
+		}}
+
+		if _, err := applyHotReloadConfig(cfg, next, state, nil, nil); err != nil {
+			t.Fatalf("options path keeps its hardcoded regime timeframe and should not trip the open-position guard: %v", err)
+		}
+		if cfg.Regime.Timeframe != "1d" {
+			t.Fatalf("Timeframe = %q, want 1d", cfg.Regime.Timeframe)
+		}
+	})
+}
+
 // #656 — direction change is allowed when the strategy is flat.
 func TestApplyHotReloadConfigAllowsDirectionChangeWhenFlat(t *testing.T) {
 	cfg := minimalReloadConfig([]StrategyConfig{{
@@ -1333,22 +1417,26 @@ func TestFormatStringMap(t *testing.T) {
 	}
 }
 
-// #696: manual_defaults flows through hot-reload so SIGHUP edits to
-// margin_usd / stop_loss_atr_mult / side / tp_tiers propagate without restart.
+// #696/#1135: user_defaults.manual flows through hot-reload so SIGHUP edits
+// to margin_usd / stop_loss_atr_mult / side / tp_tiers propagate without restart.
 func TestApplyHotReloadConfigPropagatesManualDefaults(t *testing.T) {
 	oldMargin := 50.0
 	newMargin := 125.0
 	newSL := 2.0
 	cfg := minimalReloadConfig(nil)
-	cfg.ManualDefaults = &ManualDefaultsConfig{MarginUSD: &oldMargin, Side: "long"}
+	cfg.UserDefaults = &UserDefaultsConfig{
+		Manual: &ManualDefaultsConfig{MarginUSD: &oldMargin, Side: "long"},
+	}
 	next := minimalReloadConfig(nil)
-	next.ManualDefaults = &ManualDefaultsConfig{
-		MarginUSD:       &newMargin,
-		StopLossATRMult: &newSL,
-		Side:            "short",
-		TPTiers: []ManualTPTier{
-			{ATRMultiple: 1.5, CloseFraction: 0.4},
-			{ATRMultiple: 2.5, CloseFraction: 1.0},
+	next.UserDefaults = &UserDefaultsConfig{
+		Manual: &ManualDefaultsConfig{
+			MarginUSD:       &newMargin,
+			StopLossATRMult: &newSL,
+			Side:            "short",
+			TPTiers: []ManualTPTier{
+				{ATRMultiple: 1.5, CloseFraction: 0.4},
+				{ATRMultiple: 2.5, CloseFraction: 1.0},
+			},
 		},
 	}
 	state := &AppState{Strategies: map[string]*StrategyState{}}
@@ -1357,11 +1445,11 @@ func TestApplyHotReloadConfigPropagatesManualDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("applyHotReloadConfig: %v", err)
 	}
-	if !strings.Contains(strings.Join(changes, "\n"), "manual_defaults") {
-		t.Fatalf("changes missing manual_defaults entry: %v", changes)
+	if !strings.Contains(strings.Join(changes, "\n"), "user_defaults") {
+		t.Fatalf("changes missing user_defaults entry: %v", changes)
 	}
-	if cfg.ManualDefaults == nil {
-		t.Fatal("cfg.ManualDefaults nil after reload")
+	if cfg.UserDefaults == nil || cfg.UserDefaults.Manual == nil {
+		t.Fatal("cfg.UserDefaults.Manual nil after reload")
 	}
 	if got := cfg.resolveManualMarginUSD(); got != 125.0 {
 		t.Errorf("resolveManualMarginUSD = %g, want 125.0", got)
@@ -1376,18 +1464,269 @@ func TestApplyHotReloadConfigPropagatesManualDefaults(t *testing.T) {
 		t.Errorf("resolveManualTPTiers length = %d, want 2", got)
 	}
 	// Mutating the next block after reload must not affect cfg (clone, not alias).
-	*next.ManualDefaults.MarginUSD = 999
+	*next.UserDefaults.Manual.MarginUSD = 999
 	if got := cfg.resolveManualMarginUSD(); got != 125.0 {
 		t.Errorf("cfg margin aliased to next: got %g after next-mutation, want 125.0", got)
 	}
 }
 
-// #696: empty tp_tiers array is rejected by validation; LoadConfig surfaces
+func TestApplyHotReloadConfigCopiesFlatRegimeTrailAndUserCloseDefaults(t *testing.T) {
+	oldTrail := &RegimeATRBlock{TrendRegime: map[string]RegimeATREntry{
+		"trending_up":   {ATR: 2.0},
+		"trending_down": {ATR: 2.0},
+		"ranging":       {ATR: 1.0},
+	}}
+	newTrail := &RegimeATRBlock{TrendRegime: map[string]RegimeATREntry{
+		"trending_up":   {ATR: 2.75},
+		"trending_down": {ATR: 2.75},
+		"ranging":       {ATR: 1.5},
+	}}
+	strategy := func(block *RegimeATRBlock) StrategyConfig {
+		return StrategyConfig{
+			ID: "hl-eth", Type: "perps", Platform: "hyperliquid",
+			Script:                "shared_scripts/check_hyperliquid.py",
+			Args:                  []string{"sma_crossover", "ETH", "1h", "--mode=paper"},
+			CloseStrategy:         &StrategyRef{Name: trailingTPRatchetRegimeCloseName},
+			TrailingStopATRRegime: block,
+			Capital:               1000,
+			MaxDrawdownPct:        10,
+			Leverage:              1,
+		}
+	}
+	cfg := minimalReloadConfig([]StrategyConfig{strategy(oldTrail)})
+	next := minimalReloadConfig([]StrategyConfig{strategy(newTrail)})
+	next.UserDefaults = &UserDefaultsConfig{
+		Close: CloseDefaultsMap{
+			trailingTPRatchetRegimeCloseName: {
+				"tp_tiers":                 ratchetRegimeUserTiers(),
+				"trailing_stop_atr_regime": ratchetRegimeTrailRaw(2.75, 2.75, 1.5),
+			},
+		},
+	}
+	state := &AppState{Strategies: map[string]*StrategyState{
+		"hl-eth": {ID: "hl-eth", Positions: map[string]*Position{}},
+	}}
+
+	changes, err := applyHotReloadConfig(cfg, next, state, nil, nil)
+	if err != nil {
+		t.Fatalf("applyHotReloadConfig: %v", err)
+	}
+	joined := strings.Join(changes, "\n")
+	if !strings.Contains(joined, "trailing_stop_atr_regime") {
+		t.Fatalf("changes missing trailing_stop_atr_regime update: %v", changes)
+	}
+	if !strings.Contains(joined, "user_defaults") {
+		t.Fatalf("changes missing user_defaults update: %v", changes)
+	}
+	got, ok := resolveRegimeATR(*cfg.Strategies[0].TrailingStopATRRegime, "ranging")
+	if !ok || got != 1.5 {
+		t.Fatalf("reloaded ranging trail = (%g, %v), want (1.5, true)", got, ok)
+	}
+	next.Strategies[0].TrailingStopATRRegime.TrendRegime["ranging"] = RegimeATREntry{ATR: 9.0}
+	got, ok = resolveRegimeATR(*cfg.Strategies[0].TrailingStopATRRegime, "ranging")
+	if !ok || got != 1.5 {
+		t.Fatalf("reloaded trail aliases next after mutation: (%g, %v)", got, ok)
+	}
+	next.UserDefaults.Close[trailingTPRatchetRegimeCloseName]["trailing_stop_atr_regime"] = map[string]interface{}{"use_defaults": true}
+	raw := cfg.UserDefaults.Close[trailingTPRatchetRegimeCloseName]["trailing_stop_atr_regime"].(map[string]interface{})
+	if _, ok := raw["use_defaults"]; ok {
+		t.Fatal("cfg.UserDefaults.Close aliases next after reload")
+	}
+}
+
+func TestApplyHotReloadConfigRejectsUserCloseDefaultRegimeTrailChangeWithOpenPosition(t *testing.T) {
+	cases := []struct {
+		name     string
+		id       string
+		strategy string
+	}{
+		{
+			name: "perps",
+			id:   "hl-eth",
+			strategy: `{
+				"id": "hl-eth",
+				"type": "perps",
+				"platform": "hyperliquid",
+				"script": "shared_scripts/check_hyperliquid.py",
+				"args": ["sma_crossover", "ETH", "1h", "--mode=paper"],
+				"capital": 1000,
+				"leverage": 1,
+				"max_drawdown_pct": 20,
+				"close_strategy": {"name": "trailing_tp_ratchet_regime", "params": {"use_defaults": true}}
+			}`,
+		},
+		{
+			name: "manual",
+			id:   "hl-manual-eth",
+			strategy: `{
+				"id": "hl-manual-eth",
+				"type": "manual",
+				"platform": "hyperliquid",
+				"symbol": "ETH",
+				"timeframe": "1h",
+				"capital": 1000,
+				"leverage": 1,
+				"max_drawdown_pct": 20
+			}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := loadUserDefaultRatchetRegimeReloadConfig(t, tc.strategy, explicitUserDefaultTrailJSON(2.5, 2.5, 2.0))
+			next := loadUserDefaultRatchetRegimeReloadConfig(t, tc.strategy, explicitUserDefaultTrailJSON(2.5, 2.5, 1.5))
+
+			_, err := applyHotReloadConfig(cfg, next, openETHReloadState(tc.id), nil, nil)
+			if err == nil {
+				t.Fatal("expected open-position reload to reject changed user_defaults.close trailing_stop_atr_regime")
+			}
+			if !strings.Contains(err.Error(), "trailing_stop_atr_regime shape changed with open positions") {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestApplyHotReloadConfigAllowsUserCloseDefaultRegimeTrailEquivalentEditWithOpenPosition(t *testing.T) {
+	strategy := `{
+		"id": "hl-eth",
+		"type": "perps",
+		"platform": "hyperliquid",
+		"script": "shared_scripts/check_hyperliquid.py",
+		"args": ["sma_crossover", "ETH", "1h", "--mode=paper"],
+		"capital": 1000,
+		"leverage": 1,
+		"max_drawdown_pct": 20,
+		"close_strategy": {"name": "trailing_tp_ratchet_regime", "params": {"use_defaults": true}}
+	}`
+	cfg := loadUserDefaultRatchetRegimeReloadConfig(t, strategy, explicitUserDefaultTrailJSON(2.5, 2.5, 2.0))
+	next := loadUserDefaultRatchetRegimeReloadConfig(t, strategy, `{"use_defaults": true}`)
+
+	changes, err := applyHotReloadConfig(cfg, next, openETHReloadState("hl-eth"), nil, nil)
+	if err != nil {
+		t.Fatalf("applyHotReloadConfig rejected equivalent effective trail: %v", err)
+	}
+	if cfg.Strategies[0].TrailingStopATRRegime == nil || !cfg.Strategies[0].TrailingStopATRRegime.UseDefaults {
+		t.Fatalf("equivalent trail edit was not copied into cfg: %#v", cfg.Strategies[0].TrailingStopATRRegime)
+	}
+	joined := strings.Join(changes, "\n")
+	if !strings.Contains(joined, "trailing_stop_atr_regime") || !strings.Contains(joined, "user_defaults") {
+		t.Fatalf("changes=%v, want trailing_stop_atr_regime and user_defaults entries", changes)
+	}
+}
+
+func TestApplyHotReloadConfigCopiesFlatStandaloneRegimeATRDefault(t *testing.T) {
+	cfg := loadUserDefaultStandaloneRegimeATRReloadConfig(t, explicitUserDefaultStopLossJSON(2.0, 2.0, 1.5))
+	next := loadUserDefaultStandaloneRegimeATRReloadConfig(t, explicitUserDefaultStopLossJSON(2.25, 2.25, 1.25))
+	state := &AppState{Strategies: map[string]*StrategyState{
+		"hl-eth": {ID: "hl-eth", Positions: map[string]*Position{}},
+	}}
+
+	changes, err := applyHotReloadConfig(cfg, next, state, nil, nil)
+	if err != nil {
+		t.Fatalf("applyHotReloadConfig: %v", err)
+	}
+	joined := strings.Join(changes, "\n")
+	if !strings.Contains(joined, "user_defaults") || !strings.Contains(joined, "stop_loss_atr_regime") {
+		t.Fatalf("changes=%v, want user_defaults and stop_loss_atr_regime entries", changes)
+	}
+	got, ok := resolveRegimeATR(*cfg.Strategies[0].StopLossATRRegime, "ranging")
+	if !ok || got != 1.25 {
+		t.Fatalf("reloaded ranging SL = (%g, %v), want (1.25, true)", got, ok)
+	}
+	next.Strategies[0].StopLossATRRegime.TrendRegime["ranging"] = RegimeATREntry{ATR: 9.0}
+	got, ok = resolveRegimeATR(*cfg.Strategies[0].StopLossATRRegime, "ranging")
+	if !ok || got != 1.25 {
+		t.Fatalf("reloaded standalone SL aliases next after mutation: (%g, %v)", got, ok)
+	}
+}
+
+func loadUserDefaultRatchetRegimeReloadConfig(t *testing.T, strategyJSON, trailJSON string) *Config {
+	t.Helper()
+	cfgJSON := fmt.Sprintf(`{
+		"regime": {"enabled": true, "period": 14, "adx_threshold": 20},
+		"user_defaults": {
+			"close": {
+				"trailing_tp_ratchet_regime": {
+					"tp_tiers": {
+						"trending_up": [{"atr_multiple": 1.0, "trailing_mult_after": 1.0, "close_fraction": 0.0}],
+						"trending_down": [{"atr_multiple": 1.0, "trailing_mult_after": 1.0, "close_fraction": 0.0}],
+						"ranging": [{"atr_multiple": 1.0, "trailing_mult_after": 1.0, "close_fraction": 0.0}]
+					},
+					"trailing_stop_atr_regime": %s
+				}
+			}
+		},
+		"strategies": [%s]
+	}`, trailJSON, strategyJSON)
+	cfg, err := LoadConfig(writeTestConfig(t, t.TempDir(), cfgJSON))
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	return cfg
+}
+
+func loadUserDefaultStandaloneRegimeATRReloadConfig(t *testing.T, slJSON string) *Config {
+	t.Helper()
+	cfgJSON := fmt.Sprintf(`{
+		"regime": {"enabled": true, "period": 14, "adx_threshold": 20},
+		"user_defaults": {
+			"regime_atr": {
+				"stop_loss_atr_regime": %s
+			}
+		},
+		"strategies": [{
+			"id": "hl-eth",
+			"type": "perps",
+			"platform": "hyperliquid",
+			"script": "shared_scripts/check_hyperliquid.py",
+			"args": ["sma_crossover", "ETH", "1h", "--mode=paper"],
+			"capital": 1000,
+			"leverage": 1,
+			"max_drawdown_pct": 20,
+			"stop_loss_atr_regime": {"use_defaults": true}
+		}]
+	}`, slJSON)
+	cfg, err := LoadConfig(writeTestConfig(t, t.TempDir(), cfgJSON))
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	return cfg
+}
+
+func explicitUserDefaultStopLossJSON(up, down, ranging float64) string {
+	return fmt.Sprintf(`{
+		"trend_regime": {
+			"trending_up": {"atr_multiple": %g},
+			"trending_down": {"atr_multiple": %g},
+			"ranging": {"atr_multiple": %g}
+		}
+	}`, up, down, ranging)
+}
+
+func explicitUserDefaultTrailJSON(up, down, ranging float64) string {
+	return fmt.Sprintf(`{
+		"trend_regime": {
+			"trending_up": {"atr_multiple": %g},
+			"trending_down": {"atr_multiple": %g},
+			"ranging": {"atr_multiple": %g}
+		}
+	}`, up, down, ranging)
+}
+
+func openETHReloadState(strategyID string) *AppState {
+	return &AppState{Strategies: map[string]*StrategyState{
+		strategyID: {ID: strategyID, Positions: map[string]*Position{
+			"ETH": {Symbol: "ETH", Quantity: 0.5, AvgCost: 3000, Side: "long"},
+		}},
+	}}
+}
+
+// #696/#1135: empty tp_tiers array is rejected by validation; LoadConfig surfaces
 // the misuse instead of silently falling back to defaults.
 func TestLoadConfigManualDefaultsRejectsEmptyTPTiersArray(t *testing.T) {
 	dir := t.TempDir()
 	cfgJSON := `{
-		"manual_defaults": {"tp_tiers": []},
+		"user_defaults": {"manual": {"tp_tiers": []}},
 		"strategies": [{
 			"id": "hl-manual-eth-live",
 			"type": "manual",
@@ -1402,7 +1741,7 @@ func TestLoadConfigManualDefaultsRejectsEmptyTPTiersArray(t *testing.T) {
 	path := writeTestConfig(t, dir, cfgJSON)
 	_, err := LoadConfig(path)
 	if err == nil {
-		t.Fatal("LoadConfig accepted empty manual_defaults.tp_tiers array")
+		t.Fatal("LoadConfig accepted empty user_defaults.manual.tp_tiers array")
 	}
 	if !strings.Contains(err.Error(), "tp_tiers") {
 		t.Errorf("error %q does not mention tp_tiers", err)

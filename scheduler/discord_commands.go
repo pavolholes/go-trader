@@ -23,14 +23,15 @@ const commandPrefix = "go-trader-"
 
 // readOnlyCommandNames are usable in a guild or in DMs by anyone.
 var readOnlyCommandNames = map[string]bool{
-	"status":           true,
-	"health":           true,
-	"positions":        true,
-	"pnl":              true,
-	"leaderboard":      true,
-	"circuit-breakers": true,
-	"dead-strategies":  true,
-	"correlation":      true,
+	"status":             true,
+	"health":             true,
+	"positions":          true,
+	"pnl":                true,
+	"leaderboard":        true,
+	"circuit-breakers":   true,
+	"dead-strategies":    true,
+	"correlation":        true,
+	"closing-strategies": true,
 }
 
 // opsCommandNames mutate state, run heavy work, or expose operator-sensitive
@@ -39,15 +40,16 @@ var readOnlyCommandNames = map[string]bool{
 // mutating set (config/add-strategy/remove-strategy/add-platform/paper-to-live)
 // changes the config file, so it gets the same owner-DM-only gate.
 var opsCommandNames = map[string]bool{
-	"restart":         true,
-	"backtest":        true,
-	"logs":            true,
-	"report-an-issue": true,
-	"config":          true,
-	"add-strategy":    true,
-	"remove-strategy": true,
-	"add-platform":    true,
-	"paper-to-live":   true,
+	"restart":           true,
+	"backtest":          true,
+	"logs":              true,
+	"report-an-issue":   true,
+	"config":            true,
+	"add-strategy":      true,
+	"remove-strategy":   true,
+	"add-platform":      true,
+	"paper-to-live":     true,
+	"apply-regime-gate": true,
 }
 
 // authorizeCommand decides whether invokerID may run command `name`. Read-only
@@ -406,6 +408,7 @@ func slashCommands() []*discordgo.ApplicationCommand {
 		{Name: commandPrefix + "circuit-breakers", Description: "Active circuit breakers and kill-switch state"},
 		{Name: commandPrefix + "dead-strategies", Description: "Strategies that have never opened a position"},
 		{Name: commandPrefix + "correlation", Description: "Correlation / concentration warnings"},
+		{Name: commandPrefix + "closing-strategies", Description: "Registered close evaluators and their config params"},
 		{Name: commandPrefix + "logs", Description: "Recent journalctl lines (owner DM only)", Contexts: dmContext(), Options: []*discordgo.ApplicationCommandOption{
 			{Type: discordgo.ApplicationCommandOptionInteger, Name: "n", Description: "Number of lines (default 50, max 200)"},
 		}},
@@ -441,6 +444,9 @@ func slashCommands() []*discordgo.ApplicationCommand {
 		}},
 		{Name: commandPrefix + "paper-to-live", Description: "Switch a strategy from paper to live (owner DM only)", Contexts: dmContext(), Options: []*discordgo.ApplicationCommandOption{
 			{Type: discordgo.ApplicationCommandOptionString, Name: "strategy", Description: "Strategy ID to switch to live", Required: true},
+		}},
+		{Name: commandPrefix + "apply-regime-gate", Description: "Interactively wire a regime entry-gate onto a strategy (owner DM only)", Contexts: dmContext(), Options: []*discordgo.ApplicationCommandOption{
+			{Type: discordgo.ApplicationCommandOptionString, Name: "gate", Description: "Gate preset (default comp_up_clean_p21)"},
 		}},
 	}
 }
@@ -484,7 +490,7 @@ func (d *DiscordNotifier) interactionCreate(s *discordgo.Session, i *discordgo.I
 	// subprocess + venue HTTP, which can exceed Discord's 3s deadline — so ACK
 	// first (deferred), then deliver the built response via a follow-up.
 	case "status":
-		d.respondReadOnlyDeferred(s, i, func() string { return d.buildReadOnly(formatStatusResponse) })
+		d.respondReadOnlyDeferred(s, i, d.buildDiscordStatus)
 	case "positions":
 		d.respondReadOnlyDeferred(s, i, func() string { return d.buildReadOnly(formatPositionsResponse) })
 	case "pnl":
@@ -501,6 +507,8 @@ func (d *DiscordNotifier) interactionCreate(s *discordgo.Session, i *discordgo.I
 		d.respondReadOnlyInline(s, i, d.buildDeadStrategies())
 	case "correlation":
 		d.respondReadOnlyInline(s, i, d.buildCorrelation())
+	case "closing-strategies":
+		d.handleClosingStrategies(s, i)
 	// Ops (owner DM only).
 	case "logs":
 		respondText(s, i, runLogs(optionInt(data.Options, "n", 50)))
@@ -529,6 +537,8 @@ func (d *DiscordNotifier) interactionCreate(s *discordgo.Session, i *discordgo.I
 		d.handleAddPlatform(s, i, data.Options)
 	case "paper-to-live":
 		d.handlePaperToLive(s, i, data.Options)
+	case "apply-regime-gate":
+		d.handleApplyRegimeGate(s, i, data.Options)
 	default:
 		respondEphemeral(s, i, "unknown command")
 	}
@@ -648,6 +658,39 @@ func (d *DiscordNotifier) buildReadOnly(fn func(*AppState, map[string]float64) s
 	return fn(d.ss.state, prices)
 }
 
+// buildDiscordStatus is the /status slash-command builder: portfolio summary plus
+// any uncertified/expired regime_directional_policy notes (#1157).
+func (d *DiscordNotifier) buildDiscordStatus() string {
+	if d.ss == nil || d.cfg == nil {
+		return "status server not wired"
+	}
+	prices := d.ss.fetchLiveMarkPrices()
+	d.ss.mu.RLock()
+	defer d.ss.mu.RUnlock()
+	base := formatStatusResponse(d.ss.state, prices)
+	base += pausedStrategiesNote(d.cfg.Strategies)
+	if note := directionalCertOperatorNotes(d.cfg.Strategies, d.cfg.Regime); note != "" {
+		return base + note
+	}
+	return base
+}
+
+// pausedStrategiesNote lists paused strategies (#1150) for /status. Empty
+// string when none are paused. IDs are sorted for stable operator output.
+func pausedStrategiesNote(strategies []StrategyConfig) string {
+	var paused []string
+	for _, sc := range strategies {
+		if sc.Paused {
+			paused = append(paused, sc.ID)
+		}
+	}
+	if len(paused) == 0 {
+		return ""
+	}
+	sort.Strings(paused)
+	return fmt.Sprintf("\n⏸️ paused: %s", strings.Join(paused, ", "))
+}
+
 func (d *DiscordNotifier) buildHealth() string {
 	if d.ss == nil {
 		return "status server not wired"
@@ -706,6 +749,44 @@ func (d *DiscordNotifier) buildCorrelation() string {
 	d.ss.mu.RLock()
 	defer d.ss.mu.RUnlock()
 	return formatCorrelationResponse(d.ss.state.CorrelationSnapshot)
+}
+
+// handleClosingStrategies answers /closing-strategies (#1203) with the full
+// close-evaluator catalog. Deferred + multi-followup because the first call
+// after startup spawns the close-registry subprocess (cached after that, see
+// fetchCloseRegistryCatalog) and the catalog may span more than one Discord
+// message.
+func (d *DiscordNotifier) handleClosingStrategies(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	flags := d.readOnlyReplyFlags()
+	_ = s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{Flags: flags},
+	})
+	entries, err := fetchCloseRegistryCatalog()
+	if err != nil {
+		_, _ = s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
+			Content: truncateForDiscord(fmt.Sprintf("closing-strategies: %v", err)),
+			Flags:   flags,
+		})
+		return
+	}
+	// cfg.UserDefaults is a hot-reloadable field mutated under d.ss.mu.Lock()
+	// on SIGHUP (config_reload.go); hold the read lock across the format call
+	// (not across the subprocess above, which can run up to scriptTimeout).
+	var pages []string
+	if d.ss == nil {
+		pages = formatClosingStrategiesResponse(d.cfg, entries)
+	} else {
+		d.ss.mu.RLock()
+		pages = formatClosingStrategiesResponse(d.cfg, entries)
+		d.ss.mu.RUnlock()
+	}
+	for _, page := range pages {
+		_, _ = s.FollowupMessageCreate(i.Interaction, true, &discordgo.WebhookParams{
+			Content: truncateForDiscord(page),
+			Flags:   flags,
+		})
+	}
 }
 
 // lifetimeStats fetches per-strategy lifetime stats from SQLite (independent of mu).

@@ -727,11 +727,27 @@ DEFAULT_PARAM_RANGES = {
         "pivot_strength": [3, 5, 8],
         "buffer_atr_mult": [0.1, 0.25, 0.5],
         "confirm_bars": [1, 2, 3],
+        "gate_rsi_period": [0, 14, 21],
+        "gate_ema_period": [0, 100, 200],
+    },
+    "anchored_vwap_channel": {
+        "pivot_strength": [3, 5, 8],
+        "buffer_atr_mult": [0.1, 0.25, 0.5],
+        "confirm_bars": [1, 2, 3],
+        "min_width_atr_mult": [1.0, 1.5, 2.5],
+    },
+    "anchored_vwap_reversion": {
+        "pivot_strength": [3, 5, 8],
+        "entry_atr_mult": [1.0, 1.5, 2.0],
+        "buffer_atr_mult": [0.1, 0.25, 0.5],
+        "confirm_bars": [1, 2, 3],
     },
     "chart_pattern": {
         "pivot_lookback": [3, 5, 7],
         "tolerance": [0.02, 0.03, 0.05],
         "vol_multiplier": [1.2, 1.5, 2.0],
+        # #982 HTF trend gate (0 = off; nonzero values from the M1 plateau).
+        "htf_gate_factor": [0, 6, 10],
     },
     "liquidity_sweeps": {
         "swing_lookback": [10, 20, 30],
@@ -775,6 +791,9 @@ DEFAULT_PARAM_RANGES = {
         "adx_max": [20.0, 25.0, 30.0],
         "rsi_oversold": [25.0, 30.0, 35.0],
         "rsi_overbought": [65.0, 70.0, 75.0],
+        # #981 default-off extra entry triggers.
+        "touch_entry": [0, 1],
+        "turn_entry": [0, 1],
     },
     "mtf_confluence": {
         "htf_factor": [3, 4, 6],

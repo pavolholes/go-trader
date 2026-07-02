@@ -339,6 +339,37 @@ CREATE TABLE IF NOT EXISTS pending_limit_orders (
     expires_at TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL
 );
+
+-- #1147 per-trade trade-quality diagnostics: one row per closed position,
+-- inserted eagerly at close; nullable quality metrics filled asynchronously.
+CREATE TABLE IF NOT EXISTS trade_diagnostics (
+    rowid INTEGER PRIMARY KEY AUTOINCREMENT,
+    strategy_id TEXT NOT NULL,
+    position_id TEXT NOT NULL DEFAULT '',
+    symbol TEXT NOT NULL,
+    side TEXT NOT NULL DEFAULT '',
+    timeframe TEXT NOT NULL DEFAULT '',
+    regime_at_open TEXT NOT NULL DEFAULT '',
+    close_reason TEXT NOT NULL DEFAULT '',
+    entry_price REAL NOT NULL DEFAULT 0,
+    exit_price REAL NOT NULL DEFAULT 0,
+    quantity REAL NOT NULL DEFAULT 0,
+    realized_pnl REAL NOT NULL DEFAULT 0,
+    entry_atr REAL NOT NULL DEFAULT 0,
+    stop_loss_atr_mult REAL,
+    opened_at TEXT NOT NULL DEFAULT '',
+    closed_at TEXT NOT NULL DEFAULT '',
+    mfe_price REAL,
+    mae_price REAL,
+    favorable_pct REAL,
+    adverse_pct REAL,
+    capture_ratio REAL,
+    metrics_status TEXT NOT NULL DEFAULT 'pending',
+    llm_verdict TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_trade_diag_strategy ON trade_diagnostics(strategy_id);
+CREATE INDEX IF NOT EXISTS idx_trade_diag_position ON trade_diagnostics(strategy_id, position_id);
 `
 
 // StateDB wraps a SQLite database for persistent state storage.
@@ -2021,12 +2052,12 @@ func (sdb *StateDB) QueryTradingViewExportTrades(strategyIDs []string) ([]Trade,
 }
 
 // PendingManualAction is a row from the pending_manual_actions queue table
-// written by the manual-open / manual-close CLI and drained by the scheduler
-// at the top of each cycle (#569).
+// written by operator CLIs (manual-open / manual-close / force-close) and
+// drained by the scheduler at the top of each cycle (#569/#1140).
 type PendingManualAction struct {
 	ID                              int64
 	StrategyID                      string
-	Action                          string // "open" | "close"
+	Action                          string // "open" | "close" | "add" | "update-sl" | "cancel-sl"
 	Symbol                          string
 	Side                            string
 	Quantity                        float64
@@ -2038,13 +2069,13 @@ type PendingManualAction struct {
 	EntryATR                        float64
 	RealizedPnL                     float64
 	IsFullClose                     bool    // close-only: operator/scheduler intent flag (avoids tolerance heuristics on the drain side)
-	TPOIDs                          []int64 // open-only: TP OIDs placed inline at manual-open time (#632)
+	TPOIDs                          []int64 // open: placed TP OIDs; close: canceled TP OIDs that must be cleared for re-arm
 	RatchetFallbackNormalizePending bool    // open-only: one-shot normalize marker for fallback ratchet SL (#1121)
 	CreatedAt                       time.Time
 }
 
-// InsertPendingManualAction enqueues a manual-open or manual-close action for
-// the scheduler to drain on its next cycle.
+// InsertPendingManualAction enqueues an operator action for the scheduler to
+// drain on its next cycle.
 func (sdb *StateDB) InsertPendingManualAction(a PendingManualAction) error {
 	if sdb == nil || sdb.db == nil {
 		return fmt.Errorf("state db unavailable")

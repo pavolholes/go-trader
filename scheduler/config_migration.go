@@ -10,7 +10,7 @@ import (
 
 // CurrentConfigVersion is the version embedded in newly generated configs.
 // When the binary starts and cfg.ConfigVersion < CurrentConfigVersion, migration runs.
-const CurrentConfigVersion = 15
+const CurrentConfigVersion = 16
 
 // ConfigField describes a config field introduced in a specific version.
 type ConfigField struct {
@@ -209,6 +209,15 @@ func MigrateConfig(configPath string, fieldValues map[string]string, cfg *Config
 	// unified per-regime block, tp_at_pct → tiered_tp_pct.
 	if oldVer < 15 {
 		migrateV15CloseKeys(raw)
+	}
+
+	// v16: consolidate operator-tunable defaults under user_defaults (#1135).
+	// The old top-level aliases are accepted only when they do not conflict
+	// with the canonical section they map to.
+	if oldVer < 16 || hasLegacyUserDefaultAliases(raw) {
+		if err := migrateV16UserDefaults(raw); err != nil {
+			return err
+		}
 	}
 
 	raw["config_version"] = CurrentConfigVersion
@@ -579,6 +588,11 @@ var closeStrategyOwnedKeys = map[string]map[string]struct{}{
 	"time_stop":     {"max_bars": {}},
 	"atr_stop":      {"atr_mult": {}, "atr_source": {}},
 	"zscore_target": {"lookback": {}, "z_target": {}},
+	// #1196 AVWAP loss-of-line exit. Post-v13 (no legacy migration story);
+	// listed for the Python registry mirror test + unknown-key hints. Virtual
+	// exit only — never added to the on-chain TP sets in
+	// hyperliquid_protection.go (the line moves every bar; no static trigger).
+	"avwap_stop": {"buffer_atr_mult": {}, "atr_source": {}},
 }
 
 // migrateV14Direction translates the legacy boolean `allow_shorts` field on
