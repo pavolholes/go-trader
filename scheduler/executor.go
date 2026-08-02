@@ -1591,10 +1591,10 @@ type BloFinFill struct {
 
 // BloFinExecution is the execution block from check_blofin.py --execute output.
 type BloFinExecution struct {
-	Action string       `json:"action"`
-	Symbol string       `json:"symbol"`
-	Size   float64      `json:"size"`
-	Fill   *BloFinFill  `json:"fill,omitempty"`
+	Action string      `json:"action"`
+	Symbol string      `json:"symbol"`
+	Size   float64     `json:"size"`
+	Fill   *BloFinFill `json:"fill,omitempty"`
 }
 
 // BloFinExecuteResult is the top-level JSON from check_blofin.py --execute.
@@ -1615,9 +1615,9 @@ type BloFinCloseFill struct {
 
 // BloFinClose is the close block from close_blofin_position.py.
 type BloFinClose struct {
-	Symbol      string         `json:"symbol"`
+	Symbol      string           `json:"symbol"`
 	Fill        *BloFinCloseFill `json:"fill,omitempty"`
-	AlreadyFlat bool           `json:"already_flat,omitempty"`
+	AlreadyFlat bool             `json:"already_flat,omitempty"`
 }
 
 // BloFinCloseResult is the top-level JSON from close_blofin_position.py.

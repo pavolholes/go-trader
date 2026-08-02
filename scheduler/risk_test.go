@@ -645,7 +645,7 @@ func TestCollectPerpsMarkSymbols(t *testing.T) {
 		{ID: "hl-empty", Type: "perps", Platform: "hyperliquid", Args: []string{"trend", "", "1h"}},
 	}
 
-	hlCoins, okxCoins := collectPerpsMarkSymbols(strategies)
+	hlCoins, okxCoins, blofinCoins := collectPerpsMarkSymbols(strategies)
 
 	// HL: BTC (dedup'd) + ETH, sorted.
 	wantHL := []string{"BTC", "ETH"}
@@ -668,6 +668,11 @@ func TestCollectPerpsMarkSymbols(t *testing.T) {
 			t.Errorf("okxCoins[%d] = %q, want %q", i, okxCoins[i], c)
 		}
 	}
+
+	// BloFin: none in this fixture.
+	if len(blofinCoins) != 0 {
+		t.Errorf("blofinCoins = %v, want empty", blofinCoins)
+	}
 }
 
 // TestCollectPerpsMarkSymbols_Empty verifies that collectPerpsMarkSymbols
@@ -676,12 +681,15 @@ func TestCollectPerpsMarkSymbols_Empty(t *testing.T) {
 	strategies := []StrategyConfig{
 		{ID: "sma-btc", Type: "spot", Platform: "binanceus", Args: []string{"sma", "BTC/USDT", "1h"}},
 	}
-	hlCoins, okxCoins := collectPerpsMarkSymbols(strategies)
+	hlCoins, okxCoins, blofinCoins := collectPerpsMarkSymbols(strategies)
 	if len(hlCoins) != 0 {
 		t.Errorf("hlCoins = %v, want empty", hlCoins)
 	}
 	if len(okxCoins) != 0 {
 		t.Errorf("okxCoins = %v, want empty", okxCoins)
+	}
+	if len(blofinCoins) != 0 {
+		t.Errorf("blofinCoins = %v, want empty", blofinCoins)
 	}
 }
 

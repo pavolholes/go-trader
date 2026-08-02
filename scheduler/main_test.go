@@ -102,6 +102,9 @@ func TestNotifyPerStrategyCircuitBreaker_BroadcastsFreshTriggers(t *testing.T) {
 							"spot":        "ch-spot",
 							"hyperliquid": "ch-hl",
 						},
+						tradeAlertChannels: map[string]string{
+							"binanceus": "ch-alert",
+						},
 					},
 				},
 			}
@@ -109,13 +112,16 @@ func TestNotifyPerStrategyCircuitBreaker_BroadcastsFreshTriggers(t *testing.T) {
 
 			notifyPerStrategyCircuitBreaker(sc, tc.reason, 1234.56, notifier, false)
 
-			if len(mock.messages) != 2 {
-				t.Fatalf("expected 2 channel messages, got %d", len(mock.messages))
+			if len(mock.messages) != 1 {
+				t.Fatalf("expected 1 trade-alert channel message, got %d", len(mock.messages))
+			}
+			if mock.messages[0].channelID != "ch-alert" {
+				t.Fatalf("expected trade-alert channel ch-alert, got %q", mock.messages[0].channelID)
 			}
 			if len(mock.dms) != 1 {
 				t.Fatalf("expected 1 owner DM, got %d", len(mock.dms))
 			}
-			for _, msg := range []string{mock.messages[0].content, mock.messages[1].content, mock.dms[0].content} {
+			for _, msg := range []string{mock.messages[0].content, mock.dms[0].content} {
 				if !strings.Contains(msg, "**CIRCUIT BREAKER**") ||
 					!strings.Contains(msg, "[test-strategy]") ||
 					!strings.Contains(msg, "Trigger:") ||

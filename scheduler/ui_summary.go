@@ -25,13 +25,14 @@ type UISummaryStrategyRow struct {
 }
 
 type UISummaryTypeRow struct {
-	Type        string  `json:"type"`
-	Total       int     `json:"total"`
-	WithTrades  int     `json:"with_trades"`
-	TotalPnL    float64 `json:"total_pnl"`
-	TotalTrades int     `json:"total_trades"`
-	LongPnL     float64 `json:"long_pnl"`
-	ShortPnL    float64 `json:"short_pnl"`
+	AvgCaptureRatio float64 `json:"avg_capture_ratio"`
+	Type            string  `json:"type"`
+	Total           int     `json:"total"`
+	WithTrades      int     `json:"with_trades"`
+	TotalPnL        float64 `json:"total_pnl"`
+	TotalTrades     int     `json:"total_trades"`
+	LongPnL         float64 `json:"long_pnl"`
+	ShortPnL        float64 `json:"short_pnl"`
 }
 
 type UISummarySymbolRow struct {
@@ -43,7 +44,6 @@ type UISummarySymbolRow struct {
 	LongPnL     float64 `json:"long_pnl"`
 	ShortPnL    float64 `json:"short_pnl"`
 }
-
 
 type UISummaryPairRow struct {
 	Strategy    string  `json:"strategy"`
@@ -144,11 +144,11 @@ func (ss *StatusServer) buildSummary() UISummary {
 		winCount int
 	}
 	type symbolAccum struct {
-		total   int
-		wTrades int
-		pnl     float64
-		trades  int
-		longPnL float64
+		total    int
+		wTrades  int
+		pnl      float64
+		trades   int
+		longPnL  float64
 		shortPnL float64
 	}
 
@@ -356,6 +356,47 @@ func (ss *StatusServer) buildSummary() UISummary {
 		return typeRows[i].TotalPnL > typeRows[j].TotalPnL
 	})
 
+	// #1147: enrich type rows with trade-diagnostics capture-ratio averages.
+	if ss.stateDB != nil {
+		diagRows, diagErr := ss.stateDB.TradeDiagnosticsRows("")
+		if diagErr == nil && len(diagRows) > 0 {
+			typeCapture := make(map[string]*[]float64)
+			for _, dr := range diagRows {
+				if dr.CaptureRatio == nil {
+					continue
+				}
+				parts := strings.SplitN(dr.StrategyID, "-", 3)
+				if len(parts) < 2 {
+					continue
+				}
+				typ := parts[1]
+				if typeCapture[typ] == nil {
+					slice := make([]float64, 0, 4)
+					typeCapture[typ] = &slice
+				}
+				*typeCapture[typ] = append(*typeCapture[typ], *dr.CaptureRatio)
+			}
+			if len(typeCapture) > 0 {
+				typeCaptureAvg := make(map[string]float64, len(typeCapture))
+				for typ, vals := range typeCapture {
+					if len(*vals) == 0 {
+						continue
+					}
+					var sum float64
+					for _, v := range *vals {
+						sum += v
+					}
+					typeCaptureAvg[typ] = sum / float64(len(*vals))
+				}
+				for i := range typeRows {
+					if avg, ok := typeCaptureAvg[typeRows[i].Type]; ok {
+						typeRows[i].AvgCaptureRatio = avg
+					}
+				}
+			}
+		}
+	}
+
 	type pairKey struct {
 		strategy  string
 		secondary string
@@ -472,24 +513,24 @@ func (ss *StatusServer) buildSummary() UISummary {
 	})
 
 	return UISummary{
-		GeneratedAt:     time.Now().Unix(),
-		TotalStrategies: totalStrats,
-		ActiveToday:     activeToday,
-		WithTrades:      withTrades,
-		OpenPositions:   openPosCount,
-		TotalPnL:        totalPnL,
-		TotalTrades:     totalTrades,
-		LongPnL:         longPnL,
-		ShortPnL:        shortPnL,
-		TodayPnL:        todayPnL,
-		TodayTrades:     todayTrades,
-		TodayWins:       todayWins,
-		TodayLosses:     todayLosses,
-		TodayPnLHistory: dailyPnLHistory,
-		TopByPnL:        topByPnL,
-		BottomByPnL:     bottomByPnL,
-		TopByWinRate:    topByWinRate,
-		TopByTrades:     topByTrades,
+		GeneratedAt:         time.Now().Unix(),
+		TotalStrategies:     totalStrats,
+		ActiveToday:         activeToday,
+		WithTrades:          withTrades,
+		OpenPositions:       openPosCount,
+		TotalPnL:            totalPnL,
+		TotalTrades:         totalTrades,
+		LongPnL:             longPnL,
+		ShortPnL:            shortPnL,
+		TodayPnL:            todayPnL,
+		TodayTrades:         todayTrades,
+		TodayWins:           todayWins,
+		TodayLosses:         todayLosses,
+		TodayPnLHistory:     dailyPnLHistory,
+		TopByPnL:            topByPnL,
+		BottomByPnL:         bottomByPnL,
+		TopByWinRate:        topByWinRate,
+		TopByTrades:         topByTrades,
 		ByType:              typeRows,
 		BySymbol:            symbolRows,
 		ByStrategySymbol:    strategySymbolRows,

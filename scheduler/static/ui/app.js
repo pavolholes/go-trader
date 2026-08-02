@@ -1384,7 +1384,7 @@ function renderSummaryActiveTable(tableId, rows) {
 function renderSummaryTypeTable(tableId, rows) {
   const tbody = document.getElementById(tableId);
   if (!rows || !rows.length) {
-    tbody.innerHTML = '<tr><td colspan="10">No data</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="11">No data</td></tr>';
     return;
   }
   tbody.innerHTML = rows.map(function (r) {
@@ -1402,6 +1402,7 @@ function renderSummaryTypeTable(tableId, rows) {
       "<td>" + escapeHTML(fmtCapitalPct(r.long_pnl, r.total)) + "</td>" +
       '<td class="' + sCls + '">' + escapeHTML(fmtSignedMoney(r.short_pnl)) + "</td>" +
       "<td>" + escapeHTML(fmtCapitalPct(r.short_pnl, r.total)) + "</td>" +
+      "<td>" + (r.avg_capture_ratio != null && r.avg_capture_ratio !== 0 ? escapeHTML((r.avg_capture_ratio * 100).toFixed(1) + '%') : '-') + "</td>" +
       "</tr>";
   }).join("");
 }
@@ -1409,7 +1410,7 @@ function renderSummaryTypeTable(tableId, rows) {
 function renderSummarySymbolTable(tableId, rows) {
   const tbody = document.getElementById(tableId);
   if (!rows || !rows.length) {
-    tbody.innerHTML = '<tr><td colspan="10">No data</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="11">No data</td></tr>';
     return;
   }
   tbody.innerHTML = rows.map(function (r) {
@@ -1427,6 +1428,7 @@ function renderSummarySymbolTable(tableId, rows) {
       "<td>" + escapeHTML(fmtCapitalPct(r.long_pnl, r.total)) + "</td>" +
       '<td class="' + sCls + '">' + escapeHTML(fmtSignedMoney(r.short_pnl)) + "</td>" +
       "<td>" + escapeHTML(fmtCapitalPct(r.short_pnl, r.total)) + "</td>" +
+      "<td>" + (r.avg_capture_ratio != null && r.avg_capture_ratio !== 0 ? escapeHTML((r.avg_capture_ratio * 100).toFixed(1) + '%') : '-') + "</td>" +
       "</tr>";
   }).join("");
 }

@@ -244,6 +244,37 @@ func (m *MultiNotifier) SendToAllChannels(content string) {
 	}
 }
 
+// SendToTradeAlertChannels sends content to each backend's dedicated trade-alert
+// channels when configured, falling back to the regular channels map otherwise.
+func (m *MultiNotifier) SendToTradeAlertChannels(content string) {
+	for _, b := range m.snapshotBackends() {
+		seen := make(map[string]bool)
+		sentAny := false
+		if len(b.tradeAlertChannels) > 0 {
+			for _, ch := range b.tradeAlertChannels {
+				if ch != "" && !seen[ch] {
+					seen[ch] = true
+					sentAny = true
+					if err := b.notifier.SendMessage(ch, content); err != nil {
+						fmt.Printf("[WARN] Notifier trade-alert broadcast failed: %v\n", err)
+					}
+				}
+			}
+		}
+		if sentAny {
+			continue
+		}
+		for _, ch := range b.channels {
+			if ch != "" && !seen[ch] {
+				seen[ch] = true
+				if err := b.notifier.SendMessage(ch, content); err != nil {
+					fmt.Printf("[WARN] Notifier trade-alert fallback failed: %v\n", err)
+				}
+			}
+		}
+	}
+}
+
 // SendOwnerDM sends a DM to the owner on all backends that have an owner configured.
 func (m *MultiNotifier) SendOwnerDM(content string) {
 	for _, b := range m.snapshotBackends() {

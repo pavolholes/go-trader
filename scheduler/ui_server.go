@@ -65,7 +65,7 @@ type UIStrategyStatus struct {
 	Sharpe           float64                    `json:"sharpe,omitempty"`
 	Regime           string                     `json:"regime,omitempty"`
 	RegimeDivergence *RegimeDivergenceState     `json:"regime_divergence,omitempty"` // #907: active window-divergence state; nil when none
-	RegimeConfig     *RegimeConfig              `json:"regime_config,omitempty"`        // global regime config from top-level
+	RegimeConfig     *RegimeConfig              `json:"regime_config,omitempty"`     // global regime config from top-level
 	RiskState        RiskState                  `json:"risk_state"`
 	Positions        map[string]*Position       `json:"positions"`
 	OptionPositions  map[string]*OptionPosition `json:"option_positions"`

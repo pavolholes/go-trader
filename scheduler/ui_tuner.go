@@ -397,11 +397,11 @@ func buildEditableFields(sc StrategyConfig, mergedParams, defaults map[string]in
 			if v, ok := sc.CloseStrategy.Params["sl_atr_mult"]; ok {
 				if f, ok := v.(float64); ok {
 					fields = append(fields, UIEditableField{
-						Key:     "close_strategy.params.sl_atr_mult",
-						Label:   "Close SL ATR mult",
-						Type:    "number",
-						Value:   f,
-						Group:   "risk",
+						Key:   "close_strategy.params.sl_atr_mult",
+						Label: "Close SL ATR mult",
+						Type:  "number",
+						Value: f,
+						Group: "risk",
 					})
 				}
 			}

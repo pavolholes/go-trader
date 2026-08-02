@@ -1297,7 +1297,7 @@ func main() {
 				if killSwitchAutoReset {
 					killSwitchMsg = formatKillSwitchAutoResetMessage(killSwitchMsg)
 				}
-				notifier.SendToAllChannels(killSwitchMsg)
+				notifier.SendToTradeAlertChannels(killSwitchMsg)
 			}
 
 			// Warning alert: drawdown approaching kill switch threshold.
@@ -1340,7 +1340,7 @@ func main() {
 					Now:         warnNow,
 				})
 				mu.Unlock()
-				notifier.SendToAllChannels(warnMsg)
+				notifier.SendToTradeAlertChannels(warnMsg)
 				notifier.SendOwnerDM(warnMsg)
 				fmt.Printf("[WARN] %s\n", portfolioReason)
 			}
@@ -1360,7 +1360,7 @@ func main() {
 
 			if len(corrWarnings) > 0 && notifier.HasBackends() {
 				msg := "**CORRELATION WARNING**\n" + strings.Join(corrWarnings, "\n")
-				notifier.SendToAllChannels(msg)
+				notifier.SendToTradeAlertChannels(msg)
 				notifier.SendOwnerDM(msg)
 			}
 
@@ -1964,7 +1964,7 @@ func main() {
 										}
 									}
 								}
-								
+
 								var execResult *BloFinExecuteResult
 								liveExecFailed := false
 								if blofinIsLive(sc.Args) && result.Signal != 0 {
@@ -3147,7 +3147,20 @@ func notifyPerStrategyCircuitBreakerWithSnapshot(sc StrategyConfig, snap perStra
 		TotalPortfolioValue: totalPortfolioValue,
 		RecentTrades:        recent,
 	})
-	notifier.SendToAllChannels(msg)
+	// Strict routing: circuit-breaker blocks go ONLY to dedicated trade-alert
+	// channels and never fall back to summary channels.
+	for _, b := range notifier.snapshotBackends() {
+		seen := make(map[string]bool)
+		for _, ch := range b.tradeAlertChannels {
+			if ch == "" || seen[ch] {
+				continue
+			}
+			seen[ch] = true
+			if err := b.notifier.SendMessage(ch, msg); err != nil {
+				fmt.Printf("[WARN] circuit-breaker channel alert failed: %v\n", err)
+			}
+		}
+	}
 	notifier.SendOwnerDM(msg)
 }
 
@@ -3568,7 +3581,7 @@ func runHyperliquidExecuteOrder(sc StrategyConfig, result *HyperliquidResult, pr
 			if notifier != nil && notifier.HasBackends() {
 				msg := fmt.Sprintf("**HL OPEN-ORDER CAP HIT** [%s] %s position is UNPROTECTED — SL placement rejected: %s",
 					sc.ID, result.Symbol, execResult.StopLossError)
-				notifier.SendToAllChannels(msg)
+				notifier.SendToTradeAlertChannels(msg)
 				notifier.SendOwnerDM(msg)
 			}
 		} else {
@@ -4644,7 +4657,7 @@ func executeBloFinResult(sc StrategyConfig, s *StrategyState, db *StateDB, resul
 	}
 
 	if result.StopLossPrice > 0 {
-		logger.Info("SL hit for %s: sl_price=$.2f atr_value=%.2f", result.Symbol, result.StopLossPrice, result.ATRValue)
+		logger.Info("SL hit for %s: sl_price=$%.2f atr_value=%.2f", result.Symbol, result.StopLossPrice, result.ATRValue)
 	}
 
 	closeReason := "signal"

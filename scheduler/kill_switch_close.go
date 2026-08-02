@@ -91,8 +91,8 @@ type KillSwitchCloseInputs struct {
 
 	// BloFinLiveAllPerps: every live BloFin perps strategy configured.
 	BloFinLiveAllPerps []StrategyConfig
-	BloFinCloser        BloFinLiveCloser
-	BloFinFetcher       BloFinPositionsFetcher
+	BloFinCloser       BloFinLiveCloser
+	BloFinFetcher      BloFinPositionsFetcher
 
 	PortfolioReason string
 

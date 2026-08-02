@@ -263,7 +263,7 @@ func TestDeferredOpenRecordsProtectionOIDSnapshotOnce(t *testing.T) {
 	}
 	logger := newTestLogger(t)
 
-	exec, err := ExecutePerpsSignalWithLeverageDeferredOpen(s, 1, "ETH", 2000, 1, 1, 0, 0.5, "12345", 0.42, DirectionLong, 0, logger)
+	exec, err := ExecutePerpsSignalWithLeverageDeferredOpen(s, 1, "ETH", 2000, 1, 1, 0, 0.5, "12345", 0.42, DirectionLong, 0, "", logger)
 	if err != nil {
 		t.Fatalf("ExecutePerpsSignalWithLeverageDeferredOpen: %v", err)
 	}
@@ -373,7 +373,7 @@ func TestRecordPositionOpenFallsBackWhenPositionMissing(t *testing.T) {
 		TradeHistory:    []Trade{},
 	}
 	logger := newTestLogger(t)
-	exec, err := ExecutePerpsSignalWithLeverageDeferredOpen(s, 1, "ETH", 2000, 1, 1, 0, 0.5, "12345", 0.42, DirectionLong, 0, logger)
+	exec, err := ExecutePerpsSignalWithLeverageDeferredOpen(s, 1, "ETH", 2000, 1, 1, 0, 0.5, "12345", 0.42, DirectionLong, 0, "", logger)
 	if err != nil {
 		t.Fatalf("ExecutePerpsSignalWithLeverageDeferredOpen: %v", err)
 	}

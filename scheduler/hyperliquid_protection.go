@@ -732,6 +732,6 @@ func notifyHLProtectionFailure(notifier *MultiNotifier, sc StrategyConfig, symbo
 		return
 	}
 	msg := fmt.Sprintf("**HL PROTECTION WARNING** [%s] %s reduce-only SL/TP sync failed: %s", sc.ID, symbol, reason)
-	notifier.SendToAllChannels(msg)
+	notifier.SendToTradeAlertChannels(msg)
 	notifier.SendOwnerDM(msg)
 }
