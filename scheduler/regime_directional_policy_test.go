@@ -351,7 +351,7 @@ func TestApplyRegimeDirectionalPolicy(t *testing.T) {
 }
 
 // TestValidateConfigRegimeDirectionalPolicy covers config-level validation:
-// HL perps only, requires regime.enabled, valid shape.
+// HL/BloFin perps only, requires regime.enabled, valid shape.
 func TestValidateConfigRegimeDirectionalPolicy(t *testing.T) {
 	makePolicyJSON := `{"trend_regime": {
 		"trending_up":   {"direction": "long",  "invert_signal": false},
@@ -429,8 +429,8 @@ func TestValidateConfigRegimeDirectionalPolicy(t *testing.T) {
 			PortfolioRisk: &PortfolioRiskConfig{MaxDrawdownPct: 25, WarnThresholdPct: 80},
 		}
 		err := ValidateConfig(&cfg)
-		if err == nil || !strings.Contains(err.Error(), "regime_directional_policy is only supported for HL perps") {
-			t.Fatalf("expected HL-perps-only error, got: %v", err)
+		if err == nil || !strings.Contains(err.Error(), "regime_directional_policy is only supported for HL/BloFin perps") {
+			t.Fatalf("expected HL/BloFin-perps-only error, got: %v", err)
 		}
 	})
 
@@ -515,8 +515,8 @@ func TestValidateConfigRegimeDirectionalPolicy(t *testing.T) {
 			PortfolioRisk: &PortfolioRiskConfig{MaxDrawdownPct: 25, WarnThresholdPct: 80},
 		}
 		err := ValidateConfig(&cfg)
-		if err == nil || !strings.Contains(err.Error(), "regime_directional_policy is only supported for HL perps") {
-			t.Fatalf("expected HL-perps-only error, got: %v", err)
+		if err == nil || !strings.Contains(err.Error(), "regime_directional_policy is only supported for HL/BloFin perps") {
+			t.Fatalf("expected HL/BloFin-perps-only error, got: %v", err)
 		}
 	})
 }

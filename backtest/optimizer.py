@@ -233,8 +233,14 @@ def _result_metric(result: dict, metric: str) -> float:
     ``dd_adjusted_return`` is derived (return / |max DD|, the #963 DDadj
     definition mirrored from eval_windows.dd_adjusted_return — zero-DD legs
     score 0.0 so untraded combos never win); other metrics are read directly.
+
+    #1005/#1228: a liquidated combo is floored to −100 (mirrors
+    eval_windows.LIQUIDATED_DDADJ_FLOOR) — its raw DDadj would be −1.0,
+    letting a blown-up combo outrank a surviving losing one.
     """
     if metric == "dd_adjusted_return":
+        if result.get("liquidated"):
+            return -100.0
         ret = float(result.get("total_return_pct", 0) or 0)
         dd = float(result.get("max_drawdown_pct", 0) or 0)
         return ret / abs(dd) if dd else 0.0
@@ -742,6 +748,13 @@ DEFAULT_PARAM_RANGES = {
         "buffer_atr_mult": [0.1, 0.25, 0.5],
         "confirm_bars": [1, 2, 3],
     },
+    # Backtest-only research strategy (#1138) — never wired live.
+    "analog_retrieval": {
+        "horizon": [6, 12, 24],
+        "k_neighbors": [15, 25, 50],
+        "min_t_stat": [1.5, 2.0, 2.5],
+        "min_edge_atr": [0.1, 0.25, 0.5],
+    },
     "chart_pattern": {
         "pivot_lookback": [3, 5, 7],
         "tolerance": [0.02, 0.03, 0.05],
@@ -794,6 +807,13 @@ DEFAULT_PARAM_RANGES = {
         # #981 default-off extra entry triggers.
         "touch_entry": [0, 1],
         "turn_entry": [0, 1],
+    },
+    "rsi_bb_combo": {
+        "bb_period": [14, 20, 30],
+        "bb_std": [1.5, 2.0, 2.5],
+        "rsi_oversold": [25.0, 30.0, 35.0],
+        "rsi_overbought": [65.0, 70.0, 75.0],
+        "confirm_window": [2, 3, 5],
     },
     "mtf_confluence": {
         "htf_factor": [3, 4, 6],

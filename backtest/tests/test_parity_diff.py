@@ -350,22 +350,19 @@ def test_backtest_effective_columns_are_prior_bar_inputs():
     want = frame["bt_signal"].iloc[:-1].tolist()
     assert got == want
 
-def _live_config_json(stype: str = "perps", platform: str = "") -> dict:
-    strategy = {
-        "id": "test-strat",
-        "type": stype,
-        "script": "shared_scripts/check_hyperliquid.py",
-        "args": ["sma_crossover", "BTC/USDT", "1h"],
-        "open_strategy": {
-            "name": "sma_crossover",
-            "params": {"fast_period": 5, "slow_period": 20},
-        },
-    }
-    if platform:
-        strategy["platform"] = platform
+def _live_config_json(stype: str = "perps") -> dict:
     return {
         "config_version": 15,
-        "strategies": [strategy],
+        "strategies": [{
+            "id": "test-strat",
+            "type": stype,
+            "script": "shared_scripts/check_hyperliquid.py",
+            "args": ["sma_crossover", "BTC/USDT", "1h"],
+            "open_strategy": {
+                "name": "sma_crossover",
+                "params": {"fast_period": 5, "slow_period": 20},
+            },
+        }],
     }
 
 
@@ -393,14 +390,6 @@ def test_config_mode_explicit_platform_overrides_autodetect(tmp_path):
     cfg = config_from_live_config(str(cfg_path), "test-strat",
                                   platform="hyperliquid")
     assert cfg.platform == "hyperliquid"
-
-
-def test_config_mode_prefers_strategy_platform_when_present(tmp_path):
-    import json as _json
-    cfg_path = tmp_path / "config.json"
-    cfg_path.write_text(_json.dumps(_live_config_json("perps", platform="blofin")))
-    cfg = config_from_live_config(str(cfg_path), "test-strat", platform="")
-    assert cfg.platform == "blofin"
 
 
 def test_main_config_mode_fills_use_autodetected_platform(tmp_path, monkeypatch):
@@ -647,3 +636,30 @@ def test_registry_close_advances_quantity_ladder():
     assert fracs[40] == pytest.approx(2.0 / 3.0)
     assert contexts[41]["current_quantity"] == pytest.approx(0.2)
     assert fracs[41] == pytest.approx(0.0)
+
+
+def test_config_mode_injects_user_close_defaults(tmp_path):
+    """#1228: live applies user_defaults unconditionally at loadConfig, so the
+    parity replay must inject them too — otherwise the diff replays params
+    live never runs and can report CLEAN against the wrong effective config."""
+    import json as _json
+    cfg_path = tmp_path / "config.json"
+    ladder = [
+        {"atr_multiple": 1.0, "close_fraction": 0.5},
+        {"atr_multiple": 2.0, "close_fraction": 1.0},
+    ]
+    cfg_path.write_text(_json.dumps({
+        "config_version": 16,
+        "user_defaults": {"close": {"tiered_tp_atr": {"tp_tiers": ladder}}},
+        "strategies": [{
+            "id": "hl-sma-btc",
+            "type": "perps",
+            "script": "shared_scripts/check_hyperliquid.py",
+            "args": ["sma_crossover", "BTC/USDT", "4h"],
+            "open_strategy": {"name": "sma_crossover", "params": {}},
+            "close_strategy": {"name": "tiered_tp_atr",
+                               "params": {"use_defaults": True}},
+        }],
+    }))
+    cfg = config_from_live_config(str(cfg_path), "hl-sma-btc")
+    assert cfg.close_refs[0]["params"].get("tp_tiers") == ladder

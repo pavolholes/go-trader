@@ -883,7 +883,7 @@ func TestLoadConfigLeverageRejectsSpot(t *testing.T) {
 	}
 }
 
-// #254: Leverage must be in [1, 100].
+// #254: Leverage must be in [1, 150].
 func TestLoadConfigLeverageRejectsOutOfRange(t *testing.T) {
 	dir := t.TempDir()
 	cfgJSON := `{
@@ -894,13 +894,13 @@ func TestLoadConfigLeverageRejectsOutOfRange(t *testing.T) {
 			"script": "shared_scripts/check_hyperliquid.py",
 			"args": ["sma_crossover", "ETH", "1h", "--mode=paper"],
 			"capital": 1000,
-			"leverage": 150
+			"leverage": 200
 		}]
 	}`
 	path := writeTestConfig(t, dir, cfgJSON)
 	_, err := LoadConfig(path)
 	if err == nil {
-		t.Fatal("expected validation error for leverage=150")
+		t.Fatal("expected validation error for leverage=200")
 	}
 	if !strings.Contains(err.Error(), "leverage must be in") {
 		t.Errorf("error = %v, want 'leverage must be in'", err)

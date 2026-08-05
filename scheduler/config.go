@@ -1728,7 +1728,7 @@ func validateConfig(cfg *Config, skipLiveCredentialChecks bool) error {
 				errs = append(errs, fmt.Sprintf("%s: leverage is only supported for perps strategies (got type %q)", prefix, sc.Type))
 			}
 			if sc.Leverage < 1 || sc.Leverage > 150 {
-				errs = append(errs, fmt.Sprintf("%s: leverage must be in [1, 100], got %g", prefix, sc.Leverage))
+				errs = append(errs, fmt.Sprintf("%s: leverage must be in [1, 150], got %g", prefix, sc.Leverage))
 			}
 		}
 		// SizingLeverage decouples position sizing from exchange margin (#497).
@@ -1741,7 +1741,7 @@ func validateConfig(cfg *Config, skipLiveCredentialChecks bool) error {
 				errs = append(errs, fmt.Sprintf("%s: sizing_leverage is only supported for perps strategies (got type %q)", prefix, sc.Type))
 			}
 			if sc.SizingLeverage < 0.01 || sc.SizingLeverage > 150 {
-				errs = append(errs, fmt.Sprintf("%s: sizing_leverage must be in [0.01, 100], got %g", prefix, sc.SizingLeverage))
+				errs = append(errs, fmt.Sprintf("%s: sizing_leverage must be in [0.01, 150], got %g", prefix, sc.SizingLeverage))
 			}
 		}
 
@@ -1833,20 +1833,22 @@ func validateConfig(cfg *Config, skipLiveCredentialChecks bool) error {
 		// distinct from plain direction="short" which opens short on
 		// raw-SELL. Both are valid (#775).
 		if sc.InvertSignal {
-			if sc.Type != "perps" && sc.Type != "manual" {
-				errs = append(errs, fmt.Sprintf("%s: invert_signal is only supported for perps/manual strategies (got platform=%q type=%q)", prefix, sc.Platform, sc.Type))
+			if sc.Platform != "hyperliquid" || (sc.Type != "perps" && sc.Type != "manual") {
+				errs = append(errs, fmt.Sprintf("%s: invert_signal is only supported for HL perps/manual strategies (got platform=%q type=%q)", prefix, sc.Platform, sc.Type))
 			}
 		}
 
-		// regime_directional_policy: HL perps only (same surface as invert_signal
-		// since both override the same fields runHyperliquidCheck consumes).
-		// Requires regime detection enabled at top-level cfg.Regime — without it
+		// regime_directional_policy: perps only (same surface as invert_signal
+		// since both override the same fields runHyperliquidCheck consumes;
+		// the BloFin execution path applies it too — main.go
+		// applyRegimeDirectionalPolicy). Requires regime detection enabled at
+		// top-level cfg.Regime — without it
 		// result.Regime stays empty and the resolver always falls back to the
 		// static base config, which silently defeats the policy. Reject the
 		// asymmetric config at startup so the operator sees the gap. (#779)
 		if sc.RegimeDirectionalPolicy.IsConfigured() {
-			if sc.Type != "perps" {
-				errs = append(errs, fmt.Sprintf("%s: regime_directional_policy is only supported for perps strategies (got platform=%q type=%q)", prefix, sc.Platform, sc.Type))
+			if sc.Type != "perps" || (sc.Platform != "hyperliquid" && sc.Platform != "blofin") {
+				errs = append(errs, fmt.Sprintf("%s: regime_directional_policy is only supported for HL/BloFin perps strategies (got platform=%q type=%q)", prefix, sc.Platform, sc.Type))
 			}
 			if cfg.Regime == nil || !cfg.Regime.Enabled {
 				errs = append(errs, fmt.Sprintf("%s: regime_directional_policy requires top-level regime.enabled=true", prefix))

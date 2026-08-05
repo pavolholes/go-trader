@@ -78,6 +78,7 @@ var knownShortNames = map[string]string{
 	"vwap_rejection_st":       "vrs",
 	"momentum_pro":            "mompro",
 	"mean_reversion_pro":      "mrpro",
+	"rsi_bb_combo":            "rsibb",
 	"consolidation_range":     "cr",
 	"atr_band_revert":         "abr",
 	"mtf_confluence":          "mtfc",
@@ -110,6 +111,7 @@ var bidirectionalPerpsStrategies = map[string]bool{
 	"vol_momentum":            true, // emits short on ATR-normalized negative momentum with efficiency confirmation (#959)
 	"funding_skew":            true, // shorts crowded-long funding extremes on EMA breakdown (#960)
 	"regime_adaptive":         true, // futures variant (allow_short) shorts clean downtrend breakouts and fades range tops (#958)
+	"rsi_bb_combo":            true, // emits short on overbought reversion back through the upper Bollinger Band (#1329)
 }
 
 func isBidirectionalPerpsStrategy(id string) bool {
@@ -132,6 +134,10 @@ var strategiesDefaultingToCompositeRangingGate = map[string][]string{
 	// anchored_vwap_reversion fades ATR-measured stretches beyond the anchored
 	// line — same mean-reversion class, gated for the same reason (#1170).
 	"anchored_vwap_reversion": {"ranging_quiet", "ranging_volatile"},
+	// rsi_bb_combo fades Bollinger Band extremes with RSI approximation but
+	// carries NO inline trend filter by design — the composite regime gate IS
+	// its no-trend filter, so line cfg must wire it by default (#1329).
+	"rsi_bb_combo": {"ranging_quiet", "ranging_volatile"},
 }
 
 // defaultCompositeRangingGate returns a fresh copy of the default composite

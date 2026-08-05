@@ -7,6 +7,8 @@ Main entry point for strategy evaluation.
 import sys
 import os
 import argparse
+import json
+from copy import deepcopy
 from typing import List, Optional
 
 import numpy as np
@@ -16,7 +18,7 @@ import pandas as pd
 # dynamically per-registry via registry_loader.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'shared_tools'))
 
-from atr import ensure_atr_indicator
+from atr import ensure_atr_indicator, normalize_atr_method
 from data_fetcher import load_cached_data
 from directional_certification import (
     config_directional_classifier,
@@ -101,6 +103,8 @@ from reporter import (
 from regime import (  # noqa: E402
     compute_regime,
     compute_regime_composite,
+    ensure_regime_columns,
+    normalize_regime_gate_on_failure,
     parse_regime_windows_spec_json,
     valid_labels_for_classifier,
     CLASSIFIER_ADX,
@@ -108,6 +112,8 @@ from regime import (  # noqa: E402
     REGIME_PRIMARY_WINDOW_KEY,
     VALID_LABELS_COMPOSITE,
 )
+
+_REGIME_COLUMNS = ("regime", "regime_score", "adx", "plus_di", "minus_di")
 
 
 def _normalize_regime_window_spec(spec) -> dict:
@@ -230,7 +236,7 @@ def _validate_allowed_regimes_vocabulary(
     # Most common slip: composite substates supplied without a composite spec.
     if classifier == CLASSIFIER_ADX and any(lab in VALID_LABELS_COMPOSITE for lab in invalid):
         msg += (
-            " (Composite 7-state labels require a composite primary window — "
+            " (Composite 9-state labels require a composite primary window — "
             "supply --regime-windows-spec-json with a composite classifier, or "
             "use --config.)"
         )
@@ -252,6 +258,108 @@ def _build_profile_label_series(df: pd.DataFrame, window_spec: dict) -> pd.Serie
         reg = compute_regime(df, period=period,
                              adx_threshold=float(window_spec.get("adx_threshold") or 20.0))
     return reg["regime"].astype(str)
+
+
+def _aligned_regime_columns(
+    symbol: str,
+    trade_index: pd.Index,
+    regime_timeframe: str,
+    since: str,
+    *,
+    regime_period: int = 14,
+    regime_adx_threshold: float = 20.0,
+    regime_windows_spec: Optional[dict] = None,
+) -> Optional[pd.DataFrame]:
+    """Compute regime labels on ``regime_timeframe`` and align backward to
+    trading bars.
+
+    The returned columns are bar-close decision inputs. ``load_cached_data``
+    indexes each HTF candle by its OPEN time, so a row's regime label (derived
+    from that candle's full OHLC) is only actually known once the candle
+    CLOSES — i.e. at the next HTF row's index, assuming contiguous candles.
+    Shifting the HTF columns by one row before reindexing onto ``trade_index``
+    makes a label available starting at its candle's close instead of its
+    open, so an LTF bar inside a still-forming HTF candle never sees that
+    candle's (not-yet-known) label. Backtester.run then applies the usual
+    one-row LTF shift on top (a separate concern: bar N's regime governs the
+    decision that fills at bar N+1), so a trading bar only ever consumes the
+    most recently CLOSED regime candle known at the prior decision point —
+    matching live's ``latest_regime`` over closed-candle OHLCV.
+    """
+    regime_df = load_cached_data(symbol, regime_timeframe, start_date=since)
+    if regime_df.empty:
+        print(f"No regime data available for {symbol} {regime_timeframe}")
+        return None
+    source = regime_df.copy().sort_index()
+    ensure_regime_columns(
+        source,
+        period=regime_period,
+        adx_threshold=regime_adx_threshold,
+        windows_spec=regime_windows_spec,
+    )
+    cols = source.loc[:, list(_REGIME_COLUMNS)].shift(1)
+    aligned = cols.reindex(trade_index, method="ffill")
+    aligned["regime"] = aligned["regime"].fillna("").astype(str)
+    for col in _REGIME_COLUMNS:
+        if col != "regime":
+            aligned[col] = aligned[col].fillna(0.0)
+    return aligned
+
+
+def _apply_regime_timeframe_override(
+    df: pd.DataFrame,
+    symbol: str,
+    trade_timeframe: str,
+    regime_timeframe: Optional[str],
+    since: str,
+    *,
+    regime_period: int,
+    regime_adx_threshold: float,
+    regime_windows_spec: Optional[dict],
+) -> Optional[pd.DataFrame]:
+    tf = str(regime_timeframe or "").strip().lower()
+    trade_tf = str(trade_timeframe or "").strip().lower()
+    if not tf or tf == trade_tf:
+        return df
+    aligned = _aligned_regime_columns(
+        symbol,
+        df.index,
+        tf,
+        since,
+        regime_period=regime_period,
+        regime_adx_threshold=regime_adx_threshold,
+        regime_windows_spec=regime_windows_spec,
+    )
+    if aligned is None:
+        return None
+    out = df.copy()
+    for col in _REGIME_COLUMNS:
+        out[col] = aligned[col].values
+    return out
+
+
+def _profile_label_series(
+    df: pd.DataFrame,
+    symbol: str,
+    trade_timeframe: str,
+    regime_timeframe: Optional[str],
+    since: str,
+    window_spec: dict,
+) -> Optional[pd.Series]:
+    tf = str(regime_timeframe or "").strip().lower()
+    trade_tf = str(trade_timeframe or "").strip().lower()
+    if not tf or tf == trade_tf:
+        return _build_profile_label_series(df, window_spec)
+    regime_df = load_cached_data(symbol, tf, start_date=since)
+    if regime_df.empty:
+        print(f"No regime profile data available for {symbol} {tf}")
+        return None
+    # Shift one HTF row before reindexing — same open-vs-close-time leak as
+    # ``_aligned_regime_columns`` (a label is only known once its HTF candle
+    # closes, i.e. at the NEXT HTF row's index); Backtester.run's own
+    # shift(1) on ``_profile_label`` is a separate, LTF-granularity concern.
+    labels = _build_profile_label_series(regime_df.copy().sort_index(), window_spec).shift(1)
+    return labels.reindex(df.index, method="ffill").fillna("").astype(str)
 
 
 def _htf_trend_series(symbol: str, timeframe: str, ltf_index: pd.Index,
@@ -279,7 +387,14 @@ def _htf_trend_series(symbol: str, timeframe: str, ltf_index: pd.Index,
         index=htf_df.index,
         dtype=int,
     )
-    return trend.reindex(ltf_index, method="ffill").fillna(0).astype(int)
+    # Shift one HTF row before reindexing — same open-vs-close-time leak as
+    # ``_aligned_regime_columns``/``_profile_label_series`` (#1153):
+    # ``load_cached_data`` indexes each HTF candle by its OPEN time, so a
+    # row's trend (derived from that candle's full close) is only known once
+    # the candle CLOSES, i.e. at the next HTF row's index. Without the shift
+    # an LTF bar inside a still-forming HTF candle would see that candle's
+    # final close (#1154).
+    return trend.shift(1).reindex(ltf_index, method="ffill").fillna(0).astype(int)
 
 
 def _apply_htf_filter_to_df(df: pd.DataFrame, symbol: str,
@@ -300,8 +415,8 @@ DEFAULT_SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"]
 DEFAULT_TIMEFRAMES = ["4h", "1d"]
 
 
-# #866: close evaluators whose default ladder is overridable via
-# user_close_defaults. Mirrors scheduler/close_defaults.go closeDefaultsSupported
+# #866/#1135: close evaluators whose default ladder is overridable via
+# user_defaults.close. Mirrors scheduler/close_defaults.go closeDefaultsSupported
 # — the evaluators that resolve purely through tp_tiers (the regime tiered-ATR
 # variants are excluded; their use_defaults baseline is #870 territory).
 _USER_CLOSE_DEFAULTS_SUPPORTED = {
@@ -311,14 +426,193 @@ _USER_CLOSE_DEFAULTS_SUPPORTED = {
     "trailing_tp_ratchet",
     "trailing_tp_ratchet_regime",
 }
+_USER_CLOSE_DEFAULT_REGIME_ATR_KEY = "regime_atr"
+
+_STOP_OWNER_KEYS = (
+    "stop_loss_atr_mult",
+    "stop_loss_pct",
+    "stop_loss_margin_pct",
+    "trailing_stop_atr_mult",
+    "trailing_stop_pct",
+    "stop_loss_atr_regime",
+    "trailing_stop_atr_regime",
+)
 
 
-def _apply_user_close_defaults(close_refs: list, user_defaults: Optional[dict]) -> None:
-    """Inject user_close_defaults tp_tiers into close refs that omit tp_tiers
-    (#866, --defaults user). Mirrors the Go injection at load: an explicit
-    per-ref tp_tiers (the strategy layer) wins, an unsupported evaluator name is
-    skipped, and a ref with no matching entry falls through to the evaluator's
-    built-in system default."""
+def _user_close_default_entry(user_defaults: Optional[dict], name: str) -> Optional[dict]:
+    if not isinstance(user_defaults, dict):
+        return None
+    want = str(name or "").strip().lower()
+    entry = user_defaults.get(want)
+    if isinstance(entry, dict):
+        return entry
+    for key in sorted(user_defaults):
+        if str(key or "").strip().lower() == want:
+            entry = user_defaults.get(key)
+            return entry if isinstance(entry, dict) else None
+    return None
+
+
+def _json_equivalent(a, b) -> bool:
+    return json.dumps(a, sort_keys=True, separators=(",", ":")) == json.dumps(
+        b, sort_keys=True, separators=(",", ":")
+    )
+
+
+def _split_legacy_user_close_defaults(legacy: Optional[dict]) -> tuple[dict, object, bool]:
+    if legacy is None:
+        return {}, None, False
+    if not isinstance(legacy, dict):
+        raise ValueError("user_close_defaults: must be an object")
+    close_defaults: dict = {}
+    regime_atr = None
+    regime_present = False
+    for key in sorted(legacy):
+        norm = str(key or "").strip().lower()
+        value = legacy[key]
+        if norm == _USER_CLOSE_DEFAULT_REGIME_ATR_KEY:
+            if regime_present and not _json_equivalent(regime_atr, value):
+                raise ValueError("user_close_defaults contains conflicting regime_atr entries")
+            regime_atr = value
+            regime_present = True
+            continue
+        if norm in close_defaults and not _json_equivalent(close_defaults[norm], value):
+            raise ValueError(f"user_close_defaults contains conflicting {norm!r} entries")
+        close_defaults[norm] = value
+    return close_defaults, regime_atr, regime_present
+
+
+def _effective_user_close_defaults(cfg: dict) -> Optional[dict]:
+    """Return the combined close-default view consumed by the backtester.
+
+    External config is canonical as user_defaults.close + user_defaults.regime_atr
+    (#1135). Deprecated user_close_defaults is still accepted when it is absent
+    from, or equivalent to, the canonical section.
+    """
+    user_defaults = cfg.get("user_defaults")
+    if user_defaults is None:
+        user_defaults = {}
+    if not isinstance(user_defaults, dict):
+        raise ValueError("user_defaults: must be an object")
+
+    close_present = "close" in user_defaults and user_defaults.get("close") is not None
+    close_defaults = user_defaults.get("close") if close_present else {}
+    if not isinstance(close_defaults, dict):
+        raise ValueError("user_defaults.close: must be an object")
+    for key in close_defaults:
+        if str(key or "").strip().lower() == _USER_CLOSE_DEFAULT_REGIME_ATR_KEY:
+            raise ValueError('user_defaults.close["regime_atr"]: regime_atr moved to user_defaults.regime_atr')
+
+    regime_present = "regime_atr" in user_defaults and user_defaults.get("regime_atr") is not None
+    regime_atr = user_defaults.get("regime_atr") if regime_present else None
+
+    legacy_present = "user_close_defaults" in cfg and cfg.get("user_close_defaults") is not None
+    legacy_close, legacy_regime, legacy_regime_present = _split_legacy_user_close_defaults(
+        cfg.get("user_close_defaults") if legacy_present else None
+    )
+    if legacy_close:
+        if close_present and not _json_equivalent(close_defaults, legacy_close):
+            raise ValueError("user_defaults.close conflicts with deprecated user_close_defaults")
+        if not close_present:
+            close_defaults = legacy_close
+            close_present = True
+    if legacy_regime_present:
+        if regime_present and not _json_equivalent(regime_atr, legacy_regime):
+            raise ValueError("user_defaults.regime_atr conflicts with deprecated user_close_defaults.regime_atr")
+        if not regime_present:
+            regime_atr = legacy_regime
+            regime_present = True
+    if regime_present and not isinstance(regime_atr, dict):
+        raise ValueError("user_defaults.regime_atr: must be an object")
+
+    combined = {}
+    if close_present:
+        combined.update(close_defaults)
+    if regime_present:
+        combined[_USER_CLOSE_DEFAULT_REGIME_ATR_KEY] = regime_atr
+    return combined or None
+
+
+def _uses_trailing_tp_ratchet_regime(close_refs: list) -> bool:
+    return any(
+        str(ref.get("name", "")).strip().lower() == "trailing_tp_ratchet_regime"
+        for ref in close_refs
+        if isinstance(ref, dict)
+    )
+
+
+def _has_explicit_stop_owner(sc: dict) -> bool:
+    return any(sc.get(k) is not None for k in _STOP_OWNER_KEYS)
+
+
+def _regime_atr_block_is_use_defaults_only(raw) -> bool:
+    if not isinstance(raw, dict):
+        return False
+    if raw.get("trend_regime") is not None:
+        return False
+    return raw.get("use_defaults") is True
+
+
+def _validate_user_close_defaults_regime_atr(user_defaults: Optional[dict]) -> None:
+    """Mirror scheduler/close_defaults.go validateUserCloseDefaultRegimeATR (#1134)."""
+    entry = _user_close_default_entry(user_defaults, _USER_CLOSE_DEFAULT_REGIME_ATR_KEY)
+    if entry is None:
+        return
+    section = "user_defaults.regime_atr"
+    if not isinstance(entry, dict):
+        raise ValueError(f"{section}: must be an object")
+    if not entry:
+        raise ValueError(f"{section}: must not be empty")
+    allowed = {"stop_loss_atr_regime", "trailing_stop_atr_regime"}
+    for key in entry:
+        if key not in allowed:
+            raise ValueError(
+                f'{section}: unknown key {key!r} '
+                "(only stop_loss_atr_regime and trailing_stop_atr_regime are allowed)"
+            )
+    # ``regime_atr`` lives under shared_strategies/close, which is NOT on
+    # sys.path under script-style invocation (`python backtest/run_backtest.py`,
+    # where only the script dir + shared_tools are added). Mirror
+    # backtester._ensure_close_strategies_path so the bare import resolves in
+    # production, not just under pytest (which inserts the path during collection).
+    _close_dir = os.path.join(
+        os.path.dirname(__file__), "..", "shared_strategies", "close"
+    )
+    if _close_dir not in sys.path:
+        sys.path.insert(0, _close_dir)
+    from regime_atr import (  # type: ignore
+        CANONICAL_TREND_REGIME_LABELS,
+        REGIME_CLASSIFIER_KEY,
+        SURFACE_STOP_LOSS,
+        SURFACE_TRAILING,
+        parse_regime_atr_block,
+    )
+
+    def _validate_sub(sub_key: str, surface: str) -> None:
+        raw = entry.get(sub_key)
+        if raw is None:
+            return
+        ctx = f'{section}.{sub_key}'
+        if not isinstance(raw, dict) or not raw:
+            raise ValueError(f"{ctx}: must be a non-empty object")
+        labels = list(CANONICAL_TREND_REGIME_LABELS)
+        trend = raw.get(REGIME_CLASSIFIER_KEY)
+        if isinstance(trend, dict) and trend:
+            labels = sorted(trend.keys())
+        _, errs = parse_regime_atr_block(raw, ctx, surface, labels)
+        if errs:
+            raise ValueError(errs[0])
+
+    _validate_sub("stop_loss_atr_regime", SURFACE_STOP_LOSS)
+    _validate_sub("trailing_stop_atr_regime", SURFACE_TRAILING)
+
+
+def _apply_user_close_defaults(close_refs: list, user_defaults: Optional[dict],
+                               sc: Optional[dict] = None) -> None:
+    """Inject user_defaults into refs/strategy fields that omit them
+    (#866/#1133, --defaults user). Mirrors the Go loader: explicit per-ref
+    tp_tiers and explicit strategy-level stop owners win, unsupported evaluator
+    names are skipped, and missing entries fall through to system defaults."""
     if not user_defaults:
         return
     for ref in close_refs:
@@ -328,8 +622,8 @@ def _apply_user_close_defaults(close_refs: list, user_defaults: Optional[dict]) 
         params = ref.setdefault("params", {})
         if params.get("tp_tiers") is not None:
             continue  # strategy_close_defaults layer wins
-        entry = user_defaults.get(name)
-        if not isinstance(entry, dict):
+        entry = _user_close_default_entry(user_defaults, name)
+        if entry is None:
             continue
         tp = entry.get("tp_tiers")
         # Mirror the Go loader (validateUserCloseDefaults): an empty or
@@ -339,6 +633,33 @@ def _apply_user_close_defaults(close_refs: list, user_defaults: Optional[dict]) 
         # config outright at load).
         if (isinstance(tp, list) or isinstance(tp, dict)) and tp:
             params["tp_tiers"] = tp
+    if sc is not None and _uses_trailing_tp_ratchet_regime(close_refs):
+        if not _has_explicit_stop_owner(sc):
+            entry = _user_close_default_entry(user_defaults, "trailing_tp_ratchet_regime")
+            if entry is not None:
+                trail = entry.get("trailing_stop_atr_regime")
+                if isinstance(trail, dict) and trail:
+                    sc["trailing_stop_atr_regime"] = deepcopy(trail)
+        return
+    if sc is None:
+        return
+    regime_entry = _user_close_default_entry(user_defaults, _USER_CLOSE_DEFAULT_REGIME_ATR_KEY)
+    if regime_entry is None:
+        return
+    sl_raw = regime_entry.get("stop_loss_atr_regime")
+    if (
+        isinstance(sl_raw, dict)
+        and sl_raw
+        and _regime_atr_block_is_use_defaults_only(sc.get("stop_loss_atr_regime"))
+    ):
+        sc["stop_loss_atr_regime"] = deepcopy(sl_raw)
+    trail_raw = regime_entry.get("trailing_stop_atr_regime")
+    if (
+        isinstance(trail_raw, dict)
+        and trail_raw
+        and _regime_atr_block_is_use_defaults_only(sc.get("trailing_stop_atr_regime"))
+    ):
+        sc["trailing_stop_atr_regime"] = deepcopy(trail_raw)
 
 
 def _effective_direction(sc: dict) -> str:
@@ -358,8 +679,35 @@ def _effective_direction(sc: dict) -> str:
     return "both" if sc.get("allow_shorts") else "long"
 
 
+def _capture_promotion_baseline(cfg: dict, sc: dict) -> dict:
+    """Snapshot raw config blocks for a later promotion drift check (#1386).
+
+    Captures verbatim JSON values with presence bits *before* any transform
+    (``_effective_user_close_defaults``, absent-``open_strategy`` collapse to
+    ``{}``, close/stop injection). Presence = key present in the object
+    (``null`` + ``true`` is distinguishable from absent → ``null`` + ``false``).
+    Deepcopied so later pipeline stages cannot alias into the persisted baseline.
+    Includes deprecated root ``user_close_defaults`` so drift through the legacy
+    block is visible (#1386 Finding 2).
+    """
+    open_present = "open_strategy" in sc
+    ud_present = "user_defaults" in cfg
+    ucd_present = "user_close_defaults" in cfg
+    return {
+        "open_strategy": deepcopy(sc["open_strategy"]) if open_present else None,
+        "open_strategy_present": open_present,
+        "user_defaults": deepcopy(cfg["user_defaults"]) if ud_present else None,
+        "user_defaults_present": ud_present,
+        "user_close_defaults": (
+            deepcopy(cfg["user_close_defaults"]) if ucd_present else None
+        ),
+        "user_close_defaults_present": ucd_present,
+    }
+
+
 def load_strategy_config(config_path: str, strategy_id: str,
-                         inject_user_defaults: bool = False) -> dict:
+                         inject_user_defaults: bool = False,
+                         include_promotion_baseline: bool = False) -> dict:
     """Load a single strategy's refs from a live go-trader config (#641).
 
     Reads the v13+ config at ``config_path``, finds the strategy with
@@ -370,6 +718,12 @@ def load_strategy_config(config_path: str, strategy_id: str,
 
     Returns ``{"open_strategy": {...}, "close_strategies": [...]}``.
 
+    ``include_promotion_baseline`` (default False) is opt-in: when True the
+    returned dict also carries a ``promotion_baseline`` key with the raw
+    ``open_strategy`` / ``user_defaults`` / ``user_close_defaults`` blocks and
+    presence bits (#1386). Opt-in because many callers spread this dict into
+    ``Backtester(**kwargs)`` — an unconditional extra key would crash them.
+
     Raises ValueError when the config is pre-v13 (legacy flat shape) or
     the strategy ID is not found — the caller should run the live
     binary's migration first.
@@ -377,6 +731,8 @@ def load_strategy_config(config_path: str, strategy_id: str,
     import json as _json
     with open(config_path) as fh:
         cfg = _json.load(fh)
+    user_defaults = _effective_user_close_defaults(cfg)
+    _validate_user_close_defaults_regime_atr(user_defaults)
     version = int(cfg.get("config_version", 0) or 0)
     # #942 (D2.8): gate on v15, not v13. The v13 co-located ref shape (#640) is
     # necessary but not sufficient — the v15 migration is what canonicalizes
@@ -401,6 +757,12 @@ def load_strategy_config(config_path: str, strategy_id: str,
     for sc in cfg.get("strategies", []) or []:
         if sc.get("id") != strategy_id:
             continue
+        # #1386: capture raw blocks from the same cfg/sc of this single read,
+        # before absent-open collapse / close-stop injection can rewrite them.
+        promotion_baseline = (
+            _capture_promotion_baseline(cfg, sc)
+            if include_promotion_baseline else None
+        )
         open_ref = sc.get("open_strategy")
         if not isinstance(open_ref, dict):
             open_ref = {}
@@ -428,6 +790,7 @@ def load_strategy_config(config_path: str, strategy_id: str,
         regime_cfg = cfg.get("regime") or {}
         if not isinstance(regime_cfg, dict):
             regime_cfg = {}
+        regime_timeframe = str(regime_cfg.get("timeframe") or "").strip().lower() or None
         regime_directional_policy = sc.get("regime_directional_policy")
         if regime_directional_policy and not regime_cfg.get("enabled"):
             raise ValueError(
@@ -481,12 +844,12 @@ def load_strategy_config(config_path: str, strategy_id: str,
                     f"tiered_tp_atr_live_regime_dynamic, which is HL-live-only "
                     f"in this release (backtester parity deferred — see #843)."
                 )
-        # #866: with --defaults user, apply the config's user_close_defaults to
+        # #866/#1135: with --defaults user, apply the config's user_defaults to
         # any close ref that omits tp_tiers (so backtest matches the live daemon
         # under the operator override). --defaults system leaves them untouched,
         # falling through to the evaluators' built-in defaults.
         if inject_user_defaults:
-            _apply_user_close_defaults(close_refs, cfg.get("user_close_defaults"))
+            _apply_user_close_defaults(close_refs, user_defaults, sc)
         # #942 (D2.1): model the live entry transforms the backtester used to
         # drop silently. ``invert_signal`` flips BUY<->SELL; ``direction`` gates
         # which side may open. Both are applied to the signal in Backtester.run
@@ -577,6 +940,31 @@ def load_strategy_config(config_path: str, strategy_id: str,
         # rejected: with regime.enabled=false the gate is a no-op in both live
         # and backtest, so there is nothing to diverge.
         allowed_regimes = sc.get("allowed_regimes") or None
+        # #1278: entry-gate failure policy — per-strategy field wins, else the
+        # global regime.gate_on_failure default, else "open" (the legacy #879
+        # fail-open behavior, keeping existing baselines byte-identical).
+        # normalize_regime_gate_on_failure is the SSoT: validate BOTH surfaces
+        # independently so a valid per-strategy override never short-circuits
+        # past a garbage global value (mirroring Go validateConfig rejecting
+        # unknown values on each surface independently). Re-raise with the
+        # config/strategy context preserved.
+        _per_raw = str(sc.get("regime_gate_on_failure") or "").strip().lower()
+        try:
+            _global_gate = normalize_regime_gate_on_failure(
+                regime_cfg.get("gate_on_failure")
+            )
+        except ValueError as exc:
+            raise ValueError(f"{config_path}: {exc}") from exc
+        try:
+            regime_gate_on_failure = (
+                normalize_regime_gate_on_failure(_per_raw)
+                if _per_raw
+                else _global_gate
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"{config_path}: strategy {strategy_id!r} {exc}"
+            ) from exc
         gate_window = str(sc.get("regime_gate_window") or "").strip().lower()
         if (
             allowed_regimes
@@ -596,9 +984,163 @@ def load_strategy_config(config_path: str, strategy_id: str,
         # any windows spec"), so a multi-window directional config keys on the
         # identical (asset,timeframe,classifier) cell. The verdict is a Backtester
         # param, so the whole returned dict still spreads cleanly into Backtester.
+        # #1277: ATR smoothing method — per-strategy atr_method wins, else
+        # the global top-level atr_method, else "simple" (the frozen legacy
+        # math), mirroring Go resolveATRMethod. Validate BOTH surfaces
+        # independently so a valid per-strategy override never short-circuits
+        # past a garbage global value (same stance as the #1278 gate above).
+        try:
+            _global_atr = normalize_atr_method(cfg.get("atr_method"))
+        except ValueError as exc:
+            raise ValueError(f"{config_path}: {exc}") from exc
+        _per_atr_raw = str(sc.get("atr_method") or "").strip().lower()
+        try:
+            atr_method = (
+                normalize_atr_method(_per_atr_raw) if _per_atr_raw else _global_atr
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"{config_path}: strategy {strategy_id!r} {exc}"
+            ) from exc
+        # #1268: opt-in risk-per-trade sizing. Mirror the live
+        # validateRiskPerTradePct gate for the parts of the surface the
+        # backtester can see; the engine's own __init__ validation covers the
+        # rest (regime-owner / unified-close / margin-pct rejects).
+        risk_per_trade_pct = sc.get("risk_per_trade_pct")
+        if risk_per_trade_pct is not None:
+            if sc.get("sizing_leverage"):
+                raise ValueError(
+                    f"{config_path}: strategy {strategy_id!r} combines "
+                    f"risk_per_trade_pct with sizing_leverage — mutually "
+                    f"exclusive sizing modes (the live daemon rejects this "
+                    f"config at startup; #1268)."
+                )
+            if sc.get("margin_per_trade_usd") is not None:
+                raise ValueError(
+                    f"{config_path}: strategy {strategy_id!r} combines "
+                    f"risk_per_trade_pct with margin_per_trade_usd — mutually "
+                    f"exclusive sizing modes (the live daemon rejects this "
+                    f"config at startup; #1268)."
+                )
+            if sc.get("allow_scale_in"):
+                raise ValueError(
+                    f"{config_path}: strategy {strategy_id!r} combines "
+                    f"risk_per_trade_pct with allow_scale_in — the live "
+                    f"daemon rejects this config at startup (#1268: add legs "
+                    f"re-size off frozen SL geometry, breaking the "
+                    f"constant-dollar-risk invariant)."
+                )
+            # The live pct stop owners are PERCENT-denominated while this
+            # engine's stop_loss_pct / trailing_stop_pct are fractions (they
+            # feed avg_cost × (1 ± pct) directly), so sizing from them here
+            # would skew the risk formula 100×. Reject rather than diverge
+            # silently — ATR-mult owners are unit-unambiguous in both worlds.
+            for _pk in ("stop_loss_pct", "trailing_stop_pct", "stop_loss_margin_pct"):
+                if (sc.get(_pk) or 0) > 0:
+                    raise ValueError(
+                        f"{config_path}: strategy {strategy_id!r} sizes "
+                        f"risk_per_trade_pct from {_pk}, but the backtester's "
+                        f"pct-stop fields are fraction-denominated (live is "
+                        f"percent), so the risk formula would skew 100×. Use "
+                        f"an ATR-mult stop owner (stop_loss_atr_mult / "
+                        f"trailing_stop_atr_mult) for risk-sizing backtests."
+                    )
+            # Mirror LoadConfig's default_stop_loss_atr_mult pass: a config
+            # with NO stop-owner key runs live with the fleet default
+            # (1.0×ATR unless overridden/opted out), and risk sizing derives
+            # its distance from exactly that owner — materialize it here so
+            # sizing AND the simulated SL match live.
+            # Presence check must be `is not None` (matching
+            # _config_has_stop_owner): an explicit-zero owner (stop_loss_pct: 0
+            # etc.) explicitly disables the stop and live REJECTS the config at
+            # load — materializing a default here would silently size a
+            # stopped run live refuses (#1268).
+            if not any(sc.get(k) is not None for k in _STOP_OWNER_KEYS):
+                _default_mult = cfg.get("default_stop_loss_atr_mult")
+                if _default_mult is None:
+                    _default_mult = 1.0
+                _default_mult = float(_default_mult or 0)
+                if _default_mult <= 0:
+                    raise ValueError(
+                        f"{config_path}: strategy {strategy_id!r} sets "
+                        f"risk_per_trade_pct with no stop owner and "
+                        f"default_stop_loss_atr_mult=0 (auto-default opted "
+                        f"out) — no stop distance to size risk from (the "
+                        f"live daemon rejects this config at startup; #1268)."
+                    )
+                sc["stop_loss_atr_mult"] = _default_mult
+        # #1276: scale-in / pyramiding. Thread the live fields through so an
+        # allow_scale_in config simulates add legs with the live #873
+        # semantics instead of silently backtesting the no-adds system.
+        # Mirror the live validateConfig rejects the loader can see (type/
+        # platform gate, block-without-flag, live-args resize guard); the
+        # engine's own __init__ validation covers bounds + the #1268 combo.
         cfg_args = sc.get("args") or []
+        allow_scale_in = bool(sc.get("allow_scale_in"))
+        scale_in_cfg = sc.get("scale_in")
+        if allow_scale_in:
+            platform_cfg = str(sc.get("platform") or "").strip().lower()
+            if strategy_type not in ("perps", "manual"):
+                raise ValueError(
+                    f"{config_path}: strategy {strategy_id!r} sets "
+                    f"allow_scale_in on type={strategy_type!r}, but scale-in "
+                    f"is perps/manual-only (the live daemon rejects this "
+                    f"config at startup; #873)."
+                )
+            if platform_cfg != "hyperliquid":
+                raise ValueError(
+                    f"{config_path}: strategy {strategy_id!r} sets "
+                    f"allow_scale_in on platform={platform_cfg!r}, but "
+                    f"scale-in is hyperliquid-only (the live daemon rejects "
+                    f"this config at startup; #873)."
+                )
+            # Live-args resize guard (config.go, from #875): on LIVE perps
+            # the on-chain SL must be growable after an add — a trailing
+            # owner or an ATR/regime fixed SL. A static scalar SL
+            # (stop_loss_pct / stop_loss_margin_pct) has no resize path;
+            # live rejects the config, so reject here rather than simulate
+            # a config the daemon refuses to load.
+            _is_live_args = False
+            for _ai, _arg in enumerate(cfg_args):
+                if _arg == "--mode=live" or (
+                    _arg == "--mode"
+                    and _ai + 1 < len(cfg_args)
+                    and cfg_args[_ai + 1] == "live"
+                ):
+                    _is_live_args = True
+                    break
+            if strategy_type == "perps" and _is_live_args:
+                _has_trailing = (
+                    (sc.get("trailing_stop_pct") or 0) > 0
+                    or (sc.get("trailing_stop_atr_mult") or 0) > 0
+                    or bool(sc.get("trailing_stop_atr_regime"))
+                    or (str((sc.get("close_strategy") or {}).get("name") or "")
+                        .strip().lower()
+                        in ("trailing_tp_ratchet", "trailing_tp_ratchet_regime"))
+                )
+                _has_static_scalar_sl = (
+                    (sc.get("stop_loss_pct") or 0) > 0
+                    or (sc.get("stop_loss_margin_pct") or 0) > 0
+                )
+                if not _has_trailing and _has_static_scalar_sl:
+                    raise ValueError(
+                        f"{config_path}: strategy {strategy_id!r} sets "
+                        f"allow_scale_in on live perps with a static scalar "
+                        f"stop (stop_loss_pct/stop_loss_margin_pct), which "
+                        f"the live scale-in resize path cannot grow — the "
+                        f"live daemon rejects this config at startup (#873). "
+                        f"Use stop_loss_atr_mult, stop_loss_atr_regime, or a "
+                        f"trailing stop."
+                    )
+        elif scale_in_cfg:
+            raise ValueError(
+                f"{config_path}: strategy {strategy_id!r} has a scale_in "
+                f"block but allow_scale_in is false — enable allow_scale_in "
+                f"or remove the block (the live daemon rejects this config "
+                f"at startup; #873)."
+            )
         cert_symbol = str(cfg_args[1]) if len(cfg_args) > 1 else ""
-        cert_timeframe = str(cfg_args[2]) if len(cfg_args) > 2 else ""
+        cert_timeframe = regime_timeframe or (str(cfg_args[2]) if len(cfg_args) > 2 else "")
         regime_directional_certified = False
         regime_directional_certified_states = None
         if regime_directional_policy and cert_symbol and cert_timeframe:
@@ -612,7 +1154,7 @@ def load_strategy_config(config_path: str, strategy_id: str,
                 _certs, cert_symbol, cert_timeframe, _clf,
             )
             regime_directional_certified = regime_directional_certified_states is not None
-        return {
+        out = {
             "open_strategy": {
                 "name": open_name,
                 "params": dict(open_ref.get("params") or {}),
@@ -635,12 +1177,24 @@ def load_strategy_config(config_path: str, strategy_id: str,
             "regime_enabled": bool(regime_cfg.get("enabled")),
             "regime_period": int(regime_cfg.get("period", 14) or 14),
             "regime_adx_threshold": float(regime_cfg.get("adx_threshold", 20.0) or 20.0),
-            # #1058: composite (7-state) regime from regime.windows. None when no
+            "regime_timeframe": regime_timeframe,
+            # #1058: composite (9-state) regime from regime.windows. None when no
             # windows are configured → legacy single-lookback ADX path unchanged.
             "regime_windows_spec": _resolve_regime_windows_spec(regime_cfg),
             "allowed_regimes": allowed_regimes,
+            "regime_gate_on_failure": regime_gate_on_failure,
             "profile_allocation": profile_allocation,
+            # #1268: opt-in risk-per-trade sizing (None = legacy full-notional).
+            "risk_per_trade_pct": risk_per_trade_pct,
+            # #1276: opt-in scale-in / pyramiding (False/None = legacy skip).
+            "allow_scale_in": allow_scale_in,
+            "scale_in": dict(scale_in_cfg) if scale_in_cfg else None,
+            # #1277: resolved ATR smoothing method ("simple" = frozen legacy).
+            "atr_method": atr_method,
         }
+        if include_promotion_baseline:
+            out["promotion_baseline"] = promotion_baseline
+        return out
     raise ValueError(
         f"{config_path}: no strategy with id={strategy_id!r}. "
         f"Available: {[s.get('id') for s in cfg.get('strategies', []) or []]}"
@@ -661,8 +1215,10 @@ def run_single_backtest(
     regime_enabled: bool = False,
     regime_period: int = 14,
     regime_adx_threshold: float = 20.0,
+    regime_timeframe: Optional[str] = None,
     regime_windows_spec: Optional[dict] = None,
     allowed_regimes: Optional[List[str]] = None,
+    regime_gate_on_failure: str = "open",
     stop_loss_atr_mult: Optional[float] = None,
     stop_loss_pct: Optional[float] = None,
     stop_loss_margin_pct: Optional[float] = None,
@@ -678,8 +1234,13 @@ def run_single_backtest(
     regime_directional_certified_states: Optional[dict] = None,
     directional_cert_path: Optional[str] = None,
     profile_allocation: Optional[dict] = None,
+    intrabar_resolution: str = "ohlc_walk",
+    risk_per_trade_pct: Optional[float] = None,
+    allow_scale_in: bool = False,
+    scale_in: Optional[dict] = None,
+    atr_method: str = "simple",
     circuit_breaker_max_drawdown_pct: Optional[float] = None,
-    save: bool = True,
+    save: bool = False,
     margin_per_trade_usd: Optional[float] = None,
     leverage: Optional[float] = None,
 ) -> Optional[dict]:
@@ -687,14 +1248,16 @@ def run_single_backtest(
 
     ``registry`` selects the strategy registry (``"spot"`` or ``"futures"``).
     ``platform`` selects the exchange fee model (``"binanceus"``,
-    ``"hyperliquid"``, ``"blofin"``, ``"robinhood"``, ``"luno"``,
-    ``"okx"``, ``"okx-perps"``), matching
-    ``scheduler/fees.go:CalculatePlatformSpotFee``.
+    ``"hyperliquid"``, ``"blofin"``, ``"robinhood"``, ``"luno"``, ``"okx"``,
+    ``"okx-perps"``), matching ``scheduler/fees.go:CalculatePlatformSpotFee``.
     ``close_strategies`` is an optional list of co-located close-evaluator
     refs (``[{"name": str, "params": dict}, ...]``) from the close registry
-    (#511, #641); each runs per-bar against the simulated position. Backtest
-    granularity is bar-level so live intra-bar trigger races (e.g. HL
-    stop-loss OIDs) are not simulated.
+    (#511, #641); each runs per-bar against the simulated position.
+    ``intrabar_resolution`` selects the SL race resolution (#1271):
+    ``"ohlc_walk"`` (default) stops out on any bar whose range touches the
+    armed trigger, priced at the trigger (or the open on a gap-through);
+    ``"bar_close"`` restores the legacy bar-level convention for reproducing
+    pre-#1271 baselines.
     """
     reg = load_registry(registry)
     strat = reg.STRATEGY_REGISTRY.get(strategy_name)
@@ -707,12 +1270,13 @@ def run_single_backtest(
     print(f"\n▶ Strategy: {strat['description']}")
     print(f"  Params: {strat_params}")
     print(f"  Symbol: {symbol} | Timeframe: {timeframe} | Since: {since}")
-    # Inject Go-compatible defaults when tp_enabled is not explicitly set
     if close_strategies:
+        print(f"  Close strategies: {[r.get('name') for r in close_strategies]}")
+        # Inject Go-compatible defaults when tp_enabled is not explicitly set
+        # (Blofin parity: Go fees/tiered-TP assume tp_enabled=False by default).
         for cr in close_strategies:
             cr_params = cr.setdefault("params", {})
             cr_params.setdefault("tp_enabled", False)
-        print(f"  Close strategies: {[r.get('name') for r in close_strategies]}")
 
     df = load_cached_data(symbol, timeframe, exchange_id=platform, start_date=since)
     if df.empty:
@@ -740,10 +1304,18 @@ def run_single_backtest(
             else:
                 df_signals["signal__" + p] = res["signal"].values
         if close_strategies:
-            df_signals = ensure_atr_indicator(df_signals)
-        df_signals["_profile_label"] = _build_profile_label_series(
-            df_signals, profile_allocation["window_spec"]
-        ).values
+            df_signals = ensure_atr_indicator(df_signals, method=atr_method)
+        profile_labels = _profile_label_series(
+            df_signals,
+            symbol,
+            timeframe,
+            regime_timeframe,
+            since,
+            profile_allocation["window_spec"],
+        )
+        if profile_labels is None:
+            return None
+        df_signals["_profile_label"] = profile_labels.values
         print(f"  Profile allocation: window={profile_allocation['window']} "
               f"profiles={names} confirm_bars={profile_allocation['confirm_bars']}")
     else:
@@ -754,15 +1326,25 @@ def run_single_backtest(
         # `entry_atr` (tiered_tp_atr) and `market.atr` (tiered_tp_atr_live)
         # see consistent volatility input. Idempotent when `atr` already exists.
         if close_strategies:
-            df_signals = ensure_atr_indicator(df_signals)
+            df_signals = ensure_atr_indicator(df_signals, method=atr_method)
 
     if htf_filter:
         df_signals = _apply_htf_filter_to_df(df_signals, symbol, timeframe)
         print(f"  HTF filter: applied (HTF={get_default_htf(timeframe)})")
 
-    resolved_margin = margin_per_trade_usd if margin_per_trade_usd is not None else 10.0  # default $10 like Go
-    resolved_leverage = leverage if leverage is not None else _get_leverage_for_symbol(symbol)
-    print(f"  Margin: ${resolved_margin:.0f}/trade | Leverage: {resolved_leverage:.0f}x")
+    if regime_enabled:
+        df_signals = _apply_regime_timeframe_override(
+            df_signals,
+            symbol,
+            timeframe,
+            regime_timeframe,
+            since,
+            regime_period=regime_period,
+            regime_adx_threshold=regime_adx_threshold,
+            regime_windows_spec=regime_windows_spec,
+        )
+        if df_signals is None:
+            return None
 
     # #1085: resolve the directional-certification verdict for parity with live.
     # The backtest honors regime_directional_policy only where the SAME
@@ -780,14 +1362,19 @@ def run_single_backtest(
             and regime_directional_certified is None):
         certs = load_certifications(directional_cert_path)
         clf = backtest_classifier(regime_windows_spec)
+        cert_timeframe = str(regime_timeframe or timeframe).strip().lower()
         regime_directional_certified_states = certified_states(
-            certs, symbol, timeframe, clf,
+            certs, symbol, cert_timeframe, clf,
         )
         if regime_directional_certified_states is None:
             print(f"  [#1085] regime_directional_policy default-off: "
-                  f"({symbol},{timeframe},{clf}) not certified — base direction "
+                  f"({symbol},{cert_timeframe},{clf}) not certified — base direction "
                   f"(matches live; #1076 negative result).")
     regime_directional_certified = bool(regime_directional_certified)
+
+    resolved_margin = margin_per_trade_usd if margin_per_trade_usd is not None else 10.0  # default 0 like Go
+    resolved_leverage = leverage if leverage is not None else _get_leverage_for_symbol(symbol)
+    print(f"  Margin: /trade | Leverage: {resolved_leverage:.0f}x")
 
     bt = Backtester(
         initial_capital=capital, platform=platform,
@@ -798,6 +1385,7 @@ def run_single_backtest(
         regime_adx_threshold=regime_adx_threshold,
         regime_windows_spec=regime_windows_spec,
         allowed_regimes=allowed_regimes,
+        regime_gate_on_failure=regime_gate_on_failure,
         stop_loss_atr_mult=stop_loss_atr_mult,
         stop_loss_pct=stop_loss_pct,
         stop_loss_margin_pct=stop_loss_margin_pct,
@@ -812,6 +1400,11 @@ def run_single_backtest(
         regime_directional_certified=regime_directional_certified,
         regime_directional_certified_states=regime_directional_certified_states,
         profile_allocation=profile_allocation,
+        intrabar_resolution=intrabar_resolution,
+        risk_per_trade_pct=risk_per_trade_pct,
+        allow_scale_in=allow_scale_in,
+        scale_in=scale_in,
+        atr_method=atr_method,
         circuit_breaker_max_drawdown_pct=circuit_breaker_max_drawdown_pct,
         margin_per_trade_usd=resolved_margin,
         leverage=resolved_leverage,
@@ -844,6 +1437,8 @@ def run_all_strategies(
     regime_adx_threshold: float = 20.0,
     allowed_regimes: Optional[List[str]] = None,
     direction: Optional[str] = None,
+    intrabar_resolution: str = "ohlc_walk",
+    atr_method: str = "simple",
     circuit_breaker_max_drawdown_pct: Optional[float] = None,
     margin_per_trade_usd: Optional[float] = None,
     leverage: Optional[float] = None,
@@ -866,6 +1461,11 @@ def run_all_strategies(
             regime_adx_threshold=regime_adx_threshold,
             allowed_regimes=allowed_regimes,
             direction=direction,
+            intrabar_resolution=intrabar_resolution,
+            atr_method=atr_method,
+            circuit_breaker_max_drawdown_pct=circuit_breaker_max_drawdown_pct,
+            margin_per_trade_usd=margin_per_trade_usd,
+            leverage=leverage,
         )
         if result:
             all_results.append(result)
@@ -891,6 +1491,8 @@ def run_multi_asset(
     regime_adx_threshold: float = 20.0,
     allowed_regimes: Optional[List[str]] = None,
     direction: Optional[str] = None,
+    intrabar_resolution: str = "ohlc_walk",
+    atr_method: str = "simple",
 ) -> dict:
     """Run strategies across multiple assets."""
     reg = load_registry(registry)
@@ -918,6 +1520,8 @@ def run_multi_asset(
                 regime_adx_threshold=regime_adx_threshold,
                 allowed_regimes=allowed_regimes,
                 direction=direction,
+                intrabar_resolution=intrabar_resolution,
+                atr_method=atr_method,
             )
             if result:
                 results_by_asset[symbol].append(result)
@@ -1039,11 +1643,12 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="Path to a live go-trader config.json. Loads a single strategy by "
                              "--strategy ID and uses its open_strategy/close_strategies refs verbatim "
                              "for the backtest. Lets you backtest a live config without reshaping (#641).")
-    parser.add_argument("--defaults", choices=["system", "user"], default="system",
+    parser.add_argument("--defaults", choices=["system", "user"], default=None,
                         help="Which close-default layer to apply when a close ref omits tp_tiers (#866): "
-                             "'system' (default) uses the built-in defaults; 'user' applies the "
-                             "user_close_defaults block from --config. Per-strategy tp_tiers always wins. "
-                             "Requires --config when set to 'user'.")
+                             "'user' applies the user_defaults block from --config (the default for "
+                             "--config, matching live); 'system' uses the built-in defaults (the "
+                             "default without --config, or an explicit baseline override). "
+                             "Per-strategy tp_tiers always wins.")
     parser.add_argument("--regime-enabled", action="store_true", default=False,
                         help="Enable market regime detection. Injects vectorized regime "
                              "column from shared_tools/regime.py before the per-bar loop, "
@@ -1054,7 +1659,7 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="ADX threshold below which market is 'ranging' (default: 20.0).")
     parser.add_argument("--regime-windows-spec-json", default=None,
                         dest="regime_windows_spec_json", metavar="JSON",
-                        help="Composite (7-state) regime windows spec, same shape as the live "
+                        help="Composite (9-state) regime windows spec, same shape as the live "
                              "--regime-windows-spec-json arg: a JSON object mapping window name "
                              "-> {classifier,period,...} (bare int = ADX period). The PRIMARY "
                              "window (medium-first) is classified into the per-bar regime label "
@@ -1067,7 +1672,7 @@ def _build_parser() -> argparse.ArgumentParser:
                              "window's classifier vocabulary (#1058): ADX (default / no "
                              "--regime-windows-spec-json) accepts trending_up, "
                              "trending_down, ranging; a composite primary window accepts "
-                             "the 7-state substates (trending_up_clean, ranging_quiet, ...).")
+                             "the 9-state substates (trending_up_clean, ranging_quiet, ...).")
     parser.add_argument("--stop-loss-atr-mult", type=float, default=None,
                         dest="stop_loss_atr_mult", metavar="MULT",
                         help="Fixed ATR-multiple stop loss (e.g. 2.0). Applied in "
@@ -1101,6 +1706,28 @@ def _build_parser() -> argparse.ArgumentParser:
                              "evaluator. In optimize mode defaults to long "
                              "when a close-stack grid is swept so every "
                              "stack scores on the same entry universe.")
+    parser.add_argument("--atr-method", dest="atr_method",
+                        choices=["simple", "wilder"], default=None,
+                        help="ATR smoothing for the injected standard-ATR "
+                             "series (#1277). simple (default): frozen legacy "
+                             "rolling mean with the >=100 integer rounding — "
+                             "byte-identical to documented baselines. wilder: "
+                             "published Wilder RMA, never rounded. Not allowed "
+                             "alongside --config (the live config's atr_method "
+                             "owns it). Regime classification stays pinned to "
+                             "simple either way.")
+    parser.add_argument("--intrabar-resolution", dest="intrabar_resolution",
+                        choices=["ohlc_walk", "bar_close"],
+                        default="ohlc_walk",
+                        help="SL race resolution (#1271). ohlc_walk "
+                             "(default): a bar whose range touches the armed "
+                             "stop trigger exits ON that bar at the trigger "
+                             "price (or at the open on a gap-through), "
+                             "winning adverse-move-first over a same-bar TP. "
+                             "bar_close: legacy pre-#1271 semantics (hit "
+                             "detected on the close only, filled at the next "
+                             "bar's open) for reproducing documented "
+                             "baselines. Single mode only.")
     return parser
 
 
@@ -1127,12 +1754,29 @@ def _parse_close_strategy_arg(raw: str) -> dict:
     return {"name": name, "params": dict(ref.get("params") or {})}
 
 
+def _resolve_defaults_mode(args) -> str:
+    """Resolve --defaults after --config is known.
+
+    A live-config backtest should match the daemon by default: LoadConfig applies
+    user_defaults unconditionally, while by-name runs have no config block to read
+    from and therefore stay on system defaults unless the user says otherwise.
+    """
+    if args.defaults:
+        if args.defaults == "user" and not args.config:
+            print("--defaults user requires --config (user_defaults lives in the config); "
+                  "falling back to system defaults")
+            return "system"
+        return args.defaults
+    return "user" if args.config else "system"
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     platform_explicit = any(
         a == "--platform" or str(a).startswith("--platform=") for a in argv
     )
     args = _build_parser().parse_args(argv)
+    args.defaults = _resolve_defaults_mode(args)
 
     close_refs = None
     if args.close_strategies:
@@ -1156,7 +1800,7 @@ def main(argv=None):
             print("--regime-windows-spec-json is only valid with --mode single")
             sys.exit(1)
 
-    # #1058 review: a composite primary window classifies 7-state substates the
+    # #1058 review: a composite primary window classifies 9-state substates the
     # entry gate must be able to filter on; validate the by-name --allowed-regimes
     # against that classifier's vocabulary so a label the classifier can never emit
     # (which would silently block every entry) is rejected loudly. The --config
@@ -1165,11 +1809,6 @@ def main(argv=None):
     if not args.config:
         _validate_allowed_regimes_vocabulary(
             args.allowed_regimes, args.regime_windows_spec)
-
-    # #866: --defaults user only has an effect via the config's user_close_defaults.
-    if args.defaults == "user" and not args.config:
-        print("--defaults user requires --config (user_close_defaults lives in the config); "
-              "falling back to system defaults")
 
     # #641: --config loads a single strategy by ID and uses its refs directly.
     open_params: Optional[dict] = None
@@ -1210,6 +1849,15 @@ def main(argv=None):
                   "live config's `allowed_regimes` field owns the regime gate); "
                   "edit the config or backtest the strategy by name")
             sys.exit(1)
+        # #1277: the live config's atr_method owns the ATR smoothing; a CLI
+        # --atr-method alongside --config would create a run that matches
+        # neither live behavior nor the config's own baseline. Reject loudly,
+        # like --close-strategy / --direction above.
+        if args.atr_method:
+            print("--atr-method is not allowed alongside --config (the live "
+                  "config's `atr_method` field owns the ATR smoothing); "
+                  "edit the config or backtest the strategy by name")
+            sys.exit(1)
         # #1058: the config's regime.windows owns the composite spec; a CLI
         # --regime-windows-spec-json alongside --config would lose to it on the
         # thread below and silently mislead. Reject loudly, like the gates above.
@@ -1245,13 +1893,26 @@ def main(argv=None):
             # fallback for callers that don't supply the map.
             "regime_directional_certified",
             "regime_directional_certified_states",
+            # #1278: entry-gate failure policy for empty/unavailable regime
+            # labels (per-strategy over the global regime.gate_on_failure
+            # default; resolved in load_strategy_config). Default "open"
+            # keeps existing baselines byte-identical.
+            "regime_gate_on_failure",
             # #998: regime-profile allocation switch block (None when unused).
             "profile_allocation",
-            # #1058: composite (7-state) regime windows spec (None when the
+            "regime_timeframe",
+            # #1058: composite (9-state) regime windows spec (None when the
             # config has no regime.windows → legacy ADX path). Only single mode
             # consumes live_stop_kwargs; optimize/compare/multi stay ADX, as they
             # already drop the other config-sourced close fields here.
             "regime_windows_spec",
+            # #1268: opt-in risk-per-trade sizing from the live config.
+            "risk_per_trade_pct",
+            # #1276: opt-in scale-in / pyramiding from the live config.
+            "allow_scale_in",
+            "scale_in",
+            # #1277: resolved ATR smoothing method from the live config.
+            "atr_method",
         )
         live_stop_kwargs = {k: live_kwargs[k] for k in stop_keys if k in live_kwargs}
         args.regime_enabled = live_kwargs.get("regime_enabled", args.regime_enabled)
@@ -1312,6 +1973,32 @@ def main(argv=None):
         # --config + --direction was rejected above, so the key can't collide.
         live_stop_kwargs["direction"] = args.direction
 
+    # #1277: CLI --atr-method drives config-less runs (e.g. re-establishing
+    # baselines under wilder). --config + explicit flag was rejected above, so
+    # setdefault can only fill the no-config case. Optimize mode constructs
+    # its own engines on the default — reject rather than silently sweeping
+    # under math the flag asked to change (same stance as --intrabar-resolution).
+    if args.atr_method and args.mode == "optimize":
+        print("--atr-method is not supported in optimize mode (the optimizer's "
+              "engines run on the default simple ATR); use --mode single/"
+              "compare/multi for wilder runs")
+        sys.exit(1)
+    if args.atr_method:
+        live_stop_kwargs.setdefault("atr_method", args.atr_method)
+
+    # #1271: engine-mode selector, not a strategy config field — cannot
+    # collide with --config keys, so set unconditionally for single mode.
+    # compare/multi thread it explicitly below; optimize rejects the legacy
+    # value rather than silently scoring a grid on semantics the flag asked
+    # to disable (optimizer.py constructs its own engines on the default).
+    live_stop_kwargs["intrabar_resolution"] = args.intrabar_resolution
+    if args.intrabar_resolution != "ohlc_walk" and args.mode == "optimize":
+        print("--intrabar-resolution bar_close is not supported in optimize "
+              "mode (the optimizer's engines run on the default ohlc_walk "
+              "semantics); use --mode single, or eval_windows.py, for legacy-"
+              "baseline reproduction")
+        sys.exit(1)
+
     reg = load_registry(args.registry)
 
     if args.mode == "single":
@@ -1341,7 +2028,9 @@ def main(argv=None):
                            regime_period=args.regime_period,
                            regime_adx_threshold=args.regime_adx_threshold,
                            allowed_regimes=args.allowed_regimes,
-                           direction=args.direction)
+                           direction=args.direction,
+                           intrabar_resolution=args.intrabar_resolution,
+                           atr_method=args.atr_method or "simple")
 
     elif args.mode == "multi":
         strategies = None if args.strategy == "all" else [args.strategy]
@@ -1355,7 +2044,9 @@ def main(argv=None):
                         regime_period=args.regime_period,
                         regime_adx_threshold=args.regime_adx_threshold,
                         allowed_regimes=args.allowed_regimes,
-                        direction=args.direction)
+                        direction=args.direction,
+                        intrabar_resolution=args.intrabar_resolution,
+                        atr_method=args.atr_method or "simple")
 
     elif args.mode == "optimize":
         # #996: close-stack co-optimization. The grid owns the close stack;

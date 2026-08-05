@@ -120,7 +120,8 @@ def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=
                      position_side="", position_ctx=None,
                      regime_enabled=False, regime_windows_spec=None, ohlcv_limit=200, regime_atr_window="",
                      regime_payload_json=None,
-                     close_params_by_name=None):
+                     close_params_by_name=None,
+                     atr_method="simple"):
     """Run strategy signal check using yfinance OHLCV data."""
     try:
         from adapter import RobinhoodExchangeAdapter
@@ -135,13 +136,13 @@ def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=
             finalize_decision,
             normalize_signal,
             parse_close_strategies,
+            reject_backtest_only_strategies,
             validate_close_strategy_names,
         )
 
         open_close_enabled = bool(open_strategy or close_strategies)
         configured_names = [open_strategy or strategy_name]
-        for name in configured_names:
-            get_strategy(name)
+        reject_backtest_only_strategies(configured_names, get_strategy)
         validate_close_strategy_names(
             parse_close_strategies(close_strategies),
             get_strategy,
@@ -183,7 +184,7 @@ def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=
         decision = None
         if open_close_enabled:
             market_ctx = {"mark_price": float(df["close"].iloc[-1])}
-            atr_now = latest_atr(df)
+            atr_now = latest_atr(df, method=atr_method)
             if atr_now > 0:
                 market_ctx["atr"] = atr_now
             # #733: live regime label for tiered_tp_atr_live_regime evaluator.
@@ -209,7 +210,7 @@ def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=
             result_df = apply_strategy(strategy_name, df, strategy_params)
             signal = normalize_signal(result_df.iloc[-1].get("signal", 0))
 
-        ensure_atr_indicator(result_df)
+        ensure_atr_indicator(result_df, method=atr_method)
         last = result_df.iloc[-1]
         price = float(last["close"])
 
@@ -386,6 +387,10 @@ def main():
         # #879: precomputed global-store regime payload; presence (even empty)
         # disables inline regime computation.
         parser.add_argument("--regime-payload-json", default=None)
+        # #1277: ATR smoothing method for the standard_atr surface (EntryATR
+        # stamping + market_ctx["atr"]). Forwarded by Go from the resolved
+        # atr_method config; "simple" is the frozen legacy default.
+        parser.add_argument("--atr-method", default="simple", choices=["simple", "wilder"])
         parser.add_argument("--regime-directional-window", default="")
         parser.add_argument("--params", default=None)
         parser.add_argument("--open-strategy", default=None)
@@ -422,6 +427,7 @@ def main():
             regime_atr_window=args.regime_atr_window,
             regime_payload_json=args.regime_payload_json,
             close_params_by_name=close_params_by_name,
+            atr_method=args.atr_method,
         )
 
 
