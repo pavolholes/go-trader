@@ -11,29 +11,15 @@ import (
 	"strings"
 )
 
-// #1147 `go-trader diagnostics` — on-demand, read-only trade-quality report.
-// Queries the trade_diagnostics table (capture side: trade_diagnostics.go),
-// aggregates per strategy, and prints deterministic, backtestable tuning
-// hypotheses. Diagnostics-only: opens the state DB mode=ro, never mutates
-// positions, orders, or config, and nothing runs unless the operator invokes
-// it.
-
-// Hypothesis thresholds. Deliberately simple, documented heuristics — the
-// report tells the operator what to INVESTIGATE (with the exact backtest
-// command); it never claims statistical proof and never tunes anything.
 const (
-	diagDefaultMinTrades = 30  // closed positions before any hypothesis prints
-	diagDefaultMinBucket = 10  // per regime/direction bucket before a split hypothesis prints
-	diagCaptureLowMean   = 0.5 // mean winner capture ratio below this → exits leak gains
-	diagMAEATRShare      = 0.5 // share of trades whose adverse excursion exceeded 1×entry-ATR → entries fire early
-	diagLoserAtStopShare = 0.7 // share of losers whose MAE reached ~the stop distance → SL placement worth a sweep
-	diagLoserAtStopSlack = 0.9 // "reached the stop" = adverse excursion ≥ this fraction of stop distance
+	diagDefaultMinTrades = 30
+	diagDefaultMinBucket = 10
+	diagCaptureLowMean   = 0.5
+	diagMAEATRShare      = 0.5
+	diagLoserAtStopShare = 0.7
+	diagLoserAtStopSlack = 0.9
 )
 
-// diagExcludedReason filters rows whose prices/PnL are synthetic or zeroed by
-// construction, which would poison quality aggregates: hl_sync_external rows
-// carry mark-based or zero close prices (see ClosedPosition doc), and
-// *_corrupt / *_dup_oid legs book zero PnL (#1009).
 func diagExcludedReason(reason string) bool {
 	return reason == "hl_sync_external" ||
 		strings.HasSuffix(reason, "_corrupt") ||
@@ -51,31 +37,36 @@ func runDiagnostics(args []string) int {
 		return 2
 	}
 
-	path := *dbPath
-	if path == "" {
-		resolved, err := diagnosticsDBPathFromConfig(*configPath)
+	// --db stays single-file; without it the report spans every owned file.
+	var reader diagnosticsReader
+	if *dbPath != "" {
+		if _, err := os.Stat(*dbPath); err != nil {
+			fmt.Fprintf(os.Stderr, "diagnostics: state DB %s not found: %v\n", *dbPath, err)
+			return 1
+		}
+		db, err := sql.Open("sqlite", "file:"+*dbPath+"?mode=ro&_pragma=busy_timeout(5000)")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "diagnostics: open %s: %v\n", *dbPath, err)
+			return 1
+		}
+		defer db.Close()
+		reader = &StateDB{db: db, readOnly: true, role: storageRolePrimary}
+	} else {
+		cfg, err := LoadConfig(*configPath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "diagnostics: %v\n", err)
 			return 1
 		}
-		path = resolved
-	}
-	if _, err := os.Stat(path); err != nil {
-		fmt.Fprintf(os.Stderr, "diagnostics: state DB %s not found: %v\n", path, err)
-		return 1
+		store, err := openToolStateStoreReadOnly(cfg)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "diagnostics: %v\n", err)
+			return 1
+		}
+		defer store.Close()
+		reader = store
 	}
 
-	// Read-only open (agent-info pattern): never migrates, never writes, safe
-	// to run next to the live daemon.
-	db, err := sql.Open("sqlite", "file:"+path+"?mode=ro&_pragma=busy_timeout(5000)")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "diagnostics: open %s: %v\n", path, err)
-		return 1
-	}
-	defer db.Close()
-	sdb := &StateDB{db: db}
-
-	rows, err := sdb.TradeDiagnosticsRows(*strategyID)
+	rows, err := reader.TradeDiagnosticsRows(*strategyID)
 	if err != nil {
 		if strings.Contains(err.Error(), "no such table") {
 			fmt.Println("No diagnostics recorded yet (the trade_diagnostics table is created on the daemon's next start; rows appear as positions close).")
@@ -84,7 +75,7 @@ func runDiagnostics(args []string) int {
 		fmt.Fprintf(os.Stderr, "diagnostics: %v\n", err)
 		return 1
 	}
-	netByPos, err := sdb.NetPnLByPosition(*strategyID)
+	netByPos, err := reader.NetPnLByPosition(*strategyID)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "diagnostics: %v\n", err)
 		return 1
@@ -97,9 +88,13 @@ func runDiagnostics(args []string) int {
 	return 0
 }
 
-// diagnosticsDBPathFromConfig extracts db_file from the config JSON without
-// loadConfig (which normalizes and can rewrite the file in place — a
-// read-only report must not touch it).
+// diagnosticsReader is satisfied by one file and by the combined store, so the
+// report reads the same way from either.
+type diagnosticsReader interface {
+	TradeDiagnosticsRows(strategyID string) ([]TradeDiagnosticsRow, error)
+	NetPnLByPosition(strategyID string) (map[string]map[string]float64, error)
+}
+
 func diagnosticsDBPathFromConfig(path string) (string, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -122,28 +117,27 @@ type diagReportOptions struct {
 	MinBucket int
 }
 
-// diagStrategyStats is the per-strategy aggregate the report prints.
 type diagStrategyStats struct {
 	StrategyID string
 	Symbol     string
 	Timeframe  string
 
-	Total    int // all rows incl. excluded-reason rows
-	Excluded int // synthetic rows (hl_sync_external, *_corrupt, *_dup_oid) kept out of the aggregates below
-	N        int // rows contributing to stats
+	Total    int
+	Excluded int
+	N        int
 	Wins     int
 	Losses   int
 	NetPnL   float64
 
 	MetricsOK     int
 	StatusCounts  map[string]int
-	CaptureVals   []float64 // winners only
+	CaptureVals   []float64
 	FavorableVals []float64
 	AdverseVals   []float64
-	MAEOverATR    int // trades whose adverse excursion ≥ 1× entry ATR (as % of entry)
-	MAEOverATRN   int // trades where that comparison was computable
-	LosersAtStop  int // losers whose MAE reached ≥ diagLoserAtStopSlack × stop distance
-	LosersWithSL  int // losers where stop distance was computable
+	MAEOverATR    int
+	MAEOverATRN   int
+	LosersAtStop  int
+	LosersWithSL  int
 
 	Regimes    map[string]*diagBucket
 	Directions map[string]*diagBucket
@@ -162,10 +156,6 @@ func (b *diagBucket) expectancy() float64 {
 	return b.NetPnL / float64(b.N)
 }
 
-// diagRowNetPnL resolves a row's net PnL: the summed convention-aware net
-// over ALL close legs of the position (multi-leg exits aggregate) when the
-// trades join can attribute it, else the final-leg pre-fee PnL stored on the
-// row.
 func diagRowNetPnL(r TradeDiagnosticsRow, netByPos map[string]map[string]float64) float64 {
 	if r.PositionID != "" {
 		if byPos, ok := netByPos[r.StrategyID]; ok {
@@ -283,8 +273,6 @@ func diagMean(vals []float64) float64 {
 	return sum / float64(len(vals))
 }
 
-// diagHypothesis is one printed finding: what the metric shows, what to try,
-// and the exact backtest command that validates it.
 type diagHypothesis struct {
 	Tag      string
 	Finding  string
@@ -296,9 +284,6 @@ func diagBaselineCommand(cfgPath, strategyID string) string {
 	return fmt.Sprintf("uv run --no-sync python backtest/run_backtest.py --config %s --strategy %s --mode single", cfgPath, strategyID)
 }
 
-// diagHypotheses derives the deterministic hypothesis list for one strategy.
-// Sample-size gating happens in the caller (buildTradeDiagnosticsReport) so
-// the "insufficient data" shortfall can be printed instead.
 func diagHypotheses(st *diagStrategyStats, cfgPath string, minBucket int) []diagHypothesis {
 	var out []diagHypothesis
 	baseline := diagBaselineCommand(cfgPath, st.StrategyID)

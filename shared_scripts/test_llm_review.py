@@ -1,8 +1,3 @@
-"""Tests for llm_review.py (#1137) — pipeline logic with an injected LLM,
-word-cap enforcement, judge parsing, and the subprocess/probe contract.
-Not in pyproject testpaths; invoke explicitly:
-    uv run --no-sync python -m pytest shared_scripts/test_llm_review.py
-"""
 
 import importlib.util
 import json
@@ -46,17 +41,14 @@ CTX = {
 
 
 class TestWordCap:
-    def test_under_cap_unchanged(self, mod):
-        assert mod.truncate_to_word_cap("one two three", 5) == "one two three"
-
-    def test_normalizes_whitespace(self, mod):
-        assert mod.truncate_to_word_cap("  a\n b\tc ", 5) == "a b c"
-
-    def test_truncates_with_ellipsis(self, mod):
-        assert mod.truncate_to_word_cap("a b c d e", 3) == "a b c …"
-
-    def test_none_safe(self, mod):
-        assert mod.truncate_to_word_cap(None, 3) == ""
+    @pytest.mark.parametrize("text,cap,expected", [
+        ("one two three", 5, "one two three"),
+        ("  a\n b\tc ", 5, "a b c"),
+        ("a b c d e", 3, "a b c …"),
+        (None, 3, ""),
+    ])
+    def test_word_cap(self, mod, text, cap, expected):
+        assert mod.truncate_to_word_cap(text, cap) == expected
 
 
 class TestSummarizeOhlcv:
@@ -75,17 +67,18 @@ class TestSummarizeOhlcv:
 
 
 class TestJudgeParsing:
-    def test_strict_json(self, mod):
-        v, r = mod.parse_judge_output('{"verdict": "Bullish", "rationale": "looks good"}', 55)
-        assert v == "bullish" and r == "looks good"
+    @pytest.mark.parametrize("raw,verdict", [
+        ('{"verdict": "Bullish", "rationale": "looks good"}', "bullish"),
+        ('```json\n{"verdict":"bearish","rationale":"r"}\n```', "bearish"),
+        ("Overall this reads mixed to me because ...", "mixed"),
+    ])
+    def test_verdict_parsing(self, mod, raw, verdict):
+        v, _ = mod.parse_judge_output(raw, 55)
+        assert v == verdict
 
-    def test_fenced_json(self, mod):
-        v, _ = mod.parse_judge_output('```json\n{"verdict":"bearish","rationale":"r"}\n```', 55)
-        assert v == "bearish"
-
-    def test_keyword_fallback_single(self, mod):
-        v, r = mod.parse_judge_output("Overall this reads mixed to me because ...", 55)
-        assert v == "mixed"
+    def test_strict_json_rationale(self, mod):
+        _, r = mod.parse_judge_output('{"verdict": "Bullish", "rationale": "looks good"}', 55)
+        assert r == "looks good"
 
     def test_ambiguous_raises(self, mod):
         with pytest.raises(RuntimeError):
@@ -96,7 +89,7 @@ class TestJudgeParsing:
     def test_rationale_capped(self, mod):
         long = " ".join(["w"] * 100)
         _, r = mod.parse_judge_output(json.dumps({"verdict": "mixed", "rationale": long}), 10)
-        assert len(r.split()) == 11  # 10 words + ellipsis
+        assert len(r.split()) == 11
 
 
 class TestPipeline:
@@ -105,7 +98,7 @@ class TestPipeline:
             calls.append((system, user))
             if "risk manager" in system:
                 return '{"verdict": "bullish", "rationale": "momentum and funding both lean up"}'
-            return "short note " + " ".join(["pad"] * 80)  # over-cap on purpose
+            return "short note " + " ".join(["pad"] * 80)
         return llm_call
 
     def test_full_pipeline_with_debate(self, mod):
@@ -115,10 +108,8 @@ class TestPipeline:
         assert out["verdict"] == "bullish"
         assert out["rationale"]
         assert set(out["per_analyst"]) == {"technical", "derivatives"}
-        # Every topic obeys the cap (55 words + ellipsis marker at most).
         for note in list(out["per_analyst"].values()) + [out["rationale"]]:
             assert len(note.split()) <= 56
-        # 2 analysts + 2 rounds x (bull+bear) + judge = 7 calls
         assert len(calls) == 7
 
     def test_zero_rounds_skips_debate(self, mod):
@@ -126,7 +117,6 @@ class TestPipeline:
         market = {"ohlcv_summary": None, "funding": None}
         out = mod.run_pipeline(CTX, market, self._fake_llm(calls), max_debate_rounds=0, word_cap=55)
         assert out["verdict"] == "bullish"
-        # funding unavailable -> derivatives analyst skipped; technical + judge only
         assert set(out["per_analyst"]) == {"technical"}
         assert len(calls) == 2
 

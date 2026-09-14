@@ -6,23 +6,16 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 )
 
-// silentStrategyLogger returns a StrategyLogger that writes to io.Discard
-// so tests don't pollute test output. The constructor name follows the
-// project convention of platform/feature-prefixed test helpers (CLAUDE.md).
 func silentStrategyLogger(id string) *StrategyLogger {
 	return &StrategyLogger{stratID: id, writer: io.Discard}
 }
-
-// Tests for the stop-loss plumbing added in #412. We exercise the pure
-// output parser (which Go CI can run without spawning Python) plus
-// StrategyConfig/Position serialization round-trips so struct-tag
-// regressions on the new fields surface here.
 
 func TestParseHyperliquidExecuteOutput_StopLossFields(t *testing.T) {
 	stdout := []byte(`{
@@ -66,10 +59,6 @@ func TestParseHyperliquidExecuteOutput_StopLossFields(t *testing.T) {
 }
 
 func TestParseHyperliquidExecuteOutput_NonFatalSLErrors(t *testing.T) {
-	// When SL placement fails but the main fill succeeds, the Python side
-	// emits top-level stop_loss_error / cancel_stop_loss_error strings and
-	// keeps the execution block intact. Parser must surface both so the
-	// scheduler can log them without aborting state updates.
 	stdout := []byte(`{
 		"execution": {
 			"action": "sell",
@@ -99,9 +88,6 @@ func TestParseHyperliquidExecuteOutput_NonFatalSLErrors(t *testing.T) {
 }
 
 func TestParseHyperliquidExecuteOutput_ErrorJSONPreserved(t *testing.T) {
-	// Python script exits 1 with an {"error": "..."} payload; runErr is
-	// non-nil but parser should return the decoded result so the scheduler
-	// can log the reason without treating it as an unparseable failure.
 	stdout := []byte(`{"execution": null, "platform": "hyperliquid", "timestamp": "2026-04-23T12:00:00+00:00", "error": "--execute requires --mode=live"}`)
 	runErr := errors.New("exit status 1")
 	result, _, err := parseHyperliquidExecuteOutput(stdout, "", runErr)
@@ -113,47 +99,80 @@ func TestParseHyperliquidExecuteOutput_ErrorJSONPreserved(t *testing.T) {
 	}
 }
 
-func TestStrategyConfig_StopLossPctJSON(t *testing.T) {
-	v := 3.5
-	sc := StrategyConfig{
-		ID:          "hl-donch-btc",
-		Platform:    "hyperliquid",
-		Type:        "perps",
-		StopLossPct: &v,
+func TestStrategyConfig_StopFieldPointerJSON(t *testing.T) {
+	cases := []struct {
+		name  string
+		key   string
+		value float64
+		set   func(*StrategyConfig, *float64)
+		get   func(StrategyConfig) *float64
+	}{
+		{"stop_loss_pct", "stop_loss_pct", 3.5,
+			func(sc *StrategyConfig, v *float64) { sc.StopLossPct = v },
+			func(sc StrategyConfig) *float64 { return sc.StopLossPct }},
+		{"stop_loss_margin_pct", "stop_loss_margin_pct", 25,
+			func(sc *StrategyConfig, v *float64) { sc.StopLossMarginPct = v },
+			func(sc StrategyConfig) *float64 { return sc.StopLossMarginPct }},
+		{"trailing_stop_atr_mult", "trailing_stop_atr_mult", 1.5,
+			func(sc *StrategyConfig, v *float64) { sc.TrailingStopATRMult = v },
+			func(sc StrategyConfig) *float64 { return sc.TrailingStopATRMult }},
+		{"stop_loss_atr_mult", "stop_loss_atr_mult", 1.5,
+			func(sc *StrategyConfig, v *float64) { sc.StopLossATRMult = v },
+			func(sc StrategyConfig) *float64 { return sc.StopLossATRMult }},
 	}
-	b, err := json.Marshal(sc)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	var round StrategyConfig
-	if err := json.Unmarshal(b, &round); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if round.StopLossPct == nil || *round.StopLossPct != 3.5 {
-		t.Errorf("round-trip StopLossPct: got %v, want 3.5", round.StopLossPct)
-	}
-	// omitempty check: nil pointer must not emit the field.
-	b2, _ := json.Marshal(StrategyConfig{ID: "x", Platform: "hyperliquid", Type: "perps"})
-	if containsKey(b2, "stop_loss_pct") {
-		t.Errorf("nil StopLossPct should be omitted; got %s", b2)
-	}
-	// #484: pointer-vs-omitted distinction — explicit 0 must round-trip and
-	// re-emit, since it carries the operator's "disabled" semantic.
-	zero := 0.0
-	scZero := StrategyConfig{ID: "x", Platform: "hyperliquid", Type: "perps", StopLossPct: &zero}
-	b3, _ := json.Marshal(scZero)
-	if !containsKey(b3, "stop_loss_pct") {
-		t.Errorf("explicit zero StopLossPct must be preserved in JSON; got %s", b3)
-	}
-	var roundZero StrategyConfig
-	if err := json.Unmarshal(b3, &roundZero); err != nil {
-		t.Fatalf("unmarshal zero: %v", err)
-	}
-	if roundZero.StopLossPct == nil || *roundZero.StopLossPct != 0 {
-		t.Errorf("round-trip explicit-zero StopLossPct: got %v, want 0 (non-nil)", roundZero.StopLossPct)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			base := func() StrategyConfig {
+				return StrategyConfig{ID: "hl-test", Type: "perps", Platform: "hyperliquid", Leverage: 10}
+			}
+
+			sc := base()
+			v := tc.value
+			tc.set(&sc, &v)
+			b, err := json.Marshal(sc)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			if !containsKey(b, tc.key) {
+				t.Errorf("expected %s in JSON; got %s", tc.key, b)
+			}
+			var round StrategyConfig
+			if err := json.Unmarshal(b, &round); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if got := tc.get(round); got == nil || *got != tc.value {
+				t.Errorf("round-trip %s: got %v, want %v", tc.key, got, tc.value)
+			}
+
+			scNil := base()
+			b2, err := json.Marshal(scNil)
+			if err != nil {
+				t.Fatalf("marshal nil: %v", err)
+			}
+			if containsKey(b2, tc.key) {
+				t.Errorf("nil %s should be omitted; got %s", tc.key, b2)
+			}
+
+			scZero := base()
+			zero := 0.0
+			tc.set(&scZero, &zero)
+			b3, err := json.Marshal(scZero)
+			if err != nil {
+				t.Fatalf("marshal zero: %v", err)
+			}
+			if !containsKey(b3, tc.key) {
+				t.Errorf("explicit zero %s must be preserved in JSON; got %s", tc.key, b3)
+			}
+			var roundZero StrategyConfig
+			if err := json.Unmarshal(b3, &roundZero); err != nil {
+				t.Fatalf("unmarshal zero: %v", err)
+			}
+			if got := tc.get(roundZero); got == nil || *got != 0 {
+				t.Errorf("round-trip explicit-zero %s: got %v, want 0 (non-nil)", tc.key, got)
+			}
+		})
 	}
 }
-
 func TestPosition_StopLossOIDJSON(t *testing.T) {
 	p := Position{Symbol: "ETH", Quantity: 1, AvgCost: 3000, Side: "long", StopLossOID: 42, StopLossTriggerPx: 2900, StopLossHighWaterPx: 3100}
 	b, err := json.Marshal(p)
@@ -173,7 +192,6 @@ func TestPosition_StopLossOIDJSON(t *testing.T) {
 	if round.StopLossHighWaterPx != 3100 {
 		t.Errorf("round-trip StopLossHighWaterPx: got %v", round.StopLossHighWaterPx)
 	}
-	// omitempty: zero should drop from JSON.
 	b2, _ := json.Marshal(Position{Symbol: "ETH", Quantity: 1, AvgCost: 3000, Side: "long"})
 	if containsKey(b2, "stop_loss_oid") {
 		t.Errorf("zero StopLossOID should be omitted; got %s", b2)
@@ -205,6 +223,10 @@ func TestComputeTrailingStopUpdate(t *testing.T) {
 		{"short ratchets down", "short", 90, 100, 3, 0.5, 103, 90, 92.7, true},
 		{"short never raises trigger", "short", 101, 100, 3, 0.5, 103, 100, 0, false},
 		{"missing current trigger places one", "long", 100, 100, 3, 0.5, 0, 100, 97, true},
+		{"long replaces at exact min-move boundary", "long", 101, 100, 50, 1.0, 50, 101, 50.5, true},
+		{"short replaces at exact min-move boundary", "short", 33, 100, 50, 1.0, 50, 33, 49.5, true},
+		{"long holds just under min-move boundary", "long", 100.8, 100, 50, 1.0, 50, 100.8, 0, false},
+		{"short holds just under min-move boundary", "short", 33.2, 100, 50, 1.0, 50, 33.2, 0, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -249,7 +271,7 @@ func TestRunHyperliquidTrailingStopUpdate_CancelThenPlaceArgs(t *testing.T) {
 	logger := silentStrategyLogger("hl-test")
 	defer logger.Close()
 
-	newHighWater, result, ok := runHyperliquidTrailingStopUpdate(sc, "ETH", "long", 0.5, &Position{AvgCost: 100}, 110, 100, 97, 111, false, nil, logger)
+	newHighWater, result, ok := runHyperliquidTrailingStopUpdate(sc, "ETH", "long", 0.5, &Position{AvgCost: 100}, 110, 100, 97, 111, trailingReplacePolicy{}, nil, logger)
 	if !ok {
 		t.Fatalf("runHyperliquidTrailingStopUpdate returned ok=false")
 	}
@@ -297,12 +319,12 @@ func TestRunHyperliquidTrailingStopUpdate_RatchetFallbackNormalizeWidensOnce(t *
 				return &HyperliquidStopLossUpdateResult{StopLossOID: 222, StopLossTriggerPx: triggerPx}, "", nil
 			}
 
-			_, result, ok := runHyperliquidTrailingStopUpdate(sc, "ETH", tc.side, 0.5, &Position{AvgCost: 100}, 100, 100, tc.currentTrigger, 111, false, nil, logger)
+			_, result, ok := runHyperliquidTrailingStopUpdate(sc, "ETH", tc.side, 0.5, &Position{AvgCost: 100}, 100, 100, tc.currentTrigger, 111, trailingReplacePolicy{}, nil, logger)
 			if !ok || result != nil || called {
 				t.Fatalf("without marker expected no replace: ok=%v result=%+v called=%v", ok, result, called)
 			}
 
-			_, result, ok = runHyperliquidTrailingStopUpdate(sc, "ETH", tc.side, 0.5, &Position{AvgCost: 100, RatchetFallbackNormalizePending: true}, 100, 100, tc.currentTrigger, 111, false, nil, logger)
+			_, result, ok = runHyperliquidTrailingStopUpdate(sc, "ETH", tc.side, 0.5, &Position{AvgCost: 100, RatchetFallbackNormalizePending: true}, 100, 100, tc.currentTrigger, 111, trailingReplacePolicy{}, nil, logger)
 			if !ok || result == nil || !called {
 				t.Fatalf("with marker expected widen replace: ok=%v result=%+v called=%v", ok, result, called)
 			}
@@ -334,7 +356,7 @@ func TestRunHyperliquidTrailingStopUpdate_DefersOnCancelFailure(t *testing.T) {
 		ownerID:  "owner",
 	})
 
-	newHighWater, result, ok := runHyperliquidTrailingStopUpdate(sc, "ETH", "long", 0.5, &Position{AvgCost: 100}, 110, 100, 97, 111, false, notifier, logger)
+	newHighWater, result, ok := runHyperliquidTrailingStopUpdate(sc, "ETH", "long", 0.5, &Position{AvgCost: 100}, 110, 100, 97, 111, trailingReplacePolicy{}, notifier, logger)
 	if ok || result == nil {
 		t.Fatalf("runHyperliquidTrailingStopUpdate = (%+v, %v), want deferred result", result, ok)
 	}
@@ -365,7 +387,7 @@ func TestRunHyperliquidTrailingStopUpdate_DefersOnOpenOrderCheckFailure(t *testi
 	logger := silentStrategyLogger("hl-test")
 	defer logger.Close()
 
-	newHighWater, result, ok := runHyperliquidTrailingStopUpdate(sc, "ETH", "long", 0.5, &Position{AvgCost: 100}, 110, 100, 97, 111, false, nil, logger)
+	newHighWater, result, ok := runHyperliquidTrailingStopUpdate(sc, "ETH", "long", 0.5, &Position{AvgCost: 100}, 110, 100, 97, 111, trailingReplacePolicy{}, nil, logger)
 	if ok || result == nil {
 		t.Fatalf("runHyperliquidTrailingStopUpdate = (%+v, %v), want deferred result", result, ok)
 	}
@@ -384,10 +406,6 @@ func containsKey(b []byte, key string) bool {
 }
 
 func TestParseHyperliquidExecuteOutput_StopLossFilledImmediately(t *testing.T) {
-	// Issue 421: when price is already through the trigger at submit, HL
-	// fills the SL immediately. The Python side surfaces this as
-	// stop_loss_filled_immediately=true (no OID) so the scheduler can
-	// reconcile virtual state instead of treating it as a placement error.
 	stdout := []byte(`{
 		"execution": {"action": "buy", "symbol": "ETH", "size": 0.1, "fill": {"avg_px": 3200, "total_sz": 0.1, "oid": 1}},
 		"platform": "hyperliquid",
@@ -407,9 +425,6 @@ func TestParseHyperliquidExecuteOutput_StopLossFilledImmediately(t *testing.T) {
 }
 
 func TestParseHyperliquidExecuteOutput_CancelSucceededOnFailure(t *testing.T) {
-	// Issue 421 (review point 3): when the cancel succeeds but the subsequent
-	// open fails, the Python error path still emits cancel_stop_loss_succeeded
-	// so the scheduler can drop the dead OID from pos.StopLossOID.
 	stdout := []byte(`{
 		"execution": null,
 		"platform": "hyperliquid",
@@ -454,11 +469,7 @@ func TestIsHLOpenOrderCapRejection(t *testing.T) {
 	}
 }
 
-func TestValidateConfig_StopLossPctBounds(t *testing.T) {
-	// Issue 421 (review point 4): hand-edited configs with out-of-range
-	// stop_loss_pct must fail validation rather than silently break the
-	// safety feature. Pointer-aware (#484): explicit 0 is the operator
-	// opt-out, valid; nil = field omitted (auto-derive path).
+func TestConfigValidation_StopLossPctBounds(t *testing.T) {
 	cases := []struct {
 		name      string
 		pct       float64
@@ -492,7 +503,7 @@ func TestValidateConfig_StopLossPctBounds(t *testing.T) {
 				},
 				PortfolioRisk: &PortfolioRiskConfig{MaxDrawdownPct: 25, WarnThresholdPct: 60},
 			}
-			err := ValidateConfig(cfg)
+			err := validateConfig(cfg, false)
 			gotErr := err != nil && containsStopLossErr(err.Error())
 			if gotErr != c.wantError {
 				t.Errorf("got err=%v wantStopLossErr=%v (full err: %v)", gotErr, c.wantError, err)
@@ -505,11 +516,6 @@ func containsStopLossErr(s string) bool {
 	return strings.Contains(s, "stop_loss_pct")
 }
 
-// #421 review point 2: when StopLossFilledImmediately is true, the on-chain
-// position is flat (the trigger fired at submit). executeHyperliquidResult
-// must reconcile virtual state by synthesizing a close at trigger_px,
-// otherwise the next reconcile cycle silently delete()s the phantom
-// position with PnL=0 and the realized loss is dropped from history.
 func TestExecuteHyperliquidResult_StopLossFilledImmediately_ReconcilesState(t *testing.T) {
 	sc := StrategyConfig{
 		ID:       "hl-test-eth",
@@ -536,7 +542,6 @@ func TestExecuteHyperliquidResult_StopLossFilledImmediately_ReconcilesState(t *t
 				TotalSz:           0.1,
 				OID:               1,
 				StopLossTriggerPx: 3104.0,
-				// note: no StopLossOID — instant fill leaves no resting OID
 			},
 		},
 		StopLossFilledImmediately: true,
@@ -544,18 +549,14 @@ func TestExecuteHyperliquidResult_StopLossFilledImmediately_ReconcilesState(t *t
 
 	logger := silentStrategyLogger("hl-test-eth")
 	defer logger.Close()
-	trades, _ := executeHyperliquidResult(sc, state, result, execResult, "BUY", 3200, nil, logger)
+	trades, _ := executeHyperliquidResult(sc, state, result, execResult, "BUY", 3200, nil, nil, HurstGateDecision{}, logger)
 
-	// Open + synthetic close = 2 trades.
 	if trades != 2 {
 		t.Errorf("trades=%d, want 2 (open + synthetic close)", trades)
 	}
-	// On-chain is flat → virtual state must also be flat.
 	if _, exists := state.Positions["ETH"]; exists {
 		t.Errorf("Position should have been deleted; got %+v", state.Positions["ETH"])
 	}
-	// One ClosedPosition entry recorded with the trigger price as ClosePrice
-	// and the realized PnL on the books (not zero).
 	if len(state.ClosedPositions) != 1 {
 		t.Fatalf("ClosedPositions=%d, want 1", len(state.ClosedPositions))
 	}
@@ -571,10 +572,6 @@ func TestExecuteHyperliquidResult_StopLossFilledImmediately_ReconcilesState(t *t
 	}
 }
 
-// Defensive: when the instant-fill flag is set but trigger_px is missing
-// (shouldn't happen with the current Python contract), the reconcile is
-// skipped and the position is left as opened — better than crashing on a
-// divide-by-zero or producing nonsense PnL.
 func TestExecuteHyperliquidResult_StopLossFilledImmediately_NoTriggerPxIsNoOp(t *testing.T) {
 	sc := StrategyConfig{ID: "hl", Platform: "hyperliquid", Type: "perps", Leverage: 1}
 	state := &StrategyState{ID: "hl", Platform: "hyperliquid", Type: "perps", Cash: 1000, Positions: map[string]*Position{}}
@@ -585,7 +582,7 @@ func TestExecuteHyperliquidResult_StopLossFilledImmediately_NoTriggerPxIsNoOp(t 
 	}
 	logger := silentStrategyLogger("hl")
 	defer logger.Close()
-	trades, _ := executeHyperliquidResult(sc, state, result, execResult, "BUY", 3200, nil, logger)
+	trades, _ := executeHyperliquidResult(sc, state, result, execResult, "BUY", 3200, nil, nil, HurstGateDecision{}, logger)
 	if trades != 1 {
 		t.Errorf("trades=%d, want 1 (only open recorded; reconcile skipped)", trades)
 	}
@@ -618,9 +615,6 @@ func TestReconcileHyperliquidPositions_RestingStopLossFillBooksPnL(t *testing.T)
 	logger := silentStrategyLogger("hl-test-eth")
 	defer logger.Close()
 
-	// #685: SL-confirmed resolver. Without a userFills hit on the SL OID, the
-	// gated fallback now routes to hl_sync_external; production paths always
-	// supply a resolver, so tests do the same.
 	resolver := hlReconcileFillResolver(func(_ string, oid int64, _ float64) (HLFillLookup, bool) {
 		return HLFillLookup{Fee: 0.05, FilledQty: 0.1, Px: 3104, Count: 1, OID: oid}, true
 	})
@@ -679,7 +673,6 @@ func TestReconcileHyperliquidPositions_RestingStopLossFillClosesShortWithBuy(t *
 	logger := silentStrategyLogger("hl-test-eth")
 	defer logger.Close()
 
-	// #685: SL-confirmed resolver — see RestingStopLossFillBooksPnL.
 	resolver := hlReconcileFillResolver(func(_ string, oid int64, _ float64) (HLFillLookup, bool) {
 		return HLFillLookup{Fee: 0.05, FilledQty: 0.1, Px: 3296, Count: 1, OID: oid}, true
 	})
@@ -705,10 +698,6 @@ func TestReconcileHyperliquidPositions_RestingStopLossFillClosesShortWithBuy(t *
 	}
 }
 
-// #421 review point 1: per-strategy circuit-breaker drain must thread
-// pos.StopLossOID through to the closer so the resting trigger is
-// cancelled before the close fires. Otherwise it sits orphaned on HL's
-// book consuming one of the 1000 account-wide open-order slots (#479).
 func TestRunPendingHyperliquidCircuitCloses_CancelsStopLossOID(t *testing.T) {
 	state := &AppState{
 		Strategies: map[string]*StrategyState{
@@ -754,18 +743,11 @@ func TestRunPendingHyperliquidCircuitCloses_CancelsStopLossOID(t *testing.T) {
 	if seenCancelOID != 99887766 {
 		t.Errorf("closer received cancelStopLossOID=%d, want 99887766", seenCancelOID)
 	}
-	// #418: a successful full-fill close now decrements virtual quantity to
-	// zero and removes the position via recordClosedPosition. The StopLossOID
-	// implicitly travels with the deleted position, so the original assertion
-	// (StopLossOID == 0) is replaced with a "position fully closed" check.
 	if _, ok := state.Strategies["hl-a"].Positions["ETH"]; ok {
 		t.Errorf("ETH position should be removed after full-fill CB close, but it's still present")
 	}
 }
 
-// #421 review point 1: kill-switch close must thread the per-coin
-// StopLossOID map through forceCloseHyperliquidLive so resting SL triggers
-// are cancelled along with the close.
 func TestForceCloseHyperliquidLive_ThreadsStopLossOIDs(t *testing.T) {
 	hlLiveAll := []StrategyConfig{
 		{ID: "hl-eth", Platform: "hyperliquid", Type: "perps",
@@ -777,7 +759,7 @@ func TestForceCloseHyperliquidLive_ThreadsStopLossOIDs(t *testing.T) {
 		{Coin: "ETH", Size: 0.5, EntryPrice: 3000},
 		{Coin: "BTC", Size: 0.01, EntryPrice: 60000},
 	}
-	slOIDs := map[string][]int64{"ETH": {1111}, "BTC": nil} // BTC has no resting SL
+	slOIDs := map[string][]int64{"ETH": {1111}, "BTC": nil}
 
 	seen := map[string][]int64{}
 	closer := func(sym string, partialSz *float64, cancelStopLossOIDs []int64) (*HyperliquidCloseResult, error) {
@@ -788,7 +770,7 @@ func TestForceCloseHyperliquidLive_ThreadsStopLossOIDs(t *testing.T) {
 		}, nil
 	}
 
-	report := forceCloseHyperliquidLive(context.Background(), positions, hlLiveAll, closer, slOIDs)
+	report := forceCloseHyperliquidLive(context.Background(), positions, hlLiveAll, nil, closer, slOIDs)
 	if len(report.Errors) != 0 {
 		t.Fatalf("expected no errors, got %v", report.Errors)
 	}
@@ -822,7 +804,7 @@ func TestForceCloseHyperliquidLive_CancelsAllSharedCoinStopLossOIDs(t *testing.T
 		}, nil
 	}
 
-	report := forceCloseHyperliquidLive(context.Background(), positions, hlLiveAll, closer, slOIDs)
+	report := forceCloseHyperliquidLive(context.Background(), positions, hlLiveAll, nil, closer, slOIDs)
 	if len(report.Errors) != 0 {
 		t.Fatalf("expected no errors, got %v", report.Errors)
 	}
@@ -834,11 +816,6 @@ func TestForceCloseHyperliquidLive_CancelsAllSharedCoinStopLossOIDs(t *testing.T
 	}
 }
 
-// #487/#484: EffectiveStopLossPct returns the price % to send to the HL execute
-// helper. Resolution order: explicit StopLossPct → StopLossMarginPct/Leverage →
-// MaxDrawdownPct fallback (capped at MaxAutoStopLossPct). Each pointer field
-// distinguishes nil (omitted, fall through) from explicit 0 (disabled).
-// Non-HL/non-perps strategies always return 0.
 func TestEffectiveStopLossPct(t *testing.T) {
 	hlPerps := func(sc StrategyConfig) StrategyConfig {
 		sc.Platform = "hyperliquid"
@@ -864,12 +841,15 @@ func TestEffectiveStopLossPct(t *testing.T) {
 		{"explicit-zero margin disables (no fallback)", hlPerps(StrategyConfig{StopLossMarginPct: pf(0), MaxDrawdownPct: 7, Leverage: 5}), 0},
 		{"explicit wins over margin", hlPerps(StrategyConfig{StopLossPct: pf(3), StopLossMarginPct: pf(20), Leverage: 10}), 3},
 		{"trailing wins over explicit before validation", hlPerps(StrategyConfig{TrailingStopPct: pf(4), StopLossPct: pf(3), Leverage: 10}), 4},
-		// #484 fallback path.
 		{"drawdown fallback when both nil", hlPerps(StrategyConfig{MaxDrawdownPct: 5, Leverage: 5}), 5},
 		{"drawdown fallback capped at 50", hlPerps(StrategyConfig{MaxDrawdownPct: 60, Leverage: 5}), 50},
 		{"drawdown fallback at cap boundary", hlPerps(StrategyConfig{MaxDrawdownPct: 50, Leverage: 5}), 50},
 		{"drawdown fallback ignored when explicit set", hlPerps(StrategyConfig{StopLossPct: pf(2), MaxDrawdownPct: 10}), 2},
 		{"margin fallthrough beats drawdown", hlPerps(StrategyConfig{StopLossMarginPct: pf(20), MaxDrawdownPct: 5, Leverage: 20}), 1.0},
+		{"stop_loss_atr_mult_regime defers, no drawdown fallback",
+			hlPerps(StrategyConfig{StopLossATRMultRegime: &RegimeATRBlock{TrendRegime: map[string]RegimeATREntry{"trending": {ATR: 2}}}, MaxDrawdownPct: 5, Leverage: 5}), 0},
+		{"trailing_stop_atr_mult_regime defers, no drawdown fallback",
+			hlPerps(StrategyConfig{TrailingStopATRMultRegime: &RegimeATRBlock{TrendRegime: map[string]RegimeATREntry{"trending": {ATR: 2}}}, MaxDrawdownPct: 5, Leverage: 5}), 0},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -881,10 +861,7 @@ func TestEffectiveStopLossPct(t *testing.T) {
 	}
 }
 
-// #487: stop_loss_margin_pct is mutually exclusive with stop_loss_pct, must be
-// in (0, 100], and is HL-perps-only. ValidateConfig must reject every other
-// shape so a hand-edited config can't silently disable the SL feature.
-func TestValidateConfig_StopLossMarginPctBounds(t *testing.T) {
+func TestConfigValidation_StopLossMarginPctBounds(t *testing.T) {
 	cases := []struct {
 		name      string
 		marginPct float64
@@ -904,18 +881,8 @@ func TestValidateConfig_StopLossMarginPctBounds(t *testing.T) {
 		{"non-HL platform", 20, true, 0, false, 10, "okx", "perps", true},
 		{"non-perps type", 20, true, 0, false, 10, "hyperliquid", "spot", true},
 		{"mutually exclusive", 20, true, 1, true, 10, "hyperliquid", "perps", true},
-		// #484/#487: both fields explicit-zero is benign — both mean "disabled"
-		// and neither places a trigger at runtime, so the mutual-exclusion
-		// guard must not fire. Operators may end up here after migrating from
-		// the legacy float StopLossPct semantics.
 		{"both explicit zero is benign", 0, true, 0, true, 10, "hyperliquid", "perps", false},
-		// Derived price stop must mirror the #421 [0, 50] cap: at leverage=1
-		// a marginPct of 80 implies an 80% price stop, which would land the
-		// HL trigger at entry×0 (long) or entry×1.8 (short) and silently
-		// never fire.
 		{"derived price stop exceeds 50% cap", 80, true, 0, false, 1, "hyperliquid", "perps", true},
-		// Edge of the derived cap: marginPct=50 at leverage=1 is exactly 50%
-		// and must be accepted (matches the inclusive #421 upper bound).
 		{"derived price stop at 50% cap", 50, true, 0, false, 1, "hyperliquid", "perps", false},
 	}
 	for _, c := range cases {
@@ -942,7 +909,7 @@ func TestValidateConfig_StopLossMarginPctBounds(t *testing.T) {
 				Strategies:      []StrategyConfig{sc},
 				PortfolioRisk:   &PortfolioRiskConfig{MaxDrawdownPct: 25, WarnThresholdPct: 60},
 			}
-			err := ValidateConfig(cfg)
+			err := validateConfig(cfg, false)
 			gotErr := err != nil && strings.Contains(err.Error(), "stop_loss")
 			if gotErr != c.wantError {
 				t.Errorf("got err=%v wantStopLossErr=%v (full err: %v)", gotErr, c.wantError, err)
@@ -951,7 +918,7 @@ func TestValidateConfig_StopLossMarginPctBounds(t *testing.T) {
 	}
 }
 
-func TestValidateConfig_TrailingStopPctBoundsAndExclusion(t *testing.T) {
+func TestConfigValidation_TrailingStopPctBoundsAndExclusion(t *testing.T) {
 	cases := []struct {
 		name      string
 		trailing  float64
@@ -1000,7 +967,7 @@ func TestValidateConfig_TrailingStopPctBoundsAndExclusion(t *testing.T) {
 				Strategies:      []StrategyConfig{sc},
 				PortfolioRisk:   &PortfolioRiskConfig{MaxDrawdownPct: 25, WarnThresholdPct: 60},
 			}
-			err := ValidateConfig(cfg)
+			err := validateConfig(cfg, false)
 			gotErr := err != nil && strings.Contains(err.Error(), "trailing_stop_pct")
 			if gotErr != c.wantError {
 				t.Errorf("got err=%v wantTrailingErr=%v (full err: %v)", gotErr, c.wantError, err)
@@ -1009,7 +976,7 @@ func TestValidateConfig_TrailingStopPctBoundsAndExclusion(t *testing.T) {
 	}
 }
 
-func TestValidateConfig_TrailingStopMinMovePct(t *testing.T) {
+func TestConfigValidation_TrailingStopMinMovePct(t *testing.T) {
 	cases := []struct {
 		name        string
 		minMove     float64
@@ -1046,7 +1013,7 @@ func TestValidateConfig_TrailingStopMinMovePct(t *testing.T) {
 				}},
 				PortfolioRisk: &PortfolioRiskConfig{MaxDrawdownPct: 25, WarnThresholdPct: 60},
 			}
-			err := ValidateConfig(cfg)
+			err := validateConfig(cfg, false)
 			gotErr := err != nil && strings.Contains(err.Error(), "trailing_stop_min_move_pct")
 			if gotErr != c.wantError {
 				t.Errorf("got err=%v wantMinMoveErr=%v (full err: %v)", gotErr, c.wantError, err)
@@ -1055,7 +1022,7 @@ func TestValidateConfig_TrailingStopMinMovePct(t *testing.T) {
 	}
 }
 
-func TestValidateConfig_HLPeersTrailingAndFixedStopLossAllowed(t *testing.T) {
+func TestConfigValidation_HLPeersTrailingAndFixedStopLossAllowed(t *testing.T) {
 	trailing := 3.0
 	fixed := 2.0
 	cfg := &Config{
@@ -1088,74 +1055,12 @@ func TestValidateConfig_HLPeersTrailingAndFixedStopLossAllowed(t *testing.T) {
 		},
 		PortfolioRisk: &PortfolioRiskConfig{MaxDrawdownPct: 25, WarnThresholdPct: 60},
 	}
-	err := ValidateConfig(cfg)
+	err := validateConfig(cfg, false)
 	if err != nil {
-		t.Fatalf("ValidateConfig failed: %v", err)
+		t.Fatalf("validateConfig failed: %v", err)
 	}
 }
 
-// #487: zero StopLossMarginPct must be omitted from the JSON encoding so
-// existing configs don't grow a noisy field after a round-trip.
-func TestStrategyConfig_StopLossMarginPctJSON(t *testing.T) {
-	v := 25.0
-	sc := StrategyConfig{
-		ID:                "hl-test",
-		Type:              "perps",
-		Platform:          "hyperliquid",
-		Leverage:          20,
-		StopLossMarginPct: &v,
-	}
-	b, err := json.Marshal(sc)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	if !strings.Contains(string(b), `"stop_loss_margin_pct":25`) {
-		t.Errorf("expected stop_loss_margin_pct in JSON; got %s", b)
-	}
-	var round StrategyConfig
-	if err := json.Unmarshal(b, &round); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if round.StopLossMarginPct == nil || *round.StopLossMarginPct != 25 {
-		t.Errorf("round-trip StopLossMarginPct: got %v, want 25", round.StopLossMarginPct)
-	}
-
-	// nil pointer (omitted) must not emit the field — operator hasn't opted
-	// in or out, auto-derive path applies.
-	sc.StopLossMarginPct = nil
-	b2, err := json.Marshal(sc)
-	if err != nil {
-		t.Fatalf("marshal nil: %v", err)
-	}
-	if strings.Contains(string(b2), "stop_loss_margin_pct") {
-		t.Errorf("nil StopLossMarginPct should be omitted; got %s", b2)
-	}
-
-	// #484: explicit zero is the "operator opt-out" semantic and must be
-	// preserved in JSON so a config round-trip doesn't silently re-enable
-	// the auto-SL fallback.
-	zero := 0.0
-	sc.StopLossMarginPct = &zero
-	b3, err := json.Marshal(sc)
-	if err != nil {
-		t.Fatalf("marshal zero: %v", err)
-	}
-	if !strings.Contains(string(b3), `"stop_loss_margin_pct":0`) {
-		t.Errorf("explicit zero StopLossMarginPct must round-trip; got %s", b3)
-	}
-}
-
-// #505: TrailingStopATRMult derives the trailing distance from the entry ATR
-// and avg cost of the open position. Once derived the percentage is fixed for
-// the life of the position. effectiveTrailingStopPct must:
-//   - return 0 (no-op) when EntryATR or AvgCost is zero so the initial-trigger
-//     placement is deferred to the cycle after stampEntryATRIfOpened populates
-//     the position rather than crashing or arming with bogus distance,
-//   - return mult * entry_atr / avg_cost * 100 once both are set,
-//   - prefer an explicit fixed TrailingStopPct over the ATR multiplier when
-//     both are present (validation rejects this combo at config-load time but
-//     the helper must still resolve deterministically),
-//   - stay HL-perps-only.
 func TestEffectiveTrailingStopPct_ATRMult(t *testing.T) {
 	pf := func(v float64) *float64 { return &v }
 	hl := func(sc StrategyConfig) StrategyConfig {
@@ -1183,7 +1088,6 @@ func TestEffectiveTrailingStopPct_ATRMult(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			got := effectiveTrailingStopPct(c.sc, c.pos)
-			// Compare with a small epsilon to keep the table values readable.
 			if d := got - c.want; d > 1e-9 || d < -1e-9 {
 				t.Errorf("effectiveTrailingStopPct = %g, want %g", got, c.want)
 			}
@@ -1191,11 +1095,6 @@ func TestEffectiveTrailingStopPct_ATRMult(t *testing.T) {
 	}
 }
 
-// #505: ATR-derived trailing stops must not arm at order-placement time
-// because EntryATR is stamped on the Position only after the fill. Until
-// EntryATR exists, EffectiveStopLossPct must return 0 so the live execute
-// path skips the initial trigger and the trailing loop arms it on the next
-// cycle.
 func TestEffectiveStopLossPct_TrailingATRMultDefersInitialTrigger(t *testing.T) {
 	pf := func(v float64) *float64 { return &v }
 	mult := pf(1.5)
@@ -1203,7 +1102,7 @@ func TestEffectiveStopLossPct_TrailingATRMultDefersInitialTrigger(t *testing.T) 
 		Platform:            "hyperliquid",
 		Type:                "perps",
 		Leverage:            10,
-		MaxDrawdownPct:      5, // would otherwise fall through to a 5% auto stop
+		MaxDrawdownPct:      5,
 		TrailingStopATRMult: mult,
 	}
 	if got := EffectiveStopLossPct(sc); got != 0 {
@@ -1211,13 +1110,7 @@ func TestEffectiveStopLossPct_TrailingATRMultDefersInitialTrigger(t *testing.T) 
 	}
 }
 
-// #505: trailing_stop_atr_mult shape validation. Acceptance criteria:
-//   - HL perps only.
-//   - mutually exclusive with trailing_stop_pct, stop_loss_pct, and
-//     stop_loss_margin_pct (each conflict surfaces a trailing_stop_atr_mult
-//     error string).
-//   - negative values rejected; zero is a benign opt-out.
-func TestValidateConfig_TrailingStopATRMult(t *testing.T) {
+func TestConfigValidation_TrailingStopATRMult(t *testing.T) {
 	pf := func(v float64) *float64 { return &v }
 	cases := []struct {
 		name      string
@@ -1272,7 +1165,7 @@ func TestValidateConfig_TrailingStopATRMult(t *testing.T) {
 				Strategies:      []StrategyConfig{c.sc},
 				PortfolioRisk:   &PortfolioRiskConfig{MaxDrawdownPct: 25, WarnThresholdPct: 60},
 			}
-			err := ValidateConfig(cfg)
+			err := validateConfig(cfg, false)
 			gotErr := err != nil && strings.Contains(err.Error(), "trailing_stop_atr_mult")
 			if gotErr != c.wantError {
 				t.Errorf("got err=%v wantATRMultErr=%v (full err: %v)", gotErr, c.wantError, err)
@@ -1281,9 +1174,7 @@ func TestValidateConfig_TrailingStopATRMult(t *testing.T) {
 	}
 }
 
-// #601: peer stop ownership is allowed because protection orders are sized per
-// strategy.
-func TestValidateConfig_HLPeersATRTrailingAllowed(t *testing.T) {
+func TestConfigValidation_HLPeersATRTrailingAllowed(t *testing.T) {
 	mult := 1.5
 	fixed := 2.0
 	cfg := &Config{
@@ -1316,14 +1207,12 @@ func TestValidateConfig_HLPeersATRTrailingAllowed(t *testing.T) {
 		},
 		PortfolioRisk: &PortfolioRiskConfig{MaxDrawdownPct: 25, WarnThresholdPct: 60},
 	}
-	err := ValidateConfig(cfg)
+	err := validateConfig(cfg, false)
 	if err != nil {
-		t.Fatalf("ValidateConfig failed: %v", err)
+		t.Fatalf("validateConfig failed: %v", err)
 	}
 }
 
-// #601: peer normalization is now a no-op; shared-coin peers keep normal
-// stop-loss defaulting because protection orders are sized per strategy.
 func TestNormalizeHyperliquidPeerStopLosses_TrailingATRMultOwnerNoop(t *testing.T) {
 	mult := 1.5
 	strategies := []StrategyConfig{
@@ -1355,50 +1244,6 @@ func TestNormalizeHyperliquidPeerStopLosses_TrailingATRMultOwnerNoop(t *testing.
 	}
 }
 
-// #505: trailing_stop_atr_mult round-trips through JSON only when explicit
-// (omitempty drops nil) and is a hot-reloadable field via formatFloatPtr.
-func TestStrategyConfig_TrailingStopATRMultJSON(t *testing.T) {
-	v := 1.5
-	sc := StrategyConfig{
-		ID:                  "hl-test",
-		Type:                "perps",
-		Platform:            "hyperliquid",
-		Leverage:            10,
-		TrailingStopATRMult: &v,
-	}
-	b, err := json.Marshal(sc)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	if !strings.Contains(string(b), `"trailing_stop_atr_mult":1.5`) {
-		t.Errorf("expected trailing_stop_atr_mult in JSON; got %s", b)
-	}
-
-	sc.TrailingStopATRMult = nil
-	b2, err := json.Marshal(sc)
-	if err != nil {
-		t.Fatalf("marshal nil: %v", err)
-	}
-	if strings.Contains(string(b2), "trailing_stop_atr_mult") {
-		t.Errorf("nil TrailingStopATRMult should be omitted; got %s", b2)
-	}
-
-	zero := 0.0
-	sc.TrailingStopATRMult = &zero
-	b3, err := json.Marshal(sc)
-	if err != nil {
-		t.Fatalf("marshal zero: %v", err)
-	}
-	if !strings.Contains(string(b3), `"trailing_stop_atr_mult":0`) {
-		t.Errorf("explicit zero TrailingStopATRMult must round-trip; got %s", b3)
-	}
-}
-
-// #505 review: a volatile coin (e.g. mult=3 with ATR ≈ 30% of price) would
-// otherwise produce a derived 90% trailing distance and a long-side trigger
-// price <= 0 that HL silently rejects. effectiveTrailingStopPct must clamp the
-// derived percentage to MaxAutoStopLossPct (50) to mirror the cap on the other
-// auto-derive paths in EffectiveStopLossPct.
 func TestEffectiveTrailingStopPct_ATRMultCappedAtMaxAutoStopLossPct(t *testing.T) {
 	pf := func(v float64) *float64 { return &v }
 	sc := StrategyConfig{
@@ -1406,26 +1251,20 @@ func TestEffectiveTrailingStopPct_ATRMultCappedAtMaxAutoStopLossPct(t *testing.T
 		Type:                "perps",
 		TrailingStopATRMult: pf(3),
 	}
-	pos := &Position{AvgCost: 100, EntryATR: 30} // raw derived = 3 * 30 / 100 * 100 = 90%
+	pos := &Position{AvgCost: 100, EntryATR: 30}
 	got := effectiveTrailingStopPct(sc, pos)
 	if got != MaxAutoStopLossPct {
 		t.Errorf("effectiveTrailingStopPct = %g, want %g (capped at MaxAutoStopLossPct)", got, MaxAutoStopLossPct)
 	}
 
-	// Just under the cap stays exactly the derived value.
 	sc.TrailingStopATRMult = pf(1.5)
-	pos = &Position{AvgCost: 100, EntryATR: 20} // raw derived = 30%
+	pos = &Position{AvgCost: 100, EntryATR: 20}
 	got = effectiveTrailingStopPct(sc, pos)
 	if d := got - 30.0; d > 1e-9 || d < -1e-9 {
 		t.Errorf("effectiveTrailingStopPct = %g, want 30 (under cap, no clamp)", got)
 	}
 }
 
-// #505 review: explicit-zero TrailingStopATRMult must fall through to the
-// next priority instead of short-circuiting EffectiveStopLossPct. A config
-// like {trailing_stop_atr_mult: 0, stop_loss_pct: 2} passes validation
-// (mutex check skips when ATR mult == 0) and the explicit fixed stop should
-// still arm the on-chain trigger.
 func TestEffectiveStopLossPct_ATRMultExplicitZeroFallsThrough(t *testing.T) {
 	pf := func(v float64) *float64 { return &v }
 	sc := StrategyConfig{
@@ -1440,7 +1279,6 @@ func TestEffectiveStopLossPct_ATRMultExplicitZeroFallsThrough(t *testing.T) {
 		t.Errorf("EffectiveStopLossPct with ATR mult=0 + stop_loss_pct=2 = %g, want 2 (fall through)", got)
 	}
 
-	// And with no other field set, mult=0 falls through to MaxDrawdownPct.
 	sc.StopLossPct = nil
 	sc.MaxDrawdownPct = 8
 	if got := EffectiveStopLossPct(sc); got != 8 {
@@ -1448,10 +1286,6 @@ func TestEffectiveStopLossPct_ATRMultExplicitZeroFallsThrough(t *testing.T) {
 	}
 }
 
-// #505 review: atrMultMissingEntryATR detects the silent foot-gun where an
-// ATR-mult-configured strategy opens a position but the entry candle did not
-// produce an ATR indicator, so EntryATR stays 0 and the trailing loop never
-// arms an on-chain trigger.
 func TestATRMultMissingEntryATR(t *testing.T) {
 	pf := func(v float64) *float64 { return &v }
 	hl := func(sc StrategyConfig) StrategyConfig {
@@ -1484,10 +1318,6 @@ func TestATRMultMissingEntryATR(t *testing.T) {
 	}
 }
 
-// #505 review: notifyATRMultMissingEntryATROnce must emit exactly one
-// alert per (strategy, symbol). Repeated cycles must be suppressed so the
-// alert channel is not flooded; clearATRMultMissingEntryATRWarning resets
-// the throttle for re-opens.
 func TestNotifyATRMultMissingEntryATROnce_ThrottlesPerStrategySymbol(t *testing.T) {
 	mock := &mockNotifier{}
 	notifier := NewMultiNotifier(notifierBackend{
@@ -1499,7 +1329,6 @@ func TestNotifyATRMultMissingEntryATROnce_ThrottlesPerStrategySymbol(t *testing.
 	defer logger.Close()
 	sc := StrategyConfig{ID: "hl-test", Platform: "hyperliquid", Type: "perps"}
 
-	// Reset between subtests so other tests don't leak warning state.
 	defer clearATRMultMissingEntryATRWarning(sc.ID, "ETH")
 	defer clearATRMultMissingEntryATRWarning(sc.ID, "BTC")
 
@@ -1517,13 +1346,11 @@ func TestNotifyATRMultMissingEntryATROnce_ThrottlesPerStrategySymbol(t *testing.
 		t.Errorf("alert content missing MISSING ENTRY ATR phrase: %q", mock.messages[0].content)
 	}
 
-	// A different symbol on the same strategy must alert independently.
 	notifyATRMultMissingEntryATROnce(sc, "BTC", notifier, logger)
 	if got := len(mock.messages); got != 2 {
 		t.Errorf("expected 2 broadcasts after BTC alert, got %d", got)
 	}
 
-	// Clearing the throttle re-arms the alert.
 	clearATRMultMissingEntryATRWarning(sc.ID, "ETH")
 	notifyATRMultMissingEntryATROnce(sc, "ETH", notifier, logger)
 	if got := len(mock.messages); got != 3 {
@@ -1531,12 +1358,6 @@ func TestNotifyATRMultMissingEntryATROnce_ThrottlesPerStrategySymbol(t *testing.
 	}
 }
 
-// #505 review follow-up: clearATRMultMissingEntryATRWarningOnHLPerpsClose
-// is the production-path shortcut wired into HL perps close sites
-// (recordPerpsStopLossClose, ExecutePerpsSignal close-long/short,
-// forceCloseAllPositions, hyperliquid_balance circuit-breaker close). It
-// must clear the throttle for HL perps and no-op for any other state, so
-// non-HL strategy closes don't accidentally drop a peer's throttle key.
 func TestClearATRMultMissingEntryATRWarningOnHLPerpsClose(t *testing.T) {
 	defer clearATRMultMissingEntryATRWarning("hl-test", "ETH")
 	defer clearATRMultMissingEntryATRWarning("spot-test", "ETH")
@@ -1544,27 +1365,23 @@ func TestClearATRMultMissingEntryATRWarningOnHLPerpsClose(t *testing.T) {
 	atrMultMissingEntryATRWarned.Store(atrMultMissingEntryATRKey("hl-test", "ETH"), struct{}{})
 	atrMultMissingEntryATRWarned.Store(atrMultMissingEntryATRKey("spot-test", "ETH"), struct{}{})
 
-	// Nil state must be safe.
 	clearATRMultMissingEntryATRWarningOnHLPerpsClose(nil, "ETH")
 	if _, ok := atrMultMissingEntryATRWarned.Load(atrMultMissingEntryATRKey("hl-test", "ETH")); !ok {
 		t.Fatalf("nil state should not have cleared HL key")
 	}
 
-	// Non-HL platform must not clear anything.
 	spotState := &StrategyState{ID: "spot-test", Platform: "binanceus", Type: "spot"}
 	clearATRMultMissingEntryATRWarningOnHLPerpsClose(spotState, "ETH")
 	if _, ok := atrMultMissingEntryATRWarned.Load(atrMultMissingEntryATRKey("spot-test", "ETH")); !ok {
 		t.Fatalf("non-HL close should not have cleared spot-test key")
 	}
 
-	// HL spot must not clear (the throttle only fires for HL perps).
 	hlSpot := &StrategyState{ID: "hl-test", Platform: "hyperliquid", Type: "spot"}
 	clearATRMultMissingEntryATRWarningOnHLPerpsClose(hlSpot, "ETH")
 	if _, ok := atrMultMissingEntryATRWarned.Load(atrMultMissingEntryATRKey("hl-test", "ETH")); !ok {
 		t.Fatalf("HL-spot close should not have cleared HL-perps key")
 	}
 
-	// HL perps clears the matching key.
 	hlPerps := &StrategyState{ID: "hl-test", Platform: "hyperliquid", Type: "perps"}
 	clearATRMultMissingEntryATRWarningOnHLPerpsClose(hlPerps, "ETH")
 	if _, ok := atrMultMissingEntryATRWarned.Load(atrMultMissingEntryATRKey("hl-test", "ETH")); ok {
@@ -1572,15 +1389,11 @@ func TestClearATRMultMissingEntryATRWarningOnHLPerpsClose(t *testing.T) {
 	}
 }
 
-// #505 review follow-up: clearATRMultMissingEntryATRWarningsForStrategy is
-// invoked from the hot-reload disable path. It must drop every key for the
-// target strategy ID and leave other strategies' keys untouched (including
-// strategies whose IDs share a common prefix).
 func TestClearATRMultMissingEntryATRWarningsForStrategy(t *testing.T) {
 	keys := []struct{ strategyID, symbol string }{
 		{"hl-momo", "ETH"},
 		{"hl-momo", "BTC"},
-		{"hl-momo-fast", "ETH"}, // share prefix; must NOT be cleared
+		{"hl-momo-fast", "ETH"},
 		{"hl-other", "ETH"},
 	}
 	for _, k := range keys {
@@ -1600,10 +1413,7 @@ func TestClearATRMultMissingEntryATRWarningsForStrategy(t *testing.T) {
 	}
 }
 
-// #522: tieredTPATRMissingEntryATR detects open positions with EntryATR == 0
-// when tiered_tp_atr is in close_strategies (platform-agnostic).
 func TestTieredTPATRMissingEntryATR(t *testing.T) {
-	// #842: a strategy has a single close; withCS takes 0 or 1 close name.
 	withCS := func(name string) StrategyConfig {
 		sc := StrategyConfig{Platform: "hyperliquid", Type: "perps"}
 		if name != "" {
@@ -1634,9 +1444,6 @@ func TestTieredTPATRMissingEntryATR(t *testing.T) {
 	}
 }
 
-// #522: notifyTieredTPATRMissingEntryATROnce throttles alerts per (strategy,
-// symbol) and shares the throttle map with the ATR-mult path so a single
-// strategy that triggers both variants only emits one alert.
 func TestNotifyTieredTPATRMissingEntryATROnce_ThrottlesAndShares(t *testing.T) {
 	mock := &mockNotifier{}
 	notifier := NewMultiNotifier(notifierBackend{
@@ -1666,15 +1473,11 @@ func TestNotifyTieredTPATRMissingEntryATROnce_ThrottlesAndShares(t *testing.T) {
 		t.Errorf("alert content missing tiered_tp_atr: %q", mock.messages[0].content)
 	}
 
-	// A different symbol alerts independently.
 	notifyTieredTPATRMissingEntryATROnce(sc, "BTC", notifier, logger)
 	if got := len(mock.messages); got != 2 {
 		t.Errorf("expected 2 broadcasts after BTC alert, got %d", got)
 	}
 
-	// ATR-mult notifier on the same (strategy, symbol) is suppressed because the
-	// throttle map key is shared — one alert per (strategy, symbol) regardless of
-	// which variant fires first.
 	clearATRMultMissingEntryATRWarning(sc.ID, "ETH")
 	notifyATRMultMissingEntryATROnce(sc, "ETH", notifier, logger)
 	if got := len(mock.messages); got != 3 {
@@ -1686,9 +1489,6 @@ func TestNotifyTieredTPATRMissingEntryATROnce_ThrottlesAndShares(t *testing.T) {
 	}
 }
 
-// #532: trailingStopBreached reports whether the current mark has crossed the
-// unfavorable side of the existing trigger. Live mode delegates this to the
-// exchange, so the helper only matters for the paper-mode loop.
 func TestTrailingStopBreached(t *testing.T) {
 	cases := []struct {
 		name           string
@@ -1717,13 +1517,6 @@ func TestTrailingStopBreached(t *testing.T) {
 	}
 }
 
-// #532: runHyperliquidTrailingStopPaper composes effectiveTrailingStopPct,
-// trailingStopBreached, and computeTrailingStopUpdate into a single per-cycle
-// decision for paper mode. We exercise (a) the breach path that fires a
-// synthetic close, (b) the trigger-replacement path that ratchets, (c) the
-// no-op path that only advances the high-water mark, (d) the bootstrap path
-// where the first cycle establishes a trigger from AvgCost, and (e) the
-// guard paths that skip when trailing is unconfigured or mark is zero.
 func TestRunHyperliquidTrailingStopPaper(t *testing.T) {
 	pct := func(v float64) *float64 { return &v }
 	scWithTrailing := StrategyConfig{
@@ -1833,7 +1626,7 @@ func TestRunHyperliquidTrailingStopPaper(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			gotHW, gotTrig, gotBreach, gotPx := runHyperliquidTrailingStopPaper(c.sc, c.side, c.pos, c.mark, c.highWater, c.currentTrigger)
+			gotHW, gotTrig, gotBreach, gotPx := runHyperliquidTrailingStopPaper(c.sc, c.side, c.pos, c.mark, c.highWater, c.currentTrigger, trailingReplacePolicy{})
 			if floatDiff(gotHW, c.want.newHighWater) > 1e-9 ||
 				floatDiff(gotTrig, c.want.newTrigger) > 1e-9 ||
 				gotBreach != c.want.breach ||
@@ -1852,11 +1645,11 @@ func TestRunHyperliquidTrailingStopPaper_RegimeSnapshotArms(t *testing.T) {
 		"ranging":  {ATR: 1.0},
 	}}
 	sc := StrategyConfig{
-		ID:                    "hl-regime-paper",
-		Platform:              "hyperliquid",
-		Type:                  "perps",
-		RegimeATRWindow:       "medium",
-		TrailingStopATRRegime: regimeBlock,
+		ID:                        "hl-regime-paper",
+		Platform:                  "hyperliquid",
+		Type:                      "perps",
+		RegimeATRWindow:           "medium",
+		TrailingStopATRMultRegime: regimeBlock,
 	}
 	pos := &Position{
 		AvgCost:         2100,
@@ -1867,22 +1660,19 @@ func TestRunHyperliquidTrailingStopPaper_RegimeSnapshotArms(t *testing.T) {
 	}
 
 	incomplete := &Position{AvgCost: pos.AvgCost, EntryATR: pos.EntryATR}
-	_, gotTrig, gotBreach, gotPx := runHyperliquidTrailingStopPaper(sc, "long", incomplete, 2000, 0, 0)
+	_, gotTrig, gotBreach, gotPx := runHyperliquidTrailingStopPaper(sc, "long", incomplete, 2000, 0, 0, trailingReplacePolicy{})
 	if gotTrig != 0 || gotBreach || gotPx != 0 {
 		t.Fatalf("incomplete snapshot unexpectedly armed: trig=%v breach=%v px=%v", gotTrig, gotBreach, gotPx)
 	}
 
 	snapshot := hyperliquidProtectionPositionSnapshot(pos)
-	gotHW, gotTrig, gotBreach, gotPx := runHyperliquidTrailingStopPaper(sc, "long", snapshot, 2000, 0, 0)
+	gotHW, gotTrig, gotBreach, gotPx := runHyperliquidTrailingStopPaper(sc, "long", snapshot, 2000, 0, 0, trailingReplacePolicy{})
 	if !approxEq(gotHW, 2000) || !approxEq(gotTrig, 1900) || gotBreach || gotPx != 0 {
 		t.Fatalf("regime snapshot paper trail = (hw=%v trig=%v breach=%v px=%v), want (2000, 1900, false, 0)",
 			gotHW, gotTrig, gotBreach, gotPx)
 	}
 }
 
-// #532: paper-mode trailing stop close must operate only on the strategy's
-// own virtual position. Two strategies on the same symbol with independent
-// StrategyState maps must remain isolated when one breaches.
 func TestRunHyperliquidTrailingStopPaper_StrategyIsolated(t *testing.T) {
 	sA := &StrategyState{
 		ID:       "hl-a",
@@ -1918,16 +1708,13 @@ func TestRunHyperliquidTrailingStopPaper_StrategyIsolated(t *testing.T) {
 	}
 }
 
-// #562: StopLossATRMult > 0 must defer the initial trigger placement just like
-// TrailingStopATRMult — EntryATR/AvgCost are not yet on the position at order-
-// placement time. Arming runs on the cycle after open.
 func TestEffectiveStopLossPct_FixedATRMultDefersInitialTrigger(t *testing.T) {
 	pf := func(v float64) *float64 { return &v }
 	sc := StrategyConfig{
 		Platform:        "hyperliquid",
 		Type:            "perps",
 		Leverage:        10,
-		MaxDrawdownPct:  5, // would otherwise fall through to a 5% auto stop
+		MaxDrawdownPct:  5,
 		StopLossATRMult: pf(1.5),
 	}
 	if got := EffectiveStopLossPct(sc); got != 0 {
@@ -1935,9 +1722,6 @@ func TestEffectiveStopLossPct_FixedATRMultDefersInitialTrigger(t *testing.T) {
 	}
 }
 
-// #562: explicit 0 StopLossATRMult must fall through to the next priority so
-// that a config like {stop_loss_atr_mult: 0, stop_loss_pct: 2} arms the
-// explicit fixed stop. Mirrors the TrailingStopATRMult fallthrough rule.
 func TestEffectiveStopLossPct_FixedATRMultExplicitZeroFallsThrough(t *testing.T) {
 	pf := func(v float64) *float64 { return &v }
 	sc := StrategyConfig{
@@ -1952,10 +1736,6 @@ func TestEffectiveStopLossPct_FixedATRMultExplicitZeroFallsThrough(t *testing.T)
 	}
 }
 
-// #562: effectiveFixedStopLossATRPct derives mult * EntryATR / AvgCost * 100,
-// returns 0 when EntryATR/AvgCost is missing, and caps the result at
-// MaxAutoStopLossPct so an outsized ATR (e.g. mult=3 on an ATR ≈ 30% of price)
-// can't produce a long-side trigger price <= 0.
 func TestEffectiveFixedStopLossATRPct(t *testing.T) {
 	pf := func(v float64) *float64 { return &v }
 	cases := []struct {
@@ -1995,7 +1775,6 @@ func TestEffectiveFixedStopLossATRPct(t *testing.T) {
 	}
 }
 
-// #562: fixedStopLossATRTriggerPx returns AvgCost ± mult*EntryATR for long/short.
 func TestFixedStopLossATRTriggerPx(t *testing.T) {
 	pf := func(v float64) *float64 { return &v }
 	sc := StrategyConfig{
@@ -2004,7 +1783,7 @@ func TestFixedStopLossATRTriggerPx(t *testing.T) {
 		StopLossATRMult: pf(1.5),
 	}
 	pos := &Position{AvgCost: 2000, EntryATR: 40}
-	wantPct := 1.5 * 40 / 2000 * 100 // 3%
+	wantPct := 1.5 * 40 / 2000 * 100
 
 	if got := fixedStopLossATRTriggerPx(sc, "long", pos); got != 2000*(1-wantPct/100) {
 		t.Errorf("long trigger = %g, want %g", got, 2000*(1-wantPct/100))
@@ -2017,9 +1796,7 @@ func TestFixedStopLossATRTriggerPx(t *testing.T) {
 	}
 }
 
-// #562: validation rules for stop_loss_atr_mult — HL perps only, mutually
-// exclusive with the four other stop fields.
-func TestValidateConfig_StopLossATRMult(t *testing.T) {
+func TestConfigValidation_StopLossATRMult(t *testing.T) {
 	pf := func(v float64) *float64 { return &v }
 	cases := []struct {
 		name      string
@@ -2075,7 +1852,7 @@ func TestValidateConfig_StopLossATRMult(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			cfg := &Config{Strategies: []StrategyConfig{c.sc}}
-			err := ValidateConfig(cfg)
+			err := validateConfig(cfg, false)
 			if c.wantError && err == nil {
 				t.Errorf("expected validation error, got nil")
 			}
@@ -2089,9 +1866,6 @@ func TestValidateConfig_StopLossATRMult(t *testing.T) {
 	}
 }
 
-// #562: peer normalization treats StopLossATRMult ownership the same as the
-// other stop-loss owners — peers without any stop field set get StopLossPct=0
-// so the MaxDrawdownPct auto-derive is suppressed for them.
 func TestNormalizeHyperliquidPeerStopLosses_FixedATRMultOwner(t *testing.T) {
 	mult := 1.5
 	strategies := []StrategyConfig{
@@ -2123,10 +1897,8 @@ func TestNormalizeHyperliquidPeerStopLosses_FixedATRMultOwner(t *testing.T) {
 	}
 }
 
-// #964: multiple same-coin trailing peers are allowed once the live trailing
-// updater serializes replacement and the reconciler attributes exact OID fills.
 func TestHyperliquidPeerStrategyErrors_TrailingStopPeersAllowed(t *testing.T) {
-	a := 0.05 // 5% trailing
+	a := 0.05
 	b := 0.03
 	strategies := []StrategyConfig{
 		{
@@ -2167,8 +1939,6 @@ func TestHyperliquidPeerStrategyErrors_TrailingATRPeersAllowed(t *testing.T) {
 	}
 }
 
-// #601: hyperliquidPeerStrategyErrors allows multiple same-coin peers with
-// fixed ATR stops because each order is sized to that strategy's virtual qty.
 func TestHyperliquidPeerStrategyErrors_FixedATRMultAllowed(t *testing.T) {
 	a := 1.5
 	b := 2.0
@@ -2190,9 +1960,6 @@ func TestHyperliquidPeerStrategyErrors_FixedATRMultAllowed(t *testing.T) {
 	}
 }
 
-// #562/#601/#605: LoadConfig defaults HL perps strategies with no explicit
-// stop fields to default_stop_loss_atr_mult (1.0× ATR by default), including
-// shared-coin peers since #601 sizes reduce-only stops per strategy.
 func TestLoadConfig_DefaultsStopLossATRMultForSoleOwner(t *testing.T) {
 	dir := t.TempDir()
 	cfgJSON := `{
@@ -2250,8 +2017,6 @@ func TestLoadConfig_UsesConfiguredDefaultStopLossATRMult(t *testing.T) {
 	}
 }
 
-// #562: sole-owner with an explicit stop_loss_pct does NOT get the default
-// stop_loss_atr_mult — explicit config wins.
 func TestLoadConfig_NoDefaultStopLossATRMultWhenExplicitFieldSet(t *testing.T) {
 	dir := t.TempDir()
 	cfgJSON := `{
@@ -2277,8 +2042,6 @@ func TestLoadConfig_NoDefaultStopLossATRMultWhenExplicitFieldSet(t *testing.T) {
 	}
 }
 
-// #601/#605: peer strategies on the same coin receive the default ATR stop
-// because exchange-side orders are sized per strategy.
 func TestLoadConfig_DefaultStopLossATRMultForPeers(t *testing.T) {
 	dir := t.TempDir()
 	cfgJSON := `{
@@ -2321,9 +2084,6 @@ func TestLoadConfig_DefaultStopLossATRMultForPeers(t *testing.T) {
 	}
 }
 
-// #601/#605: when no peer owns an explicit stop, every peer receives the
-// configured top-level default — #601 sizes reduce-only protection per
-// strategy, so peers no longer share a single owner.
 func TestLoadConfig_ConfiguredDefaultAppliesToAllPeers(t *testing.T) {
 	dir := t.TempDir()
 	cfgJSON := `{
@@ -2364,9 +2124,6 @@ func TestLoadConfig_ConfiguredDefaultAppliesToAllPeers(t *testing.T) {
 	}
 }
 
-// #605: explicit default_stop_loss_atr_mult=0 opts out of the auto-default
-// entirely; HL perps strategies with all stop fields omitted keep nil so
-// EffectiveStopLossPct's MaxDrawdownPct fallback can still apply.
 func TestLoadConfig_DefaultStopLossATRMultZeroOptsOut(t *testing.T) {
 	dir := t.TempDir()
 	cfgJSON := `{
@@ -2396,8 +2153,6 @@ func TestLoadConfig_DefaultStopLossATRMultZeroOptsOut(t *testing.T) {
 	}
 }
 
-// #562: paper-mode arming returns the trigger on the first cycle (currentTrigger=0)
-// and breach=true once mark crosses the trigger on a subsequent cycle.
 func TestRunHyperliquidFixedATRStopLossPaper(t *testing.T) {
 	pf := func(v float64) *float64 { return &v }
 	sc := StrategyConfig{
@@ -2406,10 +2161,8 @@ func TestRunHyperliquidFixedATRStopLossPaper(t *testing.T) {
 		StopLossATRMult: pf(1.5),
 	}
 	pos := &Position{AvgCost: 2000, EntryATR: 40}
-	// expected: pct = 1.5 * 40 / 2000 * 100 = 3%; long trigger = 2000 * 0.97 = 1940
 	wantTrigger := 1940.0
 
-	// Cycle 1: not yet armed — return trigger px, no breach.
 	newTrigger, breach, breachPx := runHyperliquidFixedATRStopLossPaper(sc, "long", pos, 2010, 0)
 	if breach {
 		t.Errorf("cycle1 breach=true, want false")
@@ -2421,7 +2174,6 @@ func TestRunHyperliquidFixedATRStopLossPaper(t *testing.T) {
 		t.Errorf("cycle1 breachPx = %g, want 0", breachPx)
 	}
 
-	// Cycle 2 above trigger: trigger already armed; no new trigger; no breach.
 	newTrigger, breach, _ = runHyperliquidFixedATRStopLossPaper(sc, "long", pos, 2050, wantTrigger)
 	if breach {
 		t.Errorf("cycle2 breach=true, want false (mark above trigger)")
@@ -2430,7 +2182,6 @@ func TestRunHyperliquidFixedATRStopLossPaper(t *testing.T) {
 		t.Errorf("cycle2 newTrigger = %g, want 0 (already armed)", newTrigger)
 	}
 
-	// Cycle 3 mark crosses trigger: breach.
 	newTrigger, breach, breachPx = runHyperliquidFixedATRStopLossPaper(sc, "long", pos, 1939, wantTrigger)
 	if !breach {
 		t.Error("cycle3 breach=false, want true")
@@ -2442,8 +2193,7 @@ func TestRunHyperliquidFixedATRStopLossPaper(t *testing.T) {
 		t.Errorf("cycle3 breachPx = %g, want %g", breachPx, wantTrigger)
 	}
 
-	// short side — mark above trigger triggers breach.
-	shortTrigger := 2060.0 // 2000 * 1.03
+	shortTrigger := 2060.0
 	newTrigger, breach, _ = runHyperliquidFixedATRStopLossPaper(sc, "short", pos, 1990, 0)
 	if breach {
 		t.Errorf("short cycle1 breach=true, want false")
@@ -2460,52 +2210,12 @@ func TestRunHyperliquidFixedATRStopLossPaper(t *testing.T) {
 	}
 }
 
-// #562: when StopLossATRMult is unset the paper helper short-circuits.
 func TestRunHyperliquidFixedATRStopLossPaper_Unset(t *testing.T) {
 	sc := StrategyConfig{Platform: "hyperliquid", Type: "perps"}
 	pos := &Position{AvgCost: 2000, EntryATR: 40}
 	newTrigger, breach, breachPx := runHyperliquidFixedATRStopLossPaper(sc, "long", pos, 2010, 0)
 	if newTrigger != 0 || breach || breachPx != 0 {
 		t.Errorf("unset short-circuit: trigger=%g breach=%v breachPx=%g, want 0,false,0", newTrigger, breach, breachPx)
-	}
-}
-
-// #562: stop_loss_atr_mult round-trips through JSON only when explicit
-// (omitempty drops nil) and is rendered via formatFloatPtr in hot-reload diffs.
-func TestStrategyConfig_StopLossATRMultJSON(t *testing.T) {
-	v := 1.5
-	sc := StrategyConfig{
-		ID:              "hl-test",
-		Type:            "perps",
-		Platform:        "hyperliquid",
-		Leverage:        10,
-		StopLossATRMult: &v,
-	}
-	b, err := json.Marshal(sc)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	if !strings.Contains(string(b), `"stop_loss_atr_mult":1.5`) {
-		t.Errorf("expected stop_loss_atr_mult in JSON; got %s", b)
-	}
-
-	sc.StopLossATRMult = nil
-	b2, err := json.Marshal(sc)
-	if err != nil {
-		t.Fatalf("marshal nil: %v", err)
-	}
-	if strings.Contains(string(b2), "stop_loss_atr_mult") {
-		t.Errorf("nil StopLossATRMult should be omitted; got %s", b2)
-	}
-
-	zero := 0.0
-	sc.StopLossATRMult = &zero
-	b3, err := json.Marshal(sc)
-	if err != nil {
-		t.Fatalf("marshal zero: %v", err)
-	}
-	if !strings.Contains(string(b3), `"stop_loss_atr_mult":0`) {
-		t.Errorf("explicit zero StopLossATRMult must round-trip; got %s", b3)
 	}
 }
 
@@ -2574,65 +2284,32 @@ func TestHyperliquidArmFixedATRStopLossLive_NotifiesOnError(t *testing.T) {
 	}
 }
 
-// --- #621: hlSLEffectiveQty caps SL size at on-chain qty ---
-
-func TestHLSLEffectiveQty_NoCapWhenOnChainGeVirtual(t *testing.T) {
-	onChain := map[string]float64{"ETH": 0.422}
-	got, capped := hlSLEffectiveQty("ETH", 0.422, onChain)
-	if capped {
-		t.Error("capped=true, want false when on-chain == virtual")
+func TestHLSLEffectiveQty(t *testing.T) {
+	cases := []struct {
+		name       string
+		onChain    map[string]float64
+		virtualQty float64
+		wantQty    float64
+		wantCapped bool
+	}{
+		{"on-chain equals virtual", map[string]float64{"ETH": 0.422}, 0.422, 0.422, false},
+		{"on-chain above virtual", map[string]float64{"ETH": 0.500}, 0.422, 0.422, false},
+		{"on-chain below virtual caps to on-chain", map[string]float64{"ETH": 0.211}, 0.422, 0.211, true},
+		{"symbol absent from the map", map[string]float64{"BTC": 0.01}, 0.422, 0.422, false},
+		{"on-chain qty is zero", map[string]float64{"ETH": 0}, 0.422, 0.422, false},
 	}
-	if got != 0.422 {
-		t.Errorf("qty = %g, want 0.422", got)
-	}
-
-	onChain2 := map[string]float64{"ETH": 0.500}
-	got2, capped2 := hlSLEffectiveQty("ETH", 0.422, onChain2)
-	if capped2 {
-		t.Error("capped=true, want false when on-chain > virtual")
-	}
-	if got2 != 0.422 {
-		t.Errorf("qty = %g, want 0.422", got2)
-	}
-}
-
-func TestHLSLEffectiveQty_CapsWhenOnChainLtVirtual(t *testing.T) {
-	onChain := map[string]float64{"ETH": 0.211}
-	got, capped := hlSLEffectiveQty("ETH", 0.422, onChain)
-	if !capped {
-		t.Error("capped=false, want true when on-chain < virtual")
-	}
-	if got < 0.211-1e-9 || got > 0.211+1e-9 {
-		t.Errorf("qty = %g, want 0.211 (on-chain qty)", got)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, capped := hlSLEffectiveQty("ETH", tc.virtualQty, tc.onChain)
+			if capped != tc.wantCapped {
+				t.Errorf("capped = %v, want %v", capped, tc.wantCapped)
+			}
+			if got < tc.wantQty-1e-9 || got > tc.wantQty+1e-9 {
+				t.Errorf("qty = %g, want %g", got, tc.wantQty)
+			}
+		})
 	}
 }
-
-func TestHLSLEffectiveQty_NoCapWhenSymbolNotInMap(t *testing.T) {
-	onChain := map[string]float64{"BTC": 0.01}
-	got, capped := hlSLEffectiveQty("ETH", 0.422, onChain)
-	if capped {
-		t.Error("capped=true, want false when symbol not in on-chain map")
-	}
-	if got != 0.422 {
-		t.Errorf("qty = %g, want 0.422", got)
-	}
-}
-
-func TestHLSLEffectiveQty_NoCapWhenOnChainZero(t *testing.T) {
-	// On-chain zero means Detector 1 territory; don't cap to zero.
-	onChain := map[string]float64{"ETH": 0}
-	got, capped := hlSLEffectiveQty("ETH", 0.422, onChain)
-	if capped {
-		t.Error("capped=true, want false when on-chain qty is zero")
-	}
-	if got != 0.422 {
-		t.Errorf("qty = %g, want 0.422", got)
-	}
-}
-
-// #562: atrMultMissingEntryATR fires when StopLossATRMult is configured but
-// the open candle didn't produce an ATR — same alert behavior as
-// TrailingStopATRMult.
 func TestATRMultMissingEntryATR_FixedATRMult(t *testing.T) {
 	pf := func(v float64) *float64 { return &v }
 	sc := StrategyConfig{
@@ -2647,5 +2324,58 @@ func TestATRMultMissingEntryATR_FixedATRMult(t *testing.T) {
 	posOK := &Position{AvgCost: 2000, EntryATR: 40}
 	if atrMultMissingEntryATR(sc, posOK) {
 		t.Error("expected atrMultMissingEntryATR=false when EntryATR is stamped")
+	}
+}
+
+func TestHyperliquidProtectionPositionSnapshot_CarriesFullSurface(t *testing.T) {
+	postTP := 1.25
+	src := &Position{
+		AvgCost:                         3100,
+		EntryATR:                        42,
+		RiskAnchorPrice:                 3000,
+		Regime:                          "trending",
+		RegimeWindows:                   map[string]string{"daily": "trending", "weekly": "ranging"},
+		RegimeAppliedLabel:              "trending",
+		RegimePendingLabel:              "ranging",
+		RegimePendingCount:              2,
+		SLAdjustedTiersProcessed:        3,
+		RatchetFallbackNormalizePending: true,
+		PostTPTrailingATRMult:           &postTP,
+	}
+	snap := hyperliquidProtectionPositionSnapshot(src)
+	if snap == nil {
+		t.Fatal("snapshot is nil for non-nil position")
+	}
+	if snap.AvgCost != 3100 || snap.EntryATR != 42 || snap.RiskAnchorPrice != 3000 {
+		t.Errorf("price surface = (AvgCost %v, EntryATR %v, RiskAnchorPrice %v); want (3100, 42, 3000)",
+			snap.AvgCost, snap.EntryATR, snap.RiskAnchorPrice)
+	}
+	if snap.Regime != "trending" || snap.RegimeAppliedLabel != "trending" ||
+		snap.RegimePendingLabel != "ranging" || snap.RegimePendingCount != 2 {
+		t.Errorf("regime surface = (%q, %q, %q, %d); want (trending, trending, ranging, 2)",
+			snap.Regime, snap.RegimeAppliedLabel, snap.RegimePendingLabel, snap.RegimePendingCount)
+	}
+	if !reflect.DeepEqual(snap.RegimeWindows, src.RegimeWindows) {
+		t.Errorf("RegimeWindows = %v; want %v", snap.RegimeWindows, src.RegimeWindows)
+	}
+	if snap.SLAdjustedTiersProcessed != 3 || !snap.RatchetFallbackNormalizePending {
+		t.Errorf("ratchet surface = (%d, %v); want (3, true)",
+			snap.SLAdjustedTiersProcessed, snap.RatchetFallbackNormalizePending)
+	}
+	if snap.PostTPTrailingATRMult == nil || *snap.PostTPTrailingATRMult != 1.25 {
+		t.Errorf("PostTPTrailingATRMult = %v; want 1.25", snap.PostTPTrailingATRMult)
+	}
+
+	src.RegimeWindows["daily"] = "ranging"
+	if snap.RegimeWindows["daily"] != "trending" {
+		t.Error("RegimeWindows was shallow-copied; walker snapshot mutated by main loop")
+	}
+	*src.PostTPTrailingATRMult = 9.9
+	if *snap.PostTPTrailingATRMult != 1.25 {
+		t.Error("PostTPTrailingATRMult pointer was shared; walker snapshot mutated by main loop")
+	}
+
+	if hyperliquidProtectionPositionSnapshot(nil) != nil {
+		t.Error("snapshot of nil position must be nil")
 	}
 }

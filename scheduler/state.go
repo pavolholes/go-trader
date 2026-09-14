@@ -4,40 +4,22 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 	"time"
 )
 
-// maxTradeHistory is the maximum number of trades to retain per strategy.
 const maxTradeHistory = 1000
 
-// tradeRecorder is the package-level hook for immediate trade persistence (#289).
-// main.go sets this to StateDB.InsertTrade after OpenStateDB; when nil (tests,
-// early boot, or persistence failure), RecordTrade still appends in-memory and
-// the cycle-end SaveStateWithDB acts as a safety net.
-//
-// Test caveat: tests that swap this hook (via prev := tradeRecorder; tradeRecorder
-// = fn; t.Cleanup(...)) must NOT use t.Parallel() — the swap mutates package
-// state and will race. Same applies to tradePersistWarn below. If concurrent
-// tests are ever needed, move the hooks onto StateDB (or an injected struct)
-// instead of keeping them global.
 var tradeRecorder func(strategyID string, trade Trade) error
 
-// tradePersistWarn is the operator-visible warning hook for RecordTrade failures
-// (#289 observability follow-up). main.go sets this after MultiNotifier is
-// constructed to route warnings to owner DM. When nil, RecordTrade falls back
-// to stderr — important for early-boot failures before the notifier exists.
+func suspendEagerTradePersist() func() {
+	prev := tradeRecorder
+	tradeRecorder = nil
+	return func() { tradeRecorder = prev }
+}
+
 var tradePersistWarn func(msg string)
 
-// RecordTrade appends a trade to a strategy's in-memory TradeHistory and, when
-// the tradeRecorder hook is set, immediately persists it to SQLite so trades
-// survive mid-cycle crashes (#289). On successful persist the trade is marked
-// persisted=true so SaveState skips it on the cycle-end flush; on failure the
-// row stays persisted=false and SaveState will retry, even if later trades
-// have already been persisted with greater timestamps.
-//
-// Persistence errors are surfaced to the operator via tradePersistWarn (owner
-// DM) when available, always logged to stderr, and never abort execution —
-// in-memory state remains intact.
 func RecordTrade(s *StrategyState, trade Trade) {
 	if trade.StrategyID == "" {
 		trade.StrategyID = s.ID
@@ -64,76 +46,57 @@ func RecordTrade(s *StrategyState, trade Trade) {
 	s.TradeHistory[len(s.TradeHistory)-1].persisted = true
 }
 
-// ReconciliationGap tracks the drift between virtual per-strategy positions and
-// the actual on-chain position for a coin that is traded by multiple strategies
-// on the same shared wallet (#258). When two strategies trade the same coin,
-// per-strategy reconciliation is skipped (to prevent phantom circuit breakers)
-// and this gap is computed instead.
 type ReconciliationGap struct {
 	Coin       string    `json:"coin"`
-	OnChainQty float64   `json:"on_chain_qty"` // signed: positive = long, negative = short
-	VirtualQty float64   `json:"virtual_qty"`  // sum of all strategies' positions (signed)
-	DeltaQty   float64   `json:"delta_qty"`    // computed: VirtualQty - OnChainQty
-	Strategies []string  `json:"strategies"`   // strategy IDs configured to trade this coin
+	OnChainQty float64   `json:"on_chain_qty"`
+	VirtualQty float64   `json:"virtual_qty"`
+	DeltaQty   float64   `json:"delta_qty"`
+	Strategies []string  `json:"strategies"`
 	UpdatedAt  time.Time `json:"updated_at"`
 }
 
-// AppState holds all persistent state across restarts.
 type AppState struct {
-	CycleCount          int                       `json:"cycle_count"`
-	LastCycle           time.Time                 `json:"last_cycle"`
-	Strategies          map[string]*StrategyState `json:"strategies"`
-	PortfolioRisk       PortfolioRiskState        `json:"portfolio_risk"`
-	CorrelationSnapshot *CorrelationSnapshot      `json:"correlation_snapshot,omitempty"`
-	// ReconciliationGaps is ephemeral — recomputed each sync cycle, not persisted to SQLite.
-	ReconciliationGaps      map[string]*ReconciliationGap `json:"reconciliation_gaps,omitempty"`
-	LastLeaderboardPostDate string                        `json:"last_leaderboard_post_date,omitempty"`
-	// LastLeaderboardSummaries tracks the last-post time for each configured
-	// leaderboard_summaries entry, keyed by LeaderboardSummaryConfig.Key().
-	// Used by the scheduler to avoid reposting within the configured frequency. (#308)
-	LastLeaderboardSummaries map[string]time.Time `json:"last_leaderboard_summaries,omitempty"`
-	// LastSummaryPost tracks the last regular summary post per notification channel key.
-	LastSummaryPost map[string]time.Time `json:"last_summary_post,omitempty"`
+	CycleCount                 int                                     `json:"cycle_count"`
+	LastCycle                  time.Time                               `json:"last_cycle"`
+	Strategies                 map[string]*StrategyState               `json:"strategies"`
+	PortfolioRisk              map[PortfolioScope]*PortfolioRiskState  `json:"portfolio_risk"`
+	CorrelationSnapshot        map[PortfolioScope]*CorrelationSnapshot `json:"correlation_snapshot,omitempty"`
+	LatestSharedWalletBalances map[SharedWalletKey]float64             `json:"-"`
+	LatestSharedWalletMembers  map[SharedWalletKey][]string            `json:"-"`
+	ReconciliationGaps         map[string]*ReconciliationGap           `json:"reconciliation_gaps,omitempty"`
+	LastLeaderboardPostDate    string                                  `json:"last_leaderboard_post_date,omitempty"`
+	LastLeaderboardSummaries   map[string]time.Time                    `json:"last_leaderboard_summaries,omitempty"`
+	LastSummaryPost            map[string]time.Time                    `json:"last_summary_post,omitempty"`
 }
 
-// StrategyState is the per-strategy persistent state.
 type StrategyState struct {
-	ID               string                     `json:"id"`
-	Type             string                     `json:"type"`
-	Platform         string                     `json:"platform,omitempty"`
-	Cash             float64                    `json:"cash"`
-	InitialCapital   float64                    `json:"initial_capital"`
-	Positions        map[string]*Position       `json:"positions"`
-	OptionPositions  map[string]*OptionPosition `json:"option_positions"`
-	TradeHistory     []Trade                    `json:"trade_history"`
-	RiskState        RiskState                  `json:"risk_state"`
-	Regime           string                     `json:"regime,omitempty"`         // most recent primary regime label from check script (#482)
-	RegimeWindows    map[string]string          `json:"regime_windows,omitempty"` // latest per-window labels from check script (#792)
-	RegimeDivergence *RegimeDivergenceState     `json:"-"`                        // in-memory divergence state; not persisted (self-heals on restart within 1 cycle) (#907)
-	RegimeProfile    *RegimeProfileState        `json:"regime_profile,omitempty"` // regime-profile allocation switch state (#998). ActiveProfile is persisted (strategies.active_profile); the pending counter is in-memory and re-arms on restart.
-	// ClosedPositions is an in-memory buffer of positions closed during the
-	// current cycle. SaveState appends these to the closed_positions table and
-	// clears the buffer on successful commit. Not serialized to JSON state
-	// files — history lives exclusively in SQLite. (#288)
-	ClosedPositions []ClosedPosition `json:"-"`
-	// ClosedOptionPositions mirrors ClosedPositions for option-position
-	// lifecycle tracking; flushed to closed_option_positions table. (#288)
-	ClosedOptionPositions []ClosedOptionPosition `json:"-"`
+	ID                      string                     `json:"id"`
+	Type                    string                     `json:"type"`
+	Platform                string                     `json:"platform,omitempty"`
+	Cash                    float64                    `json:"cash"`
+	InitialCapital          float64                    `json:"initial_capital"`
+	Positions               map[string]*Position       `json:"positions"`
+	OptionPositions         map[string]*OptionPosition `json:"option_positions"`
+	TradeHistory            []Trade                    `json:"trade_history"`
+	RiskState               RiskState                  `json:"risk_state"`
+	Regime                  string                     `json:"regime,omitempty"`
+	RegimeWindows           map[string]string          `json:"regime_windows,omitempty"`
+	RegimeDivergence        *RegimeDivergenceState     `json:"-"`
+	RegimeProfile           *RegimeProfileState        `json:"regime_profile,omitempty"`
+	HurstGate               HurstGateState             `json:"hurst_gate_state,omitempty"`
+	ClosedPositions         []ClosedPosition           `json:"-"`
+	ClosedOptionPositions   []ClosedOptionPosition     `json:"-"`
+	pendingTradeDiagnostics []TradeDiagnosticsRow      `json:"-"`
 
-	// SharedWalletValue is the exchange-authoritative display value for this
-	// strategy when it is a member of a shared on-exchange wallet (#918). It is
-	// recomputed each cycle from the real account balance + on-chain positions
-	// so the per-strategy operator rows sum EXACTLY to the wallet balance.
-	// In-memory only (never persisted): a stale value would misreport equity;
-	// it self-heals every cycle. Consumed by displayStrategyValue; risk math
-	// continues to use the modeled PortfolioValue (s.Cash + modeled P&L).
-	SharedWalletValue float64 `json:"-"`
-	// SharedWalletValueSet gates SharedWalletValue: true only on cycles where a
-	// fresh balance + position snapshot was reconciled for this strategy's
-	// wallet. False (the default, and reset whenever the fetch fails or the
-	// strategy is not a shared-wallet member) makes display fall back to the
-	// modeled PortfolioValue.
-	SharedWalletValueSet bool `json:"-"`
+	SharedWalletValue           float64 `json:"-"`
+	SharedWalletValueSet        bool    `json:"-"`
+	SharedWalletPerformanceOnly bool    `json:"-"`
+	SharedWalletPoolBudget      bool    `json:"shared_wallet_pool_budget,omitempty"`
+
+	CashReconcileRequired bool `json:"cash_reconcile_required,omitempty"`
+
+	ReplayMirrorWatermark       int64  `json:"replay_mirror_watermark,omitempty"`
+	ReplayMirrorWatermarkSource string `json:"replay_mirror_watermark_source,omitempty"`
 }
 
 func NewStrategyState(cfg StrategyConfig) *StrategyState {
@@ -159,30 +122,220 @@ func NewStrategyState(cfg StrategyConfig) *StrategyState {
 
 func NewAppState() *AppState {
 	return &AppState{
-		CycleCount: 0,
-		Strategies: make(map[string]*StrategyState),
+		CycleCount:          0,
+		Strategies:          make(map[string]*StrategyState),
+		PortfolioRisk:       make(map[PortfolioScope]*PortfolioRiskState),
+		CorrelationSnapshot: make(map[PortfolioScope]*CorrelationSnapshot),
 	}
 }
 
-// ValidateState checks loaded state for invalid entries and removes or clamps them (#39).
-// Logs warnings for each corrected field rather than refusing to start.
-func ValidateState(state *AppState) {
+func (s *AppState) scopeRisk(scope PortfolioScope) *PortfolioRiskState {
+	if s == nil {
+		return &PortfolioRiskState{}
+	}
+	if s.PortfolioRisk == nil {
+		s.PortfolioRisk = make(map[PortfolioScope]*PortfolioRiskState)
+	}
+	if prs, ok := s.PortfolioRisk[scope]; ok && prs != nil {
+		return prs
+	}
+	prs := &PortfolioRiskState{}
+	if scope == ScopePaper {
+		prs.ManualMarkBasisRebaselined = true
+	}
+	s.PortfolioRisk[scope] = prs
+	return prs
+}
+
+func (s *AppState) scopeRiskIfPresent(scope PortfolioScope) *PortfolioRiskState {
+	if s == nil || s.PortfolioRisk == nil {
+		return nil
+	}
+	return s.PortfolioRisk[scope]
+}
+
+func (s *AppState) scopeLatched(scope PortfolioScope) bool {
+	prs := s.scopeRiskIfPresent(scope)
+	return prs != nil && prs.KillSwitchActive
+}
+
+func (s *AppState) latchedScopes() []PortfolioScope {
+	var out []PortfolioScope
+	for _, scope := range []PortfolioScope{ScopeLive, ScopePaper} {
+		if s.scopeLatched(scope) {
+			out = append(out, scope)
+		}
+	}
+	return out
+}
+
+func (s *AppState) anyScopeLatched() bool {
+	if s == nil {
+		return false
+	}
+	for _, prs := range s.PortfolioRisk {
+		if prs != nil && prs.KillSwitchActive {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *AppState) scopeCorrelation(scope PortfolioScope) *CorrelationSnapshot {
+	if s == nil || s.CorrelationSnapshot == nil {
+		return nil
+	}
+	return s.CorrelationSnapshot[scope]
+}
+
+func (s *AppState) setScopeCorrelation(scope PortfolioScope, snap *CorrelationSnapshot) {
+	if s == nil {
+		return
+	}
+	if s.CorrelationSnapshot == nil {
+		s.CorrelationSnapshot = make(map[PortfolioScope]*CorrelationSnapshot)
+	}
+	if snap != nil {
+		snap.Scope = scope
+	}
+	s.CorrelationSnapshot[scope] = snap
+}
+
+type sharedWalletPoolStateTransition string
+
+const (
+	sharedWalletPoolStateUnchanged sharedWalletPoolStateTransition = ""
+	sharedWalletPoolStateEntered   sharedWalletPoolStateTransition = "entered"
+	sharedWalletPoolStateLeft      sharedWalletPoolStateTransition = "left"
+)
+
+func applySharedWalletPoolStateMode(sc StrategyConfig, s *StrategyState) (sharedWalletPoolStateTransition, error) {
+	if s == nil {
+		return sharedWalletPoolStateUnchanged, nil
+	}
+	currentPool := usesSharedWalletPoolBudget(sc)
+	if currentPool == s.SharedWalletPoolBudget {
+		s.SharedWalletPerformanceOnly = currentPool
+		return sharedWalletPoolStateUnchanged, nil
+	}
+	if strategyHasOpenPositions(s) {
+		s.SharedWalletPerformanceOnly = s.SharedWalletPoolBudget
+		return sharedWalletPoolStateUnchanged, fmt.Errorf(
+			"strategy[%s]: cannot transition shared-wallet pool budgeting while positions are open",
+			sc.ID)
+	}
+
+	if currentPool {
+		s.SharedWalletPerformanceOnly = true
+		s.SharedWalletPoolBudget = true
+		s.Cash = 0
+		s.InitialCapital = 0
+		s.RiskState.PeakValue = 0
+		s.RiskState.CurrentDrawdownPct = 0
+		return sharedWalletPoolStateEntered, nil
+	}
+
+	baseline := sc.InitialCapital
+	if baseline <= 0 {
+		baseline = sc.Capital
+	}
+	if baseline <= 0 {
+		s.SharedWalletPerformanceOnly = true
+		return sharedWalletPoolStateUnchanged, fmt.Errorf(
+			"strategy[%s]: cannot leave shared-wallet pool mode without a positive resolved capital or initial_capital",
+			sc.ID)
+	}
+
+	s.SharedWalletPoolBudget = false
+	s.SharedWalletPerformanceOnly = false
+	s.Cash += baseline
+	s.InitialCapital = baseline
+	s.RiskState.PeakValue = PortfolioValue(s, nil)
+	s.RiskState.CurrentDrawdownPct = 0
+	return sharedWalletPoolStateLeft, nil
+}
+
+func deferSharedWalletPoolTransition(sc *StrategyConfig, transitionErr error) string {
+	sc.sharedWalletModeDeferred = true
+	sc.Paused = true
+	return fmt.Sprintf(
+		"strategy %s shared-wallet pool transition deferred: %v; running manage-only until a later flat restart can complete it",
+		sc.ID, transitionErr)
+}
+
+func effectiveSharedWalletPoolBook(sc StrategyConfig, s *StrategyState) bool {
+	if sc.sharedWalletModeDeferred && s != nil {
+		return s.SharedWalletPoolBudget
+	}
+	return usesSharedWalletPoolBudget(sc)
+}
+
+func sharedWalletPoolTransitionBlockers(strategies []StrategyConfig, state *AppState) map[string]error {
+	blocked := make(map[string]error)
+	if state == nil {
+		return blocked
+	}
+	groups := make(map[configuredWalletKey][]StrategyConfig)
+	for _, sc := range strategies {
+		if key, ok := configuredWalletKeyFor(sc); ok {
+			groups[key] = append(groups[key], sc)
+		}
+	}
+	for key, members := range groups {
+		if len(members) < 2 {
+			continue
+		}
+		transitioning := false
+		var openIDs []string
+		for _, sc := range members {
+			ss := state.Strategies[sc.ID]
+			if ss == nil {
+				continue
+			}
+			if usesSharedWalletPoolBudget(sc) != ss.SharedWalletPoolBudget {
+				transitioning = true
+			}
+			if strategyHasOpenPositions(ss) {
+				openIDs = append(openIDs, sc.ID)
+			}
+		}
+		if !transitioning || len(openIDs) == 0 {
+			continue
+		}
+		sort.Strings(openIDs)
+		err := fmt.Errorf(
+			"shared-wallet %s/%s cannot transition pool budgeting while members have open positions: %s",
+			key.Platform, key.Instrument, strings.Join(openIDs, ", "))
+		for _, sc := range members {
+			blocked[sc.ID] = err
+		}
+	}
+	return blocked
+}
+
+func ValidateState(state *AppState, strategies []StrategyConfig) {
+	configuredPoolIDs := make(map[string]bool)
+	for _, sc := range strategies {
+		if usesSharedWalletPoolBudget(sc) {
+			configuredPoolIDs[sc.ID] = true
+		}
+	}
 	for id, s := range state.Strategies {
-		if s.InitialCapital <= 0 {
+		if s.InitialCapital < 0 {
 			fmt.Printf("[WARN] state: strategy %s has invalid initial_capital=%g, resetting to 0\n", id, s.InitialCapital)
 			s.InitialCapital = 0
 		}
-		if s.Cash < 0 {
+		if s.Cash < 0 && !s.SharedWalletPoolBudget && !configuredPoolIDs[id] {
 			fmt.Printf("[WARN] state: strategy %s has negative cash=%g, clamping to 0\n", id, s.Cash)
 			s.Cash = 0
 		}
+		maybeClearCashReconcileRequired(s)
 		for sym, pos := range s.Positions {
 			if pos.Quantity <= 0 {
 				fmt.Printf("[WARN] state: strategy %s position %s has invalid quantity=%g, removing\n", id, sym, pos.Quantity)
 				delete(s.Positions, sym)
 				continue
 			}
-			// Migrate legacy positions: stamp ownership if missing.
 			if pos.OwnerStrategyID == "" {
 				pos.OwnerStrategyID = id
 			}
@@ -236,20 +389,6 @@ func migrateLegacyPerpsPositionMultipliers(state *AppState, cfg *Config) int {
 	return migrated
 }
 
-// ValidatePerpsDirectionConfig flags positions whose side conflicts with the
-// strategy's effective direction (#336/#656/#783). When regime_directional_policy
-// is configured, resolution uses the stamped position regime (hold-on-transition)
-// or treats the side as valid if any policy regime allows it when the stamp is
-// missing (legacy pre-#741 positions).
-//
-// In either case the strategy's next signal-driven order will desync virtual
-// state from the exchange. At runtime, sole-owner live HL perps orphans are
-// auto-closed during hl-sync reconcile when the position conflicts with the
-// *current* regime direction (#822). Startup still warn-and-continues (marks
-// may be unavailable; reconcile has not run yet).
-//
-// Returns human-readable warnings so the caller can both log them and forward
-// to the operator via DM once the notifier is ready.
 func ValidatePerpsDirectionConfig(state *AppState, cfg *Config) []string {
 	var warnings []string
 	for i := range cfg.Strategies {
@@ -273,19 +412,14 @@ func ValidatePerpsDirectionConfig(state *AppState, cfg *Config) []string {
 			if pos == nil || pos.Quantity <= 0 {
 				continue
 			}
+			if pos.isHedgeLeg() {
+				continue
+			}
 			posRegime := positionDirectionalRegimeLabel(pos, *sc)
-			// #1085: gate by the open stamp. An uncertified/legacy directional
-			// position (certified=false) validates against BASE direction — this is
-			// the from-flat migration surface: a side that conflicts with base is
-			// flagged for the operator to close before the next signal.
 			effectiveDir := EffectiveDirectionForPositionGated(*sc, "", posRegime, pos.Quantity, pos.DirectionCertifiedStatesAtOpen)
 			if !perpsPositionConflictsDirection(pos.Side, effectiveDir) {
 				continue
 			}
-			// Legacy / unstamped under a CERTIFIED-at-open policy: if any configured
-			// regime allows this side, skip (it opened under the honored policy).
-			// Uncertified positions are NOT skipped — they must surface for
-			// from-flat migration (#1085).
 			if policyConfigured && pos.DirectionCertifiedAtOpen && posRegime == "" && policyAllowsPositionSideGated(*sc, pos.Side, pos.DirectionCertifiedStatesAtOpen) {
 				continue
 			}
@@ -309,30 +443,8 @@ func ValidatePerpsDirectionConfig(state *AppState, cfg *Config) []string {
 	return warnings
 }
 
-// ReconcileConfigInitialCapital bridges the #343 baseline guard with operator
-// intent expressed via config. The SaveState guard treats initial_capital as
-// immutable, so a legitimate change ("bump $505 → $1000") would otherwise be
-// silently reverted on every cycle. This function runs once at startup:
-//
-//   - For each strategy where config explicitly sets initial_capital
-//     (sc.InitialCapital > 0) and the persisted state baseline disagrees,
-//     treat the config field as the explicit override signal.
-//   - Persist the new baseline via the sanctioned StateDB.SetInitialCapital
-//     path so the guard's snapshot picks it up next cycle.
-//   - Mutate the in-memory StrategyState so any startup-time PnL/risk
-//     calculation in the same process sees the new value immediately.
-//   - Return separate info messages (successful applies) and error messages
-//     (persist failures) so main.go can DM the owner with a clear distinction
-//     — a baseline change is rare and worth surfacing either way, but the
-//     caller should be able to tell success from failure without parsing the
-//     string.
-//
-// Strategies that omit initial_capital from config are ignored: Capital is a
-// runtime field that drifts with PnL and capital_pct rebases, so it is not a
-// reliable signal of "operator wants to change the baseline." The explicit
-// path is `initial_capital` in config or a direct SetInitialCapital call.
-func ReconcileConfigInitialCapital(cfg *Config, state *AppState, sdb *StateDB) (infos []string, errors []string) {
-	if state == nil || sdb == nil {
+func ReconcileConfigInitialCapital(cfg *Config, state *AppState, store *StateStore) (infos []string, errors []string) {
+	if state == nil || store == nil {
 		return nil, nil
 	}
 	for _, sc := range cfg.Strategies {
@@ -344,7 +456,7 @@ func ReconcileConfigInitialCapital(cfg *Config, state *AppState, sdb *StateDB) (
 			continue
 		}
 		prev := s.InitialCapital
-		if err := sdb.SetInitialCapital(sc.ID, sc.InitialCapital); err != nil {
+		if err := store.SetInitialCapital(sc.ID, sc.InitialCapital); err != nil {
 			msg := fmt.Sprintf("config-driven initial_capital change for %s ($%.2f → $%.2f) failed to persist: %v — DB still holds $%.2f",
 				sc.ID, prev, sc.InitialCapital, err, prev)
 			fmt.Fprintf(os.Stderr, "[state] WARN: %s\n", msg)
@@ -360,13 +472,86 @@ func ReconcileConfigInitialCapital(cfg *Config, state *AppState, sdb *StateDB) (
 	return infos, errors
 }
 
-// LoadStateWithDB loads state from SQLite. Returns a fresh AppState when the DB is empty.
+func assignLegacyPortfolioScope(state *AppState, cfg *Config) (PortfolioScope, bool) {
+	if state == nil {
+		return scopeUnassigned, false
+	}
+	legacy := state.PortfolioRisk[scopeUnassigned]
+	legacySnap := state.CorrelationSnapshot[scopeUnassigned]
+	if legacy == nil && legacySnap == nil {
+		return scopeUnassigned, false
+	}
+
+	target := ScopePaper
+	if cfg != nil && HasLiveStrategy(cfg.Strategies) {
+		target = ScopeLive
+	}
+	placeLegacyPortfolioRisk(state, cfg, legacy, legacySnap, target)
+	return target, true
+}
+
+// placeLegacyPortfolioRisk moves one file's unscoped legacy rows into the scope
+// that file owns. The caller decides the target, so a split layout places each
+// file's row from that file's own validated scope.
+func placeLegacyPortfolioRisk(state *AppState, cfg *Config, legacy *PortfolioRiskState, legacySnap *CorrelationSnapshot, target PortfolioScope) {
+	if state == nil || (legacy == nil && legacySnap == nil) {
+		return
+	}
+
+	if legacy != nil {
+		existing := state.PortfolioRisk[target]
+		if existing == nil {
+			if target == ScopePaper {
+				legacy.ManualMarkBasisRebaselined = true
+			}
+			for i := range legacy.Events {
+				legacy.Events[i].Scope = target
+			}
+			state.PortfolioRisk[target] = legacy
+			if target == ScopeLive && cfg != nil && len(strategiesInScope(cfg.Strategies, ScopePaper)) > 0 {
+				priorPeak := legacy.PeakValue
+				newPeak := liveScopeRebasedPeak(state, cfg, nil)
+				legacy.PeakValue = newPeak
+				addKillSwitchEvent(legacy, "scope_basis_rebaseline", "equity", legacy.CurrentDrawdownPct, 0, newPeak,
+					fmt.Sprintf("#1509 legacy whole-roster peak $%.2f re-based onto the live-only roster: $%.2f (sum of live per-strategy peaks, configured capital for a strategy with no peak, wallet equity for a shared-wallet pool); latch untouched", priorPeak, newPeak))
+				legacy.Events[len(legacy.Events)-1].Scope = target
+				fmt.Printf("[state] Legacy portfolio peak re-based for the live scope: $%.0f -> $%.0f (paper strategies now measure in their own scope)\n", priorPeak, newPeak)
+			}
+		} else {
+			if legacy.KillSwitchActive && !existing.KillSwitchActive {
+				existing.KillSwitchActive = true
+				existing.KillSwitchAt = legacy.KillSwitchAt
+			}
+			addKillSwitchEvent(existing, "migration_conflict", "",
+				existing.CurrentDrawdownPct, 0, existing.PeakValue,
+				fmt.Sprintf("legacy unscoped portfolio_risk row found alongside an existing %s row; kept the %s row and OR-ed the latch (legacy latched=%v, kept latched=%v)",
+					scopeLabel(target), scopeLabel(target), legacy.KillSwitchActive, existing.KillSwitchActive))
+			existing.Events[len(existing.Events)-1].Scope = target
+		}
+		delete(state.PortfolioRisk, scopeUnassigned)
+	}
+
+	if legacySnap != nil {
+		if _, ok := state.CorrelationSnapshot[target]; !ok {
+			legacySnap.Scope = target
+			state.CorrelationSnapshot[target] = legacySnap
+		}
+		delete(state.CorrelationSnapshot, scopeUnassigned)
+	}
+}
+
 func LoadStateWithDB(cfg *Config, sdb *StateDB) (*AppState, error) {
 	state, err := sdb.LoadState()
 	if err != nil {
 		return nil, fmt.Errorf("sqlite load: %w", err)
 	}
 	if state != nil {
+		if target, moved := assignLegacyPortfolioScope(state, cfg); moved {
+			fmt.Printf("[state] Legacy unscoped portfolio risk row placed in the %s scope\n", scopeLabel(target))
+			if err := sdb.SaveState(state); err != nil {
+				return nil, fmt.Errorf("persist legacy portfolio scope placement: %w", err)
+			}
+		}
 		if migrated := migrateLegacyPerpsPositionMultipliers(state, cfg); migrated > 0 {
 			fmt.Printf("[state] Migrated %d legacy perps position multiplier(s) to 1\n", migrated)
 		}
@@ -376,7 +561,10 @@ func LoadStateWithDB(cfg *Config, sdb *StateDB) (*AppState, error) {
 	return NewAppState(), nil
 }
 
-// SaveStateWithDB saves state to SQLite.
 func SaveStateWithDB(state *AppState, cfg *Config, sdb *StateDB) error {
 	return sdb.SaveState(state)
+}
+
+func SaveStrategyBookWithDB(s *StrategyState, sdb *StateDB) error {
+	return sdb.SaveStrategyBook(s)
 }

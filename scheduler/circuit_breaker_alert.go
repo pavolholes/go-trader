@@ -243,7 +243,7 @@ func formatPerStrategyCircuitBreakerBlock(in perStrategyCircuitBreakerFormatInpu
 			b.WriteByte('\n')
 		}
 		if strings.HasPrefix(in.Reason, RiskReasonConsecutiveLosses) && in.Snapshot.Risk.ConsecutiveLosses > 0 {
-			b.WriteString(fmt.Sprintf("Consecutive loss run: %d/5\n", in.Snapshot.Risk.ConsecutiveLosses))
+			b.WriteString(fmt.Sprintf("Consecutive loss run: %d/%d\n", in.Snapshot.Risk.ConsecutiveLosses, in.Strategy.CircuitBreakerLossStreakThreshold()))
 		}
 	}
 
@@ -260,9 +260,6 @@ func formatPerStrategyCircuitBreakerBlock(in perStrategyCircuitBreakerFormatInpu
 func circuitBreakerTriggerLine(reason string) string {
 	if m := cbMaxDrawdownReasonRE.FindStringSubmatch(reason); len(m) == 7 {
 		return fmt.Sprintf("%s - %s%% > %s%% (denom: %s=$%s)", RiskReasonMaxDrawdownExceeded, m[1], m[2], m[5], m[6])
-	}
-	if strings.HasPrefix(reason, RiskReasonConsecutiveLosses) {
-		return RiskReasonConsecutiveLosses
 	}
 	return reason
 }

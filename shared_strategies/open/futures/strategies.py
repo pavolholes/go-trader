@@ -1,13 +1,3 @@
-"""Futures strategy shim \u2014 platform-filtered view of shared_strategies.registry.
-
-All strategy implementations live in ``shared_strategies/open/registry.py``; this
-file exposes the subset tagged ``platforms=("futures", ...)`` with any
-futures-specific ``variants`` applied. ``check_hyperliquid.py``,
-``check_topstep.py``, ``check_robinhood.py``, and ``check_okx.py`` (swap mode)
-import from this module via sys.path insertion (``from strategies import ...``),
-so the surface (``STRATEGY_REGISTRY``, ``apply_strategy``, ``list_strategies``,
-``get_strategy``) must stay stable.
-"""
 
 import importlib.util
 import json
@@ -25,8 +15,6 @@ from strategy_composition import strip_unsupported_position_context
 
 
 def _load_registry_module():
-    """Load ``shared_strategies/open/registry.py`` as an isolated module \u2014 see
-    spot/strategies.py for rationale (independent modules per shim)."""
     registry_path = os.path.join(os.path.dirname(__file__), "..", "registry.py")
     spec = importlib.util.spec_from_file_location("_strategy_registry_futures", registry_path)
     mod = importlib.util.module_from_spec(spec)
@@ -55,6 +43,17 @@ def apply_strategy(name: str, df: pd.DataFrame, params: Optional[dict] = None) -
     p = {**strat["default_params"], **(params or {})}
     p = strip_unsupported_position_context(strat["fn"], p)
     return strat["fn"](df, **p)
+
+
+def validate_params(name: str, params: Optional[dict] = None,
+                    default_params: Optional[dict] = None) -> None:
+    if default_params is None:
+        default_params = get_strategy(name)["default_params"]
+    _registry.validate_params(name, params or {}, default_params)
+
+
+def validate_param_value(name: str, param: str, value) -> None:
+    _registry.validate_param_value(name, param, value)
 
 
 if __name__ == "__main__":

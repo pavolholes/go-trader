@@ -9,62 +9,41 @@ import (
 	"time"
 )
 
-// #1147 per-trade trade-quality diagnostics.
-//
-// Every full position close (all recordClosedPosition paths: signal closes,
-// kill switch, circuit breaker, corrupt legs, HL reconcile/external sync,
-// manual, deribit assignment) writes one diagnostics row to the
-// trade_diagnostics table. The identity/outcome part of the row is inserted
-// EAGERLY under the caller's lock — mirroring the tradeRecorder hook (#289) so
-// a crash right after the close never loses the row — and the derived quality
-// metrics (MFE/MAE/capture ratio, which need a hold-window OHLCV fetch) are
-// filled in by a background worker OUTSIDE mu, via an UPDATE keyed on rowid.
-//
-// Diagnostics-only by construction: nothing here mutates positions, orders,
-// or config; a fetch/compute failure downgrades the row's metrics_status and
-// leaves the quality columns NULL — it can never block or alter a close.
-//
-// Options positions are out of scope (they close via
-// recordClosedOptionPosition and premium P&L has no meaningful underlying
-// MFE/MAE); the on-demand report lives in diagnostics_cmd.go.
-
-// tradeDiagnosticsRecorder is the package-level hook for eager row inserts,
-// set in main() to stateDB.InsertTradeDiagnostics (nil in subcommands and
-// tests that don't wire it — capture then no-ops).
 var tradeDiagnosticsRecorder func(row *TradeDiagnosticsRow) error
 
-// tradeDiagnosticsEnqueue hands the inserted row to the async metrics worker.
-// nil (e.g. --once teardown races, tests) leaves the row at metrics_status
-// 'pending' — still fully usable by the report, just without MFE/MAE.
 var tradeDiagnosticsEnqueue func(row TradeDiagnosticsRow)
 
-// Metrics status values for trade_diagnostics.metrics_status.
+var tradeDiagnosticsPersistDeferred bool
+
+func suspendEagerDiagnosticsPersist() func() {
+	prev := tradeDiagnosticsPersistDeferred
+	tradeDiagnosticsPersistDeferred = true
+	return func() { tradeDiagnosticsPersistDeferred = prev }
+}
+
 const (
-	diagMetricsPending         = "pending"          // inserted; worker hasn't resolved it yet
-	diagMetricsOK              = "ok"               // MFE/MAE/capture computed from a covered window
-	diagMetricsFetchFailed     = "fetch_failed"     // candle fetch errored
-	diagMetricsNoCandles       = "no_candles"       // fetch returned an empty window
-	diagMetricsWindowUncovered = "window_uncovered" // fetched candles don't reach back to the open (metrics would be biased)
-	diagMetricsNoStrategyMeta  = "no_strategy_meta" // strategy no longer in config; no platform/timeframe to fetch with
-	diagMetricsBadInputs       = "bad_inputs"       // entry price/side unusable
+	diagMetricsPending         = "pending"
+	diagMetricsOK              = "ok"
+	diagMetricsFetchFailed     = "fetch_failed"
+	diagMetricsNoCandles       = "no_candles"
+	diagMetricsWindowUncovered = "window_uncovered"
+	diagMetricsNoStrategyMeta  = "no_strategy_meta"
+	diagMetricsBadInputs       = "bad_inputs"
 )
 
-// TradeDiagnosticsRow is one closed position's diagnostics record.
-// Quality-metric pointers are nil until the worker computes them (NULL in
-// SQLite). LLMVerdict is reserved for #1137 and never written here.
 type TradeDiagnosticsRow struct {
 	RowID           int64
 	StrategyID      string
 	PositionID      string
 	Symbol          string
-	Side            string // "long" / "short"
-	Timeframe       string // stamped by the worker when it resolves the fetch timeframe
+	Side            string
+	Timeframe       string
 	RegimeAtOpen    string
 	CloseReason     string
-	EntryPrice      float64 // blended AvgCost at close (scale-ins blend; RiskAnchorPrice is not used for excursions)
+	EntryPrice      float64
 	ExitPrice       float64
 	Quantity        float64
-	RealizedPnL     float64 // PRE-FEE final-close-leg PnL as passed to recordClosedPosition; report reads NET over all legs via the trades join
+	RealizedPnL     float64
 	EntryATR        float64
 	StopLossATRMult *float64
 	OpenedAt        time.Time
@@ -72,21 +51,28 @@ type TradeDiagnosticsRow struct {
 
 	MFEPrice     *float64
 	MAEPrice     *float64
-	FavorablePct *float64 // max favorable excursion, % of entry
-	AdversePct   *float64 // max adverse excursion, % of entry
-	CaptureRatio *float64 // realized price return / favorable excursion, winners only
+	FavorablePct *float64
+	AdversePct   *float64
+	CaptureRatio *float64
 
 	MetricsStatus string
 	LLMVerdict    *string
+
+	HurstAtOpen   *float64
+	HurstSizeMult *float64
+
+	Scope      PortfolioScope `json:"-"`
+	SourceRole storageRole    `json:"-"`
 }
 
-// captureTradeDiagnostics builds and eagerly persists the diagnostics row for
-// a just-closed position, then queues it for async metric enrichment. Called
-// from recordClosedPosition under the caller's state lock — the insert is a
-// local SQLite write (same cost class as the InsertTrade that already runs on
-// every close path); the OHLCV fetch never happens here.
 func captureTradeDiagnostics(s *StrategyState, pos *Position, closePrice, realizedPnL float64, reason string, closedAt time.Time) {
-	if tradeDiagnosticsRecorder == nil || s == nil || pos == nil {
+	if s == nil || pos == nil {
+		return
+	}
+	if pos.isHedgeLeg() {
+		return
+	}
+	if !tradeDiagnosticsPersistDeferred && tradeDiagnosticsRecorder == nil {
 		return
 	}
 	row := TradeDiagnosticsRow{
@@ -106,6 +92,22 @@ func captureTradeDiagnostics(s *StrategyState, pos *Position, closePrice, realiz
 		ClosedAt:        closedAt,
 		MetricsStatus:   diagMetricsPending,
 	}
+	if pos.LLMVerdict != "" {
+		v := pos.LLMVerdict
+		row.LLMVerdict = &v
+	}
+	if pos.HurstAtOpen > 0 {
+		v := pos.HurstAtOpen
+		row.HurstAtOpen = &v
+	}
+	if pos.HurstSizeMult > 0 {
+		v := pos.HurstSizeMult
+		row.HurstSizeMult = &v
+	}
+	if tradeDiagnosticsPersistDeferred {
+		s.pendingTradeDiagnostics = append(s.pendingTradeDiagnostics, row)
+		return
+	}
 	if err := tradeDiagnosticsRecorder(&row); err != nil {
 		log.Printf("[diagnostics] insert row for %s %s: %v", s.ID, pos.Symbol, err)
 		return
@@ -115,8 +117,6 @@ func captureTradeDiagnostics(s *StrategyState, pos *Position, closePrice, realiz
 	}
 }
 
-// tradeQualityMetrics is the derived quality block computed from hold-window
-// candles.
 type tradeQualityMetrics struct {
 	MFEPrice     float64
 	MAEPrice     float64
@@ -125,23 +125,12 @@ type tradeQualityMetrics struct {
 	CaptureRatio *float64
 }
 
-// computeTradeQuality derives MFE/MAE/capture ratio from hold-window OHLCV.
-//
-// Long:  MFE = best high seen (floored at entry), MAE = worst low (capped at
-// entry). Short: mirrored. Excursions are % of entry price. Capture ratio is
-// the realized price return divided by the favorable excursion, defined only
-// for winning trades with a positive favorable move, clamped to [0, 1] (a
-// fill can beat the candle range on a gap; >1 carries no signal).
-//
-// Single-bar holds work (one candle spanning both open and close) with a
-// known bounded imprecision: intra-bar movement before the actual open fill
-// is included in the excursion.
 func computeTradeQuality(candles []UICandle, side string, entry, exit float64) (tradeQualityMetrics, bool) {
 	if entry <= 0 || len(candles) == 0 {
 		return tradeQualityMetrics{}, false
 	}
-	short := side == "short"    // anything else (incl. legacy empty side) = long/spot
-	best, worst := entry, entry // best = favorable extreme, worst = adverse extreme
+	short := side == "short"
+	best, worst := entry, entry
 	for _, c := range candles {
 		hi, lo := c.High, c.Low
 		if hi <= 0 || lo <= 0 {
@@ -182,8 +171,6 @@ func computeTradeQuality(candles []UICandle, side string, entry, exit float64) (
 	return m, true
 }
 
-// realizedPriceReturnPct is the price-based (pre-fee) return of the round
-// trip in % of entry, sign-adjusted for shorts.
 func realizedPriceReturnPct(side string, entry, exit float64) float64 {
 	if entry <= 0 {
 		return 0
@@ -195,8 +182,6 @@ func realizedPriceReturnPct(side string, entry, exit float64) float64 {
 	return pct
 }
 
-// diagTimeframeDuration parses a candle timeframe token ("1m", "15m", "1h",
-// "4h", "1d", "1w") into a duration. Unknown tokens return false.
 func diagTimeframeDuration(tf string) (time.Duration, bool) {
 	tf = strings.TrimSpace(strings.ToLower(tf))
 	if len(tf) < 2 {
@@ -220,34 +205,27 @@ func diagTimeframeDuration(tf string) (time.Duration, bool) {
 }
 
 const (
-	// diagQueueCap bounds the pending-metrics queue; the enqueue is
-	// non-blocking (it runs under mu) so overflow drops the metric update,
-	// never the row.
-	diagQueueCap = 256
-	// diagMaxFetchBars caps the hold-window candle fetch. Holds needing more
-	// bars than this at the strategy timeframe get metrics_status
-	// window_uncovered rather than silently-truncated (biased) excursions.
-	diagMaxFetchBars = 1500
-	// diagDefaultTimeframe is the fetch timeframe when the strategy config
-	// doesn't resolve one (manual strategies without an explicit timeframe),
-	// matching resolveManualATRTimeframe's 1h default (#1131).
+	diagQueueCap         = 256
+	diagMaxFetchBars     = 1500
 	diagDefaultTimeframe = "1h"
 )
 
-// tradeDiagnosticsWorker fills in quality metrics for captured rows outside
-// mu: resolve the strategy's fetch metadata, fetch hold-window candles via
-// fetch_candles.py (read-only subprocess), compute, and UPDATE the row.
 type tradeDiagnosticsWorker struct {
 	ch chan TradeDiagnosticsRow
 
 	metaMu sync.RWMutex
 	meta   map[string]StrategyConfig
 
-	fetchCandles  func(UICandleRequest) ([]UICandle, string, error)
-	updateMetrics func(rowID int64, timeframe string, m *tradeQualityMetrics, status string) error
+	fetchCandles func(UICandleRequest) ([]UICandle, string, error)
+	// updateMetrics carries the owning scope beside the row identifier: a bare
+	// row identifier cannot choose a file.
+	updateMetrics func(scope PortfolioScope, rowID int64, timeframe string, m *tradeQualityMetrics, status string) error
+
+	// splitStorage marks a layout where an unscoped row cannot be resolved.
+	splitStorage bool
 }
 
-func newTradeDiagnosticsWorker(fetch func(UICandleRequest) ([]UICandle, string, error), update func(int64, string, *tradeQualityMetrics, string) error) *tradeDiagnosticsWorker {
+func newTradeDiagnosticsWorker(fetch func(UICandleRequest) ([]UICandle, string, error), update func(PortfolioScope, int64, string, *tradeQualityMetrics, string) error) *tradeDiagnosticsWorker {
 	return &tradeDiagnosticsWorker{
 		ch:            make(chan TradeDiagnosticsRow, diagQueueCap),
 		meta:          make(map[string]StrategyConfig),
@@ -256,9 +234,6 @@ func newTradeDiagnosticsWorker(fetch func(UICandleRequest) ([]UICandle, string, 
 	}
 }
 
-// UpdateStrategies refreshes the strategy-ID → config snapshot the worker
-// resolves fetch metadata from. Called at startup and after each successful
-// SIGHUP reload; independent of the main state mutex.
 func (w *tradeDiagnosticsWorker) UpdateStrategies(strategies []StrategyConfig) {
 	next := make(map[string]StrategyConfig, len(strategies))
 	for _, sc := range strategies {
@@ -276,9 +251,6 @@ func (w *tradeDiagnosticsWorker) strategyConfig(id string) (StrategyConfig, bool
 	return sc, ok
 }
 
-// Enqueue hands a freshly inserted row to the worker. Non-blocking: it is
-// called under mu, so a full queue drops the metric update (the row stays
-// 'pending') instead of ever stalling a close.
 func (w *tradeDiagnosticsWorker) Enqueue(row TradeDiagnosticsRow) {
 	select {
 	case w.ch <- row:
@@ -287,8 +259,6 @@ func (w *tradeDiagnosticsWorker) Enqueue(row TradeDiagnosticsRow) {
 	}
 }
 
-// run drains the queue until ctx is cancelled (daemon shutdown). In-flight
-// fetches are cancelled by runPythonReadOnly's own shutdown context.
 func (w *tradeDiagnosticsWorker) run(ctx context.Context) {
 	for {
 		select {
@@ -300,12 +270,13 @@ func (w *tradeDiagnosticsWorker) run(ctx context.Context) {
 	}
 }
 
-// process resolves metadata, fetches the hold window, computes metrics, and
-// persists the update. Every failure path downgrades metrics_status and
-// returns — diagnostics never escalate.
 func (w *tradeDiagnosticsWorker) process(row TradeDiagnosticsRow) {
+	if w.splitStorage && row.Scope == scopeUnassigned {
+		log.Printf("[diagnostics] row %d (%s %s) carries no scope; refusing to update before choosing a state file", row.RowID, row.StrategyID, row.Symbol)
+		return
+	}
 	status, tf, metrics := w.computeRowMetrics(row)
-	if err := w.updateMetrics(row.RowID, tf, metrics, status); err != nil {
+	if err := w.updateMetrics(row.Scope, row.RowID, tf, metrics, status); err != nil {
 		log.Printf("[diagnostics] update metrics for row %d (%s %s): %v", row.RowID, row.StrategyID, row.Symbol, err)
 	}
 }
@@ -326,11 +297,6 @@ func (w *tradeDiagnosticsWorker) computeRowMetrics(row TradeDiagnosticsRow) (str
 	if !ok {
 		tfDur, tf = time.Hour, diagDefaultTimeframe
 	}
-	// Stamp the resolved timeframe back onto the local (value-copy) config so
-	// FetchUICandles fetches the same timeframe used for the window/bar math.
-	// Without this, a strategy whose timeframe only defaults here (unset
-	// sc.Timeframe/args, or an unknown token) would fetch at a different — or
-	// empty, hence rejected — timeframe and land in fetch_failed instead of ok.
 	sc.Timeframe = tf
 	from := row.OpenedAt.UTC().Truncate(tfDur)
 	to := row.ClosedAt.UTC()
@@ -342,9 +308,6 @@ func (w *tradeDiagnosticsWorker) computeRowMetrics(row TradeDiagnosticsRow) (str
 		bars = 10
 	}
 	if bars > diagMaxFetchBars {
-		// fetch_candles.py fetches the most recent `limit` bars then filters;
-		// a hold longer than the cap can't be covered back to the open, and a
-		// truncated window would bias MFE/MAE.
 		return diagMetricsWindowUncovered, tf, nil
 	}
 	candles, _, err := w.fetchCandles(UICandleRequest{
@@ -360,8 +323,6 @@ func (w *tradeDiagnosticsWorker) computeRowMetrics(row TradeDiagnosticsRow) (str
 	if len(candles) == 0 {
 		return diagMetricsNoCandles, tf, nil
 	}
-	// Coverage check: the earliest candle must reach back to the open's
-	// bar (within one timeframe of slack for exchange bucketing).
 	first := time.Unix(candles[0].Time, 0).UTC()
 	if first.After(from.Add(tfDur)) {
 		return diagMetricsWindowUncovered, tf, nil

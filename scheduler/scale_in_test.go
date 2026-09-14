@@ -5,7 +5,6 @@ import (
 	"time"
 )
 
-// Scale-in per-position state survives a SaveState/LoadState round-trip (#873).
 func TestScaleInStatePersistsRoundTrip(t *testing.T) {
 	db := openTestDB(t)
 	now := time.Now().UTC().Truncate(time.Nanosecond)
@@ -50,8 +49,6 @@ func TestScaleInStatePersistsRoundTrip(t *testing.T) {
 	}
 }
 
-// A scale_in leg is excluded from the #T open count but the round-trip is still
-// counted and graded (#873).
 func TestScaleInLegExcludedFromOpenCount(t *testing.T) {
 	db := openTestDB(t)
 	now := time.Now().UTC().Truncate(time.Nanosecond)
@@ -83,7 +80,6 @@ func TestScaleInLegExcludedFromOpenCount(t *testing.T) {
 	if got.Wins != 1 {
 		t.Errorf("Wins = %d, want 1 (round-trip still graded)", got.Wins)
 	}
-	// per-strategy variant mirrors the exclusion
 	one, err := db.LifetimeTradeStatsForStrategy("hl-scalein-eth")
 	if err != nil {
 		t.Fatalf("LifetimeTradeStatsForStrategy: %v", err)
@@ -93,11 +89,7 @@ func TestScaleInLegExcludedFromOpenCount(t *testing.T) {
 	}
 }
 
-// After a scale-in the protection re-size force-replaces the SL and already-
-// placed (un-cleared) TP tiers, leaving un-placed tiers for fresh placement and
-// never resetting the cleared-tier watermark (#873).
 func TestScaleInProtectionForceReplace(t *testing.T) {
-	// tier 0 already filled (OID 0, armed), tier 1 still resting (OID > 0).
 	pos := &Position{
 		TPOIDs:                   []int64{0, 555},
 		TPArmedTiers:             []bool{true, true},
@@ -120,15 +112,11 @@ func TestScaleInProtectionForceReplace(t *testing.T) {
 	if !forceTP[1] {
 		t.Errorf("forceTP[1] = false, want true (resting tier must resize to new total)")
 	}
-	// watermark untouched by the force-replace computation
 	if pos.SLAdjustedTiersProcessed != 1 {
 		t.Errorf("watermark mutated: %d, want 1", pos.SLAdjustedTiersProcessed)
 	}
 }
 
-// forceResize makes the trailing-stop walker cancel+replace at the EXISTING
-// trigger even when no trailing move occurred, so a scale-in's grown size gets
-// covered (#873 review finding 2). Without it, the same inputs are a no-op.
 func TestTrailingStopForceResizeReplacesWithoutMove(t *testing.T) {
 	old := runHyperliquidUpdateStopLossFunc
 	defer func() { runHyperliquidUpdateStopLossFunc = old }()
@@ -146,16 +134,13 @@ func TestTrailingStopForceResizeReplacesWithoutMove(t *testing.T) {
 	logger := silentStrategyLogger("hl-test")
 	defer logger.Close()
 
-	// mark==highWater, currentTrigger already at the trailing level → no move.
-	// forceResize=false: no replace.
 	called = false
-	_, result, ok := runHyperliquidTrailingStopUpdate(sc, "ETH", "long", 2.0, &Position{AvgCost: 100}, 100, 100, 97, 111, false, nil, logger)
+	_, result, ok := runHyperliquidTrailingStopUpdate(sc, "ETH", "long", 2.0, &Position{AvgCost: 100}, 100, 100, 97, 111, trailingReplacePolicy{}, nil, logger)
 	if !ok || result != nil || called {
 		t.Fatalf("without force, expected no replace (called=%v result=%+v)", called, result)
 	}
-	// forceResize=true: replace at the existing trigger (97) with the grown size (2.0).
 	called = false
-	_, result, ok = runHyperliquidTrailingStopUpdate(sc, "ETH", "long", 2.0, &Position{AvgCost: 100}, 100, 100, 97, 111, true, nil, logger)
+	_, result, ok = runHyperliquidTrailingStopUpdate(sc, "ETH", "long", 2.0, &Position{AvgCost: 100}, 100, 100, 97, 111, trailingReplacePolicy{forceResize: true}, nil, logger)
 	if !ok || result == nil || !called {
 		t.Fatalf("with force, expected a replace (called=%v result=%+v ok=%v)", called, result, ok)
 	}
@@ -183,8 +168,6 @@ func TestOrForceReplace(t *testing.T) {
 	}
 }
 
-// applyManualAction "add" blends a manual scale-in and records a scale_in leg;
-// it refuses when no position is open (#873).
 func TestApplyManualActionAddBlendsAndRecords(t *testing.T) {
 	now := time.Now().UTC()
 	ss := &StrategyState{
@@ -203,14 +186,14 @@ func TestApplyManualActionAddBlendsAndRecords(t *testing.T) {
 		StrategyID: "hl-manual-eth", Action: "add", Symbol: "ETH", Side: "long",
 		Quantity: 1, FillPrice: 2200, FillFee: 1.5, CreatedAt: now,
 	}
-	if err := applyManualAction(state, scByID, add); err != nil {
+	if err := applyManualAction(state, nil, scByID, add); err != nil {
 		t.Fatalf("applyManualAction add: %v", err)
 	}
 	pos := ss.Positions["ETH"]
 	if !approxEq(pos.Quantity, 2) || !approxEq(pos.InitialQuantity, 2) {
 		t.Errorf("qty/initial = %v/%v, want 2/2", pos.Quantity, pos.InitialQuantity)
 	}
-	if !approxEq(pos.AvgCost, 2100) { // (2000+2200)/2
+	if !approxEq(pos.AvgCost, 2100) {
 		t.Errorf("AvgCost = %v, want 2100", pos.AvgCost)
 	}
 	if pos.ScaleInCount != 1 {
@@ -219,7 +202,7 @@ func TestApplyManualActionAddBlendsAndRecords(t *testing.T) {
 	if pos.EntryATR != 50 || pos.Regime != "trending" {
 		t.Errorf("frozen fields moved: EntryATR=%v Regime=%q", pos.EntryATR, pos.Regime)
 	}
-	if !approxEq(ss.Cash, 998.5) { // 1000 - fee 1.5
+	if !approxEq(ss.Cash, 998.5) {
 		t.Errorf("Cash = %v, want 998.5", ss.Cash)
 	}
 	var found bool
@@ -235,16 +218,14 @@ func TestApplyManualActionAddBlendsAndRecords(t *testing.T) {
 		t.Errorf("no scale_in trade leg recorded")
 	}
 
-	// refuse when flat
 	flat := &StrategyState{ID: "hl-manual-eth", Type: "manual", Positions: map[string]*Position{}, OptionPositions: map[string]*OptionPosition{}}
 	state2 := &AppState{Strategies: map[string]*StrategyState{"hl-manual-eth": flat}}
-	if err := applyManualAction(state2, scByID, add); err == nil {
+	if err := applyManualAction(state2, nil, scByID, add); err == nil {
 		t.Errorf("expected error adding to a flat strategy")
 	}
 }
 
-// allow_scale_in is rejected outside HL perps/manual (#873).
-func TestValidateConfigRejectsScaleInOffPlatform(t *testing.T) {
+func TestConfigValidationRejectsScaleInOffPlatform(t *testing.T) {
 	cfg := &Config{
 		Strategies: []StrategyConfig{
 			{ID: "spot-x", Type: "spot", Platform: "binanceus", Script: "s.py", AllowScaleIn: true},
@@ -256,8 +237,6 @@ func TestValidateConfigRejectsScaleInOffPlatform(t *testing.T) {
 	}
 }
 
-// applyScaleIn blends price+size into an existing position while freezing the
-// risk plan (#873).
 func TestApplyScaleInBlendsPriceAndSizeFreezesRiskPlan(t *testing.T) {
 	mult := 1.5
 	pos := &Position{
@@ -275,14 +254,12 @@ func TestApplyScaleInBlendsPriceAndSizeFreezesRiskPlan(t *testing.T) {
 	}
 	applyScaleIn(pos, 100, 2200)
 
-	// blended average: (100*2000 + 100*2200)/200 = 2100
 	if !approxEq(pos.AvgCost, 2100) {
 		t.Fatalf("AvgCost = %v, want 2100", pos.AvgCost)
 	}
 	if !approxEq(pos.Quantity, 200) {
 		t.Fatalf("Quantity = %v, want 200", pos.Quantity)
 	}
-	// InitialQuantity grows so Quantity < InitialQuantity stays the partial-close test
 	if !approxEq(pos.InitialQuantity, 200) {
 		t.Fatalf("InitialQuantity = %v, want 200", pos.InitialQuantity)
 	}
@@ -298,7 +275,6 @@ func TestApplyScaleInBlendsPriceAndSizeFreezesRiskPlan(t *testing.T) {
 	if !pos.ScaleInResizePending {
 		t.Fatalf("ScaleInResizePending = false, want true")
 	}
-	// frozen
 	if !approxEq(pos.EntryATR, 50) {
 		t.Fatalf("EntryATR moved: %v, want 50 (frozen)", pos.EntryATR)
 	}
@@ -315,15 +291,14 @@ func TestApplyScaleInBlendsPriceAndSizeFreezesRiskPlan(t *testing.T) {
 
 func TestApplyScaleInMultipleAddsAccumulate(t *testing.T) {
 	pos := &Position{Side: "short", Quantity: 10, InitialQuantity: 10, AvgCost: 100}
-	applyScaleIn(pos, 10, 90)  // added 900
-	applyScaleIn(pos, 10, 110) // added 1100
+	applyScaleIn(pos, 10, 90)
+	applyScaleIn(pos, 10, 110)
 	if pos.ScaleInCount != 2 {
 		t.Fatalf("ScaleInCount = %d, want 2", pos.ScaleInCount)
 	}
 	if !approxEq(pos.Quantity, 30) || !approxEq(pos.InitialQuantity, 30) {
 		t.Fatalf("Quantity/InitialQuantity = %v/%v, want 30/30", pos.Quantity, pos.InitialQuantity)
 	}
-	// (10*100 + 10*90 + 10*110)/30 = 100
 	if !approxEq(pos.AvgCost, 100) {
 		t.Fatalf("AvgCost = %v, want 100", pos.AvgCost)
 	}
@@ -335,19 +310,16 @@ func TestApplyScaleInMultipleAddsAccumulate(t *testing.T) {
 	}
 }
 
-// applyScaleIn stamps a frozen risk anchor (= the AvgCost at first add, which is
-// the original entry) so on-chain SL/TP triggers stay pinned to the first entry
-// even though the blended AvgCost drives PnL (#873 review finding 1).
 func TestApplyScaleInStampsFrozenRiskAnchor(t *testing.T) {
 	pos := &Position{Side: "long", Quantity: 100, InitialQuantity: 100, AvgCost: 2000}
-	applyScaleIn(pos, 100, 2200) // blend → AvgCost 2100
+	applyScaleIn(pos, 100, 2200)
 	if !approxEq(pos.RiskAnchorPrice, 2000) {
 		t.Fatalf("RiskAnchorPrice = %v, want 2000 (original entry frozen)", pos.RiskAnchorPrice)
 	}
 	if !approxEq(pos.AvgCost, 2100) {
 		t.Fatalf("AvgCost = %v, want 2100 (blended for PnL)", pos.AvgCost)
 	}
-	applyScaleIn(pos, 200, 2400) // second add must NOT move the anchor
+	applyScaleIn(pos, 200, 2400)
 	if !approxEq(pos.RiskAnchorPrice, 2000) {
 		t.Fatalf("RiskAnchorPrice moved on second add: %v, want 2000", pos.RiskAnchorPrice)
 	}
@@ -356,8 +328,6 @@ func TestApplyScaleInStampsFrozenRiskAnchor(t *testing.T) {
 	}
 }
 
-// A position that never scaled in falls back to AvgCost for the risk anchor, so
-// trigger geometry is unchanged for the common case (#873).
 func TestRiskAnchorPriceFallsBackToAvgCost(t *testing.T) {
 	pos := &Position{AvgCost: 1500}
 	if !approxEq(pos.riskAnchorPrice(), 1500) {
@@ -365,9 +335,6 @@ func TestRiskAnchorPriceFallsBackToAvgCost(t *testing.T) {
 	}
 }
 
-// The protection plan computes SL/TP triggers from the frozen risk anchor, not
-// the blended AvgCost — so a forced re-size after a scale-in keeps triggers at
-// the original entry (#873 review finding 1).
 func TestProtectionPlanFreezesTriggersAtRiskAnchor(t *testing.T) {
 	mult := 1.5
 	pos := &Position{
@@ -375,7 +342,7 @@ func TestProtectionPlanFreezesTriggersAtRiskAnchor(t *testing.T) {
 		AvgCost: 2100, RiskAnchorPrice: 2000, EntryATR: 50, StopLossATRMult: &mult,
 	}
 	sc := StrategyConfig{Type: "perps", Platform: "hyperliquid", StopLossATRMult: &mult}
-	plan, ok := buildHyperliquidProtectionPlan(sc, pos)
+	plan, ok := buildHyperliquidProtectionPlan(sc, pos, 0)
 	if !ok {
 		t.Fatalf("expected a protection plan")
 	}
@@ -391,146 +358,87 @@ func longSnap() scaleInSnapshot {
 	return scaleInSnapshot{Side: "long", Quantity: 100, AvgCost: 2000, EntryATR: 50, LastAddPrice: 2000}
 }
 
-func TestPerpsScaleInDecisionRequiresOptIn(t *testing.T) {
-	sc := StrategyConfig{AllowScaleIn: false}
-	if _, ok, _ := perpsScaleInDecision(sc, longSnap(), 1, 2000, 1000); ok {
-		t.Fatalf("scale-in allowed with AllowScaleIn=false")
+func TestPerpsScaleInDecision(t *testing.T) {
+	shortSnap := func() scaleInSnapshot {
+		return scaleInSnapshot{Side: "short", Quantity: 100, AvgCost: 2000, EntryATR: 50, LastAddPrice: 2000}
+	}
+	withSnap := func(mut func(*scaleInSnapshot)) scaleInSnapshot {
+		s := longSnap()
+		mut(&s)
+		return s
+	}
+
+	cases := []struct {
+		name     string
+		sc       StrategyConfig
+		snap     scaleInSnapshot
+		signal   int
+		price    float64
+		notional float64
+		wantOK   bool
+		wantQty  *float64
+	}{
+		{name: "opt-in required", sc: StrategyConfig{AllowScaleIn: false}, snap: longSnap(), signal: 1, price: 2000, notional: 1000},
+
+		{name: "buy on long adds", sc: StrategyConfig{AllowScaleIn: true}, snap: longSnap(), signal: 1, price: 2000, notional: 1000, wantOK: true},
+		{name: "sell on long does not add", sc: StrategyConfig{AllowScaleIn: true}, snap: longSnap(), signal: -1, price: 2000, notional: 1000},
+		{name: "buy on short does not add", sc: StrategyConfig{AllowScaleIn: true}, snap: shortSnap(), signal: 1, price: 2000, notional: 1000},
+		{name: "sell on short adds", sc: StrategyConfig{AllowScaleIn: true}, snap: shortSnap(), signal: -1, price: 2000, notional: 1000, wantOK: true},
+		{name: "add from flat is rejected", sc: StrategyConfig{AllowScaleIn: true}, snap: scaleInSnapshot{Side: "", Quantity: 0}, signal: 1, price: 2000, notional: 1000},
+
+		{name: "at max_adds", sc: StrategyConfig{AllowScaleIn: true, ScaleIn: &ScaleInConfig{MaxAdds: 2}},
+			snap: withSnap(func(s *scaleInSnapshot) { s.ScaleInCount = 2 }), signal: 1, price: 2000, notional: 1000},
+		{name: "under max_adds", sc: StrategyConfig{AllowScaleIn: true, ScaleIn: &ScaleInConfig{MaxAdds: 2}},
+			snap: withSnap(func(s *scaleInSnapshot) { s.ScaleInCount = 1 }), signal: 1, price: 2000, notional: 1000, wantOK: true},
+
+		{name: "past max_added_notional", sc: StrategyConfig{AllowScaleIn: true, ScaleIn: &ScaleInConfig{MaxAddedNotionalUSD: 1500}},
+			snap: withSnap(func(s *scaleInSnapshot) { s.AddedNotionalUSD = 1000 }), signal: 1, price: 2000, notional: 1000},
+		{name: "under max_added_notional", sc: StrategyConfig{AllowScaleIn: true, ScaleIn: &ScaleInConfig{MaxAddedNotionalUSD: 1500}},
+			snap: withSnap(func(s *scaleInSnapshot) { s.AddedNotionalUSD = 1000 }), signal: 1, price: 2000, notional: 400, wantOK: true},
+
+		{name: "long add-to-winners before the spacing distance", sc: StrategyConfig{AllowScaleIn: true, ScaleIn: &ScaleInConfig{AddSpacingATR: 1.0}},
+			snap: longSnap(), signal: 1, price: 2049, notional: 1000},
+		{name: "long add-to-winners past the spacing distance", sc: StrategyConfig{AllowScaleIn: true, ScaleIn: &ScaleInConfig{AddSpacingATR: 1.0}},
+			snap: longSnap(), signal: 1, price: 2051, notional: 1000, wantOK: true},
+		{name: "long add-to-winners on an adverse move", sc: StrategyConfig{AllowScaleIn: true, ScaleIn: &ScaleInConfig{AddSpacingATR: 1.0}},
+			snap: longSnap(), signal: 1, price: 1900, notional: 1000},
+
+		{name: "long average-down before the adverse distance", sc: StrategyConfig{AllowScaleIn: true, ScaleIn: &ScaleInConfig{AddSpacingATR: -1.0}},
+			snap: longSnap(), signal: 1, price: 1951, notional: 1000},
+		{name: "long average-down past the adverse distance", sc: StrategyConfig{AllowScaleIn: true, ScaleIn: &ScaleInConfig{AddSpacingATR: -1.0}},
+			snap: longSnap(), signal: 1, price: 1949, notional: 1000, wantOK: true},
+		{name: "long average-down on a favorable move", sc: StrategyConfig{AllowScaleIn: true, ScaleIn: &ScaleInConfig{AddSpacingATR: -1.0}},
+			snap: longSnap(), signal: 1, price: 2100, notional: 1000},
+
+		{name: "short add-to-winners on a favorable (down) move", sc: StrategyConfig{AllowScaleIn: true, ScaleIn: &ScaleInConfig{AddSpacingATR: 1.0}},
+			snap: shortSnap(), signal: -1, price: 1949, notional: 1000, wantOK: true},
+		{name: "short add-to-winners on an adverse (up) move", sc: StrategyConfig{AllowScaleIn: true, ScaleIn: &ScaleInConfig{AddSpacingATR: 1.0}},
+			snap: shortSnap(), signal: -1, price: 2100, notional: 1000},
+
+		{name: "zero spacing does not gate", sc: StrategyConfig{AllowScaleIn: true, ScaleIn: &ScaleInConfig{AddSpacingATR: 0}},
+			snap: longSnap(), signal: 1, price: 2000, notional: 1000, wantOK: true},
+		{name: "spacing measures from AvgCost when LastAddPrice is unset", sc: StrategyConfig{AllowScaleIn: true, ScaleIn: &ScaleInConfig{AddSpacingATR: 1.0}},
+			snap: withSnap(func(s *scaleInSnapshot) { s.LastAddPrice = 0 }), signal: 1, price: 2051, notional: 1000, wantOK: true},
+		{name: "spacing gate rejects a missing EntryATR", sc: StrategyConfig{AllowScaleIn: true, ScaleIn: &ScaleInConfig{AddSpacingATR: 1.0}},
+			snap: withSnap(func(s *scaleInSnapshot) { s.EntryATR = 0 }), signal: 1, price: 5000, notional: 1000},
+
+		{name: "default add notional sizes the leg", sc: StrategyConfig{AllowScaleIn: true},
+			snap: longSnap(), signal: 1, price: 2000, notional: 1000, wantOK: true, wantQty: scaleInQtyPtr(0.5)},
+		{name: "override add notional sizes the leg", sc: StrategyConfig{AllowScaleIn: true, ScaleIn: &ScaleInConfig{AddNotionalUSD: 4000}},
+			snap: longSnap(), signal: 1, price: 2000, notional: 1000, wantOK: true, wantQty: scaleInQtyPtr(2.0)},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			addQty, ok, reason := perpsScaleInDecision(tc.sc, tc.snap, tc.signal, tc.price, tc.notional)
+			if ok != tc.wantOK {
+				t.Fatalf("ok = %v, want %v (reason=%q)", ok, tc.wantOK, reason)
+			}
+			if tc.wantQty != nil && !approxEq(addQty, *tc.wantQty) {
+				t.Fatalf("addQty = %v, want %v", addQty, *tc.wantQty)
+			}
+		})
 	}
 }
 
-func TestPerpsScaleInDecisionDirectionMatch(t *testing.T) {
-	sc := StrategyConfig{AllowScaleIn: true}
-	// buy on a long → add
-	if _, ok, _ := perpsScaleInDecision(sc, longSnap(), 1, 2000, 1000); !ok {
-		t.Fatalf("buy on long should add")
-	}
-	// sell on a long → not an add (that's a close)
-	if _, ok, _ := perpsScaleInDecision(sc, longSnap(), -1, 2000, 1000); ok {
-		t.Fatalf("sell on long should NOT add")
-	}
-	// buy on a short → not an add (that's a cover/flip)
-	short := scaleInSnapshot{Side: "short", Quantity: 100, AvgCost: 2000, EntryATR: 50, LastAddPrice: 2000}
-	if _, ok, _ := perpsScaleInDecision(sc, short, 1, 2000, 1000); ok {
-		t.Fatalf("buy on short should NOT add")
-	}
-	// sell on a short → add
-	if _, ok, _ := perpsScaleInDecision(sc, short, -1, 2000, 1000); !ok {
-		t.Fatalf("sell on short should add")
-	}
-	// flat → not an add
-	flat := scaleInSnapshot{Side: "", Quantity: 0}
-	if _, ok, _ := perpsScaleInDecision(sc, flat, 1, 2000, 1000); ok {
-		t.Fatalf("add from flat should be rejected")
-	}
-}
-
-func TestPerpsScaleInDecisionMaxAdds(t *testing.T) {
-	sc := StrategyConfig{AllowScaleIn: true, ScaleIn: &ScaleInConfig{MaxAdds: 2}}
-	snap := longSnap()
-	snap.ScaleInCount = 2
-	if _, ok, reason := perpsScaleInDecision(sc, snap, 1, 2000, 1000); ok {
-		t.Fatalf("add past max_adds allowed (reason=%q)", reason)
-	}
-	snap.ScaleInCount = 1
-	if _, ok, _ := perpsScaleInDecision(sc, snap, 1, 2000, 1000); !ok {
-		t.Fatalf("add under max_adds rejected")
-	}
-}
-
-func TestPerpsScaleInDecisionMaxAddedNotional(t *testing.T) {
-	sc := StrategyConfig{AllowScaleIn: true, ScaleIn: &ScaleInConfig{MaxAddedNotionalUSD: 1500}}
-	snap := longSnap()
-	snap.AddedNotionalUSD = 1000
-	// next add of 1000 would push cumulative to 2000 > 1500
-	if _, ok, _ := perpsScaleInDecision(sc, snap, 1, 2000, 1000); ok {
-		t.Fatalf("add past max_added_notional allowed")
-	}
-	// add of 400 → cumulative 1400 ≤ 1500
-	if _, ok, _ := perpsScaleInDecision(sc, snap, 1, 2000, 400); !ok {
-		t.Fatalf("add under max_added_notional rejected")
-	}
-}
-
-func TestPerpsScaleInDecisionSpacingAddToWinnersLong(t *testing.T) {
-	sc := StrategyConfig{AllowScaleIn: true, ScaleIn: &ScaleInConfig{AddSpacingATR: 1.0}}
-	snap := longSnap() // EntryATR 50, LastAddPrice 2000; need +50 in-favor
-	// price 2049 → +49 < 50 → blocked
-	if _, ok, _ := perpsScaleInDecision(sc, snap, 1, 2049, 1000); ok {
-		t.Fatalf("add allowed before reaching spacing distance")
-	}
-	// price 2051 → +51 ≥ 50 → allowed
-	if _, ok, _ := perpsScaleInDecision(sc, snap, 1, 2051, 1000); !ok {
-		t.Fatalf("add blocked after reaching spacing distance")
-	}
-	// adverse move blocks add-to-winners
-	if _, ok, _ := perpsScaleInDecision(sc, snap, 1, 1900, 1000); ok {
-		t.Fatalf("add-to-winners allowed on adverse move")
-	}
-}
-
-func TestPerpsScaleInDecisionSpacingAverageDownLong(t *testing.T) {
-	sc := StrategyConfig{AllowScaleIn: true, ScaleIn: &ScaleInConfig{AddSpacingATR: -1.0}}
-	snap := longSnap() // need -50 adverse (price down 50)
-	if _, ok, _ := perpsScaleInDecision(sc, snap, 1, 1951, 1000); ok {
-		t.Fatalf("average-down allowed before reaching adverse distance")
-	}
-	if _, ok, _ := perpsScaleInDecision(sc, snap, 1, 1949, 1000); !ok {
-		t.Fatalf("average-down blocked after reaching adverse distance")
-	}
-	// favorable move blocks average-down
-	if _, ok, _ := perpsScaleInDecision(sc, snap, 1, 2100, 1000); ok {
-		t.Fatalf("average-down allowed on favorable move")
-	}
-}
-
-func TestPerpsScaleInDecisionSpacingShort(t *testing.T) {
-	// short add-to-winners: price must move DOWN (in-favor for short)
-	sc := StrategyConfig{AllowScaleIn: true, ScaleIn: &ScaleInConfig{AddSpacingATR: 1.0}}
-	snap := scaleInSnapshot{Side: "short", Quantity: 100, AvgCost: 2000, EntryATR: 50, LastAddPrice: 2000}
-	if _, ok, _ := perpsScaleInDecision(sc, snap, -1, 1949, 1000); !ok {
-		t.Fatalf("short add-to-winners blocked on favorable (down) move")
-	}
-	if _, ok, _ := perpsScaleInDecision(sc, snap, -1, 2100, 1000); ok {
-		t.Fatalf("short add-to-winners allowed on adverse (up) move")
-	}
-}
-
-func TestPerpsScaleInDecisionSpacingZeroNoGate(t *testing.T) {
-	sc := StrategyConfig{AllowScaleIn: true, ScaleIn: &ScaleInConfig{AddSpacingATR: 0}}
-	if _, ok, _ := perpsScaleInDecision(sc, longSnap(), 1, 2000, 1000); !ok {
-		t.Fatalf("zero spacing should not gate an add")
-	}
-}
-
-func TestPerpsScaleInDecisionLastAddPriceFallsBackToAvgCost(t *testing.T) {
-	sc := StrategyConfig{AllowScaleIn: true, ScaleIn: &ScaleInConfig{AddSpacingATR: 1.0}}
-	snap := longSnap()
-	snap.LastAddPrice = 0 // pre-#873 position; fall back to AvgCost 2000
-	if _, ok, _ := perpsScaleInDecision(sc, snap, 1, 2051, 1000); !ok {
-		t.Fatalf("spacing should measure from AvgCost when LastAddPrice unset")
-	}
-}
-
-func TestPerpsScaleInDecisionAddQtySizing(t *testing.T) {
-	// default notional (config AddNotionalUSD unset) → use the passed default
-	sc := StrategyConfig{AllowScaleIn: true}
-	addQty, ok, _ := perpsScaleInDecision(sc, longSnap(), 1, 2000, 1000)
-	if !ok || !approxEq(addQty, 0.5) {
-		t.Fatalf("addQty = %v ok=%v, want 0.5 from default notional 1000/2000", addQty, ok)
-	}
-	// explicit AddNotionalUSD overrides the default
-	sc2 := StrategyConfig{AllowScaleIn: true, ScaleIn: &ScaleInConfig{AddNotionalUSD: 4000}}
-	addQty2, ok2, _ := perpsScaleInDecision(sc2, longSnap(), 1, 2000, 1000)
-	if !ok2 || !approxEq(addQty2, 2.0) {
-		t.Fatalf("addQty = %v ok=%v, want 2.0 from override notional 4000/2000", addQty2, ok2)
-	}
-}
-
-func TestPerpsScaleInDecisionSpacingNeedsEntryATR(t *testing.T) {
-	sc := StrategyConfig{AllowScaleIn: true, ScaleIn: &ScaleInConfig{AddSpacingATR: 1.0}}
-	snap := longSnap()
-	snap.EntryATR = 0 // can't evaluate spacing
-	if _, ok, _ := perpsScaleInDecision(sc, snap, 1, 5000, 1000); ok {
-		t.Fatalf("spacing gate should reject when EntryATR is unavailable")
-	}
-}
+func scaleInQtyPtr(v float64) *float64 { return &v }

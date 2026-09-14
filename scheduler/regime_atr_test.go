@@ -10,7 +10,7 @@ import (
 
 func TestParseRegimeATRBlock_UseDefaultsExpandsToBaseline(t *testing.T) {
 	raw := map[string]interface{}{"use_defaults": true}
-	got, errs := parseRegimeATRBlock(raw, "stop_loss_atr_regime", regimeSurfaceStopLoss, canonicalTrendRegimeLabels)
+	got, errs := parseRegimeATRBlock(raw, "stop_loss_atr_mult_regime", regimeSurfaceStopLoss, canonicalTrendRegimeLabels)
 	if len(errs) > 0 {
 		t.Fatalf("unexpected errors: %v", errs)
 	}
@@ -26,24 +26,21 @@ func TestParseRegimeATRBlock_UseDefaultsExpandsToBaseline(t *testing.T) {
 			t.Fatalf("default %s.atr must be > 0, got %g", label, entry.ATR)
 		}
 	}
-	// ranging should differ from trending_up per baseline table.
 	if got.TrendRegime["ranging"].ATR == got.TrendRegime["trending_up"].ATR {
 		t.Fatalf("ranging should differ from trending_up in stop_loss defaults")
 	}
 }
 
 func TestParseRegimeATRBlock_RejectsBareLabelKeys(t *testing.T) {
-	// Bare labels without the trend_regime wrapper must be rejected.
 	raw := map[string]interface{}{
 		"trending_up":   map[string]interface{}{"atr_multiple": 2.0},
 		"trending_down": map[string]interface{}{"atr_multiple": 2.0},
 		"ranging":       map[string]interface{}{"atr_multiple": 1.5},
 	}
-	_, errs := parseRegimeATRBlock(raw, "stop_loss_atr_regime", regimeSurfaceStopLoss, canonicalTrendRegimeLabels)
+	_, errs := parseRegimeATRBlock(raw, "stop_loss_atr_mult_regime", regimeSurfaceStopLoss, canonicalTrendRegimeLabels)
 	if len(errs) == 0 {
 		t.Fatalf("expected errors for bare label keys")
 	}
-	// At least one error should mention the classifier wrapper.
 	found := false
 	for _, e := range errs {
 		if strings.Contains(e, regimeClassifierKey) || strings.Contains(e, "unknown key") {
@@ -63,7 +60,7 @@ func TestParseRegimeATRBlock_RequiresExhaustiveLabels(t *testing.T) {
 			"ranging":     map[string]interface{}{"atr_multiple": 1.5},
 		},
 	}
-	_, errs := parseRegimeATRBlock(raw, "stop_loss_atr_regime", regimeSurfaceStopLoss, canonicalTrendRegimeLabels)
+	_, errs := parseRegimeATRBlock(raw, "stop_loss_atr_mult_regime", regimeSurfaceStopLoss, canonicalTrendRegimeLabels)
 	if len(errs) == 0 {
 		t.Fatalf("expected missing-label error")
 	}
@@ -87,7 +84,7 @@ func TestParseRegimeATRBlock_RejectsUseDefaultsAndExplicit(t *testing.T) {
 			"ranging":       map[string]interface{}{"atr_multiple": 1.5},
 		},
 	}
-	_, errs := parseRegimeATRBlock(raw, "stop_loss_atr_regime", regimeSurfaceStopLoss, canonicalTrendRegimeLabels)
+	_, errs := parseRegimeATRBlock(raw, "stop_loss_atr_mult_regime", regimeSurfaceStopLoss, canonicalTrendRegimeLabels)
 	if len(errs) == 0 {
 		t.Fatalf("expected mutex error")
 	}
@@ -101,7 +98,7 @@ func TestParseRegimeATRBlock_RejectsCloseFractionOnStopLossSurface(t *testing.T)
 			"ranging":       map[string]interface{}{"atr_multiple": 1.5},
 		},
 	}
-	_, errs := parseRegimeATRBlock(raw, "stop_loss_atr_regime", regimeSurfaceStopLoss, canonicalTrendRegimeLabels)
+	_, errs := parseRegimeATRBlock(raw, "stop_loss_atr_mult_regime", regimeSurfaceStopLoss, canonicalTrendRegimeLabels)
 	if len(errs) == 0 {
 		t.Fatalf("expected error for close_fraction on stop_loss surface")
 	}
@@ -142,15 +139,14 @@ func TestResolveRegimeATR_ReturnsLabeledMultiplier(t *testing.T) {
 }
 
 func TestDefaultRegimeTPTiersForRegime(t *testing.T) {
-	// #870: per-group ragged ladders (ranging=2, choppy=3, clean=4 tiers).
 	cases := []struct {
 		regime    string
 		wantMults []float64
 	}{
 		{"ranging", []float64{0.5, 1.0}},
 		{"ranging_quiet", []float64{0.5, 1.0}},
-		{"trending_up", []float64{1.5, 3.0, 5.0}},          // ADX trend → choppy group
-		{"trending_down_choppy", []float64{1.5, 3.0, 5.0}}, // composite choppy
+		{"trending_up", []float64{1.5, 3.0, 5.0}},
+		{"trending_down_choppy", []float64{1.5, 3.0, 5.0}},
 		{"trending_up_clean", []float64{2.5, 4.0, 5.5, 7.0}},
 	}
 	for _, tc := range cases {
@@ -195,7 +191,6 @@ func TestStrategyTPTiersForRegime_RegimeAwareNeedsRegime(t *testing.T) {
 		Platform:      "hyperliquid",
 		CloseStrategy: &StrategyRef{Name: "tiered_tp_atr_regime", Params: map[string]interface{}{"use_defaults": true}},
 	}
-	// Empty regime → nil so the protection loop defers TP placement.
 	if tiers := strategyTPTiersForRegime(sc, ""); len(tiers) != 0 {
 		t.Fatalf("regime-aware without pos.Regime must return nil, got %v", tiers)
 	}
@@ -217,7 +212,7 @@ func TestRegimeATRBlock_UnmarshalThenResolveSurface(t *testing.T) {
 	if !b.IsZero() {
 		t.Fatalf("block must look zero until ResolveSurface is called")
 	}
-	errs := b.ResolveSurface("test.stop_loss_atr_regime", regimeSurfaceStopLoss)
+	errs := b.ResolveSurface("test.stop_loss_atr_mult_regime", regimeSurfaceStopLoss)
 	if len(errs) > 0 {
 		t.Fatalf("ResolveSurface errors: %v", errs)
 	}
@@ -266,7 +261,7 @@ func TestValidateRegimeATRConfig_RequiresRegimeEnabled(t *testing.T) {
 				ID:       "test",
 				Type:     "perps",
 				Platform: "hyperliquid",
-				StopLossATRRegime: &RegimeATRBlock{
+				StopLossATRMultRegime: &RegimeATRBlock{
 					raw: map[string]interface{}{"use_defaults": true},
 				},
 			},
@@ -284,12 +279,6 @@ func TestValidateRegimeATRConfig_RequiresRegimeEnabled(t *testing.T) {
 	}
 }
 
-// TestLoadConfig_RegimeBlockSkipsDefaultStopLossATRMult is the regression
-// test for review #735.1 — a config that opts into stop_loss_atr_regime
-// must NOT also receive the scalar auto-default StopLossATRMult, because
-// validateRegimeATRConfig would then fire a false mutex error. The fix
-// gates the default loop on IsConfigured() (which is raw-aware) instead
-// of IsZero() (which only knows the resolved fields).
 func TestLoadConfig_RegimeBlockSkipsDefaultStopLossATRMult(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.json")
@@ -306,7 +295,7 @@ func TestLoadConfig_RegimeBlockSkipsDefaultStopLossATRMult(t *testing.T) {
 			"capital": 1000,
 			"max_drawdown_pct": 25,
 			"leverage": 1,
-			"stop_loss_atr_regime": {"use_defaults": true}
+			"stop_loss_atr_mult_regime": {"use_defaults": true}
 		}]
 	}`
 	if err := os.WriteFile(cfgPath, []byte(cfgBody), 0644); err != nil {
@@ -321,27 +310,23 @@ func TestLoadConfig_RegimeBlockSkipsDefaultStopLossATRMult(t *testing.T) {
 	}
 	sc := cfg.Strategies[0]
 	if sc.StopLossATRMult != nil {
-		t.Fatalf("scalar stop_loss_atr_mult must remain nil when stop_loss_atr_regime is configured, got %v", *sc.StopLossATRMult)
+		t.Fatalf("scalar stop_loss_atr_mult must remain nil when stop_loss_atr_mult_regime is configured, got %v", *sc.StopLossATRMult)
 	}
-	if sc.StopLossATRRegime == nil || sc.StopLossATRRegime.IsZero() {
-		t.Fatalf("stop_loss_atr_regime must be populated post-ResolveSurface")
+	if sc.StopLossATRMultRegime == nil || sc.StopLossATRMultRegime.IsZero() {
+		t.Fatalf("stop_loss_atr_mult_regime must be populated post-ResolveSurface")
 	}
-	if !sc.StopLossATRRegime.UseDefaults {
+	if !sc.StopLossATRMultRegime.UseDefaults {
 		t.Fatalf("UseDefaults flag must be true after expansion")
 	}
 }
 
-// TestValidateHotReloadStateCompatible_BlocksRegimeShapeChangeWhileOpen
-// covers review #735.4 — flipping scalar↔regime, or mutating the regime
-// shape itself, must be rejected when a position is open so the resting
-// on-chain trigger isn't orphaned under a new distance regime.
 func TestValidateHotReloadStateCompatible_BlocksRegimeShapeChangeWhileOpen(t *testing.T) {
 	mkOld := func() StrategyConfig {
 		return StrategyConfig{
 			ID:       "hl-test",
 			Type:     "perps",
 			Platform: "hyperliquid",
-			StopLossATRRegime: &RegimeATRBlock{
+			StopLossATRMultRegime: &RegimeATRBlock{
 				UseDefaults: true,
 				TrendRegime: cloneRegimeMap(regimeATRDefaults.StopLoss),
 				raw:         map[string]interface{}{"use_defaults": true},
@@ -366,23 +351,20 @@ func TestValidateHotReloadStateCompatible_BlocksRegimeShapeChangeWhileOpen(t *te
 	mkCfg := func(sc StrategyConfig) *Config {
 		return &Config{Strategies: []StrategyConfig{sc}}
 	}
-	// Scalar↔regime mode flip with open position: REJECTED.
 	old := mkOld()
 	mult := 2.0
 	ns := old
-	ns.StopLossATRRegime = nil
+	ns.StopLossATRMultRegime = nil
 	ns.StopLossATRMult = &mult
 	err := validateHotReloadStateCompatible(mkCfg(old), mkCfg(ns), openState)
-	if err == nil || !strings.Contains(err.Error(), "stop_loss_atr_regime mode changed") {
+	if err == nil || !strings.Contains(err.Error(), "stop_loss_atr_mult_regime mode changed") {
 		t.Fatalf("expected mode-change rejection with open position, got: %v", err)
 	}
-	// Same flip while flat: ACCEPTED.
 	if err := validateHotReloadStateCompatible(mkCfg(old), mkCfg(ns), flatState); err != nil {
 		t.Fatalf("flat-position hot reload should be accepted, got: %v", err)
 	}
-	// Shape change (use_defaults → explicit values) with open position: REJECTED.
 	ns2 := mkOld()
-	ns2.StopLossATRRegime = &RegimeATRBlock{
+	ns2.StopLossATRMultRegime = &RegimeATRBlock{
 		TrendRegime: map[string]RegimeATREntry{
 			"trending_up":   {ATR: 3.0},
 			"trending_down": {ATR: 3.0},
@@ -391,14 +373,12 @@ func TestValidateHotReloadStateCompatible_BlocksRegimeShapeChangeWhileOpen(t *te
 		raw: map[string]interface{}{},
 	}
 	err = validateHotReloadStateCompatible(mkCfg(old), mkCfg(ns2), openState)
-	if err == nil || !strings.Contains(err.Error(), "stop_loss_atr_regime shape changed") {
+	if err == nil || !strings.Contains(err.Error(), "stop_loss_atr_mult_regime shape changed") {
 		t.Fatalf("expected shape-change rejection with open position, got: %v", err)
 	}
 }
 
 func TestRegimeATRBlock_IsConfigured(t *testing.T) {
-	// IsConfigured is the raw-aware predicate used by LoadConfig's defaults
-	// loop before ResolveSurface runs (review #735.1).
 	var nilBlock *RegimeATRBlock
 	if nilBlock.IsConfigured() {
 		t.Fatalf("nil block should not be configured")
@@ -426,7 +406,7 @@ func TestValidateRegimeATRConfig_RejectsScalarRegimeMutex(t *testing.T) {
 				Type:            "perps",
 				Platform:        "hyperliquid",
 				StopLossATRMult: &mult,
-				StopLossATRRegime: &RegimeATRBlock{
+				StopLossATRMultRegime: &RegimeATRBlock{
 					raw: map[string]interface{}{"use_defaults": true},
 				},
 			},
@@ -444,8 +424,6 @@ func TestValidateRegimeATRConfig_RejectsScalarRegimeMutex(t *testing.T) {
 	}
 }
 
-// TestParseRegimeATRBlock_AtrMultipleCanonical locks in the #841 canonical
-// trigger key after v15 dropped the legacy "atr" alias.
 func TestParseRegimeATRBlock_AtrMultipleCanonical(t *testing.T) {
 	block := map[string]interface{}{
 		regimeClassifierKey: map[string]interface{}{
@@ -454,7 +432,7 @@ func TestParseRegimeATRBlock_AtrMultipleCanonical(t *testing.T) {
 			"ranging":       map[string]interface{}{"atr_multiple": 1.5},
 		},
 	}
-	got, errs := parseRegimeATRBlock(block, "stop_loss_atr_regime", regimeSurfaceStopLoss, canonicalTrendRegimeLabels)
+	got, errs := parseRegimeATRBlock(block, "stop_loss_atr_mult_regime", regimeSurfaceStopLoss, canonicalTrendRegimeLabels)
 	if len(errs) > 0 {
 		t.Fatalf("unexpected errors: %v", errs)
 	}
@@ -469,12 +447,11 @@ func TestParseRegimeATRBlock_AtrMultipleCanonical(t *testing.T) {
 			"ranging":       map[string]interface{}{"atr": 1.5},
 		},
 	}
-	_, legacyErrs := parseRegimeATRBlock(legacy, "stop_loss_atr_regime", regimeSurfaceStopLoss, canonicalTrendRegimeLabels)
+	_, legacyErrs := parseRegimeATRBlock(legacy, "stop_loss_atr_mult_regime", regimeSurfaceStopLoss, canonicalTrendRegimeLabels)
 	if len(legacyErrs) == 0 {
 		t.Fatal("legacy atr key should be rejected")
 	}
 
-	// Both keys in one entry → ambiguous, rejected.
 	both := map[string]interface{}{
 		regimeClassifierKey: map[string]interface{}{
 			"trending_up":   map[string]interface{}{"atr_multiple": 2.0, "atr": 9.0},
@@ -482,8 +459,71 @@ func TestParseRegimeATRBlock_AtrMultipleCanonical(t *testing.T) {
 			"ranging":       map[string]interface{}{"atr_multiple": 1.5},
 		},
 	}
-	_, errs = parseRegimeATRBlock(both, "stop_loss_atr_regime", regimeSurfaceStopLoss, canonicalTrendRegimeLabels)
+	_, errs = parseRegimeATRBlock(both, "stop_loss_atr_mult_regime", regimeSurfaceStopLoss, canonicalTrendRegimeLabels)
 	if len(errs) == 0 {
 		t.Fatal("expected error when both atr_multiple and atr are set")
+	}
+}
+
+func TestValidateRegimeATRConfig_RegimeOwnerMutexAllPairs(t *testing.T) {
+	pf := func(v float64) *float64 { return &v }
+	regimeBlock := func() *RegimeATRBlock { return &RegimeATRBlock{raw: adx3StateATR(2.0)} }
+	cases := []struct {
+		name    string
+		mutate  func(sc *StrategyConfig)
+		wantErr string
+	}{
+		{"stop_loss_atr_mult_regime x stop_loss_pct",
+			func(sc *StrategyConfig) { sc.StopLossATRMultRegime = regimeBlock(); sc.StopLossPct = pf(1.5) },
+			"stop_loss_atr_mult_regime is mutually exclusive with stop_loss_pct"},
+		{"stop_loss_atr_mult_regime x stop_loss_margin_pct",
+			func(sc *StrategyConfig) { sc.StopLossATRMultRegime = regimeBlock(); sc.StopLossMarginPct = pf(20) },
+			"stop_loss_atr_mult_regime is mutually exclusive with stop_loss_margin_pct"},
+		{"stop_loss_atr_mult_regime x trailing_stop_pct",
+			func(sc *StrategyConfig) { sc.StopLossATRMultRegime = regimeBlock(); sc.TrailingStopPct = pf(2) },
+			"stop_loss_atr_mult_regime is mutually exclusive with trailing_stop_pct"},
+		{"stop_loss_atr_mult_regime x trailing_stop_atr_mult",
+			func(sc *StrategyConfig) { sc.StopLossATRMultRegime = regimeBlock(); sc.TrailingStopATRMult = pf(2) },
+			"stop_loss_atr_mult_regime is mutually exclusive with trailing_stop_atr_mult"},
+		{"stop_loss_atr_mult_regime x stop_loss_atr_mult",
+			func(sc *StrategyConfig) { sc.StopLossATRMultRegime = regimeBlock(); sc.StopLossATRMult = pf(2) },
+			"stop_loss_atr_mult_regime is mutually exclusive with stop_loss_atr_mult"},
+		{"trailing_stop_atr_mult_regime x stop_loss_pct",
+			func(sc *StrategyConfig) { sc.TrailingStopATRMultRegime = regimeBlock(); sc.StopLossPct = pf(1.5) },
+			"trailing_stop_atr_mult_regime is mutually exclusive with stop_loss_pct"},
+		{"trailing_stop_atr_mult_regime x stop_loss_margin_pct",
+			func(sc *StrategyConfig) { sc.TrailingStopATRMultRegime = regimeBlock(); sc.StopLossMarginPct = pf(20) },
+			"trailing_stop_atr_mult_regime is mutually exclusive with stop_loss_margin_pct"},
+		{"trailing_stop_atr_mult_regime x trailing_stop_pct",
+			func(sc *StrategyConfig) { sc.TrailingStopATRMultRegime = regimeBlock(); sc.TrailingStopPct = pf(2) },
+			"trailing_stop_atr_mult_regime is mutually exclusive with trailing_stop_pct"},
+		{"trailing_stop_atr_mult_regime x trailing_stop_atr_mult",
+			func(sc *StrategyConfig) { sc.TrailingStopATRMultRegime = regimeBlock(); sc.TrailingStopATRMult = pf(2) },
+			"trailing_stop_atr_mult_regime is mutually exclusive with trailing_stop_atr_mult"},
+		{"trailing_stop_atr_mult_regime x stop_loss_atr_mult",
+			func(sc *StrategyConfig) { sc.TrailingStopATRMultRegime = regimeBlock(); sc.StopLossATRMult = pf(2) },
+			"trailing_stop_atr_mult_regime is mutually exclusive with stop_loss_atr_mult"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sc := StrategyConfig{
+				ID:              "hl-test",
+				Type:            "perps",
+				Platform:        "hyperliquid",
+				RegimeATRWindow: "daily",
+			}
+			tc.mutate(&sc)
+			errs := validateRegimeATRConfig(adxRegimeCfg(sc))
+			found := false
+			for _, e := range errs {
+				if strings.Contains(e, tc.wantErr) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Fatalf("want error containing %q, got: %v", tc.wantErr, errs)
+			}
+		})
 	}
 }

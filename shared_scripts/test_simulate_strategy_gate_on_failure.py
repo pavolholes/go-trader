@@ -1,15 +1,3 @@
-"""#1300: tuner-path entry-gate failure policy resolution (simulate_strategy).
-
-``simulate_strategy._resolve_gate_on_failure`` mirrors the live/backtest
-``regime_gate_on_failure`` resolution: per-strategy field wins over the global
-``regime.gate_on_failure``, else the ``"open"`` default. Both surfaces are
-validated independently via ``normalize_regime_gate_on_failure`` (the SSoT), so
-a garbage global value raises even when a valid per-strategy override would
-otherwise short-circuit past it — the class of bug #1300's review flagged.
-
-Not in the pytest testpaths (shared_scripts/test_*.py) — invoke explicitly:
-  uv run --no-sync python -m pytest shared_scripts/test_simulate_strategy_gate_on_failure.py
-"""
 import os
 import sys
 
@@ -20,45 +8,27 @@ sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "shared_tools"))
 sys.path.insert(0, os.path.join(ROOT, "backtest"))
 
-from simulate_strategy import _resolve_gate_on_failure  # noqa: E402
+from shared_tools.conftest import load_module
+
+_SIMULATE_STRATEGY = load_module("_simulate_strategy_gate_test", os.path.join(ROOT, "shared_scripts", "simulate_strategy.py"))
+_resolve_gate_on_failure = _SIMULATE_STRATEGY._resolve_gate_on_failure
 
 
-def test_default_open_when_neither_set():
-    assert _resolve_gate_on_failure({}, {}) == "open"
+@pytest.mark.parametrize("strategy_cfg,global_cfg,expected", [
+    ({}, {}, "open"),
+    ({}, {"gate_on_failure": "closed"}, "closed"),
+    ({"regime_gate_on_failure": "open"}, {"gate_on_failure": "closed"}, "open"),
+    ({"regime_gate_on_failure": "closed"}, {}, "closed"),
+])
+def test_resolves_gate_on_failure(strategy_cfg, global_cfg, expected):
+    assert _resolve_gate_on_failure(strategy_cfg, global_cfg) == expected
 
 
-def test_global_applies_when_no_per_strategy():
-    assert _resolve_gate_on_failure({}, {"gate_on_failure": "closed"}) == "closed"
-
-
-def test_per_strategy_wins_over_global():
-    assert _resolve_gate_on_failure(
-        {"regime_gate_on_failure": "open"}, {"gate_on_failure": "closed"}
-    ) == "open"
-
-
-def test_per_strategy_applies_with_no_global():
-    assert _resolve_gate_on_failure(
-        {"regime_gate_on_failure": "closed"}, {}
-    ) == "closed"
-
-
-def test_unknown_per_strategy_rejected():
+@pytest.mark.parametrize("strategy_cfg,global_cfg", [
+    ({"regime_gate_on_failure": "fail-closed"}, {}),
+    ({}, {"gate_on_failure": "garbage"}),
+    ({"regime_gate_on_failure": "closed"}, {"gate_on_failure": "garbage"}),
+])
+def test_unknown_value_rejected(strategy_cfg, global_cfg):
     with pytest.raises(ValueError, match="regime_gate_on_failure"):
-        _resolve_gate_on_failure({"regime_gate_on_failure": "fail-closed"}, {})
-
-
-def test_unknown_global_rejected_with_no_override():
-    with pytest.raises(ValueError, match="regime_gate_on_failure"):
-        _resolve_gate_on_failure({}, {"gate_on_failure": "garbage"})
-
-
-def test_garbage_global_rejected_even_with_valid_per_strategy_override():
-    """The core #1300 regression: a valid per-strategy override must NOT let a
-    garbage global value slip through unvalidated. The old `or` chain validated
-    only the winning value, so the bad global silently passed."""
-    with pytest.raises(ValueError, match="regime_gate_on_failure"):
-        _resolve_gate_on_failure(
-            {"regime_gate_on_failure": "closed"},
-            {"gate_on_failure": "garbage"},
-        )
+        _resolve_gate_on_failure(strategy_cfg, global_cfg)

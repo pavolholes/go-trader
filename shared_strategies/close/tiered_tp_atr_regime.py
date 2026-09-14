@@ -1,12 +1,3 @@
-"""Regime-aware tiered ATR take-profit with SL support.
-
-Multipliers are resolved once at position open via ``position["regime"]``
-(the regime stamped on the Go-side Position) and frozen for the lifetime
-of the position. Compatible with HL on-chain reduce-only TP placement
-because the tier prices are determined when the order is armed.
-
-SL is checked first (takes priority over TP).
-"""
 
 from __future__ import annotations
 
@@ -35,11 +26,6 @@ DEFAULT_SL_ATR_MULT = 1.5
 def _resolve_tiers_for_regime(
     params: dict, regime: str
 ) -> Tuple[List[Tuple[float, float]], List[str]]:
-    """Walk the configured tier specs and return concrete
-    [(atr_multiple, cumulative_close_fraction)] for the given regime label.
-
-    Returns (tiers, errors).
-    """
     if close_params_are_unified_regime(params):
         scalar, _ = unified_regime_scalar_params(params, regime)
         if scalar is None:

@@ -12,112 +12,104 @@ func diagCandle(t int64, o, h, l, c float64) UICandle {
 	return UICandle{Time: t, Open: o, High: h, Low: l, Close: c}
 }
 
-func TestComputeTradeQualityLongWinner(t *testing.T) {
-	candles := []UICandle{
-		diagCandle(0, 100, 104, 99, 103),
-		diagCandle(3600, 103, 110, 102, 108),
-		diagCandle(7200, 108, 109, 105, 106),
+func TestComputeTradeQuality(t *testing.T) {
+	f := func(v float64) *float64 { return &v }
+	cases := []struct {
+		name          string
+		candles       []UICandle
+		side          string
+		entry, exit   float64
+		wantOK        bool
+		wantMFE       *float64
+		wantMAE       *float64
+		wantFav       *float64
+		wantAdv       *float64
+		wantCapture   *float64
+		wantNoCapture bool
+	}{
+		{
+			name: "long winner",
+			candles: []UICandle{
+				diagCandle(0, 100, 104, 99, 103),
+				diagCandle(3600, 103, 110, 102, 108),
+				diagCandle(7200, 108, 109, 105, 106),
+			},
+			side: "long", entry: 100, exit: 106, wantOK: true,
+			wantMFE: f(110), wantMAE: f(99), wantFav: f(10), wantAdv: f(1), wantCapture: f(0.6),
+		},
+		{
+			name: "short winner",
+			candles: []UICandle{
+				diagCandle(0, 100, 102, 95, 96),
+				diagCandle(3600, 96, 98, 90, 92),
+			},
+			side: "short", entry: 100, exit: 95, wantOK: true,
+			wantMFE: f(90), wantMAE: f(102), wantFav: f(10), wantAdv: f(2), wantCapture: f(0.5),
+		},
+		{
+			name:    "loser has no capture ratio",
+			candles: []UICandle{diagCandle(0, 100, 101, 94, 95)},
+			side:    "long", entry: 100, exit: 95, wantOK: true,
+			wantAdv: f(6), wantNoCapture: true,
+		},
+		{
+			name:    "immediate reversal",
+			candles: []UICandle{diagCandle(0, 100, 100, 92, 93)},
+			side:    "long", entry: 100, exit: 93, wantOK: true,
+			wantMFE: f(100), wantFav: f(0), wantNoCapture: true,
+		},
+		{
+			name:    "single bar hold",
+			candles: []UICandle{diagCandle(0, 100, 105, 98, 104)},
+			side:    "long", entry: 100, exit: 104, wantOK: true,
+			wantMFE: f(105), wantMAE: f(98), wantCapture: f(0.8),
+		},
+		{
+			name:    "capture clamps at one",
+			candles: []UICandle{diagCandle(0, 100, 104, 99, 104)},
+			side:    "long", entry: 100, exit: 106, wantOK: true,
+			wantCapture: f(1),
+		},
+		{
+			name: "no candles fails", candles: nil,
+			side: "long", entry: 100, exit: 105, wantOK: false,
+		},
+		{
+			name: "zero entry fails", candles: []UICandle{diagCandle(0, 1, 1, 1, 1)},
+			side: "long", entry: 0, exit: 105, wantOK: false,
+		},
 	}
-	m, ok := computeTradeQuality(candles, "long", 100, 106)
-	if !ok {
-		t.Fatal("expected metrics")
-	}
-	if m.MFEPrice != 110 || m.MAEPrice != 99 {
-		t.Fatalf("MFE/MAE = %v/%v, want 110/99", m.MFEPrice, m.MAEPrice)
-	}
-	if m.FavorablePct != 10 {
-		t.Fatalf("favorable = %v, want 10", m.FavorablePct)
-	}
-	if m.AdversePct != 1 {
-		t.Fatalf("adverse = %v, want 1", m.AdversePct)
-	}
-	if m.CaptureRatio == nil || *m.CaptureRatio != 0.6 {
-		t.Fatalf("capture = %v, want 0.6", m.CaptureRatio)
-	}
-}
 
-func TestComputeTradeQualityShortWinner(t *testing.T) {
-	candles := []UICandle{
-		diagCandle(0, 100, 102, 95, 96),
-		diagCandle(3600, 96, 98, 90, 92),
-	}
-	m, ok := computeTradeQuality(candles, "short", 100, 95)
-	if !ok {
-		t.Fatal("expected metrics")
-	}
-	if m.MFEPrice != 90 || m.MAEPrice != 102 {
-		t.Fatalf("MFE/MAE = %v/%v, want 90/102", m.MFEPrice, m.MAEPrice)
-	}
-	if m.FavorablePct != 10 || m.AdversePct != 2 {
-		t.Fatalf("favorable/adverse = %v/%v, want 10/2", m.FavorablePct, m.AdversePct)
-	}
-	if m.CaptureRatio == nil || *m.CaptureRatio != 0.5 {
-		t.Fatalf("capture = %v, want 0.5", m.CaptureRatio)
-	}
-}
-
-func TestComputeTradeQualityLoserHasNoCaptureRatio(t *testing.T) {
-	candles := []UICandle{diagCandle(0, 100, 101, 94, 95)}
-	m, ok := computeTradeQuality(candles, "long", 100, 95)
-	if !ok {
-		t.Fatal("expected metrics")
-	}
-	if m.CaptureRatio != nil {
-		t.Fatalf("losers must not get a capture ratio, got %v", *m.CaptureRatio)
-	}
-	if m.AdversePct != 6 {
-		t.Fatalf("adverse = %v, want 6", m.AdversePct)
-	}
-}
-
-func TestComputeTradeQualityImmediateReversal(t *testing.T) {
-	// Price never went favorable: MFE floors at entry, no capture ratio even
-	// though exit > entry is impossible here.
-	candles := []UICandle{diagCandle(0, 100, 100, 92, 93)}
-	m, ok := computeTradeQuality(candles, "long", 100, 93)
-	if !ok {
-		t.Fatal("expected metrics")
-	}
-	if m.MFEPrice != 100 || m.FavorablePct != 0 {
-		t.Fatalf("MFE = %v favorable = %v, want entry/0", m.MFEPrice, m.FavorablePct)
-	}
-	if m.CaptureRatio != nil {
-		t.Fatal("no favorable move → no capture ratio")
-	}
-}
-
-func TestComputeTradeQualitySingleBarHold(t *testing.T) {
-	candles := []UICandle{diagCandle(0, 100, 105, 98, 104)}
-	m, ok := computeTradeQuality(candles, "long", 100, 104)
-	if !ok {
-		t.Fatal("expected metrics")
-	}
-	if m.MFEPrice != 105 || m.MAEPrice != 98 {
-		t.Fatalf("MFE/MAE = %v/%v, want 105/98", m.MFEPrice, m.MAEPrice)
-	}
-	if m.CaptureRatio == nil || *m.CaptureRatio != 0.8 {
-		t.Fatalf("capture = %v, want 0.8", m.CaptureRatio)
-	}
-}
-
-func TestComputeTradeQualityCaptureClampsAtOne(t *testing.T) {
-	// Exit fill better than any candle extreme (gap fill): ratio clamps to 1.
-	candles := []UICandle{diagCandle(0, 100, 104, 99, 104)}
-	m, ok := computeTradeQuality(candles, "long", 100, 106)
-	if !ok {
-		t.Fatal("expected metrics")
-	}
-	if m.CaptureRatio == nil || *m.CaptureRatio != 1 {
-		t.Fatalf("capture = %v, want clamp to 1", m.CaptureRatio)
-	}
-}
-
-func TestComputeTradeQualityBadInputs(t *testing.T) {
-	if _, ok := computeTradeQuality(nil, "long", 100, 105); ok {
-		t.Fatal("no candles must fail")
-	}
-	if _, ok := computeTradeQuality([]UICandle{diagCandle(0, 1, 1, 1, 1)}, "long", 0, 105); ok {
-		t.Fatal("zero entry must fail")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m, ok := computeTradeQuality(tc.candles, tc.side, tc.entry, tc.exit)
+			if ok != tc.wantOK {
+				t.Fatalf("ok = %v, want %v", ok, tc.wantOK)
+			}
+			if !tc.wantOK {
+				return
+			}
+			if tc.wantMFE != nil && m.MFEPrice != *tc.wantMFE {
+				t.Fatalf("MFE = %v, want %v", m.MFEPrice, *tc.wantMFE)
+			}
+			if tc.wantMAE != nil && m.MAEPrice != *tc.wantMAE {
+				t.Fatalf("MAE = %v, want %v", m.MAEPrice, *tc.wantMAE)
+			}
+			if tc.wantFav != nil && m.FavorablePct != *tc.wantFav {
+				t.Fatalf("favorable = %v, want %v", m.FavorablePct, *tc.wantFav)
+			}
+			if tc.wantAdv != nil && m.AdversePct != *tc.wantAdv {
+				t.Fatalf("adverse = %v, want %v", m.AdversePct, *tc.wantAdv)
+			}
+			if tc.wantNoCapture && m.CaptureRatio != nil {
+				t.Fatalf("expected no capture ratio, got %v", *m.CaptureRatio)
+			}
+			if tc.wantCapture != nil {
+				if m.CaptureRatio == nil || *m.CaptureRatio != *tc.wantCapture {
+					t.Fatalf("capture = %v, want %v", m.CaptureRatio, *tc.wantCapture)
+				}
+			}
+		})
 	}
 }
 
@@ -196,6 +188,34 @@ func TestCaptureTradeDiagnosticsNilRecorderNoop(t *testing.T) {
 
 	s := &StrategyState{ID: "x", Positions: map[string]*Position{}}
 	recordClosedPosition(s, &Position{Symbol: "BTC", AvgCost: 1, Quantity: 1}, 1, 0, "signal", time.Now().UTC())
+	if len(s.pendingTradeDiagnostics) != 0 {
+		t.Fatalf("nil recorder buffered %d pending rows; defer only happens under suspendEagerDiagnosticsPersist", len(s.pendingTradeDiagnostics))
+	}
+}
+
+func TestCaptureTradeDiagnosticsDeferredBuffersUntilSave(t *testing.T) {
+	prevRec, prevEnq, prevDef := tradeDiagnosticsRecorder, tradeDiagnosticsEnqueue, tradeDiagnosticsPersistDeferred
+	defer func() {
+		tradeDiagnosticsRecorder, tradeDiagnosticsEnqueue = prevRec, prevEnq
+		tradeDiagnosticsPersistDeferred = prevDef
+	}()
+	var inserts int
+	tradeDiagnosticsRecorder = func(*TradeDiagnosticsRow) error {
+		inserts++
+		return nil
+	}
+	tradeDiagnosticsEnqueue = func(TradeDiagnosticsRow) { t.Fatal("must not enqueue while deferred") }
+	restore := suspendEagerDiagnosticsPersist()
+	defer restore()
+
+	s := &StrategyState{ID: "hl-test", Positions: map[string]*Position{}}
+	recordClosedPosition(s, &Position{Symbol: "ETH", TradePositionID: "pos-1", AvgCost: 1, Quantity: 1}, 1, 0, "signal", time.Now().UTC())
+	if inserts != 0 {
+		t.Fatalf("eager insert ran %d time(s) while deferred, want 0", inserts)
+	}
+	if len(s.pendingTradeDiagnostics) != 1 || s.pendingTradeDiagnostics[0].PositionID != "pos-1" {
+		t.Fatalf("pending = %+v, want one pos-1 row", s.pendingTradeDiagnostics)
+	}
 }
 
 type diagWorkerFixture struct {
@@ -213,7 +233,7 @@ func newDiagWorkerFixture(candles []UICandle, fetchErr error) *diagWorkerFixture
 			f.fetched = append(f.fetched, req)
 			return candles, "test", fetchErr
 		},
-		func(rowID int64, tf string, m *tradeQualityMetrics, status string) error {
+		func(_ PortfolioScope, rowID int64, tf string, m *tradeQualityMetrics, status string) error {
 			f.updates = append(f.updates, status)
 			f.metrics = append(f.metrics, m)
 			f.tfs = append(f.tfs, tf)
@@ -281,8 +301,6 @@ func TestDiagnosticsWorkerFailurePaths(t *testing.T) {
 		}
 	})
 	t.Run("uncovered window", func(t *testing.T) {
-		// Earliest candle starts two hours after the open: metrics would be
-		// biased, so they must be refused.
 		f := newDiagWorkerFixture([]UICandle{diagCandle(opened.Add(2*time.Hour).Unix(), 3150, 3160, 3080, 3100)}, nil)
 		f.worker.process(diagTestRow(opened, closed))
 		if f.updates[0] != diagMetricsWindowUncovered || f.metrics[0] != nil {
@@ -322,9 +340,6 @@ func TestDiagnosticsWorkerFailurePaths(t *testing.T) {
 		}
 	})
 	t.Run("missing timeframe defaults to 1h and fetches at 1h", func(t *testing.T) {
-		// Manual strategy with no sc.Timeframe and <3 args (the exact case the
-		// default targets): window math AND the candle fetch must use 1h, so the
-		// row reaches metrics_status=ok rather than fetch_failed.
 		f := newDiagWorkerFixture([]UICandle{diagCandle(opened.Unix(), 3000, 3200, 2980, 3100)}, nil)
 		f.worker.UpdateStrategies([]StrategyConfig{{ID: "hl-test", Platform: "hyperliquid", Type: "manual", Symbol: "ETH"}})
 		f.worker.process(diagTestRow(opened, closed))
@@ -339,8 +354,6 @@ func TestDiagnosticsWorkerFailurePaths(t *testing.T) {
 		}
 	})
 	t.Run("unknown timeframe token uses 1h for both window math and fetch", func(t *testing.T) {
-		// diagTimeframeDuration rejects the token: the window math falls back to
-		// 1h, and the fetch must be re-pointed at 1h too (not the bad token).
 		f := newDiagWorkerFixture([]UICandle{diagCandle(opened.Unix(), 3000, 3200, 2980, 3100)}, nil)
 		f.worker.UpdateStrategies([]StrategyConfig{{ID: "hl-test", Platform: "hyperliquid", Type: "manual", Symbol: "ETH", Timeframe: "bogus"}})
 		f.worker.process(diagTestRow(opened, closed))
@@ -355,8 +368,6 @@ func TestDiagnosticsWorkerFailurePaths(t *testing.T) {
 		}
 	})
 	t.Run("explicit timeframe fetches unchanged", func(t *testing.T) {
-		// A valid explicit timeframe must reach the fetch verbatim — no regression
-		// from the resolution→fetch wiring.
 		f := newDiagWorkerFixture([]UICandle{diagCandle(opened.Truncate(15*time.Minute).Unix(), 3000, 3200, 2980, 3100)}, nil)
 		f.worker.UpdateStrategies([]StrategyConfig{{ID: "hl-test", Platform: "hyperliquid", Type: "perps", Symbol: "ETH", Timeframe: "15m"}})
 		f.worker.process(diagTestRow(opened, closed))
@@ -426,7 +437,6 @@ func TestTradeDiagnosticsDBRoundTrip(t *testing.T) {
 		t.Fatalf("timestamps round-trip wrong: %+v", got)
 	}
 
-	// Status-only update (failure path) leaves quality columns NULL.
 	row2 := &TradeDiagnosticsRow{StrategyID: "hl-a", Symbol: "BTC", MetricsStatus: diagMetricsPending, OpenedAt: opened, ClosedAt: closed}
 	if err := sdb.InsertTradeDiagnostics(row2); err != nil {
 		t.Fatalf("insert2: %v", err)
@@ -445,7 +455,6 @@ func TestTradeDiagnosticsDBRoundTrip(t *testing.T) {
 		t.Fatalf("failure row wrong: %+v", rows[1])
 	}
 
-	// Idempotent migration: reopening the same DB must not error.
 	if err := sdb.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
@@ -472,8 +481,6 @@ func TestNetPnLByPositionAggregatesLegs(t *testing.T) {
 	defer sdb.Close()
 
 	now := time.Now().UTC()
-	// Two tiered-TP close legs of the same position under the #954 gross
-	// convention: net = (60-1) + (50-1) = 108.
 	for i, pnl := range []float64{60, 50} {
 		trade := Trade{
 			Timestamp: now.Add(time.Duration(i) * time.Minute), Symbol: "ETH", Side: "sell",
@@ -484,13 +491,11 @@ func TestNetPnLByPositionAggregatesLegs(t *testing.T) {
 			t.Fatalf("insert trade: %v", err)
 		}
 	}
-	// Legacy-convention close leg of a different position: net = RealizedPnL as-is.
 	legacy := Trade{Timestamp: now, Symbol: "ETH", Side: "sell", Quantity: 1, Price: 3000, Value: 3000,
 		PositionID: "p2", IsClose: true, RealizedPnL: -25}
 	if err := sdb.InsertTrade("hl-a", legacy); err != nil {
 		t.Fatalf("insert legacy: %v", err)
 	}
-	// Open leg must not contribute.
 	open := Trade{Timestamp: now, Symbol: "ETH", Side: "buy", Quantity: 1, Price: 3000, Value: 3000,
 		PositionID: "p1", PnLGross: true, ExchangeFee: 1, FeeSource: FeeSourceModeled}
 	if err := sdb.InsertTrade("hl-a", open); err != nil {
@@ -542,7 +547,6 @@ func TestDiagnosticsReportSampleGating(t *testing.T) {
 
 func TestDiagnosticsReportCaptureAndRegimeHypotheses(t *testing.T) {
 	var rows []TradeDiagnosticsRow
-	// 20 winners in trending_up with low capture, 12 losers in ranging_choppy.
 	for i := 0; i < 20; i++ {
 		rows = append(rows, diagReportRow(i, "trending_up", "long", 10, fptr(0.2)))
 	}
@@ -582,8 +586,6 @@ func TestDiagnosticsReportDirectionHypothesis(t *testing.T) {
 }
 
 func TestDiagnosticsReportPartialCloseAggregation(t *testing.T) {
-	// The diagnostics row stores only the final leg's PnL (-5), but the trades
-	// join says the position's legs sum to +40 net — the report must use +40.
 	row := diagReportRow(0, "trending_up", "long", -5, nil)
 	net := map[string]map[string]float64{"hl-a": {"p0": 40}}
 	out := buildTradeDiagnosticsReport([]TradeDiagnosticsRow{row}, net, "cfg.json", diagReportOptions{MinTrades: 30, MinBucket: 10})

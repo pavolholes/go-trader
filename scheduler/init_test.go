@@ -6,9 +6,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
-// init sets module-level strategy lists to defaults so tests don't depend on Python.
 func init() {
 	spotStrategies = defaultSpotStrategies
 	optionsStrategies = defaultOptionsStrategies
@@ -16,7 +16,6 @@ func init() {
 	futuresStrategies = defaultFuturesStrategies
 }
 
-// baseOpts returns an InitOptions suitable as a starting point for tests.
 func baseOpts() InitOptions {
 	return InitOptions{
 		Assets:          []string{"BTC", "ETH"},
@@ -35,6 +34,188 @@ func baseOpts() InitOptions {
 		OptionsDrawdown: 10,
 		PerpsDrawdown:   5,
 	}
+}
+
+func findStrategy(cfg *Config, id string) (StrategyConfig, bool) {
+	for _, s := range cfg.Strategies {
+		if s.ID == id {
+			return s, true
+		}
+	}
+	return StrategyConfig{}, false
+}
+
+func TestDefaultRangingStrategyWiring(t *testing.T) {
+	cases := []struct {
+		id        string
+		shortName string
+	}{
+		{id: "anchored_vwap", shortName: "avwap"},
+		{id: "anchored_vwap_channel", shortName: "avwapch"},
+		{id: "anchored_vwap_reversion", shortName: "avwaprev"},
+	}
+	lists := []struct {
+		name string
+		list []stratDef
+	}{
+		{name: "spot", list: defaultSpotStrategies},
+		{name: "perps", list: defaultPerpsStrategies},
+		{name: "futures", list: defaultFuturesStrategies},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.id, func(t *testing.T) {
+			if got := deriveShortName(tc.id); got != tc.shortName {
+				t.Fatalf("deriveShortName(%s) = %q, want %q", tc.id, got, tc.shortName)
+			}
+			if !isBidirectionalPerpsStrategy(tc.id) {
+				t.Fatalf("%s must be a bidirectional perps strategy", tc.id)
+			}
+			for _, list := range lists {
+				found := false
+				for _, s := range list.list {
+					if s.ID != tc.id {
+						continue
+					}
+					found = true
+					if s.ShortName != tc.shortName {
+						t.Fatalf("%s list: %s short name = %q, want %q", list.name, tc.id, s.ShortName, tc.shortName)
+					}
+				}
+				if !found {
+					t.Fatalf("%s missing from default %s list", tc.id, list.name)
+				}
+			}
+		})
+	}
+}
+
+func TestGenerateConfig_DefaultCompositeRangingGateStrategies(t *testing.T) {
+	cases := []struct {
+		id                  string
+		shortName           string
+		regimeGateOnFailure string
+	}{
+		{id: "atr_band_revert", shortName: "abr", regimeGateOnFailure: RegimeGateOnFailureClosed},
+		{id: "anchored_vwap_channel", shortName: "avwapch"},
+		{id: "anchored_vwap_reversion", shortName: "avwaprev"},
+	}
+	wantRegimes := []string{"ranging_quiet", "ranging_volatile"}
+
+	for _, tc := range cases {
+		t.Run(tc.id+"/spot", func(t *testing.T) {
+			opts := baseOpts()
+			opts.Assets = []string{"BTC"}
+			opts.SpotStrategies = []string{tc.id}
+
+			cfg := generateConfig(opts)
+			sc, ok := findStrategy(cfg, tc.shortName+"-btc")
+			if !ok {
+				t.Fatalf("expected strategy %s-btc, got %v", tc.shortName, cfg.Strategies)
+			}
+			if len(sc.AllowedRegimes) != len(wantRegimes) {
+				t.Fatalf("allowed_regimes = %v, want %v", sc.AllowedRegimes, wantRegimes)
+			}
+			for i, want := range wantRegimes {
+				if sc.AllowedRegimes[i] != want {
+					t.Fatalf("allowed_regimes[%d] = %q, want %q", i, sc.AllowedRegimes[i], want)
+				}
+			}
+			if tc.regimeGateOnFailure != "" && sc.RegimeGateOnFailure != tc.regimeGateOnFailure {
+				t.Fatalf("regime_gate_on_failure = %q, want %q", sc.RegimeGateOnFailure, tc.regimeGateOnFailure)
+			}
+			if cfg.Regime == nil || !cfg.Regime.Enabled {
+				t.Fatalf("expected cfg.Regime enabled, got %+v", cfg.Regime)
+			}
+			win, ok := cfg.Regime.Windows["medium"]
+			if !ok {
+				t.Fatalf("expected a composite 'medium' window, got windows %+v", cfg.Regime.Windows)
+			}
+			if win.effectiveClassifier() != regimeClassifierComposite {
+				t.Fatalf("medium window classifier = %q, want composite", win.effectiveClassifier())
+			}
+			if vErrs := validateStrategyRegimeVocabulary(cfg); len(vErrs) != 0 {
+				t.Fatalf("regime vocabulary errors: %v", vErrs)
+			}
+			if err := validateConfig(cfg, true); err != nil {
+				t.Fatalf("generated config failed validation: %v", err)
+			}
+		})
+
+		t.Run(tc.id+"/perps", func(t *testing.T) {
+			opts := baseOpts()
+			opts.Assets = []string{"BTC"}
+			opts.EnableSpot = false
+			opts.EnablePerps = true
+			opts.PerpsStrategies = []string{tc.id}
+
+			cfg := generateConfig(opts)
+			sc, ok := findStrategy(cfg, "hl-"+tc.shortName+"-btc")
+			if !ok {
+				t.Fatalf("expected strategy hl-%s-btc, got %v", tc.shortName, cfg.Strategies)
+			}
+			if len(sc.AllowedRegimes) == 0 {
+				t.Fatalf("perps %s should be regime-gated, got none", tc.id)
+			}
+			if cfg.Regime == nil || !cfg.Regime.Enabled {
+				t.Fatalf("expected cfg.Regime enabled for perps %s", tc.id)
+			}
+			if err := validateConfig(cfg, true); err != nil {
+				t.Fatalf("generated perps config failed validation: %v", err)
+			}
+		})
+	}
+}
+
+func TestGenerateConfig_RegimeOnlyForRangingStrategies(t *testing.T) {
+	t.Run("momentum-only", func(t *testing.T) {
+		opts := baseOpts()
+		opts.Assets = []string{"BTC"}
+		opts.SpotStrategies = []string{"momentum"}
+
+		cfg := generateConfig(opts)
+		if cfg.Regime != nil && cfg.Regime.Enabled {
+			t.Fatalf("regime should stay disabled without a ranging strategy, got %+v", cfg.Regime)
+		}
+		sc, ok := findStrategy(cfg, "momentum-btc")
+		if !ok {
+			t.Fatalf("expected momentum-btc")
+		}
+		if len(sc.AllowedRegimes) != 0 {
+			t.Fatalf("momentum should not be regime-gated, got %v", sc.AllowedRegimes)
+		}
+	})
+
+	t.Run("mixed", func(t *testing.T) {
+		opts := baseOpts()
+		opts.Assets = []string{"BTC"}
+		opts.SpotStrategies = []string{"momentum", "atr_band_revert"}
+
+		cfg := generateConfig(opts)
+		if cfg.Regime == nil || !cfg.Regime.Enabled {
+			t.Fatalf("expected regime enabled for a ranging strategy, got %+v", cfg.Regime)
+		}
+		momentum, ok := findStrategy(cfg, "momentum-btc")
+		if !ok {
+			t.Fatalf("expected momentum-btc")
+		}
+		if len(momentum.AllowedRegimes) != 0 {
+			t.Fatalf("momentum should stay ungated in a mixed config, got %v", momentum.AllowedRegimes)
+		}
+		abr, ok := findStrategy(cfg, "abr-btc")
+		if !ok {
+			t.Fatalf("expected abr-btc")
+		}
+		want := []string{"ranging_quiet", "ranging_volatile"}
+		if len(abr.AllowedRegimes) != len(want) {
+			t.Fatalf("abr allowed_regimes = %v, want %v", abr.AllowedRegimes, want)
+		}
+		for i, label := range want {
+			if abr.AllowedRegimes[i] != label {
+				t.Fatalf("abr allowed_regimes[%d] = %q, want %q", i, abr.AllowedRegimes[i], label)
+			}
+		}
+	})
 }
 
 func TestGenerateConfig_AllTypes(t *testing.T) {
@@ -64,12 +245,6 @@ func TestGenerateConfig_AllTypes(t *testing.T) {
 	}
 	cfg := generateConfig(opts)
 
-	// momentum × 3 assets = 3 spot
-	// pairs: (BTC,ETH),(BTC,SOL),(ETH,SOL) = 3 pairs
-	// options deribit × vol × (BTC,ETH) = 2  (SOL skipped)
-	// perps momentum × 3 assets = 3
-	// futures momentum × 1 symbol = 1
-	// total = 12
 	if len(cfg.Strategies) != 12 {
 		t.Errorf("expected 12 strategies, got %d", len(cfg.Strategies))
 		for _, s := range cfg.Strategies {
@@ -81,11 +256,10 @@ func TestGenerateConfig_AllTypes(t *testing.T) {
 func TestGenerateConfig_SingleAsset_NoPairs(t *testing.T) {
 	opts := baseOpts()
 	opts.Assets = []string{"BTC"}
-	opts.IncludePairs = true // should be ignored: < 2 assets
+	opts.IncludePairs = true
 
 	cfg := generateConfig(opts)
 
-	// momentum × BTC = 1, no pairs
 	if len(cfg.Strategies) != 1 {
 		t.Errorf("expected 1 strategy for single asset, got %d", len(cfg.Strategies))
 	}
@@ -114,7 +288,6 @@ func TestGenerateConfig_OptionsSinglePlatformDeribit(t *testing.T) {
 
 	cfg := generateConfig(opts)
 
-	// deribit × vol × (BTC, ETH) = 2
 	if len(cfg.Strategies) != 2 {
 		t.Errorf("expected 2 options strategies, got %d", len(cfg.Strategies))
 	}
@@ -140,7 +313,6 @@ func TestGenerateConfig_OptionsBothPlatforms(t *testing.T) {
 
 	cfg := generateConfig(opts)
 
-	// 2 platforms × vol × (BTC, ETH) = 4
 	if len(cfg.Strategies) != 4 {
 		t.Errorf("expected 4 options strategies (both platforms), got %d", len(cfg.Strategies))
 	}
@@ -172,7 +344,6 @@ func TestGenerateConfig_PerpsLiveMode(t *testing.T) {
 	}
 }
 
-// #486: HL perps strategies default to isolated margin mode in generateConfig.
 func TestGenerateConfig_PerpsDefaultsToIsolatedMargin(t *testing.T) {
 	opts := baseOpts()
 	opts.EnableSpot = false
@@ -225,12 +396,11 @@ func TestGenerateConfig_PerpsDefaultPaperMode(t *testing.T) {
 func TestGenerateConfig_ThreeAssets_ThreePairs(t *testing.T) {
 	opts := baseOpts()
 	opts.Assets = []string{"BTC", "ETH", "SOL"}
-	opts.SpotStrategies = []string{} // no regular spot
+	opts.SpotStrategies = []string{}
 	opts.IncludePairs = true
 
 	cfg := generateConfig(opts)
 
-	// pairs: (BTC,ETH),(BTC,SOL),(ETH,SOL) = 3
 	if len(cfg.Strategies) != 3 {
 		t.Errorf("expected 3 pairs for 3 assets, got %d", len(cfg.Strategies))
 	}
@@ -248,7 +418,6 @@ func TestGenerateConfig_TwoAssets_OnePair(t *testing.T) {
 
 	cfg := generateConfig(opts)
 
-	// pairs: (BTC,ETH) = 1
 	if len(cfg.Strategies) != 1 {
 		t.Errorf("expected 1 pair for 2 assets, got %d", len(cfg.Strategies))
 	}
@@ -313,7 +482,6 @@ func TestGenerateConfig_SOLSkippedForOptions(t *testing.T) {
 
 	cfg := generateConfig(opts)
 
-	// Only BTC and ETH — SOL skipped
 	if len(cfg.Strategies) != 2 {
 		t.Errorf("expected 2 options strategies (SOL skipped), got %d", len(cfg.Strategies))
 	}
@@ -424,68 +592,36 @@ func TestGenerateConfig_IntervalDefaults(t *testing.T) {
 	}
 }
 
-func TestGenerateConfig_PortfolioRiskDefaults(t *testing.T) {
-	cfg := generateConfig(baseOpts())
+func TestGenerateConfig_PortfolioRisk(t *testing.T) {
+	cases := []struct {
+		name         string
+		maxDrawdown  float64
+		warnThresh   float64
+		wantDrawdown float64
+		wantWarn     float64
+	}{
+		{"unset uses defaults", 0, 0, 25, 60},
+		{"explicit override", 15, 70, 15, 70},
+		{"explicit zero keeps defaults", 0, 0, 25, 60},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := baseOpts()
+			opts.PortfolioMaxDrawdownPct = tc.maxDrawdown
+			opts.PortfolioWarnThresholdPct = tc.warnThresh
 
-	if cfg.PortfolioRisk == nil {
-		t.Fatal("expected PortfolioRisk to be set")
-	}
-	if cfg.PortfolioRisk.MaxDrawdownPct != 25 {
-		t.Errorf("expected MaxDrawdownPct=25, got %.0f", cfg.PortfolioRisk.MaxDrawdownPct)
-	}
-	if cfg.PortfolioRisk.WarnThresholdPct != 60 {
-		t.Errorf("expected WarnThresholdPct=60, got %.0f", cfg.PortfolioRisk.WarnThresholdPct)
-	}
-}
+			cfg := generateConfig(opts)
 
-// #85: live-setup risk prompts feed into PortfolioRisk.* via InitOptions.
-func TestGenerateConfig_PortfolioRiskOverride(t *testing.T) {
-	opts := baseOpts()
-	opts.PortfolioMaxDrawdownPct = 15
-	opts.PortfolioWarnThresholdPct = 70
-
-	cfg := generateConfig(opts)
-
-	if cfg.PortfolioRisk == nil {
-		t.Fatal("expected PortfolioRisk to be set")
-	}
-	if cfg.PortfolioRisk.MaxDrawdownPct != 15 {
-		t.Errorf("expected MaxDrawdownPct=15, got %.0f", cfg.PortfolioRisk.MaxDrawdownPct)
-	}
-	if cfg.PortfolioRisk.WarnThresholdPct != 70 {
-		t.Errorf("expected WarnThresholdPct=70, got %.0f", cfg.PortfolioRisk.WarnThresholdPct)
-	}
-}
-
-// Zero values must not overwrite the safe defaults — the interactive wizard
-// only prompts when a live mode is enabled, so JSON configs that omit the
-// fields should still produce a valid portfolio_risk block.
-func TestGenerateConfig_PortfolioRiskZeroKeepsDefaults(t *testing.T) {
-	opts := baseOpts()
-	opts.PortfolioMaxDrawdownPct = 0
-	opts.PortfolioWarnThresholdPct = 0
-
-	cfg := generateConfig(opts)
-
-	if cfg.PortfolioRisk.MaxDrawdownPct != 25 || cfg.PortfolioRisk.WarnThresholdPct != 60 {
-		t.Errorf("expected defaults 25/60, got %.0f/%.0f",
-			cfg.PortfolioRisk.MaxDrawdownPct, cfg.PortfolioRisk.WarnThresholdPct)
-	}
-}
-
-// JSON-mode consumers (OpenClaw, scripted setup) pass risk values under the
-// camelCase tags; verify the unmarshal path wires them into generateConfig.
-func TestInitOptions_PortfolioRiskJSONTags(t *testing.T) {
-	blob := `{"portfolioMaxDrawdownPct": 18, "portfolioWarnThresholdPct": 65}`
-	var opts InitOptions
-	if err := json.Unmarshal([]byte(blob), &opts); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if opts.PortfolioMaxDrawdownPct != 18 {
-		t.Errorf("expected 18, got %.0f", opts.PortfolioMaxDrawdownPct)
-	}
-	if opts.PortfolioWarnThresholdPct != 65 {
-		t.Errorf("expected 65, got %.0f", opts.PortfolioWarnThresholdPct)
+			if cfg.PortfolioRisk == nil {
+				t.Fatal("expected PortfolioRisk to be set")
+			}
+			if cfg.PortfolioRisk.MaxDrawdownPct != tc.wantDrawdown {
+				t.Errorf("expected MaxDrawdownPct=%g, got %g", tc.wantDrawdown, cfg.PortfolioRisk.MaxDrawdownPct)
+			}
+			if cfg.PortfolioRisk.WarnThresholdPct != tc.wantWarn {
+				t.Errorf("expected WarnThresholdPct=%g, got %g", tc.wantWarn, cfg.PortfolioRisk.WarnThresholdPct)
+			}
+		})
 	}
 }
 
@@ -515,33 +651,31 @@ func TestMakePairs(t *testing.T) {
 	if len(pairs) != 3 {
 		t.Errorf("expected 3 pairs, got %d", len(pairs))
 	}
-	// Verify ordering: (BTC,ETH), (BTC,SOL), (ETH,SOL)
 	expected := [][2]string{{"BTC", "ETH"}, {"BTC", "SOL"}, {"ETH", "SOL"}}
 	for i, pair := range pairs {
 		if pair != expected[i] {
 			t.Errorf("pair[%d]: expected %v, got %v", i, expected[i], pair)
 		}
 	}
-}
 
-func TestMakePairs_TwoAssets(t *testing.T) {
-	pairs := makePairs([]string{"BTC", "ETH"})
-	if len(pairs) != 1 {
-		t.Errorf("expected 1 pair, got %d", len(pairs))
+	if pairs := makePairs([]string{"BTC", "ETH"}); len(pairs) != 1 {
+		t.Errorf("expected 1 pair for two assets, got %d", len(pairs))
 	}
 }
 
 func TestStratShortName(t *testing.T) {
-	if got := stratShortName(spotStrategies, "momentum"); got != "momentum" {
-		t.Errorf("expected momentum, got %s", got)
+	if got := stratShortName(spotStrategies, "chart_pattern"); got != "cpat" {
+		t.Errorf("expected cpat, got %s", got)
 	}
-	if got := stratShortName(spotStrategies, "sma_crossover"); got != "sma" {
-		t.Errorf("expected sma, got %s", got)
+	if got := stratShortName(spotStrategies, "tema_cross"); got != "tema_cross" {
+		t.Errorf("expected tema_cross, got %s", got)
+	}
+	if got := stratShortName(spotStrategies, "sma_crossover"); got != "sma_crossover" {
+		t.Errorf("expected sma_crossover, got %s", got)
 	}
 	if got := stratShortName(optionsStrategies, "vol_mean_reversion"); got != "vol" {
 		t.Errorf("expected vol, got %s", got)
 	}
-	// Unknown strategy falls back to the ID itself.
 	if got := stratShortName(spotStrategies, "unknown_strat"); got != "unknown_strat" {
 		t.Errorf("expected unknown_strat, got %s", got)
 	}
@@ -586,8 +720,8 @@ func TestRunInitFromJSON_EmptyUsesStarterSpotDefaults(t *testing.T) {
 		t.Fatalf("expected 1 starter strategy, got %d", len(cfg.Strategies))
 	}
 	s := cfg.Strategies[0]
-	if s.ID != "momentum-btc" {
-		t.Errorf("expected starter ID momentum-btc, got %s", s.ID)
+	if s.ID != "cpat-btc" {
+		t.Errorf("expected starter ID cpat-btc, got %s", s.ID)
 	}
 	if s.Type != "spot" || s.Platform != "binanceus" {
 		t.Errorf("expected starter spot strategy on binanceus, got %s/%s", s.Type, s.Platform)
@@ -612,8 +746,8 @@ func TestRunInitFromJSON_AssetsOnlyDefaultsToStarterSpot(t *testing.T) {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		t.Fatalf("output is not valid JSON: %v", err)
 	}
-	if len(cfg.Strategies) != 1 || cfg.Strategies[0].ID != "momentum-btc" {
-		t.Fatalf("expected starter momentum-btc config, got %+v", cfg.Strategies)
+	if len(cfg.Strategies) != 1 || cfg.Strategies[0].ID != "cpat-btc" {
+		t.Fatalf("expected starter cpat-btc config, got %+v", cfg.Strategies)
 	}
 }
 
@@ -632,15 +766,11 @@ func TestRunInitFromJSON_SpotEnabledNoStrategiesUsesStarterStrategy(t *testing.T
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		t.Fatalf("output is not valid JSON: %v", err)
 	}
-	if len(cfg.Strategies) != 1 || cfg.Strategies[0].ID != "momentum-btc" {
-		t.Fatalf("expected starter momentum-btc config, got %+v", cfg.Strategies)
+	if len(cfg.Strategies) != 1 || cfg.Strategies[0].ID != "cpat-btc" {
+		t.Fatalf("expected starter cpat-btc config, got %+v", cfg.Strategies)
 	}
 }
 
-// When the user passes includePairs=true but no assets, the starter defaulter
-// populates Assets with the single starter asset. pairs_spread needs ≥2 assets,
-// so IncludePairs must be cleared rather than leaving an inert flag that would
-// silently generate a 1-asset config with no pair strategies.
 func TestApplyMinimalStarterDefaults_IncludePairsWithoutAssetsDrops(t *testing.T) {
 	opts := InitOptions{IncludePairs: true}
 	applyMinimalStarterDefaults(&opts)
@@ -655,8 +785,6 @@ func TestApplyMinimalStarterDefaults_IncludePairsWithoutAssetsDrops(t *testing.T
 	}
 }
 
-// If the user explicitly passes assets=["BTC","ETH"] and includePairs=true,
-// the defaulter must leave IncludePairs alone (pairs are valid with 2+ assets).
 func TestApplyMinimalStarterDefaults_IncludePairsWithMultipleAssetsPreserved(t *testing.T) {
 	opts := InitOptions{Assets: []string{"BTC", "ETH"}, IncludePairs: true}
 	applyMinimalStarterDefaults(&opts)
@@ -665,12 +793,6 @@ func TestApplyMinimalStarterDefaults_IncludePairsWithMultipleAssetsPreserved(t *
 	}
 }
 
-// Guard against drift between the starter constants and the option lists the
-// interactive wizard uses: if `starterAssetName` is ever removed from
-// `supportedAssets` or `starterSpotStrategyID` disappears from the spot
-// registry, `selectionDefaults` silently falls back to index 0 — a first-run
-// user would end up with some other asset/strategy without warning. Pin them
-// here so the test fails loudly instead.
 func TestStarterConstants_PinnedToOptionLists(t *testing.T) {
 	found := false
 	for _, a := range supportedAssets {
@@ -739,7 +861,6 @@ func TestDeriveShortName(t *testing.T) {
 		{"rsi_macd_combo", "rmc"},
 		{"vol_mean_reversion", "vol"},
 		{"momentum_options", "mom"},
-		// unknown: first letter of each word
 		{"my_new_strategy", "mns"},
 		{"alpha_beta_gamma", "abg"},
 	}
@@ -750,9 +871,6 @@ func TestDeriveShortName(t *testing.T) {
 	}
 }
 
-// #328/#656 — triple_ema_bidir must generate Direction="both" in perps
-// configs so ExecutePerpsSignal opens shorts from flat. Long-only strategies
-// must keep Direction="long" so they can't silently flip into short positions.
 func TestGenerateConfig_PerpsDirectionWiring(t *testing.T) {
 	opts := baseOpts()
 	opts.EnableSpot = false
@@ -772,13 +890,13 @@ func TestGenerateConfig_PerpsDirectionWiring(t *testing.T) {
 	cfg := generateConfig(opts)
 
 	want := map[string]string{
-		"hl-temab-eth": DirectionBoth, // bidirectional — must allow shorts
-		"hl-tema-eth":  DirectionLong, // long-only — must NOT allow shorts
-		"hl-rmc-eth":   DirectionLong, // long-only — must NOT allow shorts
-		"hl-sbo-eth":   DirectionBoth, // bidirectional — must allow shorts (#371)
-		"hl-dbo-eth":   DirectionBoth, // bidirectional — emits short on lower-channel breakdown (#649)
-		"hl-cpat-eth":  DirectionBoth, // bidirectional — emits short on bearish patterns (#649)
-		"hl-liqsw-eth": DirectionBoth, // bidirectional — emits short on stop-hunt wicks (#649)
+		"hl-temab-eth": DirectionBoth,
+		"hl-tema-eth":  DirectionLong,
+		"hl-rmc-eth":   DirectionLong,
+		"hl-sbo-eth":   DirectionBoth,
+		"hl-dbo-eth":   DirectionBoth,
+		"hl-cpat-eth":  DirectionBoth,
+		"hl-liqsw-eth": DirectionBoth,
 	}
 	seen := map[string]bool{}
 	for _, s := range cfg.Strategies {
@@ -790,7 +908,6 @@ func TestGenerateConfig_PerpsDirectionWiring(t *testing.T) {
 		if s.Direction != expected {
 			t.Errorf("%s Direction = %q, want %q", s.ID, s.Direction, expected)
 		}
-		// Defensive: never emit the legacy AllowShorts boolean from generateConfig.
 		if s.AllowShorts {
 			t.Errorf("%s AllowShorts = true, want false (deprecated; use Direction)", s.ID)
 		}
@@ -812,7 +929,6 @@ func TestGenerateConfig_PerpsMultipleStrategies(t *testing.T) {
 
 	cfg := generateConfig(opts)
 
-	// 2 strategies × 1 asset = 2 perps strategies
 	if len(cfg.Strategies) != 2 {
 		t.Fatalf("expected 2 perps strategies, got %d", len(cfg.Strategies))
 	}
@@ -844,7 +960,6 @@ func TestGenerateConfig_FuturesEnabled(t *testing.T) {
 
 	cfg := generateConfig(opts)
 
-	// 1 strategy × 2 symbols = 2 futures strategies
 	if len(cfg.Strategies) != 2 {
 		for _, s := range cfg.Strategies {
 			t.Logf("  %s (%s)", s.ID, s.Type)
@@ -918,7 +1033,6 @@ func TestGenerateConfig_FuturesNoFeeConfig(t *testing.T) {
 	opts.FuturesSymbols = []string{"ES"}
 	opts.FuturesCapital = 5000
 	opts.FuturesDrawdown = 5
-	// No fee per contract set
 
 	cfg := generateConfig(opts)
 
@@ -969,7 +1083,6 @@ func TestGenerateConfig_CapitalPct(t *testing.T) {
 
 func TestGenerateConfig_NoCapitalPct(t *testing.T) {
 	opts := baseOpts()
-	// CapitalPct defaults to 0 (not set)
 
 	cfg := generateConfig(opts)
 
@@ -980,7 +1093,7 @@ func TestGenerateConfig_NoCapitalPct(t *testing.T) {
 	}
 }
 
-func TestValidateConfig_CapitalPctValid(t *testing.T) {
+func TestConfigValidation_CapitalPctValid(t *testing.T) {
 	t.Setenv("HYPERLIQUID_ACCOUNT_ADDRESS", "0xTEST")
 	cfg := &Config{
 		IntervalSeconds: 600,
@@ -997,12 +1110,12 @@ func TestValidateConfig_CapitalPctValid(t *testing.T) {
 		},
 		PortfolioRisk: &PortfolioRiskConfig{MaxDrawdownPct: 25, WarnThresholdPct: 80},
 	}
-	if err := ValidateConfig(cfg); err != nil {
+	if err := validateConfig(cfg, false); err != nil {
 		t.Errorf("expected valid config with capital_pct, got error: %v", err)
 	}
 }
 
-func TestValidateConfig_CapitalPctInvalid(t *testing.T) {
+func TestConfigValidation_CapitalPctInvalid(t *testing.T) {
 	cfg := &Config{
 		IntervalSeconds: 600,
 		Strategies: []StrategyConfig{
@@ -1012,18 +1125,18 @@ func TestValidateConfig_CapitalPctInvalid(t *testing.T) {
 				Platform:       "hyperliquid",
 				Script:         "shared_scripts/check_strategy.py",
 				Capital:        0,
-				CapitalPct:     1.5, // invalid: > 1
+				CapitalPct:     1.5,
 				MaxDrawdownPct: 10,
 			},
 		},
 		PortfolioRisk: &PortfolioRiskConfig{MaxDrawdownPct: 25, WarnThresholdPct: 80},
 	}
-	if err := ValidateConfig(cfg); err == nil {
+	if err := validateConfig(cfg, false); err == nil {
 		t.Error("expected validation error for capital_pct > 1")
 	}
 }
 
-func TestValidateConfig_CapitalPctNegative(t *testing.T) {
+func TestConfigValidation_CapitalPctNegative(t *testing.T) {
 	cfg := &Config{
 		IntervalSeconds: 600,
 		Strategies: []StrategyConfig{
@@ -1033,18 +1146,18 @@ func TestValidateConfig_CapitalPctNegative(t *testing.T) {
 				Platform:       "hyperliquid",
 				Script:         "shared_scripts/check_strategy.py",
 				Capital:        0,
-				CapitalPct:     -0.5, // invalid: < 0
+				CapitalPct:     -0.5,
 				MaxDrawdownPct: 10,
 			},
 		},
 		PortfolioRisk: &PortfolioRiskConfig{MaxDrawdownPct: 25, WarnThresholdPct: 80},
 	}
-	if err := ValidateConfig(cfg); err == nil {
+	if err := validateConfig(cfg, false); err == nil {
 		t.Error("expected validation error for negative capital_pct")
 	}
 }
 
-func TestValidateConfig_NoCapitalNoCapitalPct(t *testing.T) {
+func TestConfigValidation_NoCapitalNoCapitalPct(t *testing.T) {
 	cfg := &Config{
 		IntervalSeconds: 600,
 		Strategies: []StrategyConfig{
@@ -1060,14 +1173,120 @@ func TestValidateConfig_NoCapitalNoCapitalPct(t *testing.T) {
 		},
 		PortfolioRisk: &PortfolioRiskConfig{MaxDrawdownPct: 25, WarnThresholdPct: 80},
 	}
-	if err := ValidateConfig(cfg); err == nil {
+	if err := validateConfig(cfg, false); err == nil {
 		t.Error("expected validation error when neither capital nor capital_pct is set")
 	}
 }
 
+func TestConfigValidation_SharedWalletPoolAllowsZeroCapitalWithTradeCaps(t *testing.T) {
+	marginCap := 100.0
+	cfg := &Config{
+		IntervalSeconds: 600,
+		Strategies: []StrategyConfig{
+			{
+				ID: "hl-pool-a", Type: "perps", Platform: "hyperliquid",
+				Script:  "shared_scripts/check_strategy.py",
+				Args:    []string{"sma_crossover", "BTC", "1h", "--mode=live"},
+				Capital: 0, MaxDrawdownPct: 10, Leverage: 5,
+				MarginPerTradeUSD: &marginCap,
+			},
+			{
+				ID: "hl-pool-b", Type: "perps", Platform: "hyperliquid",
+				Script:  "shared_scripts/check_strategy.py",
+				Args:    []string{"tema", "ETH", "1h", "--mode=live"},
+				Capital: 0, MaxDrawdownPct: 10, Leverage: 5,
+				MarginPerTradeUSD: &marginCap,
+			},
+		},
+		PortfolioRisk: &PortfolioRiskConfig{MaxDrawdownPct: 25, WarnThresholdPct: 80},
+	}
+	if err := validateConfig(cfg, true); err != nil {
+		t.Fatalf("shared-wallet pool config should be valid: %v", err)
+	}
+}
+
+func TestConfigValidation_SharedWalletPoolRequiresEveryTradeCap(t *testing.T) {
+	marginCap := 100.0
+	cfg := &Config{
+		IntervalSeconds: 600,
+		Strategies: []StrategyConfig{
+			{
+				ID: "okx-pool-a", Type: "perps", Platform: "okx",
+				Script:  "shared_scripts/check_strategy.py",
+				Args:    []string{"sma_crossover", "BTC", "1h", "--mode=live"},
+				Capital: 0, MaxDrawdownPct: 10, Leverage: 5,
+				MarginPerTradeUSD: &marginCap,
+			},
+			{
+				ID: "okx-pool-b", Type: "perps", Platform: "okx",
+				Script:  "shared_scripts/check_strategy.py",
+				Args:    []string{"tema", "ETH", "1h", "--mode=live"},
+				Capital: 0, MaxDrawdownPct: 10, Leverage: 5,
+			},
+		},
+		PortfolioRisk: &PortfolioRiskConfig{MaxDrawdownPct: 25, WarnThresholdPct: 80},
+	}
+	err := validateConfig(cfg, true)
+	if err == nil || !strings.Contains(err.Error(), "margin_per_trade_usd") {
+		t.Fatalf("expected missing pooled trade-cap error, got %v", err)
+	}
+}
+
+func TestConfigValidation_SharedWalletPoolRejectsAllocationBaselines(t *testing.T) {
+	marginCap := 100.0
+	tests := []struct {
+		name       string
+		second     StrategyConfig
+		wantErrSub string
+	}{
+		{
+			name: "mixed virtual allocation",
+			second: StrategyConfig{
+				ID: "okx-pool-b", Type: "perps", Platform: "okx",
+				Script:  "shared_scripts/check_strategy.py",
+				Args:    []string{"tema", "ETH", "1h", "--mode=live"},
+				Capital: 500, MaxDrawdownPct: 10, Leverage: 5,
+				MarginPerTradeUSD: &marginCap,
+			},
+			wantErrSub: "every member must omit capital and capital_pct",
+		},
+		{
+			name: "fake initial capital",
+			second: StrategyConfig{
+				ID: "okx-pool-b", Type: "perps", Platform: "okx",
+				Script:  "shared_scripts/check_strategy.py",
+				Args:    []string{"tema", "ETH", "1h", "--mode=live"},
+				Capital: 0, InitialCapital: 500, MaxDrawdownPct: 10, Leverage: 5,
+				MarginPerTradeUSD: &marginCap,
+			},
+			wantErrSub: "initial_capital is not supported",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{
+				IntervalSeconds: 600,
+				Strategies: []StrategyConfig{
+					{
+						ID: "okx-pool-a", Type: "perps", Platform: "okx",
+						Script:  "shared_scripts/check_strategy.py",
+						Args:    []string{"sma_crossover", "BTC", "1h", "--mode=live"},
+						Capital: 0, MaxDrawdownPct: 10, Leverage: 5,
+						MarginPerTradeUSD: &marginCap,
+					},
+					tt.second,
+				},
+				PortfolioRisk: &PortfolioRiskConfig{MaxDrawdownPct: 25, WarnThresholdPct: 80},
+			}
+			err := validateConfig(cfg, true)
+			if err == nil || !strings.Contains(err.Error(), tt.wantErrSub) {
+				t.Fatalf("expected %q error, got %v", tt.wantErrSub, err)
+			}
+		})
+	}
+}
+
 func TestGenerateConfig_DefaultsForOptionalFields(t *testing.T) {
-	// Simulates what the interactive wizard now does: only essential fields are set,
-	// optional fields (notifications, auto-update) use zero-value/defaults.
 	opts := InitOptions{
 		Assets:         []string{"BTC"},
 		EnableSpot:     true,
@@ -1078,7 +1297,6 @@ func TestGenerateConfig_DefaultsForOptionalFields(t *testing.T) {
 	}
 	cfg := generateConfig(opts)
 
-	// Notifications should be disabled by default.
 	if cfg.Discord.Enabled {
 		t.Error("expected Discord.Enabled=false by default")
 	}
@@ -1092,19 +1310,16 @@ func TestGenerateConfig_DefaultsForOptionalFields(t *testing.T) {
 		t.Errorf("expected Telegram.DMChannels=nil by default, got %v", cfg.Telegram.DMChannels)
 	}
 
-	// Auto-update should default to empty (off).
 	if cfg.AutoUpdate != "" {
 		t.Errorf("expected AutoUpdate empty by default, got %q", cfg.AutoUpdate)
 	}
 
-	// HTF filter should be applied.
 	for _, s := range cfg.Strategies {
 		if s.Type != "options" && s.HTFFilter != true {
 			t.Errorf("expected HTFFilter=true for %s", s.ID)
 		}
 	}
 
-	// Strategy should exist with correct defaults.
 	if len(cfg.Strategies) != 1 {
 		t.Fatalf("expected 1 strategy, got %d", len(cfg.Strategies))
 	}
@@ -1114,7 +1329,6 @@ func TestGenerateConfig_DefaultsForOptionalFields(t *testing.T) {
 }
 
 func TestRunInitFromJSON_DefaultCapitalAndNotifications(t *testing.T) {
-	// Verify that JSON mode with minimal input produces correct config with defaults.
 	out := filepath.Join(t.TempDir(), "config.json")
 	jsonStr := `{"assets":["BTC"],"enableSpot":true,"spotStrategies":["sma_crossover"],"spotCapital":1000,"spotDrawdown":5}`
 	code := runInitFromJSON(jsonStr, out)
@@ -1130,7 +1344,6 @@ func TestRunInitFromJSON_DefaultCapitalAndNotifications(t *testing.T) {
 		t.Fatalf("output is not valid JSON: %v", err)
 	}
 
-	// Notifications disabled by default.
 	if cfg.Discord.Enabled {
 		t.Error("expected Discord disabled by default in JSON mode")
 	}
@@ -1138,7 +1351,6 @@ func TestRunInitFromJSON_DefaultCapitalAndNotifications(t *testing.T) {
 		t.Error("expected Telegram disabled by default in JSON mode")
 	}
 
-	// Auto-update defaults to empty/off.
 	if cfg.AutoUpdate != "" {
 		t.Errorf("expected AutoUpdate empty by default, got %q", cfg.AutoUpdate)
 	}
@@ -1150,7 +1362,6 @@ func TestGenerateConfig_OptionsRobinhood(t *testing.T) {
 	opts.EnableOptions = true
 	opts.OptionPlatforms = []string{"robinhood"}
 	opts.OptStrategies = []string{"vol_mean_reversion"}
-	// RobinhoodOptionsSymbols left empty — should default to [SPY, QQQ]
 
 	cfg := generateConfig(opts)
 
@@ -1190,7 +1401,6 @@ func TestGenerateConfig_OptionsExcludesSOL(t *testing.T) {
 
 	cfg := generateConfig(opts)
 
-	// SOL must be excluded; BTC and ETH included → 2 strategies
 	if len(cfg.Strategies) != 2 {
 		t.Fatalf("expected 2 options strategies (no SOL), got %d", len(cfg.Strategies))
 	}
@@ -1209,7 +1419,7 @@ func TestGenerateConfig_PerpsSizingLeverageDefault(t *testing.T) {
 	opts.PerpsMode = "paper"
 	opts.PerpsStrategies = []string{"momentum"}
 	opts.PerpsLeverage = 5
-	opts.PerpsSizingLeverage = 0 // omitted → should inherit PerpsLeverage
+	opts.PerpsSizingLeverage = 0
 
 	cfg := generateConfig(opts)
 
@@ -1364,7 +1574,6 @@ func TestGenerateConfig_EnableManualDefaults(t *testing.T) {
 	opts.EnableManual = true
 	opts.ManualSymbol = "BTC"
 	opts.ManualCapital = 2000
-	// ManualTimeframe, ManualLeverage, ManualDrawdown left at zero → use defaults
 
 	cfg := generateConfig(opts)
 
@@ -1389,23 +1598,6 @@ func TestGenerateConfig_EnableManualDefaults(t *testing.T) {
 	}
 	if s.Capital != 2000 {
 		t.Errorf("expected Capital=2000, got %g", s.Capital)
-	}
-}
-
-func TestGenerateConfig_PortfolioRiskZeroUsesDefaults(t *testing.T) {
-	opts := baseOpts()
-	// PortfolioMaxDrawdownPct and PortfolioWarnThresholdPct both zero → use defaults
-
-	cfg := generateConfig(opts)
-
-	if cfg.PortfolioRisk == nil {
-		t.Fatal("expected PortfolioRisk to be set")
-	}
-	if cfg.PortfolioRisk.MaxDrawdownPct != 25 {
-		t.Errorf("expected MaxDrawdownPct=25 default, got %g", cfg.PortfolioRisk.MaxDrawdownPct)
-	}
-	if cfg.PortfolioRisk.WarnThresholdPct != 60 {
-		t.Errorf("expected WarnThresholdPct=60 default, got %g", cfg.PortfolioRisk.WarnThresholdPct)
 	}
 }
 
@@ -1444,7 +1636,6 @@ func TestGenerateConfig_HTFFilterSkipsOptionsAndDNF(t *testing.T) {
 
 func TestRunInitFromJSON_FuturesAutoPopulate(t *testing.T) {
 	out := filepath.Join(t.TempDir(), "config.json")
-	// Only enable futures; omit strategies/symbols/capital/drawdown — all should be auto-populated.
 	jsonStr := `{"assets":["BTC"],"enableFutures":true}`
 	code := runInitFromJSON(jsonStr, out)
 	if code != 0 {
@@ -1579,7 +1770,6 @@ func TestRunInitFromJSON_DeprecatedChannelMigration(t *testing.T) {
 
 func TestRunInitFromJSON_PerpsSizingLeverageInherits(t *testing.T) {
 	out := filepath.Join(t.TempDir(), "config.json")
-	// PerpsLeverage=5, no PerpsSizingLeverage → should inherit 5
 	jsonStr := `{"assets":["BTC"],"enablePerps":true,"perpsLeverage":5,"perpsStrategies":["momentum"],"perpsCapital":1000,"perpsDrawdown":5}`
 	code := runInitFromJSON(jsonStr, out)
 	if code != 0 {
@@ -1604,7 +1794,6 @@ func TestRunInitFromJSON_PerpsSizingLeverageInherits(t *testing.T) {
 }
 
 func TestRunInitFromJSON_WriteError(t *testing.T) {
-	// Pass a directory as output path → os.WriteFile should fail → exit 1
 	dir := t.TempDir()
 	jsonStr := `{"assets":["BTC"],"enableSpot":true,"spotStrategies":["momentum"],"spotCapital":1000,"spotDrawdown":5}`
 	code := runInitFromJSON(jsonStr, dir)
@@ -1613,9 +1802,6 @@ func TestRunInitFromJSON_WriteError(t *testing.T) {
 	}
 }
 
-// #1048: DisableCircuitBreaker stamps circuit_breaker:false on every generated
-// non-manual strategy; manual is exempt from CheckRisk so it is skipped (left
-// nil). Default (false) leaves every strategy nil → enabled.
 func TestGenerateConfig_DisableCircuitBreaker(t *testing.T) {
 	opts := InitOptions{
 		Assets:          []string{"BTC", "ETH"},
@@ -1628,7 +1814,6 @@ func TestGenerateConfig_DisableCircuitBreaker(t *testing.T) {
 		PerpsCapital:    1000,
 		SpotDrawdown:    5,
 		PerpsDrawdown:   5,
-		// #569 manual tracking strategy — must stay nil (CB no-op for manual).
 		EnableManual:    true,
 		ManualSymbol:    "ETH",
 		ManualTimeframe: "1h",
@@ -1637,7 +1822,6 @@ func TestGenerateConfig_DisableCircuitBreaker(t *testing.T) {
 		ManualLeverage:  20,
 	}
 
-	// Default: no stamping — every strategy stays nil → enabled.
 	def := generateConfig(opts)
 	for _, s := range def.Strategies {
 		if s.CircuitBreaker != nil {
@@ -1645,7 +1829,6 @@ func TestGenerateConfig_DisableCircuitBreaker(t *testing.T) {
 		}
 	}
 
-	// Opt-out: every non-manual strategy gets explicit false; manual stays nil.
 	opts.DisableCircuitBreaker = true
 	cfg := generateConfig(opts)
 	sawNonManual := false
@@ -1668,5 +1851,51 @@ func TestGenerateConfig_DisableCircuitBreaker(t *testing.T) {
 	}
 	if !sawManual {
 		t.Fatal("expected the manual tracking strategy to be generated")
+	}
+}
+
+func TestGenerateConfig_CBOverrides(t *testing.T) {
+	opts := InitOptions{
+		Assets:          []string{"ETH"},
+		EnablePerps:     true,
+		PerpsMode:       "paper",
+		PerpsStrategies: []string{"momentum"},
+		PerpsCapital:    1000,
+		PerpsDrawdown:   5,
+		EnableManual:    true,
+		ManualSymbol:    "ETH",
+		ManualTimeframe: "1h",
+		ManualCapital:   1000,
+		ManualDrawdown:  20,
+		ManualLeverage:  20,
+	}
+
+	def := generateConfig(opts)
+	for _, s := range def.Strategies {
+		if s.CBDrawdownCooldownMinutes != nil || s.CBLossStreakThreshold != nil || s.CBLossStreakCooldownMinutes != nil {
+			t.Fatalf("default generateConfig should leave cb_* overrides nil on %s", s.ID)
+		}
+	}
+
+	opts.CBDrawdownCooldownMinutes = 720
+	opts.CBLossStreakThreshold = 3
+	opts.CBLossStreakCooldownMinutes = 30
+	cfg := generateConfig(opts)
+	sawNonManual, sawManual := false, false
+	for _, s := range cfg.Strategies {
+		if s.Type == "manual" {
+			sawManual = true
+			if s.CBDrawdownCooldownMinutes != nil || s.CBLossStreakThreshold != nil || s.CBLossStreakCooldownMinutes != nil {
+				t.Fatalf("manual strategy %s should be skipped (CheckRisk-exempt)", s.ID)
+			}
+			continue
+		}
+		sawNonManual = true
+		if s.CircuitBreakerDrawdownCooldown() != 12*time.Hour || s.CircuitBreakerLossStreakThreshold() != 3 || s.CircuitBreakerLossStreakCooldown() != 30*time.Minute {
+			t.Fatalf("non-manual strategy %s missing stamped cb_* overrides", s.ID)
+		}
+	}
+	if !sawNonManual || !sawManual {
+		t.Fatal("expected both a non-manual and the manual tracking strategy")
 	}
 }

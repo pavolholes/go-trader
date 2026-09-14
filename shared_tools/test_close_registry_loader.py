@@ -1,11 +1,14 @@
-"""Tests for close_registry_loader.py's --list-json catalog surface (#1203)."""
 
 import json
 import subprocess
 import sys
 from pathlib import Path
 
-from close_registry_loader import list_strategies, list_strategies_detailed
+from shared_tools.conftest import load_module
+
+_CLOSE_REGISTRY_LOADER = load_module("_close_registry_loader_test", Path(__file__).with_name("close_registry_loader.py"))
+list_strategies = _CLOSE_REGISTRY_LOADER.list_strategies
+list_strategies_detailed = _CLOSE_REGISTRY_LOADER.list_strategies_detailed
 
 _LOADER_PATH = Path(__file__).resolve().parent / "close_registry_loader.py"
 
@@ -39,7 +42,6 @@ def test_list_strategies_detailed_spot_check_known_evaluators():
 
 
 def test_cli_list_json_emits_same_shape_as_python_call():
-    """Subprocess contract: --list-json prints JSON to stdout on success."""
     result = subprocess.run(
         [sys.executable, str(_LOADER_PATH), "--list-json"],
         capture_output=True,
@@ -51,7 +53,6 @@ def test_cli_list_json_emits_same_shape_as_python_call():
 
 
 def test_cli_without_list_json_flag_errors_with_json_on_stdout():
-    """Subprocess contract: scripts emit JSON to stdout even on error, exit 1."""
     result = subprocess.run(
         [sys.executable, str(_LOADER_PATH)],
         capture_output=True,

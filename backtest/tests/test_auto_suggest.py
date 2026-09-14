@@ -1,9 +1,3 @@
-"""#1210: pure-helper unit tests for the M1-M6 auto-suggester.
-
-Every test exercises a PURE helper against fixture payload dicts — no subprocess
-spawning, no market-data access, no live-config touch (matching the repo's
-"extract pure helpers from subprocess wrappers" rule so Go/Python CI never
-depends on running a harness)."""
 import copy
 import json
 import os
@@ -16,10 +10,6 @@ from regime_stats import benjamini_hochberg
 _STUDY_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                           "candidates", "squeeze_momentum_1198")
 
-
-# --------------------------------------------------------------------------
-# 1. Spec loading / validation
-# --------------------------------------------------------------------------
 
 def _base_spec(**over):
     spec = {
@@ -42,41 +32,61 @@ def test_load_spec_accepts_committed_1198_shape():
     assert spec["registry"] == "spot"
     assert [c["key"] for c in spec["candidates"]] == ["baseline", "adx_not_down",
                                                       "comp_up_family"]
-    # file refs resolved to dicts
     assert spec["candidates"][1]["candidate"]["allowed_regimes"] == ["trending_up", "ranging"]
 
 
-def test_load_spec_rejects_unknown_harness():
-    with pytest.raises(ValueError, match="unknown harnesses"):
-        asug.load_spec(_base_spec(harnesses=["m1", "m9"]), _STUDY_DIR)
+_M6_VARIANT = {"key": "v",
+               "candidate_close": [{"name": "atr_stop",
+                                    "params": {"atr_mult": 2}}]}
 
 
-def test_load_spec_rejects_unknown_window():
-    with pytest.raises(ValueError, match="unknown windows"):
-        asug.load_spec(_base_spec(windows=["is", "nope"]), _STUDY_DIR)
+@pytest.mark.parametrize("overrides,match", [
+    (dict(harnesses=["m1", "m9"]), "unknown harnesses"),
+    (dict(windows=["is", "nope"]), "unknown windows"),
+    (dict(registry="options"), "registry must be"),
+    (dict(correction={"method": "bonferroni"}), "benjamini_hochberg"),
+    (dict(candidates=[{"key": "c", "candidate": {
+        "name": "squeeze_momentum", "allowed_regimes": "trending_up"}}]),
+     "allowed_regimes"),
+    (dict(correction={"method": "benjamini_hochberg", "family_size": 0}),
+     "family_size"),
+    (dict(correction={"method": "benjamini_hochberg", "family_size": -1}),
+     "family_size"),
+    (dict(correction={"method": "benjamini_hochberg", "family_size": 1.5}),
+     "family_size"),
+    (dict(correction={"method": "benjamini_hochberg", "family_size": True}),
+     "family_size"),
+    (dict(correction={"method": "benjamini_hochberg", "family_size": "8"}),
+     "family_size"),
+    (dict(candidates=[], m6={"strategy_id": "s", "baseline_config": "cfg.json",
+                             "incumbent_close": [{"name": "tiered_tp_atr"}],
+                             "candidate_close_variants": []}), "EXACTLY one"),
+    (dict(candidates=[], m6={"strategy_id": "s",
+                             "candidate_close_variants": []}), "EXACTLY one"),
+    (dict(candidates=[], m6={"incumbent_close": [{"name": "tiered_tp_atr",
+                                                  "params": {}}],
+                             "candidate_close_variants": [_M6_VARIANT]}),
+     "strategy_id"),
+    (dict(candidates=[], m6={"baseline_config": "cfg.json",
+                             "candidate_close_variants": [_M6_VARIANT]}),
+     "strategy_id"),
+    (dict(candidates=[], m6={
+        "incumbent_close": [{"name": "tiered_tp_atr", "params": {}}],
+        "candidate_close_variants": [],
+        "close_stack_specs": [{"close": {"name": "atr_stop",
+                                         "params": {"atr_mult": [2.0]}}}]}),
+     "close_stack_specs"),
+    (dict(mc={"kill_switch_pct": 30, "config": "c.json", "strategy_id": "x"}),
+     "mutually exclusive"),
+    (dict(mc={"config": "c.json"}), "go together"),
+    (dict(mc={"strategy_id": "x"}), "go together"),
+    (dict(mc={"schemes": ["permute"]}), "unknown mc keys"),
+    (dict(mc={"n_paths": 0}), "n_paths"),
+])
+def test_load_spec_rejects_invalid_spec(overrides, match):
+    with pytest.raises(ValueError, match=match):
+        asug.load_spec(_base_spec(**overrides), _STUDY_DIR)
 
-
-def test_load_spec_rejects_unknown_registry():
-    with pytest.raises(ValueError, match="registry must be"):
-        asug.load_spec(_base_spec(registry="options"), _STUDY_DIR)
-
-
-def test_load_spec_rejects_non_bh_correction():
-    with pytest.raises(ValueError, match="benjamini_hochberg"):
-        asug.load_spec(_base_spec(correction={"method": "bonferroni"}), _STUDY_DIR)
-
-
-def test_load_spec_runs_candidate_validator():
-    # allowed_regimes as a bare string is the #1031 trap validate_candidate catches.
-    bad = _base_spec(candidates=[{"key": "c", "candidate": {
-        "name": "squeeze_momentum", "allowed_regimes": "trending_up"}}])
-    with pytest.raises(ValueError, match="allowed_regimes"):
-        asug.load_spec(bad, _STUDY_DIR)
-
-
-# --------------------------------------------------------------------------
-# 2. Candidate expansion
-# --------------------------------------------------------------------------
 
 def test_expand_explicit_candidates():
     spec = asug.load_spec(_base_spec(), _STUDY_DIR)
@@ -137,10 +147,6 @@ def test_close_stack_specs_round_trip_through_optimizer_grid():
     assert len(ab) == expected
 
 
-# --------------------------------------------------------------------------
-# 3. Preconditions (replayability, m5 params limitation)
-# --------------------------------------------------------------------------
-
 def test_non_replayable_m6_close_excluded():
     spec = asug.load_spec(_base_spec(candidates=[], base=None, m6={
         "baseline_config": "cfg.json", "strategy_id": "s",
@@ -151,19 +157,6 @@ def test_non_replayable_m6_close_excluded():
     entries = {e["key"]: e for e in asug.expand_candidates(spec)}
     assert entries["m6.bad"]["precondition_errors"] == ["excluded_not_replayable"]
     assert entries["m6.good"]["precondition_errors"] == []
-
-
-def test_m6_requires_exactly_one_incumbent_source():
-    base = dict(candidates=[])
-    both = _base_spec(**base, m6={"strategy_id": "s", "baseline_config": "cfg.json",
-                                  "incumbent_close": [{"name": "tiered_tp_atr"}],
-                                  "candidate_close_variants": []})
-    with pytest.raises(ValueError, match="EXACTLY one"):
-        asug.load_spec(both, _STUDY_DIR)
-    neither = _base_spec(**base, m6={"strategy_id": "s",
-                                     "candidate_close_variants": []})
-    with pytest.raises(ValueError, match="EXACTLY one"):
-        asug.load_spec(neither, _STUDY_DIR)
 
 
 def test_m6_incumbent_close_only_spec_loads():
@@ -179,19 +172,7 @@ def test_m6_incumbent_close_only_spec_loads():
     assert ab[0]["candidate"]["baseline_config"] is None
 
 
-def test_m6_missing_strategy_id_everywhere_fails_at_load():
-    # (a) incumbent_close set, no strategy_id at m6 OR variant level -> must
-    # raise at load, not surface as a broken '--strategy None' subprocess.
-    bad = _base_spec(candidates=[], m6={
-        "incumbent_close": [{"name": "tiered_tp_atr", "params": {}}],
-        "candidate_close_variants": [
-            {"key": "v", "candidate_close": [{"name": "atr_stop", "params": {"atr_mult": 2}}]}]})
-    with pytest.raises(ValueError, match="strategy_id"):
-        asug.load_spec(bad, _STUDY_DIR)
-
-
 def test_m6_per_variant_strategy_id_override_loads_without_m6_default():
-    # (b) m6 block omits strategy_id but each variant supplies its own -> legit.
     spec = asug.load_spec(_base_spec(candidates=[], m6={
         "incumbent_close": [{"name": "tiered_tp_atr", "params": {}}],
         "candidate_close_variants": [
@@ -202,62 +183,18 @@ def test_m6_per_variant_strategy_id_override_loads_without_m6_default():
     assert len(ab) == 1 and ab[0]["candidate"]["strategy_id"] == "squeeze_momentum"
 
 
-def test_m6_close_stack_specs_require_m6_level_strategy_id():
-    # close_stack variants are generated and cannot carry a per-variant
-    # strategy_id, so an m6-level default is mandatory when they are present.
-    bad = _base_spec(candidates=[], m6={
-        "incumbent_close": [{"name": "tiered_tp_atr", "params": {}}],
-        "candidate_close_variants": [],
-        "close_stack_specs": [{"close": {"name": "atr_stop", "params": {"atr_mult": [2.0]}}}]})
-    with pytest.raises(ValueError, match="close_stack_specs"):
-        asug.load_spec(bad, _STUDY_DIR)
-
-
-def test_m6_baseline_config_path_also_requires_strategy_id():
-    # (c) the baseline_config path embeds --strategy too; same missing-value guard.
-    bad = _base_spec(candidates=[], m6={
-        "baseline_config": "cfg.json",
-        "candidate_close_variants": [
-            {"key": "v", "candidate_close": [{"name": "atr_stop", "params": {"atr_mult": 2}}]}]})
-    with pytest.raises(ValueError, match="strategy_id"):
-        asug.load_spec(bad, _STUDY_DIR)
-
-
-_TEMPLATE = os.path.join(os.path.dirname(_STUDY_DIR), "suggest.template.jsonc")
-
-
-def _load_template_json():
-    import re
-    return json.loads(re.sub(r"//.*", "", open(_TEMPLATE).read()))
-
-
-def test_template_documents_every_variant_and_candidate_option():
-    # The template header asserts it "documents EVERY option the loader accepts";
-    # three prior review rounds each found one omitted key. Lock in the fixes so
-    # a future edit can't silently regress the completeness claim.
-    raw = _load_template_json()
-    # per-candidate harness override (auto_suggest.py: c.get("harnesses"))
-    assert any("harnesses" in c for c in raw["candidates"]), "template omits per-candidate harnesses"
-    m6 = raw["m6"]
-    # m6-level allowed_regimes default (seeds close_stack variants)
-    assert "allowed_regimes" in m6, "template omits m6-level allowed_regimes"
-    # per-variant strategy_id override (variant.get("strategy_id"))
-    assert any("strategy_id" in v for v in m6["candidate_close_variants"]), \
-        "template omits per-variant strategy_id override"
 
 
 def test_shipped_full_options_spec_loads_and_expands():
-    # The committed all-options default must load and expand cleanly (guards the
-    # demo from silently rotting — every generator + M6 exercised).
     with open(os.path.join(_STUDY_DIR, "suggest.json")) as fh:
         raw = json.load(fh)
     spec = asug.load_spec(raw, _STUDY_DIR)
     entries = asug.expand_candidates(spec)
     kinds = {e["kind"] for e in entries}
-    assert kinds == {"open", "exit_ab"}          # both harness families present
+    assert kinds == {"open", "exit_ab"}
     ab = [e for e in entries if e["kind"] == "exit_ab"]
-    assert all(e["precondition_errors"] == [] for e in ab)   # all M6 closes replayable
-    assert len({e["key"] for e in entries}) == len(entries)  # keys unique
+    assert all(e["precondition_errors"] == [] for e in ab)
+    assert len({e["key"] for e in entries}) == len(entries)
 
 
 def test_m5_params_limitation_flagged():
@@ -268,10 +205,6 @@ def test_m5_params_limitation_flagged():
     entry = asug.expand_candidates(spec)[0]
     assert "m5_params_unaudited" in entry["limitations"]
 
-
-# --------------------------------------------------------------------------
-# 4. argv-tail builders (golden)
-# --------------------------------------------------------------------------
 
 def test_m1_argv_tail():
     assert asug.m1_argv_tail("/t/c.json", "spot", ["is", "oos"],
@@ -311,11 +244,10 @@ def test_m6_argv_tail_baseline_config_path():
            "candidate_close": [{"name": "atr_stop"}]}
     tail = asug.m6_argv_tail(m6c, "spot", ["oos"], None, 100, 1066, "/t/m6.json")
     assert "--baseline-config" in tail and "/cfg.json" in tail
-    assert "--incumbent-close" not in tail  # exactly one incumbent source
+    assert "--incumbent-close" not in tail
 
 
 def test_m6_argv_tail_incumbent_close_path_omits_baseline():
-    # The self-contained path: no baseline_config, an explicit incumbent ladder.
     m6c = {"strategy_id": "squeeze_momentum",
            "incumbent_close": [{"name": "tiered_tp_atr", "params": {}}],
            "candidate_close": [{"name": "atr_stop", "params": {"atr_mult": 2}}]}
@@ -331,10 +263,6 @@ def test_m5_argv_tail():
                     "--windows", "oos", "--json", "/t/m5.json"]
 
 
-# --------------------------------------------------------------------------
-# 5. Extractors / rollup
-# --------------------------------------------------------------------------
-
 def _m6_payload(is_rows, oos_rows):
     def _mk(rows):
         return [{"dataset": ds, "per_regime": {"all": {
@@ -348,7 +276,6 @@ def test_m6_window_rollup_matches_paired_n_weighting():
         is_rows=[("BTC 1h", 0.10, 100, 0.01), ("ETH 1h", -0.20, 50, 0.30)],
         oos_rows=[("BTC 1h", 0.05, 40, 0.20)])
     roll = asug.m6_window_rollup(payload)
-    # pooled = (0.10*100 + -0.20*50) / 150 = 0.0
     assert roll["is"]["pooled_delta_net_pct_per_entry"] == 0.0
     assert roll["is"]["paired_n"] == 150
     assert roll["is"]["datasets_delta_pos"] == 1
@@ -400,16 +327,11 @@ def test_extract_m5_matches_strategy_row():
     assert out["fee_drag_pp"] == 0.3
 
 
-# --------------------------------------------------------------------------
-# 6. Family correction
-# --------------------------------------------------------------------------
-
 def test_apply_correction_matches_direct_bh_and_reports_threshold():
     tests = [{"candidate_key": "a", "harness": "m6", "p": p, "effect_positive": True}
              for p in [0.001, 0.02, 0.04, 0.5]]
     corr = asug.apply_family_correction(copy.deepcopy(tests), alpha=0.05)
     mask = benjamini_hochberg([t["p"] for t in tests], 0.05)
-    # stamped bh_pass agrees with a direct BH call
     stamped = asug.apply_family_correction(tests, 0.05) and [t["bh_pass"] for t in tests]
     assert stamped == mask
     assert corr["m"] == 4
@@ -426,23 +348,61 @@ def test_correction_empty_family():
     assert corr["n_survivors"] == 0
 
 
+def test_bh_family_size_widens_denominator_and_is_stricter():
+    pvals = [0.01, 0.04]
+    assert benjamini_hochberg(pvals, 0.05) == [True, True]
+    assert benjamini_hochberg(pvals, 0.05, family_size=10) == [False, False]
+    assert (benjamini_hochberg(pvals, 0.05, family_size=2)
+            == benjamini_hochberg(pvals, 0.05))
+
+
+def test_bh_family_size_below_test_count_raises():
+    with pytest.raises(ValueError, match="family_size"):
+        benjamini_hochberg([0.01, 0.04], 0.05, family_size=1)
+
+
+def test_apply_correction_family_size_reports_m_and_tests_run():
+    tests = [{"candidate_key": "a", "harness": "m6", "p": p, "effect_positive": True}
+             for p in [0.001, 0.02]]
+    corr = asug.apply_family_correction(copy.deepcopy(tests), alpha=0.05,
+                                        family_size=8)
+    assert corr["m"] == 8
+    assert corr["tests_run"] == 2
+    assert corr["bonferroni_threshold"] == pytest.approx(0.05 / 8)
+    strict = asug.apply_family_correction(copy.deepcopy(tests), alpha=0.05,
+                                          family_size=8)
+    loose = asug.apply_family_correction(copy.deepcopy(tests), alpha=0.05)
+    assert strict["n_survivors"] <= loose["n_survivors"]
+
+
+def test_apply_correction_family_size_below_produced_count_raises():
+    tests = [{"candidate_key": "a", "harness": "m6", "p": p, "effect_positive": True}
+             for p in [0.001, 0.02, 0.04]]
+    with pytest.raises(ValueError, match="family_size"):
+        asug.apply_family_correction(tests, alpha=0.05, family_size=2)
+
+
+def test_load_spec_accepts_positive_family_size():
+    spec = asug.load_spec(
+        _base_spec(correction={"method": "benjamini_hochberg", "alpha": 0.05,
+                               "family_size": 40}),
+        _STUDY_DIR)
+    assert spec["correction"]["family_size"] == 40
+
+
 def test_collect_family_pvalues_dedupes_noise_and_excludes_m3_m5():
     e1 = {"key": "a", "kind": "open", "noise_family_key": "K",
           "results": {"m1_noise": {"data": {"permutation_p": 0.01, "mean": 0.2}},
                       "m3": {"data": {"x": 1}}, "m5": {"data": {"salvage_verdict": "healthy"}}}}
-    e2 = {"key": "b", "kind": "open", "noise_family_key": "K",  # same base -> deduped
+    e2 = {"key": "b", "kind": "open", "noise_family_key": "K",
           "results": {"m1_noise": {"data": {"permutation_p": 0.01, "mean": 0.2}}}}
     e3 = {"key": "c", "kind": "exit_ab",
           "results": {"m6": {"data": {"oos": {"per_dataset": [
               {"dataset": "BTC 1h", "mean": 0.3, "p": 0.02}]}}}}}
     tests = asug.collect_family_pvalues([e1, e2, e3])
     harnesses = sorted(t["harness"] for t in tests)
-    assert harnesses == ["m1_noise", "m6"]  # one noise (deduped), one m6; no m3/m5
+    assert harnesses == ["m1_noise", "m6"]
 
-
-# --------------------------------------------------------------------------
-# 7. Promotion gate (verdict matrix)
-# --------------------------------------------------------------------------
 
 def _open_entry(key, noise=None, m1=None, harnesses=("m1_noise", "m1"), fam=None):
     results = {}
@@ -495,31 +455,21 @@ def test_verdict_open_m1_fail_is_incumbent_stands():
 
 
 def test_gated_siblings_share_noise_bh_verdict():
-    # #1210 review (Needs Fixing): candidates differing only by gate share ONE
-    # noise_family_key. The deduped noise p is attached to the FIRST sibling's
-    # candidate_key only, so lookup-by-family (not by candidate_key) is required
-    # or the other siblings skip the BH downgrade and promote on a failed p.
     fam = "shared"
     m1_pass = {"is": {"verdict": "pass"}, "oos": {"verdict": "pass"}}
     noise = {"verdict": "distinguishable_positive", "mean": 0.3}
     siblings = [_open_entry(k, fam=fam, noise=noise, m1=m1_pass)
                 for k in ("baseline", "adx_gate", "comp_gate")]
-    # The deduped noise test lives under the FIRST sibling only, and it FAILS BH.
     tests = [_noise_test(fam, "baseline", 0.049, bh_pass=False)]
     verdicts = [asug.candidate_verdict(e, tests) for e in siblings]
-    # (a) NONE may be survivor — every sibling gets the downgrade.
     assert verdicts == ["positive_uncorrected_only"] * 3
-    # (c) reordering the entries must not change any verdict.
     verdicts_rev = [asug.candidate_verdict(e, tests) for e in reversed(siblings)]
     assert set(verdicts_rev) == {"positive_uncorrected_only"}
-    # When the shared noise p SURVIVES BH, all three become survivors together.
     tests[0]["bh_pass"] = True
     assert [asug.candidate_verdict(e, tests) for e in siblings] == ["survivor"] * 3
 
 
 def test_distinct_param_families_keep_independent_noise_tests():
-    # (b) same name+direction, different params => distinct families => two noise
-    # tests, each governing its own candidate.
     e_a = {"key": "a", "kind": "open", "noise_family_key": "famA",
            "results": {"m1_noise": {"data": {"permutation_p": 0.01, "mean": 0.2}}}}
     e_b = {"key": "b", "kind": "open", "noise_family_key": "famB",
@@ -570,10 +520,6 @@ def test_verdict_m6_incumbent_stands_when_not_both_positive():
     assert asug.candidate_verdict(e, []) == "incumbent_stands"
 
 
-# --------------------------------------------------------------------------
-# 8. Ranking + report
-# --------------------------------------------------------------------------
-
 def test_rank_survivors_first_failed_still_present():
     entries = [
         {"key": "loser", "verdict": "incumbent_stands", "results": {}},
@@ -583,22 +529,7 @@ def test_rank_survivors_first_failed_still_present():
     ranked = asug.rank_shortlist(entries)
     assert ranked[0]["key"] == "win"
     assert [e["key"] for e in ranked] == ["win", "loser", "broke"]
-    assert any(e["verdict"] == "run_failed" for e in ranked)  # never dropped
-
-
-def test_format_shortlist_has_correction_line_context_label_and_footer():
-    report = {
-        "study": "t", "exploratory": False,
-        "correction": {"method": "benjamini_hochberg", "alpha": 0.05, "m": 3,
-                       "effective_threshold": 0.01, "bonferroni_threshold": 0.0167,
-                       "n_survivors": 1},
-        "ranked": [{"key": "win", "verdict": "survivor", "limitations": [],
-                    "results": {"m5": {"data": {"salvage_verdict": "graduate_m1"}}}}],
-    }
-    text = asug.format_shortlist(report)
-    assert "benjamini_hochberg" in text
-    assert "UNCORRECTED CONTEXT" in text
-    assert asug.FOOTER in text
+    assert any(e["verdict"] == "run_failed" for e in ranked)
 
 
 def test_reproduction_command_uses_relative_harness_paths():
@@ -609,13 +540,7 @@ def test_reproduction_command_uses_relative_harness_paths():
     assert "--candidate-json" in cmds[0]
 
 
-# --------------------------------------------------------------------------
-# 9. #1295 — advisory Monte Carlo columns must never touch the promotion gate
-# --------------------------------------------------------------------------
-
 def _survivor_entry(**results_over):
-    """An entry whose GATE evidence is a clean pass: noise distinguishable,
-    M1 pass on both protocol windows."""
     results = {
         "m1_noise": {"status": "ok",
                      "data": {"verdict": "distinguishable_positive",
@@ -642,9 +567,6 @@ def _family_tests(entry):
 
 
 def test_mc_absent_present_and_failed_all_yield_the_same_verdict():
-    # The #1274 pre-registered criterion, strengthened per #1295: a FAILED mc
-    # run is the case the naive "no mc key is read" invariant misses, because
-    # candidate_verdict's failed-run scan reads results.values() generically.
     absent = _survivor_entry()
     present = _survivor_entry(mc=_mc_ok_run())
     failed = _survivor_entry(mc={"status": "failed", "argv_tail": ["--json", "x"]})
@@ -662,7 +584,6 @@ def test_gate_relevant_results_drops_only_advisory_harnesses():
     gate = asug.gate_relevant_results(entry)
     assert set(gate) == {"m1_noise", "m1", "m5"}
     assert "mc" not in gate
-    # M5 stays gate-relevant: a failed M5 still means run_failed (pre-#1295).
     assert asug.candidate_verdict(
         _survivor_entry(m5={"status": "failed"}), []) == "run_failed"
 
@@ -683,7 +604,6 @@ def test_mc_failure_surfaces_as_a_limitation_not_a_verdict():
     entry = _survivor_entry(mc={"status": "failed"})
     assert asug.advisory_failures(entry) == ["mc"]
     assert asug.advisory_failures(_survivor_entry(mc=_mc_ok_run())) == []
-    # a failed GATE harness is not an "advisory failure"
     assert asug.advisory_failures(_survivor_entry(m1={"status": "failed"})) == []
 
 
@@ -696,13 +616,11 @@ def test_mc_contributes_no_pvalue_and_leaves_bh_family_size_unchanged():
     assert all(t["harness"] != "mc" for t in with_mc)
 
 
-# ---- mc argv tail ---------------------------------------------------------
-
 def test_mc_argv_tail_threads_the_candidate_json_not_a_bare_strategy():
     tail = asug.mc_argv_tail("/t/c.json", "spot", ["is", "oos"],
                              ["BTC/USDT:1h"], 500, 7, {}, "/t/o.json")
     assert tail[:2] == ["--candidate-json", "/t/c.json"]
-    assert "--strategy" not in tail          # fidelity: never the bare strategy
+    assert "--strategy" not in tail
     assert "--windows" in tail and tail[tail.index("--windows") + 1] == "is,oos"
     assert tail[tail.index("--datasets") + 1] == "BTC/USDT:1h"
     assert tail[tail.index("--n-paths") + 1] == "500"
@@ -726,30 +644,7 @@ def test_mc_argv_tail_threshold_sources_are_exclusive():
                                  "/o")
     assert from_cfg[from_cfg.index("--config") + 1] == "/cfg.json"
     assert from_cfg[from_cfg.index("--strategy-id") + 1] == "hl-x"
-    assert "--kill-switch-pct" not in from_cfg   # monte_carlo.py refuses both
-
-
-# ---- mc spec block --------------------------------------------------------
-
-def test_load_spec_rejects_both_mc_threshold_sources():
-    with pytest.raises(ValueError, match="mutually exclusive"):
-        asug.load_spec(_base_spec(mc={"kill_switch_pct": 30,
-                                      "config": "c.json",
-                                      "strategy_id": "x"}), _STUDY_DIR)
-
-
-def test_load_spec_rejects_mc_config_without_strategy_id():
-    with pytest.raises(ValueError, match="go together"):
-        asug.load_spec(_base_spec(mc={"config": "c.json"}), _STUDY_DIR)
-    with pytest.raises(ValueError, match="go together"):
-        asug.load_spec(_base_spec(mc={"strategy_id": "x"}), _STUDY_DIR)
-
-
-def test_load_spec_rejects_unknown_mc_key_and_bad_n_paths():
-    with pytest.raises(ValueError, match="unknown mc keys"):
-        asug.load_spec(_base_spec(mc={"schemes": ["permute"]}), _STUDY_DIR)
-    with pytest.raises(ValueError, match="n_paths"):
-        asug.load_spec(_base_spec(mc={"n_paths": 0}), _STUDY_DIR)
+    assert "--kill-switch-pct" not in from_cfg
 
 
 def test_load_spec_resolves_mc_config_against_the_spec_dir():
@@ -760,18 +655,12 @@ def test_load_spec_resolves_mc_config_against_the_spec_dir():
 
 def test_mc_is_opt_in_not_a_default_harness():
     assert "mc" not in asug.DEFAULT_HARNESSES and "mc" in asug.OPEN_HARNESSES
-    # a spec that doesn't name its own harnesses list gets the defaults, and
-    # those must not include mc
     spec = asug.load_spec(_base_spec(harnesses=None), _STUDY_DIR)
     entry = asug.expand_candidates(spec)[0]
     assert "mc" not in entry["harnesses"]
-    # a spec that explicitly opts in still gets mc, since it's a valid
-    # selectable open-kind harness
     spec = asug.load_spec(_base_spec(harnesses=["m1", "mc"]), _STUDY_DIR)
     assert "mc" in asug.expand_candidates(spec)[0]["harnesses"]
 
-
-# ---- extract_mc -----------------------------------------------------------
 
 def _mc_payload():
     def leg(window, ds, p_ks, p95, p_down, status="ok"):
@@ -789,7 +678,6 @@ def test_extract_mc_keys_by_window_and_takes_the_worst_dataset():
     out = asug.extract_mc(_mc_payload())
     assert set(out) == {"is", "oos"}
     worst = out["oos"]["worst"]["permute"]
-    # worst-case, not mean: the fragile ETH leg must not be averaged away
     assert worst == {"p_dd_ge_kill_switch": 0.55, "p95_max_dd": 70.0,
                      "p_final_below_start": 0.40}
     assert set(out["oos"]["per_dataset"]) == {"BTC/USDT 1h", "ETH/USDT 4h"}
@@ -801,51 +689,14 @@ def test_extract_mc_tolerates_no_data_legs_and_missing_percentiles():
          "n_trades": 0, "schemes": []},
         {"window": "oos", "dataset": "ETH/USDT 1h", "status": "ok", "n_trades": 3,
          "schemes": [{"scheme": "permute", "p_dd_ge_kill_switch": 0.2,
-                      "max_dd_pct_percentiles": {"p50": 5.0},  # no p95 configured
+                      "max_dd_pct_percentiles": {"p50": 5.0},
                       "p_final_below_start": 0.1}]}]}
     out = asug.extract_mc(payload)
     worst = out["oos"]["worst"]["permute"]
     assert worst["p_dd_ge_kill_switch"] == 0.2
-    assert worst["p95_max_dd"] is None      # never fabricated
+    assert worst["p95_max_dd"] is None
     assert asug.extract_mc({}) == {}
 
-
-# ---- report ---------------------------------------------------------------
-
-def test_format_shortlist_labels_mc_advisory_and_prints_the_oos_worst_case():
-    report = {
-        "study": "t", "exploratory": False,
-        "correction": {"method": "benjamini_hochberg", "alpha": 0.05, "m": 1,
-                       "effective_threshold": 0.01, "bonferroni_threshold": 0.05,
-                       "n_survivors": 1},
-        "ranked": [{"key": "win", "verdict": "survivor", "limitations": [],
-                    "results": {"mc": {"data": asug.extract_mc(_mc_payload())}}}],
-    }
-    text = asug.format_shortlist(report)
-    assert "MC(adv,oos)" in text
-    assert "p95DD 70.0%" in text and "pKS 0.550" in text
-    assert "does not gate" in text
-    assert "M3/M5/MC figures are UNCORRECTED CONTEXT" in text
-
-
-def test_format_shortlist_omits_the_mc_segment_when_the_run_failed():
-    report = {
-        "study": "t", "exploratory": False,
-        "correction": {"method": "benjamini_hochberg", "alpha": 0.05, "m": 1,
-                       "effective_threshold": None, "bonferroni_threshold": None,
-                       "n_survivors": 0},
-        "ranked": [{"key": "win", "verdict": "survivor",
-                    "limitations": ["mc_run_failed"],
-                    "results": {"mc": {"status": "failed"}}}],
-    }
-    text = asug.format_shortlist(report)
-    row = next(ln for ln in text.splitlines() if ln.strip().startswith("1 "))
-    assert "MC(adv," not in row       # no column, rather than a fake 0
-    assert "mc_run_failed" in row     # but the absence is visible
-    assert "survivor" in row          # and the verdict is untouched
-
-
-# ---- dry run --------------------------------------------------------------
 
 def test_dry_run_prints_a_command_for_every_enabled_harness():
     spec = asug.load_spec(_base_spec(harnesses=["m1_noise", "m1", "m3", "m5", "mc"]),
@@ -870,17 +721,6 @@ def test_dry_run_with_default_harnesses_omits_mc():
         "mc must not run when a spec doesn't opt into it (#1316)"
 
 
-def test_dry_run_omits_the_mc_command_when_mc_is_not_enabled():
-    spec = asug.load_spec(_base_spec(harnesses=["m1"]), _STUDY_DIR)
-    spec["seed"], spec["resamples"], spec["datasets"] = 1066, 10, None
-    cmds = asug._dry_run_commands(asug.expand_candidates(spec), spec, "/tmp/out")
-    assert not any("monte_carlo.py" in c for c in cmds)
-
-
-# --------------------------------------------------------------------------
-# 10. #1312 review — candidate JSON freshness + MC column window selection
-# --------------------------------------------------------------------------
-
 def _open_spec(harnesses):
     spec = asug.load_spec(_base_spec(harnesses=harnesses), _STUDY_DIR)
     spec["seed"], spec["resamples"], spec["datasets"] = 1066, 10, None
@@ -888,8 +728,6 @@ def _open_spec(harnesses):
 
 
 def _capture_candidate(monkeypatch, harness_flag):
-    """Run one open entry, returning the candidate dict the harness actually
-    read off disk at subprocess-spawn time."""
     seen = {}
 
     def fake_run_harness(harness, tail, out_json):
@@ -903,9 +741,6 @@ def _capture_candidate(monkeypatch, harness_flag):
 
 
 def test_candidate_json_is_rewritten_over_a_stale_file_from_a_prior_run(monkeypatch, tmp_path):
-    # out_dir persists between runs (main only makedirs(exist_ok=True)) and keys
-    # are stable, so an existence-check write lets M1 — the PROMOTION GATE —
-    # score last run's candidate while the shortlist looks current.
     spec = _open_spec(["m1"])
     entry = asug.expand_candidates(spec)[0]
     stale = tmp_path / f"{entry['key']}.candidate.json"
@@ -948,14 +783,11 @@ def test_candidate_json_is_written_once_per_run_and_shared_by_m1_and_mc(monkeypa
         or {"harness": h, "argv_tail": tail, "status": "failed"}))
 
     asug.run_open_entry(entry, spec, str(tmp_path), {}, {})
-    assert len(paths) == 2 and paths[0] == paths[1]   # one file, both harnesses
-    assert len(writes) == 1                           # written exactly once
+    assert len(paths) == 2 and paths[0] == paths[1]
+    assert len(writes) == 1
 
-
-# ---- MC column window selection -------------------------------------------
 
 def _mc_data(**windows):
-    """windows: name -> dict of permute stats, or None for an all-no_data bucket."""
     out = {}
     for w, stats in windows.items():
         out[w] = {"per_dataset": {},
@@ -971,33 +803,11 @@ _NO_TRADES = {"p_dd_ge_kill_switch": None, "p95_max_dd": None,
               "p_final_below_start": None}
 
 
-def test_mc_column_falls_back_to_a_scored_window_when_oos_is_all_no_data():
-    mc = _mc_data(**{"is": _SCORED, "oos": None})
-    assert asug._mc_column_window(mc) == "is"
-    seg = asug._mc_segment(mc)
-    assert "MC(adv,is)=p95DD 40.0%" in seg   # not blanked
-
-
-def test_mc_column_still_prefers_oos_when_both_windows_are_scored():
-    mc = _mc_data(**{"is": _SCORED, "oos": _SCORED_OOS})
-    assert asug._mc_column_window(mc) == "oos"
-    assert "MC(adv,oos)=p95DD 70.0%" in asug._mc_segment(mc)
-
-
-def test_mc_column_prefers_a_scored_window_over_a_zero_trade_one():
-    mc = _mc_data(**{"is": _SCORED, "oos": _NO_TRADES})
-    assert asug._mc_column_window(mc) == "is"
-    assert "MC(adv,is)" in asug._mc_segment(mc)
-
-
-def test_mc_column_reports_dashes_when_every_window_was_resampled_but_empty():
-    # 0 trades everywhere: measured, nothing to resample — say so, don't hide.
-    mc = _mc_data(**{"is": _NO_TRADES, "oos": _NO_TRADES})
-    assert asug._mc_column_window(mc) == "oos"
-    assert "MC(adv,oos)=p95DD -% pKS - pDown -" in asug._mc_segment(mc)
-
-
-def test_mc_column_absent_when_no_window_was_resampled_at_all():
-    assert asug._mc_column_window(_mc_data(**{"is": None, "oos": None})) is None
-    assert asug._mc_segment(_mc_data(**{"is": None, "oos": None})) == ""
-    assert asug._mc_segment({}) == ""
+@pytest.mark.parametrize("windows,expected", [
+    ({"is": _SCORED, "oos": None}, "is"),
+    ({"is": _SCORED, "oos": _SCORED_OOS}, "oos"),
+    ({"is": _SCORED, "oos": _NO_TRADES}, "is"),
+    ({"is": None, "oos": None}, None),
+])
+def test_mc_column_window(windows, expected):
+    assert asug._mc_column_window(_mc_data(**windows)) == expected

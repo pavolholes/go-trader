@@ -1,108 +1,3 @@
-"""Backtest-vs-live parity diff tool (#906 D7.4).
-
-The parity contract between the backtester and the live scheduler is:
-same ``compute_*`` function, same window, same params → same decision.
-The backtester evaluates a strategy ONCE over the full vectorized frame
-and reads decisions row-by-row; the live check scripts re-evaluate the
-strategy every cycle over a trailing fetch window (``--ohlcv-limit``,
-default 200 in ``shared_scripts/check_strategy.py``) and act on the LAST
-closed bar. Any strategy whose bar-N output depends on the frame it was
-computed in — full-series normalization, unseeded rolling state, warmup
-that never converges — silently diverges between the two paths, and no
-existing test catches it because both suites only exercise one path.
-
-This tool replays both paths over the same candles and emits a per-bar
-diff of the decision surface:
-
-  • ``signal``          — vectorized value at bar N  vs  the decision a
-                          check-script run over a window ENDING at bar N
-                          would emit (live semantics — see below).
-  • ``open_action``     — backtester semantics (the ``open_action`` column
-                          when the strategy emits it, else derived from
-                          ``signal``)  vs  live semantics (always derived
-                          from the composed signal, exactly as
-                          ``finalize_decision`` does). A strategy whose
-                          column disagrees with ``sign(signal)`` is a real
-                          parity break and is flagged here.
-  • ``close_fraction``  — max across ``close_fraction*`` columns AND any
-                          configured close-strategy refs, same comparison.
-                          Registry close evaluators (``tiered_tp_atr`` …)
-                          are invoked through the SAME
-                          ``close_registry_loader.evaluate`` on both
-                          sides; the backtest side feeds bar-N close +
-                          full-frame closed-bar ATR + full-frame regime
-                          (engine semantics), the live side feeds
-                          ``latest_atr``/``prepare_check_regime`` on the
-                          trailing window (check-script semantics) — so a
-                          mismatch isolates window-dependent evaluator
-                          inputs.
-  • ``regime``          — full-frame ``compute_regime`` label at bar N vs
-                          the ``prepare_check_regime`` label on the
-                          trailing window (the per-bar generalization of
-                          the last-bar parity test in
-                          ``test_backtester_regime.py``).
-
-The live side is not a re-implementation: it calls the same helpers the
-live check script calls — ``prepare_check_regime`` → ``params["regime"]``
-injection → ``evaluate_open_close`` / ``finalize_decision`` with
-``close_registry_loader.evaluate`` — so the replay IS check-script
-semantics, not a model of them. (The HTF filter is the one deliberate
-omission: it needs a second-timeframe fetch and is orthogonal to
-frame-dependence.)
-
-Non-registry (signal-strategy) close refs are rejected upfront with the
-engine's own error: ``Backtester`` refuses unknown close names at init,
-so there is no backtest path to diff against. The live composition's
-signal-strategy close fallback (``legacy_close_fraction_from_signal``)
-is a live-only surface; comparing it against a silent bt-side zero
-would manufacture mismatches, so the tool fails loudly instead.
-
-When close refs are configured, both sides share a single simulated
-position lifecycle (side / avg_cost / quantities / entry values),
-seeded from the backtest-effective open/close decisions — shared so the
-position itself can never be the source of a diff. The bt-side registry
-evaluator's fraction folds back into the next bar's quantity (the
-engine's ``pending_close_fraction``), so cumulative tier ladders advance
-exactly as the engine books them and each compared fraction is the
-per-bar increment, not a repeated cumulative value. The dict shape each
-evaluator sees mirrors its real caller: the backtest side always passes
-``regime`` (possibly empty) and ``entry_atr``, exactly like
-``Backtester._evaluate_close_strategies`` (#747); the live side omits
-empty keys, exactly like the check scripts. The asymmetry is deliberate
-— a diff at empty-regime bars surfaces that genuine engine-vs-live
-shape divergence instead of masking it.
-
-Every row also carries ``backtest_effective_*`` columns — the post-
-``shift(1)`` values the engine actually reads at bar N — informational
-only, never part of the match.
-
-Usage (ad-hoc):
-  uv run --no-sync python backtest/parity_diff.py \
-      --strategy supertrend --symbol BTC/USDT --timeframe 1h \
-      [--since 2024-01-01] [--params '{"period": 10}'] \
-      [--registry spot|futures] [--window 200] [--stride 1] \
-      [--close tiered_tp_atr] [--close 'name:{"param": 1}'] \
-      [--regime] [--fills] [--csv /tmp/diff.csv] [--jsonl /tmp/diff.jsonl]
-
-Usage (exact live config, #641 loader):
-  uv run --no-sync python backtest/parity_diff.py \
-      --config scheduler/config.json --strategy-id hl-supertrend-btc \
-      [--since 2024-01-01] [--fills]
-
-``--fills`` additionally runs the full ``Backtester`` over the same
-candles and reports the simulated entry/exit fills (price + modeled fee)
-so a decision-level diff can be lined up against the trades it produced.
-
-Exit code 0 when the paths agree on every compared bar, 1 when any bar
-differs (CI-friendly), 2 on usage/data errors. A run that compares zero
-bars (data shorter than the trailing window, or --since/--stride
-leaving nothing to compare) is a data error — a vacuous comparison is
-not agreement.
-
-The per-bar loop re-runs the strategy O(N) times on trailing windows —
-this is a debugging tool, not a benchmark; bound the range with --since
-or thin the comparison with --stride for long histories.
-"""
 
 import argparse
 import inspect
@@ -116,8 +11,6 @@ import pandas as pd
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'shared_tools'))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-# Repo root: post_tp_sl.py (loaded lazily by Backtester) imports via the
-# `shared_strategies.` package path, which is only resolvable from the root.
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from atr import ensure_atr_indicator, latest_atr
@@ -146,28 +39,21 @@ from backtester import (
     fee_pct_for_platform,
 )
 
-# Mirror live: check_strategy.py refuses to evaluate fewer than 30 candles.
 LIVE_MIN_CANDLES = 30
-# Engine default slippage, read from the Backtester signature so the
-# scaffold's effective_price math can never drift out of sync with it.
 _ENGINE_SLIPPAGE_PCT = float(
     inspect.signature(Backtester.__init__).parameters["slippage_pct"].default
 )
-# Mirror live: check scripts fetch --ohlcv-limit candles (default 200).
 DEFAULT_WINDOW = 200
 
 
 @dataclass
 class ParityConfig:
-    """Everything both replay paths need to evaluate one strategy."""
     strategy_name: str
     params: dict = field(default_factory=dict)
     registry: str = "spot"
     platform: str = "binanceus"
     symbol: str = "BTC/USDT"
     timeframe: str = "1h"
-    # Close refs as ``[{"name": ..., "params": {...}}]`` — single-element in
-    # practice since #842; the list shape matches the Backtester kwarg.
     close_refs: Optional[list] = None
     regime_enabled: bool = False
     regime_period: int = 14
@@ -175,10 +61,10 @@ class ParityConfig:
     direction: Optional[str] = None
     invert_signal: bool = False
     regime_directional_policy: Optional[dict] = None
-    # #1085: the certified PER-STATE direction map (None when uncertified). Fed to
-    # the Backtester so it applies the SAME per-state sign gate the live daemon
-    # does — a state whose config contradicts the certified sign resolves to base.
     regime_directional_certified_states: Optional[dict] = None
+    hurst_gate: Optional[dict] = None
+    regime_windows_spec: Optional[dict] = None
+    batched: bool = False
 
     def __post_init__(self):
         self.regime_directional_policy = _normalize_regime_directional_policy(
@@ -188,18 +74,7 @@ class ParityConfig:
 
 def config_from_live_config(config_path: str, strategy_id: str,
                             platform: str = "") -> ParityConfig:
-    """Build a ParityConfig from a live go-trader config (#641 loader).
-
-    Reuses ``run_backtest.load_strategy_config`` for the open/close refs
-    (so the same v13+ gate, #842 single-close collapse, and HL-live-only
-    rejections apply), then reads the raw strategy entry for the symbol /
-    timeframe / registry / regime settings the loader doesn't return.
-    """
     from run_backtest import load_strategy_config
-    # #1228: live applies user_defaults.{close,regime_atr,manual}
-    # unconditionally in loadConfig, so a live-parity replay must inject them
-    # too — without this the diff could report CLEAN against effective params
-    # live never runs.
     loaded = load_strategy_config(config_path, strategy_id,
                                   inject_user_defaults=True)
     with open(config_path) as fh:
@@ -215,11 +90,6 @@ def config_from_live_config(config_path: str, strategy_id: str,
     stype = str(entry.get("type", "spot"))
     symbol = str(args[1]) if len(args) > 1 else "BTC/USDT"
     timeframe = str(args[2]) if len(args) > 2 else "1h"
-    # #1085: apply the same evidence gate the live daemon and backtester do. We
-    # resolve the certified PER-STATE direction map (not just a cell-level bool)
-    # and hand it to the Backtester, which drops each state whose configured side
-    # contradicts the certified sign (or is uncertified) to base direction — so
-    # parity_diff reflects the gated per-state runtime, not the ungated config.
     rdp = loaded.get("regime_directional_policy")
     rdp_cert_states = None
     if rdp:
@@ -228,7 +98,6 @@ def config_from_live_config(config_path: str, strategy_id: str,
             config_directional_classifier,
         )
         certs = load_certifications()
-        # Resolve the directional window's classifier exactly as live (#1085).
         clf = config_directional_classifier(regime, entry)
         rdp_cert_states = certified_states(certs, symbol, timeframe, clf)
     return ParityConfig(
@@ -252,20 +121,12 @@ def config_from_live_config(config_path: str, strategy_id: str,
         invert_signal=bool(loaded.get("invert_signal")),
         regime_directional_policy=rdp,
         regime_directional_certified_states=rdp_cert_states,
+        hurst_gate=loaded.get("hurst_gate"),
+        regime_windows_spec=loaded.get("regime_windows_spec"),
     )
 
 
 def _normalize_signal(value) -> int:
-    """Collapse a raw signal to {-1, 0, 1}, mirroring the engine's contract.
-
-    NaN → 0 (the engine ``fillna(0)``s); any other value outside
-    {-1, 0, 1} is rejected the way ``Backtester.run`` rejects it. On such
-    a signal the engine raises while the live check script's
-    ``normalize_signal`` coerces (``int(0.5)`` → 0) — a real divergence.
-    Normalizing it identically on both tool paths would report CLEAN for
-    a value neither real path produces, so the tool surfaces the contract
-    violation loudly instead.
-    """
     try:
         f = float(value)
     except (TypeError, ValueError):
@@ -330,12 +191,6 @@ def _has_close_fraction_columns(result_df: pd.DataFrame) -> bool:
 
 
 def _full_frame_decisions(result_df: pd.DataFrame) -> pd.DataFrame:
-    """Extract the backtest-path decision surface for every bar.
-
-    ``open_action`` mirrors the engine's normalization: prefer the column
-    when the strategy emits it, else derive from the signal — the same
-    branch ``Backtester.run`` takes before shifting.
-    """
     out = pd.DataFrame(index=result_df.index)
     out["signal"] = result_df.get(
         "signal", pd.Series(0, index=result_df.index)
@@ -354,13 +209,6 @@ def _full_frame_decisions(result_df: pd.DataFrame) -> pd.DataFrame:
 def _live_bar_decision(window: pd.DataFrame, cfg: ParityConfig, reg,
                        position_side: str = "",
                        position_ctx: Optional[dict] = None) -> dict:
-    """Run the check-script decision path on a window ending at the bar.
-
-    This is ``shared_scripts/check_strategy.py``'s flow with the fetch and
-    JSON plumbing removed: ``prepare_check_regime`` → ``params["regime"]``
-    injection → either ``evaluate_open_close``+``finalize_decision`` (when
-    close refs are configured) or a plain last-bar signal read.
-    """
     _stdout_regime, live_regime, strategy_regime = prepare_check_regime(
         window,
         regime_enabled=cfg.regime_enabled,
@@ -368,8 +216,6 @@ def _live_bar_decision(window: pd.DataFrame, cfg: ParityConfig, reg,
         adx_threshold=cfg.regime_adx_threshold,
     )
     params = dict(cfg.params or {})
-    # check_strategy.py injects the regime snapshot unconditionally;
-    # apply_strategy strips it for strategies that don't declare it (#720).
     params["regime"] = strategy_regime
 
     close_names = _close_names(cfg.close_refs)
@@ -406,8 +252,6 @@ def _live_bar_decision(window: pd.DataFrame, cfg: ParityConfig, reg,
         decision["signal"] = int(final["signal"])
         decision["open_action"] = str(final["open_action"])
         decision["close_fraction"] = float(final["close_fraction"])
-        # Column-emitting closes on the open result still count, exactly as
-        # the engine reads them — max-wins against the evaluator output.
         if _has_close_fraction_columns(evaluation.open_result_df):
             decision["close_fraction"] = max(
                 decision["close_fraction"],
@@ -418,9 +262,6 @@ def _live_bar_decision(window: pd.DataFrame, cfg: ParityConfig, reg,
 
     result_df = reg.apply_strategy(cfg.strategy_name, window, params)
     last = result_df.iloc[-1]
-    # Same strict normalizer as the backtest side: in-contract signals
-    # collapse identically, out-of-contract signals raise (see
-    # _normalize_signal) instead of being coerced into a false CLEAN.
     decision["signal"] = _transform_entry_signal(
         _normalize_signal(last.get("signal", 0)),
         cfg,
@@ -437,22 +278,94 @@ def _live_bar_decision(window: pd.DataFrame, cfg: ParityConfig, reg,
     return decision
 
 
+HL_CHECK_SCRIPT = os.path.abspath(os.path.join(
+    os.path.dirname(__file__), "..", "shared_scripts", "check_hyperliquid.py"))
+
+_HL_BATCH_MODULE = None
+
+
+def _load_hl_batch_module():
+    global _HL_BATCH_MODULE
+    if _HL_BATCH_MODULE is None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "_parity_diff_check_hyperliquid", HL_CHECK_SCRIPT)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _HL_BATCH_MODULE = mod
+    return _HL_BATCH_MODULE
+
+
+def _hl_batch_slot(mod, cfg: ParityConfig, slot_id: str, position_side: str,
+                   position_ctx: Optional[dict]) -> dict:
+    refs = {"open": {"name": cfg.strategy_name,
+                     "params": dict(cfg.params or {})}}
+    if cfg.close_refs:
+        refs["closes"] = [
+            {"name": ref["name"], "params": dict(ref.get("params") or {})}
+            for ref in cfg.close_refs
+        ]
+    raw = {
+        "id": slot_id,
+        "strategy": cfg.strategy_name,
+        "mode": "paper",
+        "htf_filter": False,
+        "strategy_refs": refs,
+        "position_side": position_side,
+        "position_ctx": dict(position_ctx or {}) or None,
+    }
+    envelope = json.dumps({"v": mod.BATCH_PROTOCOL_VERSION, "slots": [raw]})
+    return mod.parse_batch_slots(envelope)[0]
+
+
+def _hl_shared_state(mod, window: pd.DataFrame, cfg: ParityConfig):
+    return mod.build_shared_signal_state(
+        cfg.symbol, cfg.timeframe,
+        df=window.copy(),
+        regime_enabled=cfg.regime_enabled,
+        regime_period=cfg.regime_period,
+        regime_adx_threshold=cfg.regime_adx_threshold,
+        regime_windows_spec=cfg.regime_windows_spec,
+    )
+
+
+def _hl_decision_fields(result: dict) -> dict:
+    signal = int(result.get("signal", 0))
+    return {
+        "signal": signal,
+        "open_action": str(result.get("open_action", "")
+                           or open_action_from_signal(signal)),
+        "close_fraction": float(result.get("close_fraction", 0.0) or 0.0),
+    }
+
+
+def _batched_bar_decisions(window: pd.DataFrame, cfg: ParityConfig,
+                           position_side: str = "",
+                           position_ctx: Optional[dict] = None) -> tuple:
+    mod = _load_hl_batch_module()
+    solo_shared = _hl_shared_state(mod, window, cfg)
+    solo = mod.evaluate_signal_slot(
+        solo_shared,
+        _hl_batch_slot(mod, cfg, "solo", position_side, position_ctx))
+
+    batch_shared = _hl_shared_state(mod, window, cfg)
+    deps = mod._signal_check_deps()
+    batched = None
+    for slot_id in ("peer", "batched"):
+        out = mod.evaluate_signal_slot(
+            batch_shared,
+            _hl_batch_slot(mod, cfg, slot_id, position_side, position_ctx),
+            deps=deps,
+        )
+        if slot_id == "batched":
+            batched = out
+    return _hl_decision_fields(solo), _hl_decision_fields(batched)
+
+
 def _bt_close_evaluator_fraction(cfg: ParityConfig, i: int,
                                  df: pd.DataFrame, atr_full: pd.Series,
                                  regime_full: Optional[pd.Series],
                                  position_ctx: Optional[dict]) -> float:
-    """Backtest-side registry close evaluation at bar ``i``.
-
-    Mirrors ``Backtester``'s close-evaluator inputs: bar-N close as the
-    mark, full-frame closed-bar ATR at bar N, full-frame regime label at
-    bar N. Same ``close_registry_loader.evaluate``, same position
-    lifecycle as the live side — but the dict SHAPE mirrors the engine
-    (#747): ``regime`` always present (possibly empty) in both dicts,
-    ``entry_atr`` always a float. The live side omits empty keys like
-    the check scripts do; the asymmetry deliberately lets the tool
-    surface a genuine engine-vs-live shape divergence at empty-regime
-    bars instead of masking it.
-    """
     if not position_ctx:
         return 0.0
     position = {
@@ -480,9 +393,6 @@ def _bt_close_evaluator_fraction(cfg: ParityConfig, i: int,
             name, params_by_name.get(name))
         if ref_params is None and resolved == cfg.strategy_name:
             ref_params = dict(cfg.params or {})
-        # Unknown names were rejected upfront (compute_parity_frame), so any
-        # ValueError here is a genuine evaluator error — propagate, exactly
-        # as the engine would.
         result = close_evaluate(resolved, position, market, ref_params)
         best = max(best, float(result.get("close_fraction", 0.0) or 0.0))
     return best
@@ -494,31 +404,6 @@ def _simulate_position_contexts(bt: pd.DataFrame, df: pd.DataFrame,
                                 cfg: Optional[ParityConfig] = None,
                                 *,
                                 return_decisions: bool = False) -> tuple:
-    """Walk the backtest-effective decisions and track a scaffold position.
-
-    The context exists so close evaluators see a plausible position on
-    BOTH sides — it is shared, so it can never be the source of a diff.
-    Entries/exits follow the engine's shift(1) semantics: bar N acts on
-    bar N-1's signal/open_action/close_fraction. ``contexts[i]`` is the
-    position AFTER bar i's open fills — the state the engine holds during
-    its end-of-bar close evaluation, and the position live's bar-i cycle
-    sees.
-
-    Registry close-evaluator output is folded back into the quantity the
-    NEXT bar — the engine's ``pending_close_fraction`` — so the cumulative
-    tier ladder advances exactly as the engine books it: 0.4 once, then 0,
-    then the increment to 0.8 at the next rung. Without the fold,
-    ``current_quantity`` would stay pinned at ``initial_quantity`` and
-    every post-tier-1 bar would repeat the cumulative fraction — a value
-    neither the engine nor live produces.
-
-    Returns ``(contexts, registry_fractions)`` by default. With
-    ``return_decisions=True`` also returns the transformed decision frame.
-    ``registry_fractions[i]``
-    is the bt-side evaluator fraction at bar i computed with that shared
-    context — the same value ``compute_parity_frame`` compares, so the
-    scaffold's accounting and the comparison can never disagree.
-    """
     decisions = bt.copy()
     contexts = []
     registry_fractions = []
@@ -531,10 +416,6 @@ def _simulate_position_contexts(bt: pd.DataFrame, df: pd.DataFrame,
 
     for i in range(len(df)):
         if i > 0:
-            # Backtest-effective inputs at bar i = unshifted bar i-1 values;
-            # the registry-evaluator fraction from bar i-1 fills here too,
-            # exactly like the engine's pending_close_fraction (max-wins
-            # against the column path, same resolution as the comparison).
             eff_signal = int(decisions["signal"].iloc[i - 1])
             eff_action = str(decisions["open_action"].iloc[i - 1])
             eff_close = max(float(decisions["close_fraction"].iloc[i - 1]),
@@ -545,9 +426,6 @@ def _simulate_position_contexts(bt: pd.DataFrame, df: pd.DataFrame,
                          or (side == "long" and eff_signal < 0)
                          or (side == "short" and eff_signal > 0)):
                 frac = eff_close if eff_close > 0 else 1.0
-                # Engine booking: qty_to_close = abs(position) * fraction —
-                # the fraction applies to the CURRENT position, not the
-                # initial size (Backtester.run's close-fraction fill).
                 qty = max(qty - qty * min(frac, 1.0), 0.0)
                 if qty <= 1e-12:
                     side = ""
@@ -555,10 +433,6 @@ def _simulate_position_contexts(bt: pd.DataFrame, df: pd.DataFrame,
                     entry_regime = ""
             elif not side and eff_action in ("long", "short"):
                 side = eff_action
-                # Engine fill semantics: an open fills at the fill bar's
-                # OPEN (fallback close), adjusted by the engine's default
-                # slippage — ``effective_price`` in Backtester.run, not the
-                # bar's close.
                 fill_price = (float(df["open"].iloc[i])
                               if "open" in df.columns else mark)
                 if side == "long":
@@ -568,19 +442,9 @@ def _simulate_position_contexts(bt: pd.DataFrame, df: pd.DataFrame,
                 qty = initial_qty = 1.0
                 atr_val = atr_full.iloc[i]
                 entry_atr = float(atr_val) if pd.notna(atr_val) else 0.0
-                # Engine plausibility guard (_stamp_entry_atr, mirroring
-                # Go's stampEntryATRIfOpened): non-positive or > 50% of the
-                # entry price (effective_price, same as the engine) stamps
-                # 0.0, so ATR-requiring close evaluators no-op.
                 if not (0.0 < entry_atr <= 0.5 * avg_cost):
                     entry_atr = 0.0
                 if regime_full is not None:
-                    # Engine semantics: the position regime is stamped from
-                    # the SHIFTED regime column at the fill row — the
-                    # decision bar's (i-1) label, which is also what live
-                    # stamps at open (the label computed alongside the
-                    # signal). The fill bar's own label (i) would match
-                    # neither side.
                     raw_label = regime_full.iloc[i - 1]
                     entry_regime = "" if pd.isna(raw_label) else str(raw_label)
 
@@ -645,17 +509,6 @@ def compute_parity_frame(
     close_refs: Optional[list] = None,
     cfg: Optional[ParityConfig] = None,
 ) -> pd.DataFrame:
-    """Replay both decision paths over ``df`` and return the per-bar diff.
-
-    Returns one row per compared bar with ``bt_*`` (vectorized full-frame /
-    engine semantics) and ``live_*`` (trailing-window check-script
-    semantics) columns, ``backtest_effective_*`` (post-shift(1) engine
-    inputs, informational) and a ``match`` bool. Comparison starts at the
-    first bar where the trailing window is full (``window`` bars, or
-    ``LIVE_MIN_CANDLES`` for expanding mode) so every live evaluation sees
-    the same window length it would in production — earlier bars would
-    diff on warmup, not on parity.
-    """
     if cfg is None:
         if not strategy_name:
             raise ValueError("strategy_name or cfg is required")
@@ -688,10 +541,6 @@ def compute_parity_frame(
 
     has_close_refs = bool(_close_names(cfg.close_refs))
     if has_close_refs:
-        # Mirror the engine: Backtester rejects non-registry close names at
-        # init, so a signal-strategy close ref has no backtest path to diff
-        # — fail with the same error instead of silently contributing 0 on
-        # the bt side while the live fallback fully evaluates it.
         available = set(close_list_strategies())
         for name in _close_names(cfg.close_refs):
             resolved, _ = rewrite_deprecated_close_ref(name, None)
@@ -714,6 +563,21 @@ def compute_parity_frame(
     else:
         contexts, registry_fracs = [None] * len(df), [0.0] * len(df)
 
+    hurst_series = None
+    hurst_states = None
+    if cfg.hurst_gate and cfg.hurst_gate.get("enabled"):
+        from hurst_gate import HurstGate, hurst_live_frame_bars, rolling_hurst
+
+        frame_bars = hurst_live_frame_bars(
+            cfg.regime_windows_spec, cfg.regime_period
+        )
+        hurst_series = rolling_hurst(df["close"], frame_bars).shift(1)
+        runner = HurstGate(cfg.hurst_gate)
+        hurst_states = []
+        for j in range(len(df)):
+            blocked, mult = runner.step(hurst_series.iloc[j], True)
+            hurst_states.append((runner.state, bool(blocked), float(mult)))
+
     start = (window - 1) if window is not None else (LIVE_MIN_CANDLES - 1)
     rows = []
     for i in range(start, len(df), stride):
@@ -727,15 +591,7 @@ def compute_parity_frame(
         bt_close = float(bt["close_fraction"].iloc[i])
         bt_signal = int(bt["signal"].iloc[i])
         if has_close_refs:
-            # The scaffold already evaluated the bt-side registry close at
-            # bar i with this exact context — reuse it so the fraction
-            # compared here is the same one the ladder accounting applied.
             bt_close = max(bt_close, registry_fracs[i])
-            # The live decision composes open intent + close intent +
-            # position side into one signal (finalize_decision). Compose
-            # the backtest inputs identically so the signal column compares
-            # like-for-like — a diff then isolates input drift, never the
-            # composition itself.
             bt_signal = compose_signal(
                 str(bt["open_action"].iloc[i]), bt_close, side)
 
@@ -757,7 +613,28 @@ def compute_parity_frame(
             row["bt_regime"] = str(regime_full.iloc[i])
             row["live_regime"] = str(live["regime"])
             match = match and row["bt_regime"] == row["live_regime"]
-        # Post-shift(1) inputs the engine reads at bar i — informational.
+        if cfg.batched:
+            solo_dec, batch_dec = _batched_bar_decisions(
+                win, cfg, position_side=side, position_ctx=ctx)
+            row["solo_signal"] = solo_dec["signal"]
+            row["batch_signal"] = batch_dec["signal"]
+            row["solo_open_action"] = solo_dec["open_action"]
+            row["batch_open_action"] = batch_dec["open_action"]
+            row["solo_close_fraction"] = solo_dec["close_fraction"]
+            row["batch_close_fraction"] = batch_dec["close_fraction"]
+            match = (
+                match
+                and row["solo_signal"] == row["batch_signal"]
+                and row["solo_open_action"] == row["batch_open_action"]
+                and abs(row["solo_close_fraction"] - row["batch_close_fraction"]) < 1e-9
+            )
+        if hurst_states is not None:
+            h = hurst_series.iloc[i]
+            state, blocked, mult = hurst_states[i]
+            row["bt_hurst"] = None if pd.isna(h) else float(h)
+            row["bt_hurst_state"] = state or "unknown"
+            row["bt_hurst_holds"] = blocked
+            row["bt_hurst_size_mult"] = mult
         if i > 0:
             row["backtest_effective_signal"] = int(bt["signal"].iloc[i - 1])
             row["backtest_effective_open_action"] = str(
@@ -773,11 +650,6 @@ def compute_parity_frame(
 
 
 def extract_fills(df: pd.DataFrame, cfg: ParityConfig) -> list:
-    """Run the full Backtester over ``df`` and return simulated fills.
-
-    Lets a decision-level diff be lined up against the trades the engine
-    would actually book (entry/exit price + modeled fee per leg).
-    """
     reg = load_registry(cfg.registry)
     work = reg.apply_strategy(
         cfg.strategy_name, df.copy(), dict(cfg.params or {}))
@@ -792,6 +664,8 @@ def extract_fills(df: pd.DataFrame, cfg: ParityConfig) -> list:
         regime_enabled=cfg.regime_enabled,
         regime_period=cfg.regime_period,
         regime_adx_threshold=cfg.regime_adx_threshold,
+        regime_windows_spec=cfg.regime_windows_spec,
+        hurst_gate=cfg.hurst_gate,
         direction=cfg.direction,
         invert_signal=cfg.invert_signal,
         regime_directional_policy=cfg.regime_directional_policy,
@@ -831,7 +705,6 @@ def extract_fills(df: pd.DataFrame, cfg: ParityConfig) -> list:
 
 
 def summarize(frame: pd.DataFrame) -> dict:
-    """Aggregate a parity frame into a result summary."""
     if frame.empty:
         return {"bars_compared": 0, "mismatches": 0, "clean": True}
     mismatched = frame[~frame["match"]]
@@ -843,11 +716,20 @@ def summarize(frame: pd.DataFrame) -> dict:
     if not mismatched.empty:
         summary["first_mismatch"] = str(mismatched.iloc[0]["ts"])
         summary["last_mismatch"] = str(mismatched.iloc[-1]["ts"])
+    if "batch_signal" in frame.columns:
+        batch_diff = frame[
+            (frame["solo_signal"] != frame["batch_signal"])
+            | (frame["solo_open_action"] != frame["batch_open_action"])
+            | ((frame["solo_close_fraction"] - frame["batch_close_fraction"]).abs() >= 1e-9)
+        ]
+        summary["batch_mismatches"] = int(len(batch_diff))
+        summary["batch_clean"] = bool(batch_diff.empty)
+        if not batch_diff.empty:
+            summary["first_batch_mismatch"] = str(batch_diff.iloc[0]["ts"])
     return summary
 
 
 def _parse_close_refs(raw_list: list) -> list:
-    """Parse repeatable --close values: ``name`` or ``name:{json params}``."""
     refs = []
     for item in raw_list:
         if ":" in item:
@@ -896,6 +778,12 @@ def main(argv: Optional[list] = None) -> int:
                         help="Also diff the regime label per bar")
     parser.add_argument("--regime-period", type=int, default=14)
     parser.add_argument("--regime-adx-threshold", type=float, default=20.0)
+    parser.add_argument("--batched", action="store_true",
+                        help="#1442: also evaluate each bar through the "
+                             "Hyperliquid batched signal evaluator (as one "
+                             "slot of a multi-slot batch) and diff it against "
+                             "the same evaluator run alone. Off by default; "
+                             "the frame and exit code are unchanged without it.")
     parser.add_argument("--fills", action="store_true",
                         help="Also run the full Backtester and report "
                              "simulated entry/exit fills")
@@ -913,15 +801,13 @@ def main(argv: Optional[list] = None) -> int:
             print("--strategy-id is required with --config", file=sys.stderr)
             return 2
         try:
-            # An unset --platform must never force binanceus here — the
-            # empty string lets the loader auto-detect from the strategy
-            # type (perps/manual → hyperliquid); an explicit flag wins.
             cfg = config_from_live_config(args.config, args.strategy_id,
                                           platform=args.platform or "")
         except (ValueError, OSError, json.JSONDecodeError) as e:
             print(f"--config: {e}", file=sys.stderr)
             return 2
         cfg.regime_enabled = cfg.regime_enabled or args.regime
+        cfg.batched = args.batched
         symbol, timeframe = cfg.symbol, cfg.timeframe
     else:
         if not args.strategy:
@@ -954,6 +840,7 @@ def main(argv: Optional[list] = None) -> int:
             regime_enabled=args.regime,
             regime_period=args.regime_period,
             regime_adx_threshold=args.regime_adx_threshold,
+            batched=args.batched,
         )
         symbol, timeframe = args.symbol, args.timeframe
 
@@ -997,6 +884,9 @@ def main(argv: Optional[list] = None) -> int:
           f"stride={args.stride})")
     print(f"  Bars compared: {result['bars_compared']}")
     print(f"  Mismatches:    {result['mismatches']}")
+    if "batch_mismatches" in result:
+        print(f"  Batch diffs:   {result['batch_mismatches']} "
+              f"(batched slot vs solo evaluation, #1442)")
     if args.fills:
         print(f"  Fills:         {len(fills)}")
     if result["clean"]:

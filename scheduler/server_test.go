@@ -12,113 +12,75 @@ import (
 )
 
 func TestHandleHealth(t *testing.T) {
-	state := NewAppState()
-	state.LastCycle = time.Now() // recent cycle
-	var mu sync.RWMutex
-
-	ss := NewStatusServer(state, &mu, "", nil, nil)
-
-	req := httptest.NewRequest("GET", "/health", nil)
-	w := httptest.NewRecorder()
-	ss.handleHealth(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Errorf("status = %d, want %d", w.Code, http.StatusOK)
+	cases := []struct {
+		name      string
+		lastCycle time.Time
+		wantCode  int
+	}{
+		{"fresh cycle is ok", time.Now(), http.StatusOK},
+		{"stale cycle is unavailable", time.Now().Add(-60 * time.Minute), http.StatusServiceUnavailable},
+		{"zero time is healthy", time.Time{}, http.StatusOK},
 	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			state := NewAppState()
+			state.LastCycle = tc.lastCycle
+			var mu sync.RWMutex
+			ss := NewStatusServer(state, &mu, "", nil, nil)
 
-	// Capture the raw body before decoding drains the buffer — update.sh
-	// matches the literal `"version":"<ver>"` substring, so assert the added
-	// #849 pid field didn't disturb it.
-	body := w.Body.String()
-	if !strings.Contains(body, "\"version\":\""+Version+"\"") {
-		t.Errorf("body %q missing literal version substring update.sh greps for", body)
-	}
+			req := httptest.NewRequest("GET", "/health", nil)
+			w := httptest.NewRecorder()
+			ss.handleHealth(w, req)
 
-	var resp map[string]any
-	json.Unmarshal([]byte(body), &resp)
-	if resp["status"] != "ok" {
-		t.Errorf("status = %q, want %q", resp["status"], "ok")
-	}
-	// #682: /health must report the build version so update.sh can verify
-	// the post-restart process matches the just-built binary.
-	if resp["version"] != Version {
-		t.Errorf("version = %q, want %q", resp["version"], Version)
-	}
-	// #849: pid lets external monitoring detect a duplicate (health.pid !=
-	// systemd MainPID). JSON numbers decode to float64 into map[string]any.
-	if pid, ok := resp["pid"].(float64); !ok || int(pid) != os.Getpid() {
-		t.Errorf("pid = %v, want %d", resp["pid"], os.Getpid())
-	}
-}
-
-func TestHandleHealthStale(t *testing.T) {
-	state := NewAppState()
-	state.LastCycle = time.Now().Add(-60 * time.Minute) // stale
-	var mu sync.RWMutex
-
-	ss := NewStatusServer(state, &mu, "", nil, nil)
-
-	req := httptest.NewRequest("GET", "/health", nil)
-	w := httptest.NewRecorder()
-	ss.handleHealth(w, req)
-
-	if w.Code != http.StatusServiceUnavailable {
-		t.Errorf("status = %d, want %d", w.Code, http.StatusServiceUnavailable)
-	}
-	// Even when stale, the version field should be present so a rolling
-	// update can still distinguish old from new during the brief window
-	// between restart and the first completed cycle.
-	var resp map[string]any
-	json.NewDecoder(w.Body).Decode(&resp)
-	if resp["version"] != Version {
-		t.Errorf("version = %q, want %q", resp["version"], Version)
+			if w.Code != tc.wantCode {
+				t.Errorf("status = %d, want %d", w.Code, tc.wantCode)
+			}
+			body := w.Body.String()
+			if !strings.Contains(body, "\"version\":\""+Version+"\"") {
+				t.Errorf("body %q missing literal version substring update.sh greps for", body)
+			}
+			var resp map[string]any
+			if err := json.Unmarshal([]byte(body), &resp); err != nil {
+				t.Fatalf("unmarshal health body: %v", err)
+			}
+			if resp["version"] != Version {
+				t.Errorf("version = %q, want %q", resp["version"], Version)
+			}
+			if pid, ok := resp["pid"].(float64); !ok || int(pid) != os.Getpid() {
+				t.Errorf("pid = %v, want %d", resp["pid"], os.Getpid())
+			}
+			if tc.wantCode == http.StatusOK && resp["status"] != "ok" {
+				t.Errorf("status = %q, want %q", resp["status"], "ok")
+			}
+		})
 	}
 }
 
-func TestHandleHealthZeroTime(t *testing.T) {
-	state := NewAppState()
-	// LastCycle is zero (never run) — should be healthy
-	var mu sync.RWMutex
-
-	ss := NewStatusServer(state, &mu, "", nil, nil)
-
-	req := httptest.NewRequest("GET", "/health", nil)
-	w := httptest.NewRecorder()
-	ss.handleHealth(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Errorf("status = %d, want %d (zero time = healthy)", w.Code, http.StatusOK)
+func TestHandleStatusRejectsBadToken(t *testing.T) {
+	cases := []struct {
+		name   string
+		header string
+	}{
+		{"no authorization header", ""},
+		{"wrong bearer token", "Bearer wrong-token"},
 	}
-}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			state := NewAppState()
+			var mu sync.RWMutex
+			ss := NewStatusServer(state, &mu, "secret-token", nil, nil)
 
-func TestHandleStatusUnauthorized(t *testing.T) {
-	state := NewAppState()
-	var mu sync.RWMutex
+			req := httptest.NewRequest("GET", "/status", nil)
+			if tc.header != "" {
+				req.Header.Set("Authorization", tc.header)
+			}
+			w := httptest.NewRecorder()
+			ss.handleStatus(w, req)
 
-	ss := NewStatusServer(state, &mu, "secret-token", nil, nil)
-
-	req := httptest.NewRequest("GET", "/status", nil)
-	w := httptest.NewRecorder()
-	ss.handleStatus(w, req)
-
-	if w.Code != http.StatusUnauthorized {
-		t.Errorf("status = %d, want %d", w.Code, http.StatusUnauthorized)
-	}
-}
-
-func TestHandleStatusUnauthorizedWrongToken(t *testing.T) {
-	state := NewAppState()
-	var mu sync.RWMutex
-
-	ss := NewStatusServer(state, &mu, "secret-token", nil, nil)
-
-	req := httptest.NewRequest("GET", "/status", nil)
-	req.Header.Set("Authorization", "Bearer wrong-token")
-	w := httptest.NewRecorder()
-	ss.handleStatus(w, req)
-
-	if w.Code != http.StatusUnauthorized {
-		t.Errorf("status = %d, want %d", w.Code, http.StatusUnauthorized)
+			if w.Code != http.StatusUnauthorized {
+				t.Errorf("status = %d, want %d", w.Code, http.StatusUnauthorized)
+			}
+		})
 	}
 }
 
@@ -207,7 +169,7 @@ func TestHandleStatusUncertifiedPolicyGatedDirection(t *testing.T) {
 	}
 	var mu sync.RWMutex
 	ss := NewStatusServer(state, &mu, "", strategies, nil)
-	ss.SetConfigContext("", &RegimeConfig{Enabled: true, Period: 14, ADXThreshold: 20})
+	ss.SetConfigContext("", &Config{Regime: &RegimeConfig{Enabled: true, Period: 14, ADXThreshold: 20}})
 
 	req := httptest.NewRequest("GET", "/status", nil)
 	w := httptest.NewRecorder()
@@ -242,11 +204,7 @@ func TestNewStatusServerExtractsSymbols(t *testing.T) {
 	strategies := []StrategyConfig{
 		{Type: "spot", Args: []string{"sma", "BTC/USDT", "1h"}},
 		{Type: "spot", Args: []string{"rsi", "ETH/USDT", "1h"}},
-		{Type: "options", Args: []string{"vol", "BTC"}}, // options skipped
-		// #263: HL perps must populate hlPerpsCoins (venue-native mark),
-		// NOT priceSymbols (BinanceUS spot). The old #245 "/USDT" normalisation
-		// and priceMirror path have been removed — perps are now sourced from
-		// the exchange they live on.
+		{Type: "options", Args: []string{"vol", "BTC"}},
 		{Type: "perps", Platform: "hyperliquid", Args: []string{"momentum", "SOL", "1h"}},
 		{Type: "perps", Platform: "okx", Args: []string{"ema", "BTC", "1h"}},
 	}
@@ -255,7 +213,6 @@ func TestNewStatusServerExtractsSymbols(t *testing.T) {
 
 	ss := NewStatusServer(state, &mu, "", strategies, nil)
 
-	// Spot symbols must be in priceSymbols.
 	symbolSet := make(map[string]bool)
 	for _, s := range ss.priceSymbols {
 		symbolSet[s] = true
@@ -266,7 +223,6 @@ func TestNewStatusServerExtractsSymbols(t *testing.T) {
 	if !symbolSet["ETH/USDT"] {
 		t.Error("ETH/USDT should be in priceSymbols")
 	}
-	// Perps must NOT be in priceSymbols — they live in hlPerpsCoins/okxPerpsCoins.
 	if symbolSet["SOL/USDT"] {
 		t.Error("SOL/USDT must not be in priceSymbols (HL perps now venue-native — #263)")
 	}
@@ -274,7 +230,6 @@ func TestNewStatusServerExtractsSymbols(t *testing.T) {
 		t.Errorf("priceSymbols len = %d, want 2 (spot only)", len(ss.priceSymbols))
 	}
 
-	// HL perps coin must appear in hlPerpsCoins.
 	hlSet := make(map[string]bool)
 	for _, c := range ss.hlPerpsCoins {
 		hlSet[c] = true
@@ -283,7 +238,6 @@ func TestNewStatusServerExtractsSymbols(t *testing.T) {
 		t.Errorf("hlPerpsCoins missing SOL; got %v", ss.hlPerpsCoins)
 	}
 
-	// OKX perps coin must appear in okxPerpsCoins.
 	okxSet := make(map[string]bool)
 	for _, c := range ss.okxPerpsCoins {
 		okxSet[c] = true
@@ -329,7 +283,7 @@ func TestHandleHistory_NoAuth(t *testing.T) {
 	}
 
 	var mu sync.RWMutex
-	ss := NewStatusServer(NewAppState(), &mu, "", nil, db)
+	ss := NewStatusServer(NewAppState(), &mu, "", nil, openTestStore(t, db))
 
 	req := httptest.NewRequest("GET", "/history", nil)
 	w := httptest.NewRecorder()
@@ -364,9 +318,8 @@ func TestHandleHistory_QueryParams(t *testing.T) {
 	}
 
 	var mu sync.RWMutex
-	ss := NewStatusServer(NewAppState(), &mu, "", nil, db)
+	ss := NewStatusServer(NewAppState(), &mu, "", nil, openTestStore(t, db))
 
-	// Filter by strategy.
 	req := httptest.NewRequest("GET", "/history?strategy=hl-momentum-btc&limit=1", nil)
 	w := httptest.NewRecorder()
 	ss.handleHistory(w, req)
@@ -391,6 +344,82 @@ func TestHandleHistory_QueryParams(t *testing.T) {
 	}
 	if resp.Limit != 1 {
 		t.Errorf("limit = %d, want 1", resp.Limit)
+	}
+}
+
+func TestUIPausedAndDirectionalSerialization(t *testing.T) {
+	state := NewAppState()
+	state.Strategies["okx-eth"] = &StrategyState{
+		ID:              "okx-eth",
+		Type:            "perps",
+		Cash:            1000,
+		InitialCapital:  1000,
+		Positions:       make(map[string]*Position),
+		OptionPositions: make(map[string]*OptionPosition),
+		RegimeProfile:   &RegimeProfileState{ActiveProfile: "bull", PendingProfile: "bear", PendingBarsSeen: 1},
+	}
+	var mu sync.RWMutex
+	strategies := []StrategyConfig{
+		{ID: "okx-eth", Platform: "okx", Type: "perps", Args: []string{"ema", "ETH", "4h"}, Direction: DirectionBoth, Paused: true},
+	}
+	ss := NewStatusServer(state, &mu, "", strategies, nil)
+
+	req := httptest.NewRequest("GET", "/api/strategies", nil)
+	w := httptest.NewRecorder()
+	ss.handleAPIStrategies(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("strategies status = %d, want %d", w.Code, http.StatusOK)
+	}
+	var listResp struct {
+		Strategies []UIStrategy `json:"strategies"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&listResp); err != nil {
+		t.Fatalf("decode strategies: %v", err)
+	}
+	if len(listResp.Strategies) != 1 || !listResp.Strategies[0].Paused {
+		t.Errorf("strategies paused = %+v, want paused true", listResp.Strategies)
+	}
+
+	req = httptest.NewRequest("GET", "/api/strategies/overview", nil)
+	w = httptest.NewRecorder()
+	ss.handleAPIStrategiesOverview(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("overview status = %d, want %d", w.Code, http.StatusOK)
+	}
+	var ovResp struct {
+		Strategies []UIStrategyOverview `json:"strategies"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&ovResp); err != nil {
+		t.Fatalf("decode overview: %v", err)
+	}
+	if len(ovResp.Strategies) != 1 || !ovResp.Strategies[0].Paused {
+		t.Errorf("overview paused = %+v, want paused true", ovResp.Strategies)
+	}
+
+	req = httptest.NewRequest("GET", "/api/strategies/okx-eth/status", nil)
+	w = httptest.NewRecorder()
+	ss.handleAPIStrategy(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status status = %d, want %d", w.Code, http.StatusOK)
+	}
+	var st UIStrategyStatus
+	if err := json.NewDecoder(w.Body).Decode(&st); err != nil {
+		t.Fatalf("decode status: %v", err)
+	}
+	if !st.Paused {
+		t.Errorf("status paused = false, want true")
+	}
+	if st.RegimeProfile == nil || st.RegimeProfile.ActiveProfile != "bull" || st.RegimeProfile.PendingProfile != "bear" {
+		t.Errorf("status regime_profile = %+v, want bull→bear", st.RegimeProfile)
+	}
+	if st.RegimeDirectionalPolicy {
+		t.Errorf("regime_directional_policy = true, want false (none configured)")
+	}
+	if st.EffectiveDirection != DirectionBoth {
+		t.Errorf("effective_direction = %q, want %q (base)", st.EffectiveDirection, DirectionBoth)
+	}
+	if st.DirectionalCertificationStatus != "" {
+		t.Errorf("cert status = %q, want empty without policy", st.DirectionalCertificationStatus)
 	}
 }
 
@@ -551,7 +580,7 @@ func TestHandleAPIStrategyTradesMarkers(t *testing.T) {
 	var mu sync.RWMutex
 	ss := NewStatusServer(state, &mu, "", []StrategyConfig{
 		{ID: "spot-btc", Platform: "binanceus", Type: "spot", Args: []string{"sma", "BTC/USDT", "1h"}},
-	}, db)
+	}, openTestStore(t, db))
 
 	req := httptest.NewRequest("GET", "/api/strategies/spot-btc/trades", nil)
 	w := httptest.NewRecorder()
@@ -646,7 +675,7 @@ func TestHandleAPIStrategyEquity(t *testing.T) {
 	var mu sync.RWMutex
 	ss := NewStatusServer(state, &mu, "", []StrategyConfig{
 		{ID: "spot-btc", Platform: "binanceus", Type: "spot", Capital: 1000, Args: []string{"sma", "BTC/USDT", "1h"}},
-	}, db)
+	}, openTestStore(t, db))
 
 	req := httptest.NewRequest("GET", "/api/strategies/spot-btc/equity?limit=40", nil)
 	w := httptest.NewRecorder()
@@ -698,12 +727,6 @@ func TestHandleAPIReturnsDraining(t *testing.T) {
 	}
 }
 
-// Regression: SIGHUP holds the global state mu.Lock() across the reload (see
-// reloadConfig in main.go), and applyHotReloadConfig calls
-// server.UpdateStrategies while still holding it. A previous version of
-// UpdateStrategies took the same non-reentrant mutex and deadlocked the
-// daemon on every reload. Exercise the path with a real *sync.RWMutex held
-// by the caller — a deadlocked implementation hangs here until the timeout.
 func TestUpdateStrategiesDoesNotDeadlockUnderStateLock(t *testing.T) {
 	state := NewAppState()
 	var mu sync.RWMutex
@@ -730,5 +753,50 @@ func TestUpdateStrategiesDoesNotDeadlockUnderStateLock(t *testing.T) {
 	got := ss.uiStrategies()
 	if len(got) != 2 {
 		t.Fatalf("uiStrategies len = %d, want 2 (%+v)", len(got), got)
+	}
+}
+
+func TestUIStrategyOverviewModeAndCloseStrategy(t *testing.T) {
+	state := &AppState{Strategies: map[string]*StrategyState{
+		"paper-eth": {Cash: 1000},
+		"live-btc":  {Cash: 1000},
+	}}
+	var mu sync.RWMutex
+	strategies := []StrategyConfig{
+		{ID: "paper-eth", Platform: "hyperliquid", Type: "perps", Args: []string{"ema", "ETH", "4h"}, InitialCapital: 1000, CloseStrategy: &StrategyRef{Name: "tiered_tp_atr"}},
+		{ID: "live-btc", Platform: "hyperliquid", Type: "perps", Args: []string{"ema", "BTC", "4h", "--mode=live"}, InitialCapital: 1000},
+	}
+	ss := NewStatusServer(state, &mu, "", strategies, nil)
+
+	req := httptest.NewRequest("GET", "/api/strategies/overview", nil)
+	w := httptest.NewRecorder()
+	ss.handleAPIStrategiesOverview(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("overview status = %d, want %d", w.Code, http.StatusOK)
+	}
+	var resp struct {
+		Strategies []UIStrategyOverview `json:"strategies"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode overview: %v", err)
+	}
+	got := map[string]UIStrategyOverview{}
+	for _, row := range resp.Strategies {
+		got[row.ID] = row
+	}
+	cases := []struct {
+		id, mode, closeStrategy string
+	}{
+		{"paper-eth", "paper", "tiered_tp_atr"},
+		{"live-btc", "live", ""},
+	}
+	for _, tc := range cases {
+		row, ok := got[tc.id]
+		if !ok {
+			t.Fatalf("overview missing %s", tc.id)
+		}
+		if row.Mode != tc.mode || row.CloseStrategy != tc.closeStrategy {
+			t.Errorf("%s: mode=%q close=%q, want mode=%q close=%q", tc.id, row.Mode, row.CloseStrategy, tc.mode, tc.closeStrategy)
+		}
 	}
 }

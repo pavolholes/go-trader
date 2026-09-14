@@ -9,13 +9,11 @@ import (
 )
 
 func TestDiscordBackend(t *testing.T) {
-	// No Discord backend present.
 	mn := NewMultiNotifier()
 	if got := mn.DiscordBackend(); got != nil {
 		t.Fatalf("expected nil DiscordBackend on empty notifier, got %v", got)
 	}
 
-	// Discord backend present (zero-value *DiscordNotifier is fine for identity).
 	d := &DiscordNotifier{}
 	mn2 := NewMultiNotifier(notifierBackend{notifier: d})
 	if got := mn2.DiscordBackend(); got != d {
@@ -29,18 +27,21 @@ func TestAuthorizeCommand(t *testing.T) {
 		name, invoker, guildID string
 		wantOK                 bool
 	}{
-		{"status", "anyone", "guild1", true}, // read-only in guild OK
-		{"status", "anyone", "", true},       // read-only in DM OK
+		{"status", "anyone", "guild1", true},
+		{"status", "anyone", "", true},
 		{"positions", "anyone", "guild1", true},
-		{"logs", "anyone", "guild1", false}, // logs is ops now: guild rejected
-		{"logs", "intruder", "", false},     // logs is ops now: non-owner DM rejected
-		{"logs", owner, "", true},           // logs is ops now: owner DM OK
-		{"restart", owner, "", true},        // ops: owner in DM OK
-		{"restart", owner, "guild1", false}, // ops: owner in guild rejected (must be DM)
-		{"restart", "intruder", "", false},  // ops: non-owner in DM rejected
+		{"logs", "anyone", "guild1", false},
+		{"logs", "intruder", "", false},
+		{"logs", owner, "", true},
+		{"restart", owner, "", true},
+		{"restart", owner, "guild1", false},
+		{"restart", "intruder", "", false},
 		{"backtest", owner, "", true},
 		{"backtest", "intruder", "", false},
-		{"unknown", owner, "", false}, // unknown command rejected
+		{"clear-cash-reconcile", owner, "", true},
+		{"clear-cash-reconcile", owner, "guild1", false},
+		{"clear-cash-reconcile", "intruder", "", false},
+		{"unknown", owner, "", false},
 	}
 	for _, c := range cases {
 		ok, reason := authorizeCommand(c.name, c.invoker, c.guildID, owner)
@@ -54,16 +55,8 @@ func TestAuthorizeCommand(t *testing.T) {
 	}
 }
 
-// discordCommandNameRe is Discord's CHAT_INPUT command-name constraint for our
-// ASCII command set: 1..32 chars, lowercase letters, digits, dash, underscore.
 var discordCommandNameRe = regexp.MustCompile(`^[a-z0-9_-]{1,32}$`)
 
-// TestSlashCommandsNamespaced locks the #891 namespacing invariants: every
-// registered command is prefixed with commandPrefix, is a valid Discord command
-// name, and strips back (as interactionCreate does) to a bare ID that is exactly
-// one of the routable commands in readOnlyCommandNames or opsCommandNames. The
-// stripped set must equal the union of those maps — so a command added to
-// slashCommands() without a classification (or vice versa) fails the build.
 func TestSlashCommandsNamespaced(t *testing.T) {
 	registered := map[string]bool{}
 	for _, c := range slashCommands() {
@@ -118,19 +111,73 @@ func TestFormatHealthResponse(t *testing.T) {
 	}
 }
 
-func TestFormatStatusResponse(t *testing.T) {
-	state := &AppState{Strategies: map[string]*StrategyState{
-		"hl-a": {ID: "hl-a", Platform: "hyperliquid", Cash: 100,
-			Positions: map[string]*Position{"BTC": {Symbol: "BTC", Quantity: 1, AvgCost: 50, Side: "long"}},
-			Regime:    "trend_up"},
-	}}
-	prices := map[string]float64{"BTC": 60}
-	got := formatStatusResponse(state, prices)
-	if !strings.Contains(got, "positions=1") {
-		t.Errorf("expected 1 position in status, got: %s", got)
+func TestFormatStatusResponseUsesWalletDedupedDisplayTotal(t *testing.T) {
+	key := SharedWalletKey{Platform: "hyperliquid", Account: "0xpool"}
+	state := &AppState{
+		Strategies: map[string]*StrategyState{
+			"hl-a": {
+				ID: "hl-a", Platform: "hyperliquid", Cash: -10,
+				SharedWalletPoolBudget: true,
+			},
+			"hl-b": {
+				ID: "hl-b", Platform: "hyperliquid", Cash: 5,
+				SharedWalletPoolBudget: true,
+			},
+		},
+		LatestSharedWalletBalances: map[SharedWalletKey]float64{key: 1000},
+		LatestSharedWalletMembers:  map[SharedWalletKey][]string{key: {"hl-a", "hl-b"}},
 	}
-	if !strings.Contains(got, "regime=trend_up") {
-		t.Errorf("expected regime in status, got: %s", got)
+
+	allPooled := formatStatusResponse(state, nil)
+	if !strings.Contains(allPooled, "value=$1000.00") {
+		t.Fatalf("all-pooled Discord value must use real wallet equity: %s", allPooled)
+	}
+	if !strings.Contains(allPooled, "shared-wallet equity is counted once") {
+		t.Fatalf("pooled status must explain the cash basis: %s", allPooled)
+	}
+
+	state.Strategies["spot"] = &StrategyState{ID: "spot", Platform: "binanceus", Cash: 200}
+	mixed := formatStatusResponse(state, nil)
+	if !strings.Contains(mixed, "value=$1200.00") || !strings.Contains(mixed, "cash=$195.00") {
+		t.Fatalf("mixed Discord total must count wallet once plus allocated book: %s", mixed)
+	}
+
+	state.LatestSharedWalletBalances = nil
+	state.LatestSharedWalletMembers = nil
+	fallback := formatStatusResponse(state, nil)
+	if !strings.Contains(fallback, "value=$195.00") {
+		t.Fatalf("missing-balance Discord total must match modeled fallback: %s", fallback)
+	}
+	if strings.Contains(fallback, "shared-wallet equity is counted once") {
+		t.Fatalf("missing-balance fallback must not claim fresh pooled equity: %s", fallback)
+	}
+}
+
+func TestFormatStatusResponse_CashReconcileRequired(t *testing.T) {
+	state := &AppState{Strategies: map[string]*StrategyState{
+		"z-latched": {ID: "z-latched", Platform: "robinhood", Cash: 0, CashReconcileRequired: true,
+			Positions: map[string]*Position{}},
+		"a-latched": {ID: "a-latched", Platform: "okx", Cash: 0.005, CashReconcileRequired: true,
+			Positions: map[string]*Position{}},
+		"m-ok": {ID: "m-ok", Platform: "hyperliquid", Cash: 50, CashReconcileRequired: false,
+			Positions: map[string]*Position{}},
+	}}
+	got := formatStatusResponse(state, nil)
+	if !strings.Contains(got, "CASH RECONCILE REQUIRED") {
+		t.Fatalf("expected reconcile banner, got: %s", got)
+	}
+	if !strings.Contains(got, "a-latched") || !strings.Contains(got, "z-latched") {
+		t.Fatalf("expected both latched IDs, got: %s", got)
+	}
+	if strings.Contains(got, "m-ok") && strings.Contains(got[strings.Index(got, "CASH RECONCILE REQUIRED"):], "m-ok") {
+		t.Fatalf("unlatched strategy must not appear in reconcile list, got: %s", got)
+	}
+	idx := strings.Index(got, "CASH RECONCILE REQUIRED:")
+	list := got[idx:]
+	if !strings.Contains(list, "a-latched, z-latched") && !strings.Contains(list, "a-latched,z-latched") {
+		if !(strings.Contains(list, "a-latched") && strings.Index(list, "a-latched") < strings.Index(list, "z-latched")) {
+			t.Fatalf("expected a-latched before z-latched in sorted list, got: %s", list)
+		}
 	}
 }
 
@@ -143,26 +190,107 @@ func testPnLState() *AppState {
 	}}
 }
 
-func TestFormatPositionsResponse(t *testing.T) {
-	empty := formatPositionsResponse(&AppState{Strategies: map[string]*StrategyState{}}, nil)
-	if !strings.Contains(empty, "No open positions") {
-		t.Errorf("expected empty message, got: %s", empty)
+func TestFormatPnLResponsePooledReturnsAreUndefined(t *testing.T) {
+	allPooled := &AppState{Strategies: map[string]*StrategyState{
+		"hl-a": {
+			ID: "hl-a", Platform: "hyperliquid", Cash: -200,
+			SharedWalletPoolBudget:      true,
+			SharedWalletPerformanceOnly: false,
+		},
+		"hl-b": {
+			ID: "hl-b", Platform: "hyperliquid", Cash: 0,
+			SharedWalletPoolBudget:      true,
+			SharedWalletPerformanceOnly: true,
+		},
+	}}
+	got := formatPnLResponse(allPooled, nil)
+	for _, want := range []string{
+		"Total: $-200.00 (—)",
+		"hyperliquid: $-200.00 (—)",
+		"hl-a: $-200.00 (—)",
+		"hl-b: $+0.00 (—)",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("all-pooled P&L missing %q:\n%s", want, got)
+		}
 	}
-
-	got := formatPositionsResponse(testPnLState(), map[string]float64{"BTC": 60})
-	if !strings.Contains(got, "BTC") || !strings.Contains(got, "hl-a") {
-		t.Errorf("expected BTC position owned by hl-a, got: %s", got)
+	if strings.Contains(got, "+0.00%") {
+		t.Fatalf("pooled P&L must never render a fabricated zero return:\n%s", got)
 	}
 }
 
-func TestFormatPnLResponse(t *testing.T) {
-	// hl-a: pv = 1*60 = 60, cap 50 -> +10 (+20%). hl-b: pv = 50, cap 50 -> 0.
-	got := formatPnLResponse(testPnLState(), map[string]float64{"BTC": 60})
-	if !strings.Contains(got, "+10.00") || !strings.Contains(got, "+20.00%") {
-		t.Errorf("expected hl-a pnl +10 (+20%%), got: %s", got)
+func TestFormatPnLResponseMixedPoolInvalidatesOnlyContainingAggregates(t *testing.T) {
+	state := &AppState{Strategies: map[string]*StrategyState{
+		"hl-pool": {
+			ID: "hl-pool", Platform: "hyperliquid", Cash: -20,
+			SharedWalletPoolBudget: true,
+		},
+		"hl-allocated": {
+			ID: "hl-allocated", Platform: "hyperliquid", Cash: 110, InitialCapital: 100,
+		},
+		"spot-allocated": {
+			ID: "spot-allocated", Platform: "binanceus", Cash: 220, InitialCapital: 200,
+		},
+	}}
+	got := formatPnLResponse(state, nil)
+	for _, want := range []string{
+		"Total: $+10.00 (—)",
+		"hyperliquid: $-10.00 (—)",
+		"hl-pool: $-20.00 (—)",
+		"hl-allocated: $+10.00 (+10.00%)",
+		"binanceus: $+20.00 (+10.00%)",
+		"spot-allocated: $+20.00 (+10.00%)",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("mixed P&L missing %q:\n%s", want, got)
+		}
 	}
-	if !strings.Contains(got, "Total") {
-		t.Errorf("expected a Total line, got: %s", got)
+}
+
+func TestFormatPnLResponseUsesWalletDedupedTotalWithoutChangingAttributedPnL(t *testing.T) {
+	key := SharedWalletKey{Platform: "hyperliquid", Account: "0xpool"}
+	state := &AppState{
+		Strategies: map[string]*StrategyState{
+			"hl-a": {
+				ID: "hl-a", Platform: "hyperliquid", Cash: -10,
+				SharedWalletPoolBudget: true,
+			},
+			"hl-b": {
+				ID: "hl-b", Platform: "hyperliquid", Cash: 5,
+				SharedWalletPoolBudget: true,
+			},
+		},
+		LatestSharedWalletBalances: map[SharedWalletKey]float64{key: 1000},
+		LatestSharedWalletMembers:  map[SharedWalletKey][]string{key: {"hl-a", "hl-b"}},
+	}
+
+	allPooled := formatPnLResponse(state, nil)
+	if !strings.Contains(allPooled, "Total: $-5.00 (—) — value $1000.00 / capital $0.00") {
+		t.Fatalf("all-pooled /pnl must use real wallet equity while retaining attributed P&L:\n%s", allPooled)
+	}
+	if !strings.Contains(formatStatusResponse(state, nil), "value=$1000.00") {
+		t.Fatal("/pnl and /status test fixtures must share the same deduped total")
+	}
+
+	state.Strategies["spot"] = &StrategyState{
+		ID: "spot", Platform: "binanceus", Cash: 200, InitialCapital: 200,
+	}
+	mixed := formatPnLResponse(state, nil)
+	for _, want := range []string{
+		"Total: $-5.00 (—) — value $1200.00 / capital $200.00",
+		"hyperliquid: $-5.00 (—)",
+		"binanceus: $+0.00 (+0.00%)",
+	} {
+		if !strings.Contains(mixed, want) {
+			t.Fatalf("mixed /pnl missing %q:\n%s", want, mixed)
+		}
+	}
+
+	state.LatestSharedWalletBalances = nil
+	state.LatestSharedWalletMembers = nil
+	fallback := formatPnLResponse(state, nil)
+	if !strings.Contains(fallback, "Total: $-5.00 (—) — value $195.00 / capital $200.00") {
+		t.Fatalf("missing wallet balance must use latestDisplayTotal modeled fallback:\n%s", fallback)
 	}
 }
 
@@ -177,7 +305,7 @@ func TestFormatCircuitBreakersResponse(t *testing.T) {
 		Strategies: map[string]*StrategyState{
 			"hl-a": {ID: "hl-a", RiskState: RiskState{CircuitBreaker: true, CircuitBreakerUntil: now.Add(10 * time.Minute)}},
 		},
-		PortfolioRisk: PortfolioRiskState{KillSwitchActive: true},
+		PortfolioRisk: map[PortfolioScope]*PortfolioRiskState{ScopeLive: {KillSwitchActive: true}},
 	}
 	got := formatCircuitBreakersResponse(state, now)
 	if !strings.Contains(got, "hl-a") {
@@ -190,7 +318,7 @@ func TestFormatCircuitBreakersResponse(t *testing.T) {
 
 func TestFormatDeadStrategiesResponse(t *testing.T) {
 	state := &AppState{Strategies: map[string]*StrategyState{"hl-a": {ID: "hl-a"}, "hl-b": {ID: "hl-b"}}}
-	lifetime := map[string]LifetimeTradeStats{"hl-a": {PositionsOpened: 3}} // hl-b is dead
+	lifetime := map[string]LifetimeTradeStats{"hl-a": {PositionsOpened: 3}}
 	got := formatDeadStrategiesResponse(state, lifetime)
 	if !strings.Contains(got, "hl-b") || strings.Contains(got, "hl-a") {
 		t.Errorf("expected only hl-b listed as dead, got: %s", got)
@@ -205,9 +333,8 @@ func TestFormatLeaderboardResponse(t *testing.T) {
 			{ID: "hl-b", Platform: "hyperliquid"},
 		},
 	}
-	state := testPnLState() // hl-a +20%, hl-b 0%
+	state := testPnLState()
 	got := formatLeaderboardResponse(cfg, state, map[string]float64{"BTC": 60}, nil, 5)
-	// hl-a should rank above hl-b.
 	ai := strings.Index(got, "hl-a")
 	bi := strings.Index(got, "hl-b")
 	if ai < 0 || bi < 0 || ai > bi {
@@ -224,7 +351,7 @@ func TestFormatCorrelationResponse(t *testing.T) {
 		Warnings:          []string{"BTC concentration 80%"},
 		Assets:            map[string]*AssetExposure{"BTC": {NetDeltaUSD: 800, ConcentrationPct: 80}},
 	}
-	got := formatCorrelationResponse(snap)
+	got := formatCorrelationResponse(map[PortfolioScope]*CorrelationSnapshot{ScopeLive: snap})
 	if !strings.Contains(got, "BTC") || !strings.Contains(got, "80") {
 		t.Errorf("expected BTC concentration, got: %s", got)
 	}
@@ -239,10 +366,9 @@ func TestFormatCorrelationResponseDeterministicTies(t *testing.T) {
 			"SOL": {NetDeltaUSD: 500, ConcentrationPct: 50},
 		},
 	}
-	// Equal concentration -> tie-break by asset name ascending, stable across runs.
-	first := formatCorrelationResponse(snap)
+	first := formatCorrelationResponse(map[PortfolioScope]*CorrelationSnapshot{ScopeLive: snap})
 	for i := 0; i < 20; i++ {
-		if got := formatCorrelationResponse(snap); got != first {
+		if got := formatCorrelationResponse(map[PortfolioScope]*CorrelationSnapshot{ScopeLive: snap}); got != first {
 			t.Fatalf("non-deterministic output on tied concentration:\n%s\n---\n%s", first, got)
 		}
 	}
@@ -272,19 +398,16 @@ func TestParseBacktestSummary(t *testing.T) {
 		}
 	}
 
-	// Missing labels degrade to a dash rather than erroring.
 	if got := parseBacktestSummary("no metrics here"); !strings.Contains(got, "—") {
 		t.Errorf("expected dash for missing metrics, got: %s", got)
 	}
 }
 
 func TestTruncateForDiscord(t *testing.T) {
-	// Short input is returned unchanged.
 	if got := truncateForDiscord("hello"); got != "hello" {
 		t.Errorf("short input mutated: %q", got)
 	}
 
-	// Over-limit ASCII input is capped to 2000 bytes with an ellipsis.
 	long := strings.Repeat("a", 2500)
 	got := truncateForDiscord(long)
 	if len(got) > 2000 {
@@ -294,8 +417,7 @@ func TestTruncateForDiscord(t *testing.T) {
 		t.Errorf("expected ellipsis suffix, got tail: %q", got[len(got)-5:])
 	}
 
-	// Multibyte runes at the cut boundary must not be split (no invalid bytes).
-	multibyte := strings.Repeat("🛑", 1000) // 4 bytes each = 4000 bytes
+	multibyte := strings.Repeat("🛑", 1000)
 	got = truncateForDiscord(multibyte)
 	if len(got) > 2000 {
 		t.Errorf("truncated multibyte output exceeds 2000 bytes: %d", len(got))

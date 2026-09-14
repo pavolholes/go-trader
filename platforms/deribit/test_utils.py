@@ -1,4 +1,3 @@
-"""Tests for deribit/utils.py — mock HTTP requests to avoid live API calls."""
 
 import sys
 import os
@@ -7,7 +6,6 @@ import pytest
 from unittest.mock import MagicMock, patch
 from datetime import datetime, timezone, timedelta
 
-# Load the deribit utils by file path to avoid module name collisions
 _utils_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "utils.py")
 _spec = importlib.util.spec_from_file_location("deribit_utils", _utils_path)
 _mod = importlib.util.module_from_spec(_spec)
@@ -22,35 +20,20 @@ get_live_quote = _mod.get_live_quote
 get_live_premium = _mod.get_live_premium
 
 
-# ─── Instrument Formatting ─────────────────────────
-
 class TestFormatInstrument:
-    def test_btc_call(self):
-        result = _format_instrument("BTC", "call", 75000, "2026-03-13")
-        assert result == "BTC-13MAR26-75000-C"
+    @pytest.mark.parametrize("underlying,option_type,strike,expiry,expected", [
+        ("BTC", "call", 75000, "2026-03-13", "BTC-13MAR26-75000-C"),
+        ("ETH", "put", 3500, "2026-12-25", "ETH-25DEC26-3500-P"),
+        ("btc", "call", 100000, "2026-01-15", "BTC-15JAN26-100000-C"),
+        ("BTC", "Call", 80000, "2026-06-20", "BTC-20JUN26-80000-C"),
+        ("BTC", "put", 80000, "2026-06-20", "BTC-20JUN26-80000-P"),
+    ])
+    def test_instrument_name(self, underlying, option_type, strike, expiry, expected):
+        assert _format_instrument(underlying, option_type, strike, expiry) == expected
 
-    def test_eth_put(self):
-        result = _format_instrument("ETH", "put", 3500, "2026-12-25")
-        assert result == "ETH-25DEC26-3500-P"
-
-    def test_lowercase_underlying(self):
-        result = _format_instrument("btc", "call", 100000, "2026-01-15")
-        assert result.startswith("BTC-")
-
-    def test_lowercase_option_type(self):
-        result = _format_instrument("BTC", "Call", 80000, "2026-06-20")
-        assert result.endswith("-C")
-
-    def test_put_suffix(self):
-        result = _format_instrument("BTC", "put", 80000, "2026-06-20")
-        assert result.endswith("-P")
-
-
-# ─── Fetch Available Expiries ──────────────────────
 
 class TestFetchAvailableExpiries:
     def _mock_instruments(self, days_list):
-        """Build a mock API response with expiries at given days offsets."""
         now = datetime.now(timezone.utc)
         instruments = []
         for d in days_list:
@@ -71,7 +54,6 @@ class TestFetchAvailableExpiries:
             result = fetch_available_expiries("BTC", min_dte=7, max_dte=60)
             dtes = [dte for _, dte in result]
             assert all(7 <= d <= 60 for d in dtes)
-            # 5-day and 90-day should be excluded
             assert 5 not in dtes
             assert 90 not in dtes
 
@@ -91,8 +73,6 @@ class TestFetchAvailableExpiries:
             assert fetch_available_expiries("BTC") == []
 
 
-# ─── Find Closest Expiry ──────────────────────────
-
 class TestFindClosestExpiry:
     def test_finds_closest(self):
         now = datetime.now(timezone.utc)
@@ -111,7 +91,7 @@ class TestFindClosestExpiry:
             result = find_closest_expiry("BTC", target_dte=20)
             assert result is not None
             _, actual_dte = result
-            assert abs(actual_dte - 21) <= 1  # closest to 20 is 21
+            assert abs(actual_dte - 21) <= 1
 
     def test_returns_none_outside_tolerance(self):
         now = datetime.now(timezone.utc)
@@ -136,13 +116,10 @@ class TestFindClosestExpiry:
             assert find_closest_expiry("BTC", target_dte=30) is None
 
 
-# ─── Fetch Available Strikes ──────────────────────
-
 class TestFetchAvailableStrikes:
     def test_fetches_strikes_for_expiry(self):
         now = datetime.now(timezone.utc)
         target_date = now + timedelta(days=30)
-        # Deribit expiry is at 8:00 UTC
         exp_time = target_date.replace(hour=8, minute=0, second=0, microsecond=0)
         exp_ts = int(exp_time.timestamp() * 1000)
         expiry_str = target_date.strftime("%Y-%m-%d")
@@ -151,7 +128,6 @@ class TestFetchAvailableStrikes:
             {"expiration_timestamp": exp_ts, "instrument_name": "BTC-65000-C", "strike": 65000},
             {"expiration_timestamp": exp_ts, "instrument_name": "BTC-70000-C", "strike": 70000},
             {"expiration_timestamp": exp_ts, "instrument_name": "BTC-70000-P", "strike": 70000},
-            # Different expiry
             {"expiration_timestamp": exp_ts + 86400 * 7 * 1000, "instrument_name": "BTC-80000-C", "strike": 80000},
         ]
         mock_resp = MagicMock()
@@ -162,14 +138,12 @@ class TestFetchAvailableStrikes:
             strikes = fetch_available_strikes("BTC", expiry_str, "call")
             assert 65000 in strikes
             assert 70000 in strikes
-            assert 80000 not in strikes  # different expiry
+            assert 80000 not in strikes
 
     def test_returns_empty_on_error(self):
         with patch("requests.get", side_effect=Exception("fail")):
             assert fetch_available_strikes("BTC", "2026-05-01", "call") == []
 
-
-# ─── Find Closest Strike ──────────────────────────
 
 class TestFindClosestStrike:
     def test_finds_closest(self):
@@ -200,8 +174,6 @@ class TestFindClosestStrike:
         with patch("requests.get", return_value=mock_resp):
             assert find_closest_strike("BTC", "2026-05-01", "call", 67000) is None
 
-
-# ─── Live Quote ────────────────────────────────────
 
 class TestGetLiveQuote:
     def test_returns_quote(self):

@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Return open-strategy default params for the dashboard tuner (#811)."""
 
 import argparse
 import json
@@ -9,13 +8,7 @@ import sys
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(ROOT, "backtest"))
 
-from registry_loader import load_registry  # noqa: E402
-
-
-def _registry_for_type(strategy_type: str) -> str:
-    if strategy_type in ("perps", "futures", "manual"):
-        return "futures"
-    return "spot"
+from registry_loader import load_registry, registry_for_strategy_type
 
 
 def main() -> None:
@@ -29,7 +22,7 @@ def main() -> None:
         print(json.dumps({"ok": True}))
         return
 
-    reg_key = _registry_for_type(args.type)
+    reg_key = registry_for_strategy_type(args.type)
     reg = load_registry(reg_key)
     name = args.strategy.strip()
     strat = reg.STRATEGY_REGISTRY.get(name)

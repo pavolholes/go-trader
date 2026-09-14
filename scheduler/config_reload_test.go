@@ -110,9 +110,6 @@ func TestApplyHotReloadConfigAppliesAllowedFields(t *testing.T) {
 	var mu sync.RWMutex
 	server := NewStatusServer(state, &mu, "", cfg.Strategies, nil)
 
-	// SIGHUP path holds mu.Lock() across applyHotReloadConfig (see
-	// reloadConfig in main.go). Mirror that here so this test also covers
-	// the deadlock risk fixed by giving StatusServer.strategies its own mu.
 	type reloadResult struct {
 		changes []string
 		err     error
@@ -182,287 +179,6 @@ func TestApplyHotReloadConfigAppliesAllowedFields(t *testing.T) {
 	}
 }
 
-func TestApplyHotReloadConfigRejectsStrategySetChange(t *testing.T) {
-	cfg := minimalReloadConfig([]StrategyConfig{{
-		ID: "s1", Type: "spot", Platform: "binanceus", Script: "x.py", Capital: 100, MaxDrawdownPct: 10,
-	}})
-	next := minimalReloadConfig([]StrategyConfig{{
-		ID: "s1", Type: "spot", Platform: "binanceus", Script: "x.py", Capital: 200, MaxDrawdownPct: 10,
-	}, {
-		ID: "s2", Type: "spot", Platform: "binanceus", Script: "x.py", Capital: 100, MaxDrawdownPct: 10,
-	}})
-
-	_, err := applyHotReloadConfig(cfg, next, NewAppState(), nil, nil)
-	if err == nil {
-		t.Fatal("expected strategy set change to be rejected")
-	}
-	if !strings.Contains(err.Error(), "strategy set changed") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if cfg.Strategies[0].Capital != 100 {
-		t.Errorf("current config mutated after rejected reload: %+v", cfg.Strategies[0])
-	}
-}
-
-func TestApplyHotReloadConfigRejectsNonReloadableStrategyField(t *testing.T) {
-	cfg := minimalReloadConfig([]StrategyConfig{{
-		ID: "s1", Type: "spot", Platform: "binanceus", Script: "x.py", Args: []string{"a"}, Capital: 100, MaxDrawdownPct: 10,
-	}})
-	next := minimalReloadConfig([]StrategyConfig{{
-		ID: "s1", Type: "spot", Platform: "binanceus", Script: "y.py", Args: []string{"a"}, Capital: 200, MaxDrawdownPct: 10,
-	}})
-
-	_, err := applyHotReloadConfig(cfg, next, NewAppState(), nil, nil)
-	if err == nil {
-		t.Fatal("expected script change to be rejected")
-	}
-	if !strings.Contains(err.Error(), "non-hot-reloadable") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if cfg.Strategies[0].Capital != 100 {
-		t.Errorf("current config mutated after rejected reload: %+v", cfg.Strategies[0])
-	}
-}
-
-func TestApplyHotReloadConfigAllowsOpenCloseStrategyChanges(t *testing.T) {
-	cfg := minimalReloadConfig([]StrategyConfig{{
-		ID: "s1", Type: "spot", Platform: "binanceus", Script: "x.py",
-		Args: []string{"triple_ema", "BTC/USDT", "1h"}, Capital: 100, MaxDrawdownPct: 10,
-	}})
-	next := minimalReloadConfig([]StrategyConfig{{
-		ID: "s1", Type: "spot", Platform: "binanceus", Script: "x.py",
-		Args: []string{"triple_ema", "BTC/USDT", "1h"}, Capital: 100, MaxDrawdownPct: 10,
-		OpenStrategy: StrategyRef{Name: "triple_ema"}, CloseStrategy: &StrategyRef{Name: "tp_at_pct"},
-	}})
-
-	changes, err := applyHotReloadConfig(cfg, next, NewAppState(), nil, nil)
-	if err != nil {
-		t.Fatalf("applyHotReloadConfig returned error: %v", err)
-	}
-	joined := strings.Join(changes, "\n")
-	for _, want := range []string{
-		"strategy[s1].open_strategy:",
-		"strategy[s1].close_strategy:",
-	} {
-		if !strings.Contains(joined, want) {
-			t.Fatalf("changes missing %q:\n%s", want, joined)
-		}
-	}
-	if cfg.Strategies[0].OpenStrategy.Name != "triple_ema" {
-		t.Fatalf("OpenStrategy.Name = %q, want triple_ema", cfg.Strategies[0].OpenStrategy.Name)
-	}
-	if cfg.Strategies[0].CloseStrategy == nil || cfg.Strategies[0].CloseStrategy.Name != "tp_at_pct" {
-		t.Fatalf("CloseStrategy = %#v, want tp_at_pct", cfg.Strategies[0].CloseStrategy)
-	}
-}
-
-func TestApplyHotReloadConfigRejectsLeverageChangeWithOpenPerpsPosition(t *testing.T) {
-	cfg := minimalReloadConfig([]StrategyConfig{{
-		ID: "hl-eth", Type: "perps", Platform: "hyperliquid", Script: "x.py", Args: []string{"a", "ETH", "1h"}, Capital: 1000, MaxDrawdownPct: 10, Leverage: 2,
-	}})
-	next := minimalReloadConfig([]StrategyConfig{{
-		ID: "hl-eth", Type: "perps", Platform: "hyperliquid", Script: "x.py", Args: []string{"a", "ETH", "1h"}, Capital: 1200, MaxDrawdownPct: 12, Leverage: 5,
-	}})
-	state := &AppState{Strategies: map[string]*StrategyState{
-		"hl-eth": {
-			ID: "hl-eth", Cash: 900,
-			RiskState: RiskState{MaxDrawdownPct: 10},
-			Positions: map[string]*Position{
-				"ETH": {Symbol: "ETH", Quantity: 1, Side: "long", AvgCost: 3000, Leverage: 2},
-			},
-		},
-	}}
-
-	_, err := applyHotReloadConfig(cfg, next, state, nil, nil)
-	if err == nil {
-		t.Fatal("expected open perps leverage change to be rejected")
-	}
-	if !strings.Contains(err.Error(), "leverage changed with open positions") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if cfg.Strategies[0].Capital != 1000 || cfg.Strategies[0].MaxDrawdownPct != 10 || cfg.Strategies[0].Leverage != 2 {
-		t.Fatalf("current config mutated after rejected reload: %+v", cfg.Strategies[0])
-	}
-	if state.Strategies["hl-eth"].Cash != 900 || state.Strategies["hl-eth"].RiskState.MaxDrawdownPct != 10 {
-		t.Fatalf("state mutated after rejected reload: %+v", state.Strategies["hl-eth"])
-	}
-	if state.Strategies["hl-eth"].Positions["ETH"].Leverage != 2 {
-		t.Fatalf("position leverage mutated after rejected reload: %+v", state.Strategies["hl-eth"].Positions["ETH"])
-	}
-}
-
-// #486: margin_mode is hot-reloadable when flat — same envelope as Leverage.
-func TestApplyHotReloadConfigRejectsMarginModeChangeWithOpenPerpsPosition(t *testing.T) {
-	cfg := minimalReloadConfig([]StrategyConfig{{
-		ID: "hl-eth", Type: "perps", Platform: "hyperliquid", Script: "x.py", Args: []string{"a", "ETH", "1h"}, Capital: 1000, MaxDrawdownPct: 10, Leverage: 2, MarginMode: "isolated",
-	}})
-	next := minimalReloadConfig([]StrategyConfig{{
-		ID: "hl-eth", Type: "perps", Platform: "hyperliquid", Script: "x.py", Args: []string{"a", "ETH", "1h"}, Capital: 1000, MaxDrawdownPct: 10, Leverage: 2, MarginMode: "cross",
-	}})
-	state := &AppState{Strategies: map[string]*StrategyState{
-		"hl-eth": {
-			ID: "hl-eth", Cash: 900,
-			RiskState: RiskState{MaxDrawdownPct: 10},
-			Positions: map[string]*Position{
-				"ETH": {Symbol: "ETH", Quantity: 1, Side: "long", AvgCost: 3000, Leverage: 2},
-			},
-		},
-	}}
-
-	_, err := applyHotReloadConfig(cfg, next, state, nil, nil)
-	if err == nil {
-		t.Fatal("expected margin_mode change with open position to be rejected")
-	}
-	if !strings.Contains(err.Error(), "margin_mode changed with open positions") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if cfg.Strategies[0].MarginMode != "isolated" {
-		t.Fatalf("current config mutated after rejected reload: %+v", cfg.Strategies[0])
-	}
-}
-
-// #486: margin_mode change is allowed when the strategy is flat.
-func TestApplyHotReloadConfigAllowsMarginModeChangeWhenFlat(t *testing.T) {
-	cfg := minimalReloadConfig([]StrategyConfig{{
-		ID: "hl-eth", Type: "perps", Platform: "hyperliquid", Script: "x.py", Args: []string{"a", "ETH", "1h"}, Capital: 1000, MaxDrawdownPct: 10, Leverage: 2, MarginMode: "isolated",
-	}})
-	next := minimalReloadConfig([]StrategyConfig{{
-		ID: "hl-eth", Type: "perps", Platform: "hyperliquid", Script: "x.py", Args: []string{"a", "ETH", "1h"}, Capital: 1000, MaxDrawdownPct: 10, Leverage: 2, MarginMode: "cross",
-	}})
-	state := &AppState{Strategies: map[string]*StrategyState{
-		"hl-eth": {ID: "hl-eth", Cash: 1000, Positions: map[string]*Position{}},
-	}}
-
-	if _, err := applyHotReloadConfig(cfg, next, state, nil, nil); err != nil {
-		t.Fatalf("expected margin_mode change to succeed when flat, got: %v", err)
-	}
-	if cfg.Strategies[0].MarginMode != "cross" {
-		t.Fatalf("MarginMode = %q, want %q", cfg.Strategies[0].MarginMode, "cross")
-	}
-}
-
-func TestApplyHotReloadConfigPreservesRuntimeCapitalPctCapital(t *testing.T) {
-	cfg := minimalReloadConfig([]StrategyConfig{{
-		ID: "s1", Type: "perps", Platform: "hyperliquid", Script: "x.py", Args: []string{"a", "BTC", "1h"}, Capital: 2500, CapitalPct: 0.5, MaxDrawdownPct: 10, Leverage: 2,
-	}})
-	next := minimalReloadConfig([]StrategyConfig{{
-		ID: "s1", Type: "perps", Platform: "hyperliquid", Script: "x.py", Args: []string{"a", "BTC", "1h"}, Capital: 100, CapitalPct: 0.5, MaxDrawdownPct: 12, Leverage: 2,
-	}})
-	state := &AppState{Strategies: map[string]*StrategyState{
-		"s1": {ID: "s1", Cash: 2400, RiskState: RiskState{MaxDrawdownPct: 10}},
-	}}
-
-	changes, err := applyHotReloadConfig(cfg, next, state, nil, nil)
-	if err != nil {
-		t.Fatalf("applyHotReloadConfig returned error: %v", err)
-	}
-	if cfg.Strategies[0].Capital != 2500 {
-		t.Errorf("runtime capital_pct capital = %g, want preserved 2500", cfg.Strategies[0].Capital)
-	}
-	if state.Strategies["s1"].Cash != 2400 {
-		t.Errorf("cash = %g, want preserved 2400", state.Strategies["s1"].Cash)
-	}
-	joined := strings.Join(changes, "\n")
-	if strings.Contains(joined, ".capital:") {
-		t.Fatalf("capital_pct fallback capital should not be hot-applied, changes:\n%s", joined)
-	}
-	if cfg.Strategies[0].MaxDrawdownPct != 12 || state.Strategies["s1"].RiskState.MaxDrawdownPct != 12 {
-		t.Fatalf("other hot-reloadable fields should still apply, cfg=%+v state=%+v", cfg.Strategies[0], state.Strategies["s1"].RiskState)
-	}
-}
-
-// #491: hot-reload mirrors LoadConfig peer validation — a reload that would
-// introduce two HL perps strategies on the same coin with mismatched
-// margin_mode/leverage must be rejected.
-func TestApplyHotReloadConfigRejectsHLPeerMismatchOnReload(t *testing.T) {
-	cfg := minimalReloadConfig([]StrategyConfig{{
-		ID: "hl-eth-a", Type: "perps", Platform: "hyperliquid", Script: "x.py", Args: []string{"a", "ETH", "1h"}, Capital: 1000, MaxDrawdownPct: 10, Leverage: 5, MarginMode: "isolated",
-	}, {
-		ID: "hl-eth-b", Type: "perps", Platform: "hyperliquid", Script: "x.py", Args: []string{"b", "ETH", "1h"}, Capital: 500, MaxDrawdownPct: 10, Leverage: 5, MarginMode: "isolated",
-	}})
-	next := minimalReloadConfig([]StrategyConfig{{
-		ID: "hl-eth-a", Type: "perps", Platform: "hyperliquid", Script: "x.py", Args: []string{"a", "ETH", "1h"}, Capital: 1000, MaxDrawdownPct: 10, Leverage: 5, MarginMode: "isolated",
-	}, {
-		ID: "hl-eth-b", Type: "perps", Platform: "hyperliquid", Script: "x.py", Args: []string{"b", "ETH", "1h"}, Capital: 500, MaxDrawdownPct: 10, Leverage: 10, MarginMode: "isolated",
-	}})
-	state := &AppState{Strategies: map[string]*StrategyState{
-		"hl-eth-a": {ID: "hl-eth-a", Cash: 1000},
-		"hl-eth-b": {ID: "hl-eth-b", Cash: 500},
-	}}
-
-	_, err := applyHotReloadConfig(cfg, next, state, nil, nil)
-	if err == nil {
-		t.Fatal("expected hot reload to reject peer leverage mismatch")
-	}
-	if !strings.Contains(err.Error(), "disagree on leverage") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
-func TestApplyHotReloadConfigAllowsTrailingStopPctChangeWithOpenPosition(t *testing.T) {
-	oldTrail := 3.0
-	newTrail := 4.0
-	oldMinMove := 0.5
-	newMinMove := 0.25
-	cfg := minimalReloadConfig([]StrategyConfig{{
-		ID: "hl-eth", Type: "perps", Platform: "hyperliquid", Script: "x.py",
-		Args: []string{"a", "ETH", "1h"}, Capital: 1000, MaxDrawdownPct: 10,
-		Leverage: 5, MarginMode: "isolated", TrailingStopPct: &oldTrail, TrailingStopMinMovePct: &oldMinMove,
-	}})
-	next := minimalReloadConfig([]StrategyConfig{{
-		ID: "hl-eth", Type: "perps", Platform: "hyperliquid", Script: "x.py",
-		Args: []string{"a", "ETH", "1h"}, Capital: 1000, MaxDrawdownPct: 10,
-		Leverage: 5, MarginMode: "isolated", TrailingStopPct: &newTrail, TrailingStopMinMovePct: &newMinMove,
-	}})
-	state := &AppState{Strategies: map[string]*StrategyState{
-		"hl-eth": {ID: "hl-eth", Positions: map[string]*Position{
-			"ETH": {Symbol: "ETH", Quantity: 0.5, AvgCost: 3000, Side: "long"},
-		}},
-	}}
-
-	changes, err := applyHotReloadConfig(cfg, next, state, nil, nil)
-	if err != nil {
-		t.Fatalf("applyHotReloadConfig: %v", err)
-	}
-	if cfg.Strategies[0].TrailingStopPct == nil || *cfg.Strategies[0].TrailingStopPct != 4 {
-		t.Fatalf("TrailingStopPct=%v, want 4", cfg.Strategies[0].TrailingStopPct)
-	}
-	if cfg.Strategies[0].TrailingStopMinMovePct == nil || *cfg.Strategies[0].TrailingStopMinMovePct != 0.25 {
-		t.Fatalf("TrailingStopMinMovePct=%v, want 0.25", cfg.Strategies[0].TrailingStopMinMovePct)
-	}
-	joined := strings.Join(changes, "\n")
-	if !strings.Contains(joined, "trailing_stop_pct") || !strings.Contains(joined, "trailing_stop_min_move_pct") {
-		t.Fatalf("changes=%v, want trailing_stop_pct and trailing_stop_min_move_pct entries", changes)
-	}
-}
-
-func TestApplyHotReloadConfigRejectsFixedToTrailingWithOpenPosition(t *testing.T) {
-	trail := 3.0
-	cfg := minimalReloadConfig([]StrategyConfig{{
-		ID: "hl-eth", Type: "perps", Platform: "hyperliquid", Script: "x.py",
-		Args: []string{"a", "ETH", "1h"}, Capital: 1000, MaxDrawdownPct: 10,
-		Leverage: 5, MarginMode: "isolated",
-	}})
-	next := minimalReloadConfig([]StrategyConfig{{
-		ID: "hl-eth", Type: "perps", Platform: "hyperliquid", Script: "x.py",
-		Args: []string{"a", "ETH", "1h"}, Capital: 1000, MaxDrawdownPct: 10,
-		Leverage: 5, MarginMode: "isolated", TrailingStopPct: &trail,
-	}})
-	state := &AppState{Strategies: map[string]*StrategyState{
-		"hl-eth": {ID: "hl-eth", Positions: map[string]*Position{
-			"ETH": {Symbol: "ETH", Quantity: 0.5, AvgCost: 3000, Side: "long"},
-		}},
-	}}
-
-	_, err := applyHotReloadConfig(cfg, next, state, nil, nil)
-	if err == nil {
-		t.Fatal("expected hot reload to reject fixed-to-trailing mode switch")
-	}
-	if !strings.Contains(err.Error(), "trailing_stop_pct mode changed") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
 func minimalReloadConfig(strategies []StrategyConfig) *Config {
 	return &Config{
 		IntervalSeconds: 600,
@@ -474,443 +190,425 @@ func minimalReloadConfig(strategies []StrategyConfig) *Config {
 	}
 }
 
-// #656 — direction change while a position is open must be rejected. Toggling
-// from "long" → "short" mid-position would either orphan the existing long or
-// flip it on the next signal; both desync virtual state from the exchange.
-func TestApplyHotReloadConfigRejectsDirectionChangeWithOpenPerpsPosition(t *testing.T) {
-	cfg := minimalReloadConfig([]StrategyConfig{{
-		ID: "hl-eth", Type: "perps", Platform: "hyperliquid", Script: "x.py", Args: []string{"a", "ETH", "1h"}, Capital: 1000, MaxDrawdownPct: 10, Leverage: 2, Direction: DirectionLong,
-	}})
-	next := minimalReloadConfig([]StrategyConfig{{
-		ID: "hl-eth", Type: "perps", Platform: "hyperliquid", Script: "x.py", Args: []string{"a", "ETH", "1h"}, Capital: 1000, MaxDrawdownPct: 10, Leverage: 2, Direction: DirectionShort,
-	}})
-	state := &AppState{Strategies: map[string]*StrategyState{
-		"hl-eth": {
-			ID: "hl-eth", Cash: 900,
-			RiskState: RiskState{MaxDrawdownPct: 10},
-			Positions: map[string]*Position{
-				"ETH": {Symbol: "ETH", Quantity: 1, Side: "long", AvgCost: 3000, Leverage: 2},
-			},
-		},
-	}}
-
-	_, err := applyHotReloadConfig(cfg, next, state, nil, nil)
-	if err == nil {
-		t.Fatal("expected direction change with open position to be rejected")
+func hlReloadStrategy(mut func(*StrategyConfig)) StrategyConfig {
+	sc := StrategyConfig{
+		ID: "hl-eth", Type: "perps", Platform: "hyperliquid", Script: "x.py",
+		Args: []string{"a", "ETH", "1h"}, Capital: 1000, MaxDrawdownPct: 10,
+		Leverage: 5, MarginMode: "isolated",
 	}
-	if !strings.Contains(err.Error(), "direction changed with open positions") {
-		t.Fatalf("unexpected error: %v", err)
+	if mut != nil {
+		mut(&sc)
 	}
-	if cfg.Strategies[0].Direction != DirectionLong {
-		t.Fatalf("current config mutated after rejected reload: %+v", cfg.Strategies[0])
-	}
+	return sc
 }
 
-// #716 item 1 — adding an sl_after rule while a position is open must be
-// rejected. Without this guard, the new rule would engage on the next cleared
-// tier (post-TP machinery + trailing walker for trail_from_here) without the
-// validation the open respected.
-func TestApplyHotReloadConfigRejectsSLAfterAddWithOpenPosition(t *testing.T) {
-	tieredOpen := &StrategyRef{
-		Name: "tiered_tp_atr",
-		Params: map[string]interface{}{
-			"tp_tiers": []interface{}{
-				map[string]interface{}{"atr_multiple": 2.0, "close_fraction": 0.5},
-				map[string]interface{}{"atr_multiple": 3.0, "close_fraction": 1.0},
-			},
-		},
-	}
-	tieredWithSLAfter := &StrategyRef{
-		Name: "tiered_tp_atr",
-		Params: map[string]interface{}{
-			"sl_after": "breakeven",
-			"tp_tiers": []interface{}{
-				map[string]interface{}{"atr_multiple": 2.0, "close_fraction": 0.5},
-				map[string]interface{}{"atr_multiple": 3.0, "close_fraction": 1.0},
-			},
-		},
-	}
-	slMult := 1.5
-	cfg := minimalReloadConfig([]StrategyConfig{{
-		ID: "hl-eth", Type: "perps", Platform: "hyperliquid", Script: "x.py",
-		Args: []string{"a", "ETH", "1h"}, Capital: 1000, MaxDrawdownPct: 10,
-		Leverage: 5, MarginMode: "isolated", StopLossATRMult: &slMult,
-		CloseStrategy: tieredOpen,
-	}})
-	next := minimalReloadConfig([]StrategyConfig{{
-		ID: "hl-eth", Type: "perps", Platform: "hyperliquid", Script: "x.py",
-		Args: []string{"a", "ETH", "1h"}, Capital: 1000, MaxDrawdownPct: 10,
-		Leverage: 5, MarginMode: "isolated", StopLossATRMult: &slMult,
-		CloseStrategy: tieredWithSLAfter,
-	}})
-	state := &AppState{Strategies: map[string]*StrategyState{
-		"hl-eth": {ID: "hl-eth", Positions: map[string]*Position{
-			"ETH": {Symbol: "ETH", Quantity: 0.5, AvgCost: 3000, Side: "long"},
-		}},
-	}}
-
-	_, err := applyHotReloadConfig(cfg, next, state, nil, nil)
-	if err == nil {
-		t.Fatal("expected hot reload to reject sl_after addition with open position")
-	}
-	if !strings.Contains(err.Error(), "sl_after rules changed with open positions") {
-		t.Fatalf("unexpected error: %v", err)
-	}
+func hlReloadConfig(mut func(*StrategyConfig)) *Config {
+	return minimalReloadConfig([]StrategyConfig{hlReloadStrategy(mut)})
 }
 
-// #716 item 1 — sl_after rule changes are allowed when the strategy is flat.
-func TestApplyHotReloadConfigAllowsSLAfterAddWhenFlat(t *testing.T) {
-	tieredOpen := &StrategyRef{
-		Name: "tiered_tp_atr",
-		Params: map[string]interface{}{
-			"tp_tiers": []interface{}{
-				map[string]interface{}{"atr_multiple": 2.0, "close_fraction": 1.0},
-			},
-		},
-	}
-	tieredWithSLAfter := &StrategyRef{
-		Name: "tiered_tp_atr",
-		Params: map[string]interface{}{
-			"sl_after": "breakeven",
-			"tp_tiers": []interface{}{
-				map[string]interface{}{"atr_multiple": 2.0, "close_fraction": 1.0},
-			},
-		},
-	}
-	slMult := 1.5
-	cfg := minimalReloadConfig([]StrategyConfig{{
-		ID: "hl-eth", Type: "perps", Platform: "hyperliquid", Script: "x.py",
-		Args: []string{"a", "ETH", "1h"}, Capital: 1000, MaxDrawdownPct: 10,
-		Leverage: 5, MarginMode: "isolated", StopLossATRMult: &slMult,
-		CloseStrategy: tieredOpen,
-	}})
-	next := minimalReloadConfig([]StrategyConfig{{
-		ID: "hl-eth", Type: "perps", Platform: "hyperliquid", Script: "x.py",
-		Args: []string{"a", "ETH", "1h"}, Capital: 1000, MaxDrawdownPct: 10,
-		Leverage: 5, MarginMode: "isolated", StopLossATRMult: &slMult,
-		CloseStrategy: tieredWithSLAfter,
-	}})
-	state := &AppState{Strategies: map[string]*StrategyState{
+func flatETHReloadState() *AppState {
+	return &AppState{Strategies: map[string]*StrategyState{
 		"hl-eth": {ID: "hl-eth", Cash: 1000, Positions: map[string]*Position{}},
 	}}
-
-	if _, err := applyHotReloadConfig(cfg, next, state, nil, nil); err != nil {
-		t.Fatalf("expected sl_after change to be allowed when flat, got: %v", err)
-	}
 }
 
-// #716 item 1 — switching from breakeven to trail_from_here mid-position is
-// the highest-risk transition (engages trailing walker without open validation).
-func TestApplyHotReloadConfigRejectsSLAfterModeChangeWithOpenPosition(t *testing.T) {
-	tierWithBreakeven := &StrategyRef{
-		Name: "tiered_tp_atr",
-		Params: map[string]interface{}{
-			"sl_after": "breakeven",
-			"tp_tiers": []interface{}{
-				map[string]interface{}{"atr_multiple": 2.0, "close_fraction": 1.0},
-			},
-		},
-	}
-	tierWithTrail := &StrategyRef{
-		Name: "tiered_tp_atr",
-		Params: map[string]interface{}{
-			"sl_after": map[string]interface{}{
-				"kind":            "trail_from_here",
-				"trail_from_here": map[string]interface{}{"atr_mult": 1.0},
-			},
-			"tp_tiers": []interface{}{
-				map[string]interface{}{"atr_multiple": 2.0, "close_fraction": 1.0},
-			},
-		},
-	}
-	slMult := 1.5
-	cfg := minimalReloadConfig([]StrategyConfig{{
-		ID: "hl-eth", Type: "perps", Platform: "hyperliquid", Script: "x.py",
-		Args: []string{"a", "ETH", "1h"}, Capital: 1000, MaxDrawdownPct: 10,
-		Leverage: 5, MarginMode: "isolated", StopLossATRMult: &slMult,
-		CloseStrategy: tierWithBreakeven,
-	}})
-	next := minimalReloadConfig([]StrategyConfig{{
-		ID: "hl-eth", Type: "perps", Platform: "hyperliquid", Script: "x.py",
-		Args: []string{"a", "ETH", "1h"}, Capital: 1000, MaxDrawdownPct: 10,
-		Leverage: 5, MarginMode: "isolated", StopLossATRMult: &slMult,
-		CloseStrategy: tierWithTrail,
-	}})
-	state := &AppState{Strategies: map[string]*StrategyState{
-		"hl-eth": {ID: "hl-eth", Positions: map[string]*Position{
-			"ETH": {Symbol: "ETH", Quantity: 0.5, AvgCost: 3000, Side: "long"},
-		}},
-	}}
-
-	_, err := applyHotReloadConfig(cfg, next, state, nil, nil)
-	if err == nil {
-		t.Fatal("expected hot reload to reject sl_after mode switch")
-	}
-	if !strings.Contains(err.Error(), "sl_after rules changed with open positions") {
-		t.Fatalf("unexpected error: %v", err)
-	}
+func tieredATRRef(params map[string]interface{}) *StrategyRef {
+	return &StrategyRef{Name: "tiered_tp_atr", Params: params}
 }
 
-// #736 — switching sl_after from scalar atr_offset to a regime-aware shape
-// with a position open is a higher-risk transition than tweaking the scalar
-// value: the post-TP machinery would arm against a re-derived target the
-// open never saw. Verifies the existing tierSLAfterRules.EqualForReload site
-// picks up the new SLAfterRule.Equal contract (which compares regime blocks
-// via RegimeATRBlock.EqualForReload).
-func TestApplyHotReloadConfigRejectsSLAfterScalarToRegimeWithOpenPosition(t *testing.T) {
-	tierScalar := &StrategyRef{
-		Name: "tiered_tp_atr",
-		Params: map[string]interface{}{
-			"sl_after": map[string]interface{}{"atr_mult": 0.25},
-			"tp_tiers": []interface{}{
-				map[string]interface{}{"atr_multiple": 2.0, "close_fraction": 1.0},
-			},
-		},
+func TestApplyHotReloadConfigOpenPositionGuards(t *testing.T) {
+	spotStrategy := func(script string, capital float64) StrategyConfig {
+		return StrategyConfig{ID: "s1", Type: "spot", Platform: "binanceus", Script: script, Args: []string{"a"}, Capital: capital, MaxDrawdownPct: 10}
 	}
-	tierRegime := &StrategyRef{
-		Name: "tiered_tp_atr",
-		Params: map[string]interface{}{
-			"sl_after": map[string]interface{}{
-				"trend_regime": map[string]interface{}{
-					"trending_up":   map[string]interface{}{"atr_multiple": 0.25},
-					"trending_down": map[string]interface{}{"atr_multiple": 0.25},
-					"ranging":       map[string]interface{}{"atr_multiple": 0.0},
-				},
-			},
-			"tp_tiers": []interface{}{
-				map[string]interface{}{"atr_multiple": 2.0, "close_fraction": 1.0},
-			},
-		},
+	tiers := func(entries ...map[string]interface{}) []interface{} {
+		out := make([]interface{}, 0, len(entries))
+		for _, e := range entries {
+			out = append(out, e)
+		}
+		return out
 	}
-	slMult := 1.5
-	cfg := minimalReloadConfig([]StrategyConfig{{
-		ID: "hl-eth", Type: "perps", Platform: "hyperliquid", Script: "x.py",
-		Args: []string{"a", "ETH", "1h"}, Capital: 1000, MaxDrawdownPct: 10,
-		Leverage: 5, MarginMode: "isolated", StopLossATRMult: &slMult,
-		CloseStrategy: tierScalar,
-	}})
-	next := minimalReloadConfig([]StrategyConfig{{
-		ID: "hl-eth", Type: "perps", Platform: "hyperliquid", Script: "x.py",
-		Args: []string{"a", "ETH", "1h"}, Capital: 1000, MaxDrawdownPct: 10,
-		Leverage: 5, MarginMode: "isolated", StopLossATRMult: &slMult,
-		CloseStrategy: tierRegime,
-	}})
-	state := &AppState{Strategies: map[string]*StrategyState{
-		"hl-eth": {ID: "hl-eth", Positions: map[string]*Position{
-			"ETH": {Symbol: "ETH", Quantity: 0.5, AvgCost: 3000, Side: "long"},
-		}},
-	}}
-
-	_, err := applyHotReloadConfig(cfg, next, state, nil, nil)
-	if err == nil {
-		t.Fatal("expected hot reload to reject sl_after scalar→regime shape change with open position")
+	twoTiers := func() []interface{} {
+		return tiers(
+			map[string]interface{}{"atr_multiple": 2.0, "close_fraction": 0.5},
+			map[string]interface{}{"atr_multiple": 3.0, "close_fraction": 1.0},
+		)
 	}
-	if !strings.Contains(err.Error(), "sl_after rules changed with open positions") {
-		t.Fatalf("unexpected error: %v", err)
+	oneTier := func() []interface{} {
+		return tiers(map[string]interface{}{"atr_multiple": 2.0, "close_fraction": 1.0})
 	}
-}
-
-// #736 — switching the regime block's per-label atr value (same shape, different
-// numbers) is also a shape change for hot-reload purposes — the resting SL was
-// armed against the old value at open.
-func TestApplyHotReloadConfigRejectsSLAfterRegimeValueChangeWithOpenPosition(t *testing.T) {
-	makeRef := func(ranging float64) *StrategyRef {
-		return &StrategyRef{
-			Name: "tiered_tp_atr",
-			Params: map[string]interface{}{
-				"sl_after": map[string]interface{}{
-					"trend_regime": map[string]interface{}{
-						"trending_up":   map[string]interface{}{"atr_multiple": 0.25},
-						"trending_down": map[string]interface{}{"atr_multiple": 0.25},
-						"ranging":       map[string]interface{}{"atr_multiple": ranging},
-					},
-				},
-				"tp_tiers": []interface{}{
-					map[string]interface{}{"atr_multiple": 2.0, "close_fraction": 1.0},
-				},
+	slAfterRegime := func(ranging float64) map[string]interface{} {
+		return map[string]interface{}{
+			"trend_regime": map[string]interface{}{
+				"trending_up":   map[string]interface{}{"atr_multiple": 0.25},
+				"trending_down": map[string]interface{}{"atr_multiple": 0.25},
+				"ranging":       map[string]interface{}{"atr_multiple": ranging},
 			},
 		}
 	}
-	slMult := 1.5
-	cfg := minimalReloadConfig([]StrategyConfig{{
-		ID: "hl-eth", Type: "perps", Platform: "hyperliquid", Script: "x.py",
-		Args: []string{"a", "ETH", "1h"}, Capital: 1000, MaxDrawdownPct: 10,
-		Leverage: 5, MarginMode: "isolated", StopLossATRMult: &slMult,
-		CloseStrategy: makeRef(0.0),
-	}})
-	next := minimalReloadConfig([]StrategyConfig{{
-		ID: "hl-eth", Type: "perps", Platform: "hyperliquid", Script: "x.py",
-		Args: []string{"a", "ETH", "1h"}, Capital: 1000, MaxDrawdownPct: 10,
-		Leverage: 5, MarginMode: "isolated", StopLossATRMult: &slMult,
-		CloseStrategy: makeRef(-0.5),
-	}})
-	state := &AppState{Strategies: map[string]*StrategyState{
-		"hl-eth": {ID: "hl-eth", Positions: map[string]*Position{
-			"ETH": {Symbol: "ETH", Quantity: 0.5, AvgCost: 3000, Side: "long"},
-		}},
-	}}
-
-	_, err := applyHotReloadConfig(cfg, next, state, nil, nil)
-	if err == nil {
-		t.Fatal("expected hot reload to reject sl_after regime value change with open position")
+	withSL := func(params map[string]interface{}) func(*StrategyConfig) {
+		return func(sc *StrategyConfig) {
+			sc.StopLossATRMult = floatPtr(1.5)
+			sc.CloseStrategy = tieredATRRef(params)
+		}
 	}
-	if !strings.Contains(err.Error(), "sl_after rules changed with open positions") {
-		t.Fatalf("unexpected error: %v", err)
+	regimeTierRef := func(rangingATR float64, slAfter bool) func(*StrategyConfig) {
+		tier0 := map[string]interface{}{
+			"trend_regime": map[string]interface{}{
+				"trending_up":   map[string]interface{}{"atr_multiple": 2.0},
+				"trending_down": map[string]interface{}{"atr_multiple": 2.0},
+				"ranging":       map[string]interface{}{"atr_multiple": rangingATR},
+			},
+			"close_fraction": 0.5,
+		}
+		if slAfter {
+			tier0["sl_after"] = map[string]interface{}{
+				"trail_from_here": map[string]interface{}{"tp_atr_fraction": 0.5},
+			}
+		}
+		return func(sc *StrategyConfig) {
+			sc.StopLossATRMult = floatPtr(1.5)
+			sc.CloseStrategy = &StrategyRef{
+				Name: "tiered_tp_atr_regime",
+				Params: map[string]interface{}{
+					"tp_tiers": []interface{}{
+						tier0,
+						map[string]interface{}{
+							"trend_regime": map[string]interface{}{
+								"trending_up":   map[string]interface{}{"atr_multiple": 4.0},
+								"trending_down": map[string]interface{}{"atr_multiple": 4.0},
+								"ranging":       map[string]interface{}{"atr_multiple": 3.0},
+							},
+							"close_fraction": 1.0,
+						},
+					},
+				},
+			}
+		}
 	}
-}
-
-// #736 — identical regime configs across reload should pass (no shape change).
-// Guards against false-positive blocks once SLAfterRule.Equal handles regime
-// blocks via RegimeATRBlock.EqualForReload.
-func TestApplyHotReloadConfigAllowsSLAfterRegimeIdentical(t *testing.T) {
-	tierRegime := &StrategyRef{
-		Name: "tiered_tp_atr",
-		Params: map[string]interface{}{
-			"sl_after": map[string]interface{}{
-				"trend_regime": map[string]interface{}{
-					"trending_up":   map[string]interface{}{"atr_multiple": 0.25},
-					"trending_down": map[string]interface{}{"atr_multiple": 0.25},
-					"ranging":       map[string]interface{}{"atr_multiple": 0.0},
+	openRangingState := func() *AppState {
+		return &AppState{Strategies: map[string]*StrategyState{
+			"hl-eth": {ID: "hl-eth", Positions: map[string]*Position{
+				"ETH": {Symbol: "ETH", Quantity: 0.5, AvgCost: 3000, Side: "long", Regime: "ranging"},
+			}},
+		}}
+	}
+	openLeveredState := func() *AppState {
+		return &AppState{Strategies: map[string]*StrategyState{
+			"hl-eth": {
+				ID: "hl-eth", Cash: 900,
+				RiskState: RiskState{MaxDrawdownPct: 10},
+				Positions: map[string]*Position{
+					"ETH": {Symbol: "ETH", Quantity: 1, Side: "long", AvgCost: 3000, Leverage: 2},
 				},
 			},
-			"tp_tiers": []interface{}{
-				map[string]interface{}{"atr_multiple": 2.0, "close_fraction": 1.0},
+		}}
+	}
+	openETH := func() *AppState { return openETHReloadState("hl-eth") }
+
+	cases := []struct {
+		name    string
+		cfg     func() *Config
+		next    func() *Config
+		state   func() *AppState
+		wantErr string
+		check   func(t *testing.T, cfg *Config, state *AppState, changes []string)
+	}{
+		{
+			name: "rejects strategy set change",
+			cfg:  func() *Config { return minimalReloadConfig([]StrategyConfig{spotStrategy("x.py", 100)}) },
+			next: func() *Config {
+				return minimalReloadConfig([]StrategyConfig{spotStrategy("x.py", 200), {ID: "s2", Type: "spot", Platform: "binanceus", Script: "x.py", Capital: 100, MaxDrawdownPct: 10}})
+			},
+			state:   NewAppState,
+			wantErr: "strategy set changed",
+		},
+		{
+			name:    "rejects non-hot-reloadable strategy field (script)",
+			cfg:     func() *Config { return minimalReloadConfig([]StrategyConfig{spotStrategy("x.py", 100)}) },
+			next:    func() *Config { return minimalReloadConfig([]StrategyConfig{spotStrategy("y.py", 200)}) },
+			state:   NewAppState,
+			wantErr: "non-hot-reloadable",
+		},
+		{
+			name: "allows open/close strategy ref changes",
+			cfg: func() *Config {
+				return minimalReloadConfig([]StrategyConfig{{ID: "s1", Type: "spot", Platform: "binanceus", Script: "x.py", Args: []string{"triple_ema", "BTC/USDT", "1h"}, Capital: 100, MaxDrawdownPct: 10}})
+			},
+			next: func() *Config {
+				return minimalReloadConfig([]StrategyConfig{{ID: "s1", Type: "spot", Platform: "binanceus", Script: "x.py", Args: []string{"triple_ema", "BTC/USDT", "1h"}, Capital: 100, MaxDrawdownPct: 10,
+					OpenStrategy: StrategyRef{Name: "triple_ema"}, CloseStrategy: &StrategyRef{Name: "tp_at_pct"}}})
+			},
+			state: NewAppState,
+			check: func(t *testing.T, cfg *Config, _ *AppState, changes []string) {
+				joined := strings.Join(changes, "\n")
+				for _, want := range []string{"strategy[s1].open_strategy:", "strategy[s1].close_strategy:"} {
+					if !strings.Contains(joined, want) {
+						t.Fatalf("changes missing %q:\n%s", want, joined)
+					}
+				}
+				if cfg.Strategies[0].OpenStrategy.Name != "triple_ema" {
+					t.Fatalf("OpenStrategy.Name = %q, want triple_ema", cfg.Strategies[0].OpenStrategy.Name)
+				}
+				if cfg.Strategies[0].CloseStrategy == nil || cfg.Strategies[0].CloseStrategy.Name != "tp_at_pct" {
+					t.Fatalf("CloseStrategy = %#v, want tp_at_pct", cfg.Strategies[0].CloseStrategy)
+				}
 			},
 		},
-	}
-	slMult := 1.5
-	cfg := minimalReloadConfig([]StrategyConfig{{
-		ID: "hl-eth", Type: "perps", Platform: "hyperliquid", Script: "x.py",
-		Args: []string{"a", "ETH", "1h"}, Capital: 1000, MaxDrawdownPct: 10,
-		Leverage: 5, MarginMode: "isolated", StopLossATRMult: &slMult,
-		CloseStrategy: tierRegime,
-	}})
-	next := minimalReloadConfig([]StrategyConfig{{
-		ID: "hl-eth", Type: "perps", Platform: "hyperliquid", Script: "x.py",
-		Args: []string{"a", "ETH", "1h"}, Capital: 1000, MaxDrawdownPct: 10,
-		Leverage: 5, MarginMode: "isolated", StopLossATRMult: &slMult,
-		CloseStrategy: tierRegime,
-	}})
-	state := &AppState{Strategies: map[string]*StrategyState{
-		"hl-eth": {ID: "hl-eth", Positions: map[string]*Position{
-			"ETH": {Symbol: "ETH", Quantity: 0.5, AvgCost: 3000, Side: "long"},
-		}},
-	}}
-
-	if _, err := applyHotReloadConfig(cfg, next, state, nil, nil); err != nil {
-		t.Fatalf("identical sl_after regime configs should reload cleanly with open position, got: %v", err)
-	}
-}
-
-func TestApplyHotReloadConfigRejectsRegimeTierMultipleChangeWithTPATRFraction(t *testing.T) {
-	makeRef := func(rangingATR float64) *StrategyRef {
-		return &StrategyRef{
-			Name: "tiered_tp_atr_regime",
-			Params: map[string]interface{}{
-				"tp_tiers": []interface{}{
-					map[string]interface{}{
-						"trend_regime": map[string]interface{}{
-							"trending_up":   map[string]interface{}{"atr_multiple": 2.0},
-							"trending_down": map[string]interface{}{"atr_multiple": 2.0},
-							"ranging":       map[string]interface{}{"atr_multiple": rangingATR},
-						},
-						"close_fraction": 0.5,
-						"sl_after": map[string]interface{}{
-							"trail_from_here": map[string]interface{}{"tp_atr_fraction": 0.5},
-						},
-					},
-					map[string]interface{}{
-						"trend_regime": map[string]interface{}{
-							"trending_up":   map[string]interface{}{"atr_multiple": 4.0},
-							"trending_down": map[string]interface{}{"atr_multiple": 4.0},
-							"ranging":       map[string]interface{}{"atr_multiple": 3.0},
-						},
-						"close_fraction": 1.0,
-					},
-				},
+		{
+			name: "rejects leverage change with open perps position",
+			cfg: func() *Config {
+				return hlReloadConfig(func(sc *StrategyConfig) { sc.Leverage = 2; sc.MarginMode = "" })
 			},
-		}
-	}
-	slMult := 1.5
-	cfg := minimalReloadConfig([]StrategyConfig{{
-		ID: "hl-eth", Type: "perps", Platform: "hyperliquid", Script: "x.py",
-		Args: []string{"a", "ETH", "1h"}, Capital: 1000, MaxDrawdownPct: 10,
-		Leverage: 5, MarginMode: "isolated", StopLossATRMult: &slMult,
-		CloseStrategy: makeRef(1.5),
-	}})
-	next := minimalReloadConfig([]StrategyConfig{{
-		ID: "hl-eth", Type: "perps", Platform: "hyperliquid", Script: "x.py",
-		Args: []string{"a", "ETH", "1h"}, Capital: 1000, MaxDrawdownPct: 10,
-		Leverage: 5, MarginMode: "isolated", StopLossATRMult: &slMult,
-		CloseStrategy: makeRef(2.5),
-	}})
-	state := &AppState{Strategies: map[string]*StrategyState{
-		"hl-eth": {ID: "hl-eth", Positions: map[string]*Position{
-			"ETH": {Symbol: "ETH", Quantity: 0.5, AvgCost: 3000, Side: "long", Regime: "ranging"},
-		}},
-	}}
-
-	_, err := applyHotReloadConfig(cfg, next, state, nil, nil)
-	if err == nil {
-		t.Fatal("expected hot reload to reject regime tier multiple change with open position")
-	}
-	if !strings.Contains(err.Error(), "sl_after rules changed with open positions") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
-func TestApplyHotReloadConfigAllowsRegimeTierMultipleChangeWithoutSLAfter(t *testing.T) {
-	makeRef := func(rangingATR float64) *StrategyRef {
-		return &StrategyRef{
-			Name: "tiered_tp_atr_regime",
-			Params: map[string]interface{}{
-				"tp_tiers": []interface{}{
-					map[string]interface{}{
-						"trend_regime": map[string]interface{}{
-							"trending_up":   map[string]interface{}{"atr_multiple": 2.0},
-							"trending_down": map[string]interface{}{"atr_multiple": 2.0},
-							"ranging":       map[string]interface{}{"atr_multiple": rangingATR},
-						},
-						"close_fraction": 0.5,
-					},
-					map[string]interface{}{
-						"trend_regime": map[string]interface{}{
-							"trending_up":   map[string]interface{}{"atr_multiple": 4.0},
-							"trending_down": map[string]interface{}{"atr_multiple": 4.0},
-							"ranging":       map[string]interface{}{"atr_multiple": 3.0},
-						},
-						"close_fraction": 1.0,
-					},
-				},
+			next: func() *Config {
+				return hlReloadConfig(func(sc *StrategyConfig) {
+					sc.Leverage = 5
+					sc.MarginMode = ""
+					sc.Capital = 1200
+					sc.MaxDrawdownPct = 12
+				})
 			},
-		}
+			state:   openLeveredState,
+			wantErr: "leverage changed with open positions",
+		},
+		{
+			name: "rejects margin_mode change with open perps position",
+			cfg:  func() *Config { return hlReloadConfig(func(sc *StrategyConfig) { sc.Leverage = 2 }) },
+			next: func() *Config {
+				return hlReloadConfig(func(sc *StrategyConfig) { sc.Leverage = 2; sc.MarginMode = "cross" })
+			},
+			state:   openLeveredState,
+			wantErr: "margin_mode changed with open positions",
+		},
+		{
+			name: "allows margin_mode change when flat",
+			cfg:  func() *Config { return hlReloadConfig(func(sc *StrategyConfig) { sc.Leverage = 2 }) },
+			next: func() *Config {
+				return hlReloadConfig(func(sc *StrategyConfig) { sc.Leverage = 2; sc.MarginMode = "cross" })
+			},
+			state: flatETHReloadState,
+			check: func(t *testing.T, cfg *Config, _ *AppState, _ []string) {
+				if cfg.Strategies[0].MarginMode != "cross" {
+					t.Fatalf("MarginMode = %q, want %q", cfg.Strategies[0].MarginMode, "cross")
+				}
+			},
+		},
+		{
+			name: "preserves runtime capital_pct capital while applying other fields",
+			cfg: func() *Config {
+				return minimalReloadConfig([]StrategyConfig{{ID: "s1", Type: "perps", Platform: "hyperliquid", Script: "x.py", Args: []string{"a", "BTC", "1h"}, Capital: 2500, CapitalPct: 0.5, MaxDrawdownPct: 10, Leverage: 2}})
+			},
+			next: func() *Config {
+				return minimalReloadConfig([]StrategyConfig{{ID: "s1", Type: "perps", Platform: "hyperliquid", Script: "x.py", Args: []string{"a", "BTC", "1h"}, Capital: 100, CapitalPct: 0.5, MaxDrawdownPct: 12, Leverage: 2}})
+			},
+			state: func() *AppState {
+				return &AppState{Strategies: map[string]*StrategyState{"s1": {ID: "s1", Cash: 2400, RiskState: RiskState{MaxDrawdownPct: 10}}}}
+			},
+			check: func(t *testing.T, cfg *Config, state *AppState, changes []string) {
+				if cfg.Strategies[0].Capital != 2500 {
+					t.Errorf("runtime capital_pct capital = %g, want preserved 2500", cfg.Strategies[0].Capital)
+				}
+				if state.Strategies["s1"].Cash != 2400 {
+					t.Errorf("cash = %g, want preserved 2400", state.Strategies["s1"].Cash)
+				}
+				if joined := strings.Join(changes, "\n"); strings.Contains(joined, ".capital:") {
+					t.Fatalf("capital_pct fallback capital should not be hot-applied, changes:\n%s", joined)
+				}
+				if cfg.Strategies[0].MaxDrawdownPct != 12 || state.Strategies["s1"].RiskState.MaxDrawdownPct != 12 {
+					t.Fatalf("other hot-reloadable fields should still apply, cfg=%+v state=%+v", cfg.Strategies[0], state.Strategies["s1"].RiskState)
+				}
+			},
+		},
+		{
+			name: "rejects HL peer leverage mismatch in next",
+			cfg: func() *Config {
+				return minimalReloadConfig([]StrategyConfig{
+					hlReloadStrategy(func(sc *StrategyConfig) { sc.ID = "hl-eth-a" }),
+					hlReloadStrategy(func(sc *StrategyConfig) { sc.ID = "hl-eth-b"; sc.Args = []string{"b", "ETH", "1h"}; sc.Capital = 500 }),
+				})
+			},
+			next: func() *Config {
+				return minimalReloadConfig([]StrategyConfig{
+					hlReloadStrategy(func(sc *StrategyConfig) { sc.ID = "hl-eth-a" }),
+					hlReloadStrategy(func(sc *StrategyConfig) {
+						sc.ID = "hl-eth-b"
+						sc.Args = []string{"b", "ETH", "1h"}
+						sc.Capital = 500
+						sc.Leverage = 10
+					}),
+				})
+			},
+			state: func() *AppState {
+				return &AppState{Strategies: map[string]*StrategyState{
+					"hl-eth-a": {ID: "hl-eth-a", Cash: 1000},
+					"hl-eth-b": {ID: "hl-eth-b", Cash: 500},
+				}}
+			},
+			wantErr: "disagree on leverage",
+		},
+		{
+			name: "allows trailing_stop_pct value change with open position",
+			cfg: func() *Config {
+				return hlReloadConfig(func(sc *StrategyConfig) { sc.TrailingStopPct = floatPtr(3); sc.TrailingStopMinMovePct = floatPtr(0.5) })
+			},
+			next: func() *Config {
+				return hlReloadConfig(func(sc *StrategyConfig) { sc.TrailingStopPct = floatPtr(4); sc.TrailingStopMinMovePct = floatPtr(0.25) })
+			},
+			state: openETH,
+			check: func(t *testing.T, cfg *Config, _ *AppState, changes []string) {
+				if cfg.Strategies[0].TrailingStopPct == nil || *cfg.Strategies[0].TrailingStopPct != 4 {
+					t.Fatalf("TrailingStopPct=%v, want 4", cfg.Strategies[0].TrailingStopPct)
+				}
+				if cfg.Strategies[0].TrailingStopMinMovePct == nil || *cfg.Strategies[0].TrailingStopMinMovePct != 0.25 {
+					t.Fatalf("TrailingStopMinMovePct=%v, want 0.25", cfg.Strategies[0].TrailingStopMinMovePct)
+				}
+				joined := strings.Join(changes, "\n")
+				if !strings.Contains(joined, "trailing_stop_pct") || !strings.Contains(joined, "trailing_stop_min_move_pct") {
+					t.Fatalf("changes=%v, want trailing_stop_pct and trailing_stop_min_move_pct entries", changes)
+				}
+			},
+		},
+		{
+			name:    "rejects fixed-to-trailing stop mode switch with open position",
+			cfg:     func() *Config { return hlReloadConfig(nil) },
+			next:    func() *Config { return hlReloadConfig(func(sc *StrategyConfig) { sc.TrailingStopPct = floatPtr(3) }) },
+			state:   openETH,
+			wantErr: "trailing_stop_pct mode changed",
+		},
+		{
+			name: "rejects direction change with open perps position",
+			cfg: func() *Config {
+				return hlReloadConfig(func(sc *StrategyConfig) { sc.Leverage = 2; sc.MarginMode = ""; sc.Direction = DirectionLong })
+			},
+			next: func() *Config {
+				return hlReloadConfig(func(sc *StrategyConfig) { sc.Leverage = 2; sc.MarginMode = ""; sc.Direction = DirectionShort })
+			},
+			state:   openLeveredState,
+			wantErr: "direction changed with open positions",
+		},
+		{
+			name: "allows direction change when flat",
+			cfg: func() *Config {
+				return hlReloadConfig(func(sc *StrategyConfig) { sc.Leverage = 2; sc.MarginMode = ""; sc.Direction = DirectionLong })
+			},
+			next: func() *Config {
+				return hlReloadConfig(func(sc *StrategyConfig) { sc.Leverage = 2; sc.MarginMode = ""; sc.Direction = DirectionShort })
+			},
+			state: flatETHReloadState,
+			check: func(t *testing.T, cfg *Config, _ *AppState, _ []string) {
+				if cfg.Strategies[0].Direction != DirectionShort {
+					t.Errorf("Direction = %q, want %q after applied reload", cfg.Strategies[0].Direction, DirectionShort)
+				}
+			},
+		},
+		{
+			name: "rejects sl_after add with open position",
+			cfg:  func() *Config { return hlReloadConfig(withSL(map[string]interface{}{"tp_tiers": twoTiers()})) },
+			next: func() *Config {
+				return hlReloadConfig(withSL(map[string]interface{}{"sl_after": "breakeven", "tp_tiers": twoTiers()}))
+			},
+			state:   openETH,
+			wantErr: "sl_after rules changed with open positions",
+		},
+		{
+			name: "allows sl_after add when flat",
+			cfg:  func() *Config { return hlReloadConfig(withSL(map[string]interface{}{"tp_tiers": oneTier()})) },
+			next: func() *Config {
+				return hlReloadConfig(withSL(map[string]interface{}{"sl_after": "breakeven", "tp_tiers": oneTier()}))
+			},
+			state: flatETHReloadState,
+		},
+		{
+			name: "rejects sl_after mode switch (breakeven -> trail_from_here) with open position",
+			cfg: func() *Config {
+				return hlReloadConfig(withSL(map[string]interface{}{"sl_after": "breakeven", "tp_tiers": oneTier()}))
+			},
+			next: func() *Config {
+				return hlReloadConfig(withSL(map[string]interface{}{
+					"sl_after": map[string]interface{}{
+						"kind":            "trail_from_here",
+						"trail_from_here": map[string]interface{}{"atr_mult": 1.0},
+					},
+					"tp_tiers": oneTier(),
+				}))
+			},
+			state:   openETH,
+			wantErr: "sl_after rules changed with open positions",
+		},
+		{
+			name: "rejects sl_after scalar -> regime shape change with open position",
+			cfg: func() *Config {
+				return hlReloadConfig(withSL(map[string]interface{}{"sl_after": map[string]interface{}{"atr_mult": 0.25}, "tp_tiers": oneTier()}))
+			},
+			next: func() *Config {
+				return hlReloadConfig(withSL(map[string]interface{}{"sl_after": slAfterRegime(0.0), "tp_tiers": oneTier()}))
+			},
+			state:   openETH,
+			wantErr: "sl_after rules changed with open positions",
+		},
+		{
+			name: "rejects sl_after regime value change with open position",
+			cfg: func() *Config {
+				return hlReloadConfig(withSL(map[string]interface{}{"sl_after": slAfterRegime(0.0), "tp_tiers": oneTier()}))
+			},
+			next: func() *Config {
+				return hlReloadConfig(withSL(map[string]interface{}{"sl_after": slAfterRegime(-0.5), "tp_tiers": oneTier()}))
+			},
+			state:   openETH,
+			wantErr: "sl_after rules changed with open positions",
+		},
+		{
+			name: "allows identical sl_after regime block with open position",
+			cfg: func() *Config {
+				return hlReloadConfig(withSL(map[string]interface{}{"sl_after": slAfterRegime(0.0), "tp_tiers": oneTier()}))
+			},
+			next: func() *Config {
+				return hlReloadConfig(withSL(map[string]interface{}{"sl_after": slAfterRegime(0.0), "tp_tiers": oneTier()}))
+			},
+			state: openETH,
+		},
+		{
+			name:    "rejects regime tier multiple change when sl_after uses tp_atr_fraction",
+			cfg:     func() *Config { return hlReloadConfig(regimeTierRef(1.5, true)) },
+			next:    func() *Config { return hlReloadConfig(regimeTierRef(2.5, true)) },
+			state:   openRangingState,
+			wantErr: "sl_after rules changed with open positions",
+		},
+		{
+			name:  "allows regime tier multiple change without sl_after",
+			cfg:   func() *Config { return hlReloadConfig(regimeTierRef(1.5, false)) },
+			next:  func() *Config { return hlReloadConfig(regimeTierRef(2.5, false)) },
+			state: openRangingState,
+		},
 	}
-	slMult := 1.5
-	cfg := minimalReloadConfig([]StrategyConfig{{
-		ID: "hl-eth", Type: "perps", Platform: "hyperliquid", Script: "x.py",
-		Args: []string{"a", "ETH", "1h"}, Capital: 1000, MaxDrawdownPct: 10,
-		Leverage: 5, MarginMode: "isolated", StopLossATRMult: &slMult,
-		CloseStrategy: makeRef(1.5),
-	}})
-	next := minimalReloadConfig([]StrategyConfig{{
-		ID: "hl-eth", Type: "perps", Platform: "hyperliquid", Script: "x.py",
-		Args: []string{"a", "ETH", "1h"}, Capital: 1000, MaxDrawdownPct: 10,
-		Leverage: 5, MarginMode: "isolated", StopLossATRMult: &slMult,
-		CloseStrategy: makeRef(2.5),
-	}})
-	state := &AppState{Strategies: map[string]*StrategyState{
-		"hl-eth": {ID: "hl-eth", Positions: map[string]*Position{
-			"ETH": {Symbol: "ETH", Quantity: 0.5, AvgCost: 3000, Side: "long", Regime: "ranging"},
-		}},
-	}}
-
-	if _, err := applyHotReloadConfig(cfg, next, state, nil, nil); err != nil {
-		t.Fatalf("tier changes without sl_after should not trip sl_after reload guard, got: %v", err)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, state := tc.cfg(), tc.state()
+			changes, err := applyHotReloadConfig(cfg, tc.next(), state, nil, nil)
+			if tc.wantErr != "" {
+				if err == nil {
+					t.Fatalf("expected reload to be rejected with %q", tc.wantErr)
+				}
+				if !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if want := tc.cfg(); !reflect.DeepEqual(cfg, want) {
+					t.Fatalf("current config mutated after rejected reload:\n got %+v\nwant %+v", cfg.Strategies, want.Strategies)
+				}
+				if want := tc.state(); !reflect.DeepEqual(state, want) {
+					t.Fatalf("state mutated after rejected reload:\n got %+v\nwant %+v", state.Strategies, want.Strategies)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("applyHotReloadConfig: %v", err)
+			}
+			if tc.check != nil {
+				tc.check(t, cfg, state, changes)
+			}
+		})
 	}
 }
 
-// #1062 — regime.display_windows is display-only and hot-reloads, but any other
-// regime field change still requires a restart.
 func TestApplyHotReloadConfigDisplayWindows(t *testing.T) {
 	regimeWith := func(display []string) *RegimeConfig {
 		return &RegimeConfig{
@@ -939,7 +637,6 @@ func TestApplyHotReloadConfigDisplayWindows(t *testing.T) {
 		return c
 	}
 
-	// (1) display-only change applies while a position is open.
 	t.Run("display-only change applies with open position", func(t *testing.T) {
 		cfg := stratWith(regimeWith(nil))
 		next := stratWith(regimeWith([]string{"composite_long"}))
@@ -956,11 +653,10 @@ func TestApplyHotReloadConfigDisplayWindows(t *testing.T) {
 		}
 	})
 
-	// (2) compound change (display_windows + a real regime field) still rejects.
 	t.Run("compound change still rejects", func(t *testing.T) {
 		cfg := stratWith(regimeWith(nil))
 		next := stratWith(regimeWith([]string{"composite_long"}))
-		next.Regime.ADXThreshold = 25 // a genuinely restart-required edit
+		next.Regime.ADXThreshold = 25
 		if _, err := applyHotReloadConfig(cfg, next, openState(), nil, nil); err == nil {
 			t.Fatal("regime change compounded with display_windows must still require restart")
 		}
@@ -969,7 +665,6 @@ func TestApplyHotReloadConfigDisplayWindows(t *testing.T) {
 		}
 	})
 
-	// (3) clearing display_windows reverts to render-all without a restart.
 	t.Run("clearing reverts to render-all", func(t *testing.T) {
 		cfg := stratWith(regimeWith([]string{"composite_long"}))
 		next := stratWith(regimeWith(nil))
@@ -982,9 +677,100 @@ func TestApplyHotReloadConfigDisplayWindows(t *testing.T) {
 	})
 }
 
-// #1139 — regime.timeframe is live reloadable only while affected non-options
-// strategies are flat. It changes the regime bundle/certification key, so open
-// positions must preserve their original regime-timeframe interpretation.
+func TestApplyHotReloadConfigRegimeTransitions(t *testing.T) {
+	regimeWith := func(tr *RegimeTransitionAlertsConfig) *RegimeConfig {
+		return &RegimeConfig{
+			Enabled: true, Period: 14, ADXThreshold: 20,
+			Transitions: tr,
+		}
+	}
+	openState := func() *AppState {
+		return &AppState{Strategies: map[string]*StrategyState{
+			"hl-eth": {ID: "hl-eth", Positions: map[string]*Position{
+				"ETH": {Symbol: "ETH", Quantity: 0.5, AvgCost: 3000, Side: "long", Regime: "ranging"},
+			}},
+		}}
+	}
+	stratWith := func(r *RegimeConfig) *Config {
+		c := minimalReloadConfig([]StrategyConfig{{
+			ID: "hl-eth", Type: "perps", Platform: "hyperliquid", Script: "x.py",
+			Args: []string{"a", "ETH", "1h"}, Capital: 1000, MaxDrawdownPct: 10,
+			Leverage: 5, MarginMode: "isolated",
+		}})
+		c.Regime = r
+		return c
+	}
+
+	t.Run("nil to nil is a no-op", func(t *testing.T) {
+		cfg := stratWith(regimeWith(nil))
+		next := stratWith(regimeWith(nil))
+		changes, err := applyHotReloadConfig(cfg, next, openState(), nil, nil)
+		if err != nil {
+			t.Fatalf("nil transitions on both sides should hot-reload cleanly, got: %v", err)
+		}
+		if cfg.Regime.Transitions != nil {
+			t.Fatalf("Transitions should remain nil, got: %+v", cfg.Regime.Transitions)
+		}
+		if joined := strings.Join(changes, " | "); strings.Contains(joined, "regime.transitions") {
+			t.Fatalf("expected no regime.transitions change entry, got: %v", changes)
+		}
+	})
+
+	t.Run("nil to enabled is accepted and copied", func(t *testing.T) {
+		cfg := stratWith(regimeWith(nil))
+		nextTransitions := &RegimeTransitionAlertsConfig{Enabled: true, DebounceCycles: 3, RetentionDays: 30, ReversalMinOpposing: 2}
+		next := stratWith(regimeWith(nextTransitions))
+		changes, err := applyHotReloadConfig(cfg, next, openState(), nil, nil)
+		if err != nil {
+			t.Fatalf("enabling regime.transitions should hot-reload even with an open position, got: %v", err)
+		}
+		if cfg.Regime.Transitions == nil || *cfg.Regime.Transitions != *nextTransitions {
+			t.Fatalf("Transitions not applied: %+v", cfg.Regime.Transitions)
+		}
+		if cfg.Regime.Transitions == nextTransitions {
+			t.Fatal("Transitions should be deep-copied, not aliased to next's struct")
+		}
+		if joined := strings.Join(changes, " | "); !strings.Contains(joined, "regime.transitions") {
+			t.Fatalf("expected a regime.transitions change entry, got: %v", changes)
+		}
+		nextTransitions.DebounceCycles = 99
+		if cfg.Regime.Transitions.DebounceCycles == 99 {
+			t.Fatal("cfg.Regime.Transitions aliases next's struct")
+		}
+	})
+
+	t.Run("tunable-only change while enabled applies with open position", func(t *testing.T) {
+		cfg := stratWith(regimeWith(&RegimeTransitionAlertsConfig{Enabled: true, DebounceCycles: 1, RetentionDays: 14, ReversalMinOpposing: 0}))
+		next := stratWith(regimeWith(&RegimeTransitionAlertsConfig{Enabled: true, DebounceCycles: 3, RetentionDays: 30, ReversalMinOpposing: 2}))
+		changes, err := applyHotReloadConfig(cfg, next, openState(), nil, nil)
+		if err != nil {
+			t.Fatalf("tunable-only regime.transitions change should hot-reload, got: %v", err)
+		}
+		if cfg.Regime.Transitions.DebounceCycles != 3 || cfg.Regime.Transitions.RetentionDays != 30 || cfg.Regime.Transitions.ReversalMinOpposing != 2 {
+			t.Fatalf("Transitions tunables not applied: %+v", cfg.Regime.Transitions)
+		}
+		if joined := strings.Join(changes, " | "); !strings.Contains(joined, "regime.transitions") {
+			t.Fatalf("expected a regime.transitions change entry, got: %v", changes)
+		}
+	})
+
+	t.Run("compound change with genuinely incompatible field still rejects", func(t *testing.T) {
+		cfg := stratWith(regimeWith(nil))
+		next := stratWith(regimeWith(&RegimeTransitionAlertsConfig{Enabled: true}))
+		next.DBFile = "scheduler/other.db"
+		_, err := applyHotReloadConfig(cfg, next, openState(), nil, nil)
+		if err == nil {
+			t.Fatal("db_file change compounded with regime.transitions must still require restart")
+		}
+		if !strings.Contains(err.Error(), "db_file changed") {
+			t.Fatalf("expected db_file rejection reason, got: %v", err)
+		}
+		if cfg.Regime.Transitions != nil {
+			t.Fatalf("rejected reload must not mutate Transitions: %+v", cfg.Regime.Transitions)
+		}
+	})
+}
+
 func TestApplyHotReloadConfigRegimeTimeframe(t *testing.T) {
 	regimeWith := func(tf string) *RegimeConfig {
 		return &RegimeConfig{Enabled: true, Period: 14, ADXThreshold: 20, Timeframe: tf}
@@ -1065,26 +851,6 @@ func TestApplyHotReloadConfigRegimeTimeframe(t *testing.T) {
 	})
 }
 
-// #656 — direction change is allowed when the strategy is flat.
-func TestApplyHotReloadConfigAllowsDirectionChangeWhenFlat(t *testing.T) {
-	cfg := minimalReloadConfig([]StrategyConfig{{
-		ID: "hl-eth", Type: "perps", Platform: "hyperliquid", Script: "x.py", Args: []string{"a", "ETH", "1h"}, Capital: 1000, MaxDrawdownPct: 10, Leverage: 2, Direction: DirectionLong,
-	}})
-	next := minimalReloadConfig([]StrategyConfig{{
-		ID: "hl-eth", Type: "perps", Platform: "hyperliquid", Script: "x.py", Args: []string{"a", "ETH", "1h"}, Capital: 1000, MaxDrawdownPct: 10, Leverage: 2, Direction: DirectionShort,
-	}})
-	state := &AppState{Strategies: map[string]*StrategyState{
-		"hl-eth": {ID: "hl-eth", Cash: 1000, Positions: map[string]*Position{}},
-	}}
-
-	if _, err := applyHotReloadConfig(cfg, next, state, nil, nil); err != nil {
-		t.Fatalf("expected direction change to be allowed when flat, got: %v", err)
-	}
-	if cfg.Strategies[0].Direction != DirectionShort {
-		t.Errorf("Direction = %q, want %q after applied reload", cfg.Strategies[0].Direction, DirectionShort)
-	}
-}
-
 func TestValidateHotReloadCompatible(t *testing.T) {
 	baseStrategy := StrategyConfig{
 		ID:             "spot-btc",
@@ -1137,7 +903,7 @@ func TestValidateHotReloadCompatible(t *testing.T) {
 				Type:           "spot",
 				Platform:       "binanceus",
 				Script:         "shared_scripts/check_strategy.py",
-				Args:           []string{"ema_crossover", "BTC/USDT", "1h"}, // changed strategy name
+				Args:           []string{"ema_crossover", "BTC/USDT", "1h"},
 				Capital:        1000,
 				MaxDrawdownPct: 10,
 			}}
@@ -1157,10 +923,12 @@ func TestValidateHotReloadCompatible(t *testing.T) {
 					Script:  "shared_scripts/check_hyperliquid.py",
 					Args:    []string{"triple_ema", "BTC", "1h", "--mode=live"},
 					Capital: 1000, MaxDrawdownPct: 10,
-					Leverage: 5, MarginMode: "isolated", // mismatched leverage
+					Leverage: 5, MarginMode: "isolated",
 				},
 			}
 		}, "leverage"},
+		{"regime_gate_window only change returns nil", func(c *Config) { c.Strategies[0].RegimeGateWindow = "medium" }, ""},
+		{"shared-wallet pool budgeting mode change requires restart", func(c *Config) { c.Strategies[0].sharedWalletPoolBudget = true }, "shared-wallet pool budgeting mode changed"},
 		{"identical configs returns nil", func(*Config) {}, ""},
 	}
 
@@ -1180,72 +948,6 @@ func TestValidateHotReloadCompatible(t *testing.T) {
 				} else if !strings.Contains(err.Error(), tc.wantErr) {
 					t.Errorf("expected error containing %q, got: %v", tc.wantErr, err)
 				}
-			}
-		})
-	}
-}
-
-func TestFormatFloatPtr(t *testing.T) {
-	v1 := float64(3.14)
-	v2 := float64(0)
-	cases := []struct {
-		name string
-		in   *float64
-		want string
-	}{
-		{"nil", nil, "<nil>"},
-		{"positive", &v1, "3.14"},
-		{"zero", &v2, "0"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := formatFloatPtr(tc.in)
-			if got != tc.want {
-				t.Errorf("formatFloatPtr(%v) = %q, want %q", tc.in, got, tc.want)
-			}
-		})
-	}
-}
-
-func TestFormatFloatPtrUSD(t *testing.T) {
-	v1 := float64(12.5)
-	v2 := float64(0)
-	cases := []struct {
-		name string
-		in   *float64
-		want string
-	}{
-		{"nil", nil, "<nil>"},
-		{"positive", &v1, "$12.50"},
-		{"zero", &v2, "$0.00"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := formatFloatPtrUSD(tc.in)
-			if got != tc.want {
-				t.Errorf("formatFloatPtrUSD(%v) = %q, want %q", tc.in, got, tc.want)
-			}
-		})
-	}
-}
-
-func TestFormatFloatPtrPct(t *testing.T) {
-	v1 := float64(12.5)
-	v2 := float64(0)
-	cases := []struct {
-		name string
-		in   *float64
-		want string
-	}{
-		{"nil", nil, "<nil>"},
-		{"positive", &v1, "12.50%"},
-		{"zero", &v2, "0.00%"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := formatFloatPtrPct(tc.in)
-			if got != tc.want {
-				t.Errorf("formatFloatPtrPct(%v) = %q, want %q", tc.in, got, tc.want)
 			}
 		})
 	}
@@ -1334,41 +1036,24 @@ func TestStrategyHasOpenPositions(t *testing.T) {
 	})
 }
 
-func TestPortfolioRiskMaxDrawdown(t *testing.T) {
+func TestPortfolioRiskAccessorsNilSafe(t *testing.T) {
 	cases := []struct {
-		name string
-		in   *PortfolioRiskConfig
-		want float64
+		name     string
+		in       *PortfolioRiskConfig
+		wantDD   float64
+		wantWarn float64
 	}{
-		{"nil", nil, 0},
-		{"populated", &PortfolioRiskConfig{MaxDrawdownPct: 15.5}, 15.5},
-		{"zero value", &PortfolioRiskConfig{}, 0},
+		{"nil", nil, 0, 0},
+		{"populated", &PortfolioRiskConfig{MaxDrawdownPct: 15.5, WarnThresholdPct: 60.0}, 15.5, 60.0},
+		{"zero value", &PortfolioRiskConfig{}, 0, 0},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := portfolioRiskMaxDrawdown(tc.in)
-			if got != tc.want {
-				t.Errorf("portfolioRiskMaxDrawdown(%v) = %v, want %v", tc.in, got, tc.want)
+			if got := portfolioRiskMaxDrawdown(tc.in); got != tc.wantDD {
+				t.Errorf("portfolioRiskMaxDrawdown(%v) = %v, want %v", tc.in, got, tc.wantDD)
 			}
-		})
-	}
-}
-
-func TestPortfolioRiskWarnThreshold(t *testing.T) {
-	cases := []struct {
-		name string
-		in   *PortfolioRiskConfig
-		want float64
-	}{
-		{"nil", nil, 0},
-		{"populated", &PortfolioRiskConfig{WarnThresholdPct: 60.0}, 60.0},
-		{"zero value", &PortfolioRiskConfig{}, 0},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := portfolioRiskWarnThreshold(tc.in)
-			if got != tc.want {
-				t.Errorf("portfolioRiskWarnThreshold(%v) = %v, want %v", tc.in, got, tc.want)
+			if got := portfolioRiskWarnThreshold(tc.in); got != tc.wantWarn {
+				t.Errorf("portfolioRiskWarnThreshold(%v) = %v, want %v", tc.in, got, tc.wantWarn)
 			}
 		})
 	}
@@ -1417,8 +1102,6 @@ func TestFormatStringMap(t *testing.T) {
 	}
 }
 
-// #696/#1135: user_defaults.manual flows through hot-reload so SIGHUP edits
-// to margin_usd / stop_loss_atr_mult / side / tp_tiers propagate without restart.
 func TestApplyHotReloadConfigPropagatesManualDefaults(t *testing.T) {
 	oldMargin := 50.0
 	newMargin := 125.0
@@ -1463,7 +1146,6 @@ func TestApplyHotReloadConfigPropagatesManualDefaults(t *testing.T) {
 	if got := len(cfg.resolveManualTPTiers()); got != 2 {
 		t.Errorf("resolveManualTPTiers length = %d, want 2", got)
 	}
-	// Mutating the next block after reload must not affect cfg (clone, not alias).
 	*next.UserDefaults.Manual.MarginUSD = 999
 	if got := cfg.resolveManualMarginUSD(); got != 125.0 {
 		t.Errorf("cfg margin aliased to next: got %g after next-mutation, want 125.0", got)
@@ -1484,13 +1166,13 @@ func TestApplyHotReloadConfigCopiesFlatRegimeTrailAndUserCloseDefaults(t *testin
 	strategy := func(block *RegimeATRBlock) StrategyConfig {
 		return StrategyConfig{
 			ID: "hl-eth", Type: "perps", Platform: "hyperliquid",
-			Script:                "shared_scripts/check_hyperliquid.py",
-			Args:                  []string{"sma_crossover", "ETH", "1h", "--mode=paper"},
-			CloseStrategy:         &StrategyRef{Name: trailingTPRatchetRegimeCloseName},
-			TrailingStopATRRegime: block,
-			Capital:               1000,
-			MaxDrawdownPct:        10,
-			Leverage:              1,
+			Script:                    "shared_scripts/check_hyperliquid.py",
+			Args:                      []string{"sma_crossover", "ETH", "1h", "--mode=paper"},
+			CloseStrategy:             &StrategyRef{Name: trailingTPRatchetRegimeCloseName},
+			TrailingStopATRMultRegime: block,
+			Capital:                   1000,
+			MaxDrawdownPct:            10,
+			Leverage:                  1,
 		}
 	}
 	cfg := minimalReloadConfig([]StrategyConfig{strategy(oldTrail)})
@@ -1498,8 +1180,8 @@ func TestApplyHotReloadConfigCopiesFlatRegimeTrailAndUserCloseDefaults(t *testin
 	next.UserDefaults = &UserDefaultsConfig{
 		Close: CloseDefaultsMap{
 			trailingTPRatchetRegimeCloseName: {
-				"tp_tiers":                 ratchetRegimeUserTiers(),
-				"trailing_stop_atr_regime": ratchetRegimeTrailRaw(2.75, 2.75, 1.5),
+				"tp_tiers":                      ratchetRegimeUserTiers(),
+				"trailing_stop_atr_mult_regime": ratchetRegimeTrailRaw(2.75, 2.75, 1.5),
 			},
 		},
 	}
@@ -1512,23 +1194,23 @@ func TestApplyHotReloadConfigCopiesFlatRegimeTrailAndUserCloseDefaults(t *testin
 		t.Fatalf("applyHotReloadConfig: %v", err)
 	}
 	joined := strings.Join(changes, "\n")
-	if !strings.Contains(joined, "trailing_stop_atr_regime") {
-		t.Fatalf("changes missing trailing_stop_atr_regime update: %v", changes)
+	if !strings.Contains(joined, "trailing_stop_atr_mult_regime") {
+		t.Fatalf("changes missing trailing_stop_atr_mult_regime update: %v", changes)
 	}
 	if !strings.Contains(joined, "user_defaults") {
 		t.Fatalf("changes missing user_defaults update: %v", changes)
 	}
-	got, ok := resolveRegimeATR(*cfg.Strategies[0].TrailingStopATRRegime, "ranging")
+	got, ok := resolveRegimeATR(*cfg.Strategies[0].TrailingStopATRMultRegime, "ranging")
 	if !ok || got != 1.5 {
 		t.Fatalf("reloaded ranging trail = (%g, %v), want (1.5, true)", got, ok)
 	}
-	next.Strategies[0].TrailingStopATRRegime.TrendRegime["ranging"] = RegimeATREntry{ATR: 9.0}
-	got, ok = resolveRegimeATR(*cfg.Strategies[0].TrailingStopATRRegime, "ranging")
+	next.Strategies[0].TrailingStopATRMultRegime.TrendRegime["ranging"] = RegimeATREntry{ATR: 9.0}
+	got, ok = resolveRegimeATR(*cfg.Strategies[0].TrailingStopATRMultRegime, "ranging")
 	if !ok || got != 1.5 {
 		t.Fatalf("reloaded trail aliases next after mutation: (%g, %v)", got, ok)
 	}
-	next.UserDefaults.Close[trailingTPRatchetRegimeCloseName]["trailing_stop_atr_regime"] = map[string]interface{}{"use_defaults": true}
-	raw := cfg.UserDefaults.Close[trailingTPRatchetRegimeCloseName]["trailing_stop_atr_regime"].(map[string]interface{})
+	next.UserDefaults.Close[trailingTPRatchetRegimeCloseName]["trailing_stop_atr_mult_regime"] = map[string]interface{}{"use_defaults": true}
+	raw := cfg.UserDefaults.Close[trailingTPRatchetRegimeCloseName]["trailing_stop_atr_mult_regime"].(map[string]interface{})
 	if _, ok := raw["use_defaults"]; ok {
 		t.Fatal("cfg.UserDefaults.Close aliases next after reload")
 	}
@@ -1577,9 +1259,9 @@ func TestApplyHotReloadConfigRejectsUserCloseDefaultRegimeTrailChangeWithOpenPos
 
 			_, err := applyHotReloadConfig(cfg, next, openETHReloadState(tc.id), nil, nil)
 			if err == nil {
-				t.Fatal("expected open-position reload to reject changed user_defaults.close trailing_stop_atr_regime")
+				t.Fatal("expected open-position reload to reject changed user_defaults.close trailing_stop_atr_mult_regime")
 			}
-			if !strings.Contains(err.Error(), "trailing_stop_atr_regime shape changed with open positions") {
+			if !strings.Contains(err.Error(), "trailing_stop_atr_mult_regime shape changed with open positions") {
 				t.Fatalf("unexpected error: %v", err)
 			}
 		})
@@ -1605,12 +1287,12 @@ func TestApplyHotReloadConfigAllowsUserCloseDefaultRegimeTrailEquivalentEditWith
 	if err != nil {
 		t.Fatalf("applyHotReloadConfig rejected equivalent effective trail: %v", err)
 	}
-	if cfg.Strategies[0].TrailingStopATRRegime == nil || !cfg.Strategies[0].TrailingStopATRRegime.UseDefaults {
-		t.Fatalf("equivalent trail edit was not copied into cfg: %#v", cfg.Strategies[0].TrailingStopATRRegime)
+	if cfg.Strategies[0].TrailingStopATRMultRegime == nil || !cfg.Strategies[0].TrailingStopATRMultRegime.UseDefaults {
+		t.Fatalf("equivalent trail edit was not copied into cfg: %#v", cfg.Strategies[0].TrailingStopATRMultRegime)
 	}
 	joined := strings.Join(changes, "\n")
-	if !strings.Contains(joined, "trailing_stop_atr_regime") || !strings.Contains(joined, "user_defaults") {
-		t.Fatalf("changes=%v, want trailing_stop_atr_regime and user_defaults entries", changes)
+	if !strings.Contains(joined, "trailing_stop_atr_mult_regime") || !strings.Contains(joined, "user_defaults") {
+		t.Fatalf("changes=%v, want trailing_stop_atr_mult_regime and user_defaults entries", changes)
 	}
 }
 
@@ -1626,15 +1308,15 @@ func TestApplyHotReloadConfigCopiesFlatStandaloneRegimeATRDefault(t *testing.T) 
 		t.Fatalf("applyHotReloadConfig: %v", err)
 	}
 	joined := strings.Join(changes, "\n")
-	if !strings.Contains(joined, "user_defaults") || !strings.Contains(joined, "stop_loss_atr_regime") {
-		t.Fatalf("changes=%v, want user_defaults and stop_loss_atr_regime entries", changes)
+	if !strings.Contains(joined, "user_defaults") || !strings.Contains(joined, "stop_loss_atr_mult_regime") {
+		t.Fatalf("changes=%v, want user_defaults and stop_loss_atr_mult_regime entries", changes)
 	}
-	got, ok := resolveRegimeATR(*cfg.Strategies[0].StopLossATRRegime, "ranging")
+	got, ok := resolveRegimeATR(*cfg.Strategies[0].StopLossATRMultRegime, "ranging")
 	if !ok || got != 1.25 {
 		t.Fatalf("reloaded ranging SL = (%g, %v), want (1.25, true)", got, ok)
 	}
-	next.Strategies[0].StopLossATRRegime.TrendRegime["ranging"] = RegimeATREntry{ATR: 9.0}
-	got, ok = resolveRegimeATR(*cfg.Strategies[0].StopLossATRRegime, "ranging")
+	next.Strategies[0].StopLossATRMultRegime.TrendRegime["ranging"] = RegimeATREntry{ATR: 9.0}
+	got, ok = resolveRegimeATR(*cfg.Strategies[0].StopLossATRMultRegime, "ranging")
 	if !ok || got != 1.25 {
 		t.Fatalf("reloaded standalone SL aliases next after mutation: (%g, %v)", got, ok)
 	}
@@ -1652,7 +1334,7 @@ func loadUserDefaultRatchetRegimeReloadConfig(t *testing.T, strategyJSON, trailJ
 						"trending_down": [{"atr_multiple": 1.0, "trailing_mult_after": 1.0, "close_fraction": 0.0}],
 						"ranging": [{"atr_multiple": 1.0, "trailing_mult_after": 1.0, "close_fraction": 0.0}]
 					},
-					"trailing_stop_atr_regime": %s
+					"trailing_stop_atr_mult_regime": %s
 				}
 			}
 		},
@@ -1671,7 +1353,7 @@ func loadUserDefaultStandaloneRegimeATRReloadConfig(t *testing.T, slJSON string)
 		"regime": {"enabled": true, "period": 14, "adx_threshold": 20},
 		"user_defaults": {
 			"regime_atr": {
-				"stop_loss_atr_regime": %s
+				"stop_loss_atr_mult_regime": %s
 			}
 		},
 		"strategies": [{
@@ -1683,7 +1365,7 @@ func loadUserDefaultStandaloneRegimeATRReloadConfig(t *testing.T, slJSON string)
 			"capital": 1000,
 			"leverage": 1,
 			"max_drawdown_pct": 20,
-			"stop_loss_atr_regime": {"use_defaults": true}
+			"stop_loss_atr_mult_regime": {"use_defaults": true}
 		}]
 	}`, slJSON)
 	cfg, err := LoadConfig(writeTestConfig(t, t.TempDir(), cfgJSON))
@@ -1721,8 +1403,6 @@ func openETHReloadState(strategyID string) *AppState {
 	}}
 }
 
-// #696/#1135: empty tp_tiers array is rejected by validation; LoadConfig surfaces
-// the misuse instead of silently falling back to defaults.
 func TestLoadConfigManualDefaultsRejectsEmptyTPTiersArray(t *testing.T) {
 	dir := t.TempDir()
 	cfgJSON := `{
@@ -1748,53 +1428,66 @@ func TestLoadConfigManualDefaultsRejectsEmptyTPTiersArray(t *testing.T) {
 	}
 }
 
-func TestStrategyRestartShape_RegimeWindowOnlyChange(t *testing.T) {
-	a := StrategyConfig{ID: "hl-a", RegimeGateWindow: "short", RegimeATRWindow: "medium"}
-	b := StrategyConfig{ID: "hl-a", RegimeGateWindow: "long", RegimeATRWindow: "short"}
-	if !reflect.DeepEqual(strategyRestartShape(a), strategyRestartShape(b)) {
-		t.Fatal("regime_*_window-only change should not affect restart shape")
+func TestApplyHotReloadConfigPreservesDeferredPoolTransitionManageOnlyLatch(t *testing.T) {
+	strategy := StrategyConfig{
+		ID: "hl-a", Type: "perps", Platform: "hyperliquid",
+		Script:     "shared_scripts/check_hyperliquid.py",
+		Args:       []string{"momentum", "BTC", "1h", "--mode=live"},
+		CapitalPct: 0.5, MaxDrawdownPct: 10,
+		Paused: true, sharedWalletModeDeferred: true,
+	}
+	cfg := minimalReloadConfig([]StrategyConfig{strategy})
+	nextStrategy := strategy
+	nextStrategy.Paused = false
+	nextStrategy.sharedWalletModeDeferred = false
+	next := minimalReloadConfig([]StrategyConfig{nextStrategy})
+
+	if _, err := applyHotReloadConfig(cfg, next, NewAppState(), nil, nil); err != nil {
+		t.Fatalf("unrelated reload must not be rejected by process-local deferred latch: %v", err)
+	}
+	got := cfg.Strategies[0]
+	if !got.Paused || !got.sharedWalletModeDeferred {
+		t.Fatalf("SIGHUP must not resume a deferred pool transition before restart: %+v", got)
 	}
 }
 
-func TestValidateHotReloadCompatible_RegimeWindowOnlyChange(t *testing.T) {
-	cfg := minimalReloadConfig([]StrategyConfig{{
-		ID:               "hl-a",
-		Type:             "perps",
-		Platform:         "hyperliquid",
-		Script:           "shared_scripts/check_hyperliquid.py",
-		Args:             []string{"momentum", "BTC", "1h", "--mode=paper"},
-		Capital:          1000,
-		MaxDrawdownPct:   10,
-		RegimeGateWindow: "short",
-	}})
-	next := minimalReloadConfig([]StrategyConfig{{
-		ID:               "hl-a",
-		Type:             "perps",
-		Platform:         "hyperliquid",
-		Script:           "shared_scripts/check_hyperliquid.py",
-		Args:             []string{"momentum", "BTC", "1h", "--mode=paper"},
-		Capital:          1000,
-		MaxDrawdownPct:   10,
-		RegimeGateWindow: "medium",
-	}})
-	if err := validateHotReloadCompatible(cfg, next); err != nil {
-		t.Fatalf("pure regime_gate_window change should be hot-reloadable: %v", err)
+func TestStrategyRestartShapeIgnoresHotReloadableFields(t *testing.T) {
+	on, off := true, false
+	dd, th, lc := 720, 3, 30
+	cases := []struct {
+		name string
+		a, b StrategyConfig
+	}{
+		{"regime_*_window only change", StrategyConfig{ID: "hl-a", RegimeGateWindow: "short", RegimeATRWindow: "medium"}, StrategyConfig{ID: "hl-a", RegimeGateWindow: "long", RegimeATRWindow: "short"}},
+		{"cb_* override set-vs-nil", StrategyConfig{ID: "hl-a"}, StrategyConfig{ID: "hl-a", CBDrawdownCooldownMinutes: &dd, CBLossStreakThreshold: &th, CBLossStreakCooldownMinutes: &lc}},
+		{"circuit_breaker on/off", StrategyConfig{ID: "hl-a", CircuitBreaker: &on}, StrategyConfig{ID: "hl-a", CircuitBreaker: &off}},
+		{"circuit_breaker set-vs-nil", StrategyConfig{ID: "hl-a", CircuitBreaker: &on}, StrategyConfig{ID: "hl-a", CircuitBreaker: nil}},
+		{"notify_ratchet_triggers on/off", StrategyConfig{ID: "hl-a", NotifyRatchetTriggers: &on}, StrategyConfig{ID: "hl-a", NotifyRatchetTriggers: &off}},
+		{"notify_ratchet_triggers set-vs-nil", StrategyConfig{ID: "hl-a", NotifyRatchetTriggers: &on}, StrategyConfig{ID: "hl-a", NotifyRatchetTriggers: nil}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if !reflect.DeepEqual(strategyRestartShape(tc.a), strategyRestartShape(tc.b)) {
+				t.Fatalf("%s should not affect restart shape", tc.name)
+			}
+		})
 	}
 }
 
-// #1048: the circuit-breaker toggle is hot-reloadable always, including while a
-// position is open — it must NOT be rejected by the reload validators, and the
-// new value must actually be applied to the running config.
-func TestApplyHotReloadConfig_CircuitBreakerToggleWhileOpen(t *testing.T) {
+func TestApplyHotReloadConfigTogglesWhileOpen(t *testing.T) {
 	falseVal, trueVal := false, true
-	base := func(cb *bool) []StrategyConfig {
-		return []StrategyConfig{{
+	intp := func(v int) *int { return &v }
+	base := func(mut func(*StrategyConfig)) *Config {
+		sc := StrategyConfig{
 			ID: "hl-eth", Type: "perps", Platform: "hyperliquid",
 			Script:  "shared_scripts/check_hyperliquid.py",
 			Args:    []string{"momentum", "ETH", "1h", "--mode=paper"},
 			Capital: 1000, MaxDrawdownPct: 10, Leverage: 2, Direction: DirectionLong,
-			CircuitBreaker: cb,
-		}}
+		}
+		if mut != nil {
+			mut(&sc)
+		}
+		return minimalReloadConfig([]StrategyConfig{sc})
 	}
 	openState := func() *AppState {
 		return &AppState{Strategies: map[string]*StrategyState{
@@ -1807,108 +1500,184 @@ func TestApplyHotReloadConfig_CircuitBreakerToggleWhileOpen(t *testing.T) {
 			},
 		}}
 	}
-
-	// on (nil) → off while a position is open: accepted, value applied, change logged.
-	cfg := minimalReloadConfig(base(nil))
-	next := minimalReloadConfig(base(&falseVal))
-	changes, err := applyHotReloadConfig(cfg, next, openState(), nil, nil)
-	if err != nil {
-		t.Fatalf("circuit_breaker on->off while open should be hot-reloadable: %v", err)
+	setOverrides := func(sc *StrategyConfig) {
+		sc.CBDrawdownCooldownMinutes = intp(720)
+		sc.CBLossStreakThreshold = intp(3)
+		sc.CBLossStreakCooldownMinutes = intp(30)
 	}
-	if cfg.Strategies[0].CircuitBreakerEnabled() {
-		t.Fatal("expected circuit breaker disabled after reload")
-	}
-	if !strings.Contains(strings.Join(changes, "\n"), "circuit_breaker") {
-		t.Fatalf("expected a circuit_breaker change entry, got %v", changes)
-	}
-
-	// off → on (re-arm) while a position is open: accepted, value applied.
-	cfg = minimalReloadConfig(base(&falseVal))
-	next = minimalReloadConfig(base(&trueVal))
-	if _, err := applyHotReloadConfig(cfg, next, openState(), nil, nil); err != nil {
-		t.Fatalf("circuit_breaker off->on while open should be hot-reloadable: %v", err)
-	}
-	if !cfg.Strategies[0].CircuitBreakerEnabled() {
-		t.Fatal("expected circuit breaker re-enabled after reload")
-	}
-}
-
-// #1048: a circuit_breaker-only change must not register in the restart shape
-// (else validateHotReloadCompatible would flag it as restart-required).
-func TestStrategyRestartShape_CircuitBreakerOnlyChange(t *testing.T) {
-	on, off := true, false
-	a := StrategyConfig{ID: "hl-a", CircuitBreaker: &on}
-	b := StrategyConfig{ID: "hl-a", CircuitBreaker: &off}
-	c := StrategyConfig{ID: "hl-a", CircuitBreaker: nil}
-	if !reflect.DeepEqual(strategyRestartShape(a), strategyRestartShape(b)) {
-		t.Fatal("circuit_breaker on/off change should not affect restart shape")
-	}
-	if !reflect.DeepEqual(strategyRestartShape(a), strategyRestartShape(c)) {
-		t.Fatal("circuit_breaker set-vs-nil should not affect restart shape")
-	}
-}
-
-// #1118: per-strategy notify_ratchet_triggers is notification-only, so a change
-// must hot-reload even while a position is open (accepted, applied, logged).
-func TestApplyHotReloadConfig_NotifyRatchetTriggersWhileOpen(t *testing.T) {
-	falseVal, trueVal := false, true
-	base := func(nrt *bool) []StrategyConfig {
-		return []StrategyConfig{{
-			ID: "hl-eth", Type: "perps", Platform: "hyperliquid",
-			Script:  "shared_scripts/check_hyperliquid.py",
-			Args:    []string{"momentum", "ETH", "1h", "--mode=paper"},
-			Capital: 1000, MaxDrawdownPct: 10, Leverage: 2, Direction: DirectionLong,
-			NotifyRatchetTriggers: nrt,
-		}}
-	}
-	openState := func() *AppState {
-		return &AppState{Strategies: map[string]*StrategyState{
-			"hl-eth": {
-				ID: "hl-eth", Cash: 900,
-				RiskState: RiskState{MaxDrawdownPct: 10},
-				Positions: map[string]*Position{
-					"ETH": {Symbol: "ETH", Quantity: 1, Side: "long", AvgCost: 3000, Leverage: 2},
-				},
+	cases := []struct {
+		name        string
+		old, new    func(*StrategyConfig)
+		wantChanges []string
+		check       func(t *testing.T, sc *StrategyConfig)
+	}{
+		{
+			name: "circuit_breaker nil->off",
+			old:  nil, new: func(sc *StrategyConfig) { sc.CircuitBreaker = &falseVal },
+			wantChanges: []string{"circuit_breaker"},
+			check: func(t *testing.T, sc *StrategyConfig) {
+				if sc.CircuitBreakerEnabled() {
+					t.Fatal("expected circuit breaker disabled after reload")
+				}
 			},
-		}}
+		},
+		{
+			name: "circuit_breaker off->on",
+			old:  func(sc *StrategyConfig) { sc.CircuitBreaker = &falseVal },
+			new:  func(sc *StrategyConfig) { sc.CircuitBreaker = &trueVal },
+			check: func(t *testing.T, sc *StrategyConfig) {
+				if !sc.CircuitBreakerEnabled() {
+					t.Fatal("expected circuit breaker re-enabled after reload")
+				}
+			},
+		},
+		{
+			name: "cb_* overrides set",
+			old:  nil, new: setOverrides,
+			wantChanges: []string{"cb_drawdown_cooldown_minutes", "cb_loss_streak_threshold", "cb_loss_streak_cooldown_minutes"},
+			check: func(t *testing.T, sc *StrategyConfig) {
+				if got := sc.CircuitBreakerDrawdownCooldown(); got != 12*time.Hour {
+					t.Fatalf("drawdown cooldown after reload = %v, want 12h", got)
+				}
+				if got := sc.CircuitBreakerLossStreakThreshold(); got != 3 {
+					t.Fatalf("loss-streak threshold after reload = %d, want 3", got)
+				}
+				if got := sc.CircuitBreakerLossStreakCooldown(); got != 30*time.Minute {
+					t.Fatalf("loss-streak cooldown after reload = %v, want 30m", got)
+				}
+			},
+		},
+		{
+			name: "cb_* overrides cleared fall back to historical defaults",
+			old:  setOverrides, new: nil,
+			check: func(t *testing.T, sc *StrategyConfig) {
+				if sc.CircuitBreakerDrawdownCooldown() != 24*time.Hour || sc.CircuitBreakerLossStreakThreshold() != 5 || sc.CircuitBreakerLossStreakCooldown() != time.Hour {
+					t.Fatal("cleared overrides should fall back to the historical defaults")
+				}
+			},
+		},
+		{
+			name: "notify_ratchet_triggers nil->off",
+			old:  nil, new: func(sc *StrategyConfig) { sc.NotifyRatchetTriggers = &falseVal },
+			wantChanges: []string{"notify_ratchet_triggers"},
+			check: func(t *testing.T, sc *StrategyConfig) {
+				if sc.NotifyRatchetTriggers == nil || *sc.NotifyRatchetTriggers {
+					t.Fatal("expected notify_ratchet_triggers=false after reload")
+				}
+			},
+		},
+		{
+			name: "notify_ratchet_triggers off->on",
+			old:  func(sc *StrategyConfig) { sc.NotifyRatchetTriggers = &falseVal },
+			new:  func(sc *StrategyConfig) { sc.NotifyRatchetTriggers = &trueVal },
+			check: func(t *testing.T, sc *StrategyConfig) {
+				if sc.NotifyRatchetTriggers == nil || !*sc.NotifyRatchetTriggers {
+					t.Fatal("expected notify_ratchet_triggers=true after reload")
+				}
+			},
+		},
 	}
-
-	// inherit-global (nil) → off while open: accepted, value applied, change logged.
-	cfg := minimalReloadConfig(base(nil))
-	next := minimalReloadConfig(base(&falseVal))
-	changes, err := applyHotReloadConfig(cfg, next, openState(), nil, nil)
-	if err != nil {
-		t.Fatalf("notify_ratchet_triggers nil->off while open should be hot-reloadable: %v", err)
-	}
-	if cfg.Strategies[0].NotifyRatchetTriggers == nil || *cfg.Strategies[0].NotifyRatchetTriggers {
-		t.Fatal("expected notify_ratchet_triggers=false after reload")
-	}
-	if !strings.Contains(strings.Join(changes, "\n"), "notify_ratchet_triggers") {
-		t.Fatalf("expected a notify_ratchet_triggers change entry, got %v", changes)
-	}
-
-	// off → on while open: accepted, value applied.
-	cfg = minimalReloadConfig(base(&falseVal))
-	next = minimalReloadConfig(base(&trueVal))
-	if _, err := applyHotReloadConfig(cfg, next, openState(), nil, nil); err != nil {
-		t.Fatalf("notify_ratchet_triggers off->on while open should be hot-reloadable: %v", err)
-	}
-	if cfg.Strategies[0].NotifyRatchetTriggers == nil || !*cfg.Strategies[0].NotifyRatchetTriggers {
-		t.Fatal("expected notify_ratchet_triggers=true after reload")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := base(tc.old)
+			changes, err := applyHotReloadConfig(cfg, base(tc.new), openState(), nil, nil)
+			if err != nil {
+				t.Fatalf("%s while open should be hot-reloadable: %v", tc.name, err)
+			}
+			joined := strings.Join(changes, "\n")
+			for _, want := range tc.wantChanges {
+				if !strings.Contains(joined, want) {
+					t.Fatalf("expected a %s change entry, got %v", want, changes)
+				}
+			}
+			tc.check(t, &cfg.Strategies[0])
+		})
 	}
 }
 
-// #1118: a notify_ratchet_triggers-only change must not register in the restart
-// shape (else validateHotReloadCompatible would flag it as restart-required).
-func TestStrategyRestartShape_NotifyRatchetTriggersOnlyChange(t *testing.T) {
-	on, off := true, false
-	a := StrategyConfig{ID: "hl-a", NotifyRatchetTriggers: &on}
-	b := StrategyConfig{ID: "hl-a", NotifyRatchetTriggers: &off}
-	c := StrategyConfig{ID: "hl-a", NotifyRatchetTriggers: nil}
-	if !reflect.DeepEqual(strategyRestartShape(a), strategyRestartShape(b)) {
-		t.Fatal("notify_ratchet_triggers on/off change should not affect restart shape")
+func TestValidateHotReloadStateCompatible_StopOwnerModeToggles(t *testing.T) {
+	pf := floatPtr
+	mkCfg := hlReloadConfig
+	openState := openETHReloadState("hl-eth")
+	flatState := flatETHReloadState()
+	regimeBlock := func(sc *StrategyConfig, trailing bool) {
+		b := &RegimeATRBlock{TrendRegime: map[string]RegimeATREntry{"trending": {ATR: 2}}}
+		if trailing {
+			sc.TrailingStopATRMultRegime = b
+		} else {
+			sc.StopLossATRMultRegime = b
+		}
 	}
-	if !reflect.DeepEqual(strategyRestartShape(a), strategyRestartShape(c)) {
-		t.Fatal("notify_ratchet_triggers set-vs-nil should not affect restart shape")
+
+	cases := []struct {
+		name     string
+		old, new func(sc *StrategyConfig)
+		wantErr  string
+	}{
+		{"trailing_stop_pct removed (positive->nil)",
+			func(sc *StrategyConfig) { sc.TrailingStopPct = pf(3) }, nil,
+			"trailing_stop_pct mode changed"},
+		{"trailing_stop_atr_mult added (nil->positive)",
+			nil, func(sc *StrategyConfig) { sc.TrailingStopATRMult = pf(2) },
+			"trailing_stop_atr_mult mode changed"},
+		{"trailing_stop_atr_mult removed (positive->nil)",
+			func(sc *StrategyConfig) { sc.TrailingStopATRMult = pf(2) }, nil,
+			"trailing_stop_atr_mult mode changed"},
+		{"stop_loss_atr_mult added (nil->positive)",
+			nil, func(sc *StrategyConfig) { sc.StopLossATRMult = pf(2) },
+			"stop_loss_atr_mult mode changed"},
+		{"stop_loss_atr_mult removed (positive->nil)",
+			func(sc *StrategyConfig) { sc.StopLossATRMult = pf(2) }, nil,
+			"stop_loss_atr_mult mode changed"},
+		{"scalar->regime swap (stop_loss_atr_mult -> stop_loss_atr_mult_regime)",
+			func(sc *StrategyConfig) { sc.StopLossATRMult = pf(2) },
+			func(sc *StrategyConfig) { regimeBlock(sc, false) },
+			"stop_loss_atr_mult_regime mode changed"},
+		{"trailing_stop_atr_mult_regime added (nil->configured)",
+			nil, func(sc *StrategyConfig) { regimeBlock(sc, true) },
+			"trailing_stop_atr_mult_regime mode changed"},
+		{"trailing_stop_atr_mult_regime removed (configured->nil)",
+			func(sc *StrategyConfig) { regimeBlock(sc, true) }, nil,
+			"trailing_stop_atr_mult_regime mode changed"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateHotReloadStateCompatible(mkCfg(tc.old), mkCfg(tc.new), openState)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("open position: want error containing %q, got: %v", tc.wantErr, err)
+			}
+			if err := validateHotReloadStateCompatible(mkCfg(tc.old), mkCfg(tc.new), flatState); err != nil {
+				t.Fatalf("flat: same toggle must be accepted, got: %v", err)
+			}
+		})
+	}
+}
+
+func TestFormatFloatPtrVariants(t *testing.T) {
+	v1 := float64(12.5)
+	v2 := float64(0)
+	v3 := float64(3.14)
+	cases := []struct {
+		name string
+		fn   func(*float64) string
+		in   *float64
+		want string
+	}{
+		{"plain nil", formatFloatPtr, nil, "<nil>"},
+		{"plain positive", formatFloatPtr, &v3, "3.14"},
+		{"plain zero", formatFloatPtr, &v2, "0"},
+		{"usd nil", formatFloatPtrUSD, nil, "<nil>"},
+		{"usd positive", formatFloatPtrUSD, &v1, "$12.50"},
+		{"usd zero", formatFloatPtrUSD, &v2, "$0.00"},
+		{"pct nil", formatFloatPtrPct, nil, "<nil>"},
+		{"pct positive", formatFloatPtrPct, &v1, "12.50%"},
+		{"pct zero", formatFloatPtrPct, &v2, "0.00%"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.fn(tc.in); got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
 	}
 }

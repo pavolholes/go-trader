@@ -1,9 +1,3 @@
-"""Parser tests for sl_after (#708, #736).
-
-Mirrors the Go tests in scheduler/post_tp_sl_test.go covering the scalar +
-trend_regime shapes. The backtester resolver is tested via the runtime
-helpers; this file focuses on parse/validate.
-"""
 
 from __future__ import annotations
 
@@ -27,24 +21,15 @@ def _regime(entries):
     }
 
 
-# --- Scalar shapes still parse identically ---------------------------------
-
-
-def test_scalar_atr_offset_implicit():
-    rule = parse_sl_after_rule({"atr_mult": 0.25})
-    assert rule == SLAfterRule(kind="atr_offset", atr_mult=0.25)
-
-
-def test_scalar_atr_offset_signed():
-    rule = parse_sl_after_rule({"atr_mult": -0.5})
-    assert rule == SLAfterRule(kind="atr_offset", atr_mult=-0.5)
-
-
-def test_scalar_trail_from_here():
-    rule = parse_sl_after_rule(
-        {"trail_from_here": {"atr_mult": 1.0}}
-    )
-    assert rule == SLAfterRule(kind="trail_from_here", trail_atr_mult=1.0)
+@pytest.mark.parametrize("raw,expected", [
+    ({"atr_mult": 0.25}, SLAfterRule(kind="atr_offset", atr_mult=0.25)),
+    ({"atr_mult": -0.5}, SLAfterRule(kind="atr_offset", atr_mult=-0.5)),
+    ({"trail_from_here": {"atr_mult": 1.0}},
+     SLAfterRule(kind="trail_from_here", trail_atr_mult=1.0)),
+    ("breakeven", SLAfterRule(kind="breakeven")),
+])
+def test_scalar_shapes_parse(raw, expected):
+    assert parse_sl_after_rule(raw) == expected
 
 
 def test_scalar_trail_from_here_tp_atr_fraction():
@@ -54,13 +39,6 @@ def test_scalar_trail_from_here_tp_atr_fraction():
     assert rule.kind == "trail_from_here"
 
 
-def test_scalar_breakeven_string():
-    assert parse_sl_after_rule("breakeven") == SLAfterRule(kind="breakeven")
-
-
-# --- Regime shape (#736) ---------------------------------------------------
-
-
 def test_regime_atr_offset_implicit():
     rule = parse_sl_after_rule(
         _regime({"trending_up": 0.0, "trending_down": 0.0, "ranging": -0.5})
@@ -68,8 +46,6 @@ def test_regime_atr_offset_implicit():
     assert rule.kind == "atr_offset"
     assert rule.atr_mult == 0.0
     assert rule.atr_regime is not None
-    # Signed atr values must round-trip — sl_after.atr_offset is the one
-    # surface where 0 and negative atrs are legal.
     entry = rule.atr_regime.resolve("ranging")
     assert entry is not None and entry.atr == -0.5
     entry_up = rule.atr_regime.resolve("trending_up")
@@ -118,91 +94,36 @@ def test_regime_trail_rejects_non_positive(atr):
         )
 
 
-def test_regime_rejects_bare_label_keys():
-    # Operator forgot the trend_regime wrapper.
+_FULL_TREND_REGIME = {
+    "trending_up": {"atr_multiple": 0.25},
+    "trending_down": {"atr_multiple": 0.25},
+    "ranging": {"atr_multiple": 0.0},
+}
+
+_FULL_TRAIL_REGIME = {
+    "trending_up": {"atr_multiple": 1.0},
+    "trending_down": {"atr_multiple": 1.0},
+    "ranging": {"atr_multiple": 0.5},
+}
+
+
+@pytest.mark.parametrize("raw,substrings", [
+    ({"trending_up": {"atr_multiple": 0.25}}, ("trend_regime", "object must contain")),
+    ({"trend_regime": {"trending_up": {"atr_multiple": 0.25},
+                       "ranging": {"atr_multiple": 0.0}}},
+     ("missing required regime labels",)),
+    ({"use_defaults": True, "trend_regime": dict(_FULL_TREND_REGIME)}, ()),
+    ({"atr_mult": 0.25, "trend_regime": dict(_FULL_TREND_REGIME)}, ("pick one shape",)),
+    ({"kind": "atr_offset", "trend_regime": dict(_FULL_TREND_REGIME),
+      "trail_atr_mult": 99.0}, ("pick one shape",)),
+    ({"trail_from_here": {"trend_regime": dict(_FULL_TRAIL_REGIME),
+                          "atr_offset": -3.0}}, ("pick one shape",)),
+])
+def test_regime_shape_rejections(raw, substrings):
     with pytest.raises(ValueError) as exc:
-        parse_sl_after_rule({"trending_up": {"atr_multiple": 0.25}})
-    assert "trend_regime" in str(exc.value) or "object must contain" in str(exc.value)
-
-
-def test_regime_rejects_missing_labels():
-    with pytest.raises(ValueError) as exc:
-        parse_sl_after_rule(
-            {
-                "trend_regime": {
-                    "trending_up": {"atr_multiple": 0.25},
-                    "ranging": {"atr_multiple": 0.0},
-                }
-            }
-        )
-    assert "missing required regime labels" in str(exc.value)
-
-
-def test_regime_rejects_use_defaults_with_explicit():
-    with pytest.raises(ValueError):
-        parse_sl_after_rule(
-            {
-                "use_defaults": True,
-                "trend_regime": {
-                    "trending_up": {"atr_multiple": 0.25},
-                    "trending_down": {"atr_multiple": 0.25},
-                    "ranging": {"atr_multiple": 0.0},
-                },
-            }
-        )
-
-
-def test_regime_rejects_scalar_and_regime_mix():
-    with pytest.raises(ValueError) as exc:
-        parse_sl_after_rule(
-            {
-                "atr_mult": 0.25,
-                "trend_regime": {
-                    "trending_up": {"atr_multiple": 0.25},
-                    "trending_down": {"atr_multiple": 0.25},
-                    "ranging": {"atr_multiple": 0.0},
-                },
-            }
-        )
-    assert "pick one shape" in str(exc.value)
-
-
-def test_atr_offset_regime_rejects_stray_trail_atr_mult():
-    # Misplaced trail_atr_mult on an atr_offset regime config — pre-review
-    # the parser silently dropped it.
-    with pytest.raises(ValueError) as exc:
-        parse_sl_after_rule(
-            {
-                "kind": "atr_offset",
-                "trend_regime": {
-                    "trending_up": {"atr_multiple": 0.25},
-                    "trending_down": {"atr_multiple": 0.25},
-                    "ranging": {"atr_multiple": 0.0},
-                },
-                "trail_atr_mult": 99.0,
-            }
-        )
-    assert "pick one shape" in str(exc.value)
-
-
-def test_trail_regime_rejects_stray_atr_offset():
-    with pytest.raises(ValueError) as exc:
-        parse_sl_after_rule(
-            {
-                "trail_from_here": {
-                    "trend_regime": {
-                        "trending_up": {"atr_multiple": 1.0},
-                        "trending_down": {"atr_multiple": 1.0},
-                        "ranging": {"atr_multiple": 0.5},
-                    },
-                    "atr_offset": -3.0,
-                }
-            }
-        )
-    assert "pick one shape" in str(exc.value)
-
-
-# --- Equality / resolve helpers --------------------------------------------
+        parse_sl_after_rule(raw)
+    if substrings:
+        assert any(sub in str(exc.value) for sub in substrings), exc.value
 
 
 def test_resolve_for_regime_atr_offset():
@@ -213,7 +134,6 @@ def test_resolve_for_regime_atr_offset():
     assert resolved is not None
     assert resolved.kind == "atr_offset"
     assert resolved.atr_mult == -0.5
-    # Resolved rule drops the regime block — purely scalar.
     assert resolved.atr_regime is None
 
 
@@ -242,10 +162,7 @@ def test_resolve_for_regime_unknown_label_defers():
 def test_resolve_scalar_pass_through():
     rule = SLAfterRule(kind="atr_offset", atr_mult=0.25)
     resolved = rule.resolve_for_regime("trending_up")
-    assert resolved is rule  # scalar form unchanged
-
-
-# --- Strategy-level parse round trip ---------------------------------------
+    assert resolved is rule
 
 
 def test_parse_strategy_tp_sl_after_rules_regime():
@@ -331,11 +248,7 @@ def test_parse_tp_tier_close_fractions_use_defaults_composite_label():
         close_refs,
         regime="trending_up_clean",
     )
-    # #870: trending_up_clean → clean group (4 cumulative fractions).
     assert got == [0.25, 0.5, 0.75, 1.0]
-
-
-# --- Manual rejection: trail_from_here regime variant ----------------------
 
 
 def test_validate_rejects_trail_regime_on_manual():
@@ -369,20 +282,13 @@ def test_validate_rejects_trail_regime_on_manual():
     ), errs
 
 
-# --- validate_sl_after_rule guards -----------------------------------------
-
-
 def test_validate_breakeven_rejects_regime_block():
-    rule = SLAfterRule(kind="breakeven", atr_regime=object())  # type: ignore[arg-type]
+    rule = SLAfterRule(kind="breakeven", atr_regime=object())
     with pytest.raises(ValueError):
         validate_sl_after_rule(rule)
 
 
 def test_parse_strategy_tp_sl_after_rules_regime_close_per_tier_sl_after():
-    # #1228 parity: a per-tier sl_after on a tiered_tp_atr_regime close loads
-    # in Go but errored in the Python mirror (parse_regime_tp_tiers rejected
-    # the sl_after sibling key), so the rule silently never armed at fire
-    # time. The regime-resolved parse must succeed and align the rule.
     close_refs = [
         {
             "name": "tiered_tp_atr_regime",

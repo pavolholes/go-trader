@@ -1,121 +1,71 @@
-"""Tests for chart_patterns.py — swing detection, individual patterns, and orchestrator."""
 
 import numpy as np
 import pandas as pd
 import pytest
 
-from chart_patterns import (
-    PatternMatch,
-    find_swing_points,
-    volume_confirmed,
-    detect_double_top,
-    detect_double_bottom,
-    detect_triple_top,
-    detect_triple_bottom,
-    detect_head_and_shoulders,
-    detect_inverse_head_and_shoulders,
-    detect_bull_flag,
-    detect_bear_flag,
-    detect_ascending_triangle,
-    detect_descending_triangle,
-    detect_cup_and_handle,
-    chart_pattern_core,
-    _get_swing_indices,
-    _htf_gate_trend,
-)
+from shared_strategies.open.conftest import load_module, make_ohlcv
+
+_CHART_PATTERNS = load_module("_chart_patterns_test", __file__.replace("test_chart_patterns.py", "chart_patterns.py"))
+PatternMatch = _CHART_PATTERNS.PatternMatch
+find_swing_points = _CHART_PATTERNS.find_swing_points
+volume_confirmed = _CHART_PATTERNS.volume_confirmed
+detect_double_top = _CHART_PATTERNS.detect_double_top
+detect_double_bottom = _CHART_PATTERNS.detect_double_bottom
+detect_triple_top = _CHART_PATTERNS.detect_triple_top
+detect_triple_bottom = _CHART_PATTERNS.detect_triple_bottom
+detect_head_and_shoulders = _CHART_PATTERNS.detect_head_and_shoulders
+detect_inverse_head_and_shoulders = _CHART_PATTERNS.detect_inverse_head_and_shoulders
+detect_bull_flag = _CHART_PATTERNS.detect_bull_flag
+detect_bear_flag = _CHART_PATTERNS.detect_bear_flag
+detect_ascending_triangle = _CHART_PATTERNS.detect_ascending_triangle
+detect_descending_triangle = _CHART_PATTERNS.detect_descending_triangle
+detect_cup_and_handle = _CHART_PATTERNS.detect_cup_and_handle
+chart_pattern_core = _CHART_PATTERNS.chart_pattern_core
+_get_swing_indices = _CHART_PATTERNS._get_swing_indices
+_htf_gate_trend = _CHART_PATTERNS._htf_gate_trend
 
 
-# ─── Helpers ────────────────────────────────
+@pytest.mark.parametrize("prices,side", [
+    (list(range(100, 90, -1)) + list(range(90, 101)), "low"),
+    (list(range(90, 101)) + list(range(100, 89, -1)), "high"),
+], ids=["trough", "peak"])
+def test_find_swing_points_detects_the_obvious_pivot(prices, side):
+    df = make_ohlcv(prices)
+    sh, sl = find_swing_points(df["high"], df["low"], lookback=3)
+    idx = _get_swing_indices(sh if side == "high" else sl)
+    assert len(idx) >= 1
+    assert any(abs(i - 10) <= 3 for i in idx)
 
-def make_ohlcv(closes, volume=None, noise=0.5):
-    """Build an OHLCV DataFrame from a close price array."""
-    closes = np.array(closes, dtype=float)
-    n = len(closes)
-    if volume is None:
-        volume = np.full(n, 100.0)
-    highs = closes + noise
-    lows = closes - noise
-    opens = closes - noise * 0.3
-    return pd.DataFrame({
-        "open": opens,
-        "high": highs,
-        "low": lows,
-        "close": closes,
-        "volume": np.array(volume, dtype=float),
-    })
-
-
-# ─── Swing Point Detection ──────────────────
 
 class TestSwingPoints:
-    def test_detects_obvious_peak_and_trough(self):
-        # V-shape: down then up — one trough in the middle
-        prices = list(range(100, 90, -1)) + list(range(90, 101))
-        df = make_ohlcv(prices)
-        sh, sl = find_swing_points(df["high"], df["low"], lookback=3)
-
-        swing_low_idx = _get_swing_indices(sl)
-        assert len(swing_low_idx) >= 1
-        # The trough should be near index 10 (the lowest point)
-        assert any(abs(i - 10) <= 3 for i in swing_low_idx)
-
-    def test_detects_peak(self):
-        # Mountain shape: up then down
-        prices = list(range(90, 101)) + list(range(100, 89, -1))
-        df = make_ohlcv(prices)
-        sh, sl = find_swing_points(df["high"], df["low"], lookback=3)
-
-        swing_high_idx = _get_swing_indices(sh)
-        assert len(swing_high_idx) >= 1
-        # Peak near index 10
-        assert any(abs(i - 10) <= 3 for i in swing_high_idx)
-
-    def test_flat_data_no_swings(self):
-        prices = [100.0] * 50
-        df = make_ohlcv(prices, noise=0)
-        sh, sl = find_swing_points(df["high"], df["low"], lookback=5)
-        # Flat data: first-in-group dedup should limit swing count
-        # All points are swing points in flat data, but that's fine
-        assert len(df) == 50
-
     def test_insufficient_data(self):
         prices = [100, 101, 100]
         df = make_ohlcv(prices)
         sh, sl = find_swing_points(df["high"], df["low"], lookback=5)
-        # With lookback=5 and only 3 bars, everything is NaN
         assert sh.notna().sum() == 0
         assert sl.notna().sum() == 0
 
 
-# ─── Volume Confirmation ────────────────────
+@pytest.mark.parametrize("bars,idx,spike,expected", [
+    (25, 24, 200, True),
+    (25, 24, 110, False),
+    (5, 3, None, True),
+])
+def test_volume_confirmed(bars, idx, spike, expected):
+    vol = pd.Series([100] * bars)
+    if spike is not None:
+        vol.iloc[idx] = spike
+    assert bool(volume_confirmed(vol, idx, vol_period=20, vol_multiplier=1.5)) is expected
 
-class TestVolumeConfirmed:
-    def test_high_volume_confirmed(self):
-        vol = pd.Series([100] * 25)
-        vol.iloc[24] = 200  # 2x average
-        assert volume_confirmed(vol, 24, vol_period=20, vol_multiplier=1.5)
-
-    def test_low_volume_rejected(self):
-        vol = pd.Series([100] * 25)
-        vol.iloc[24] = 110  # only 1.1x
-        assert not volume_confirmed(vol, 24, vol_period=20, vol_multiplier=1.5)
-
-    def test_insufficient_history_allows(self):
-        vol = pd.Series([100] * 5)
-        assert volume_confirmed(vol, 3, vol_period=20, vol_multiplier=1.5)
-
-
-# ─── Double Top / Bottom ────────────────────
 
 class TestDoubleTop:
     def test_detects_double_top(self):
-        # Rally to 100, drop to 90, rally to ~100, break below 90
         prices = (
-            list(np.linspace(80, 100, 20)) +   # rally to first peak
-            list(np.linspace(100, 90, 15)) +    # drop to neckline
-            list(np.linspace(90, 99, 15)) +     # rally to second peak
-            list(np.linspace(99, 85, 20)) +     # breakdown
-            [85] * 30                            # continuation
+            list(np.linspace(80, 100, 20)) +
+            list(np.linspace(100, 90, 15)) +
+            list(np.linspace(90, 99, 15)) +
+            list(np.linspace(99, 85, 20)) +
+            [85] * 30
         )
         df = make_ohlcv(prices)
         sh, sl = find_swing_points(df["high"], df["low"], lookback=3)
@@ -127,11 +77,10 @@ class TestDoubleTop:
         assert matches[0].pattern == "double_top"
 
     def test_no_double_top_when_peaks_differ(self):
-        # Two peaks but very different heights
         prices = (
             list(np.linspace(80, 100, 20)) +
             list(np.linspace(100, 90, 15)) +
-            list(np.linspace(90, 110, 15)) +  # much higher second peak
+            list(np.linspace(90, 110, 15)) +
             list(np.linspace(110, 85, 20)) +
             [85] * 30
         )
@@ -146,10 +95,10 @@ class TestDoubleTop:
 class TestDoubleBottom:
     def test_detects_double_bottom(self):
         prices = (
-            list(np.linspace(100, 80, 20)) +   # drop to first trough
-            list(np.linspace(80, 90, 15)) +     # bounce to neckline
-            list(np.linspace(90, 81, 15)) +     # drop to second trough
-            list(np.linspace(81, 100, 20)) +    # breakout
+            list(np.linspace(100, 80, 20)) +
+            list(np.linspace(80, 90, 15)) +
+            list(np.linspace(90, 81, 15)) +
+            list(np.linspace(81, 100, 20)) +
             [100] * 30
         )
         df = make_ohlcv(prices)
@@ -161,17 +110,15 @@ class TestDoubleBottom:
         assert matches[0].signal == 1
 
 
-# ─── Head & Shoulders ───────────────────────
-
 class TestHeadAndShoulders:
     def test_detects_head_and_shoulders(self):
         prices = (
-            list(np.linspace(80, 95, 15)) +    # left shoulder up
-            list(np.linspace(95, 85, 10)) +    # trough 1
-            list(np.linspace(85, 105, 15)) +   # head up
-            list(np.linspace(105, 85, 10)) +   # trough 2
-            list(np.linspace(85, 96, 15)) +    # right shoulder up
-            list(np.linspace(96, 80, 20)) +    # breakdown
+            list(np.linspace(80, 95, 15)) +
+            list(np.linspace(95, 85, 10)) +
+            list(np.linspace(85, 105, 15)) +
+            list(np.linspace(105, 85, 10)) +
+            list(np.linspace(85, 96, 15)) +
+            list(np.linspace(96, 80, 20)) +
             [80] * 15
         )
         df = make_ohlcv(prices)
@@ -186,12 +133,12 @@ class TestHeadAndShoulders:
 class TestInverseHeadAndShoulders:
     def test_detects_inverse_hs(self):
         prices = (
-            list(np.linspace(100, 85, 15)) +   # left shoulder down
-            list(np.linspace(85, 95, 10)) +     # peak 1
-            list(np.linspace(95, 75, 15)) +     # head down
-            list(np.linspace(75, 95, 10)) +     # peak 2
-            list(np.linspace(95, 84, 15)) +     # right shoulder down
-            list(np.linspace(84, 100, 20)) +    # breakout
+            list(np.linspace(100, 85, 15)) +
+            list(np.linspace(85, 95, 10)) +
+            list(np.linspace(95, 75, 15)) +
+            list(np.linspace(75, 95, 10)) +
+            list(np.linspace(95, 84, 15)) +
+            list(np.linspace(84, 100, 20)) +
             [100] * 15
         )
         df = make_ohlcv(prices)
@@ -202,8 +149,6 @@ class TestInverseHeadAndShoulders:
         assert len(matches) >= 1
         assert matches[0].signal == 1
 
-
-# ─── Triple Top / Bottom ────────────────────
 
 class TestTripleTop:
     def test_detects_triple_top(self):
@@ -245,19 +190,15 @@ class TestTripleBottom:
         assert matches[0].signal == 1
 
 
-# ─── Flags ───────────────────────────────────
-
 class TestBullFlag:
     def test_detects_bull_flag(self):
-        # Strong rally (pole) then mild consolidation then breakout
         prices = (
-            list(np.linspace(80, 120, 15)) +   # pole (strong rally)
-            list(np.linspace(120, 115, 10)) +  # flag (mild pullback)
-            list(np.linspace(115, 125, 10)) +  # breakout
+            list(np.linspace(80, 120, 15)) +
+            list(np.linspace(120, 115, 10)) +
+            list(np.linspace(115, 125, 10)) +
             [125] * 15
         )
         vol = [100] * len(prices)
-        # High volume on the pole
         for i in range(15):
             vol[i] = 200
         df = make_ohlcv(prices, volume=vol)
@@ -265,16 +206,15 @@ class TestBullFlag:
         matches = detect_bull_flag(
             df["high"], df["low"], df["close"], df["volume"], sh, sl
         )
-        # Flag detection is geometry-sensitive; at minimum no crash
         assert isinstance(matches, list)
 
 
 class TestBearFlag:
     def test_detects_bear_flag(self):
         prices = (
-            list(np.linspace(120, 80, 15)) +   # pole (strong drop)
-            list(np.linspace(80, 85, 10)) +     # flag (mild bounce)
-            list(np.linspace(85, 75, 10)) +     # breakdown
+            list(np.linspace(120, 80, 15)) +
+            list(np.linspace(80, 85, 10)) +
+            list(np.linspace(85, 75, 10)) +
             [75] * 15
         )
         vol = [100] * len(prices)
@@ -288,16 +228,14 @@ class TestBearFlag:
         assert isinstance(matches, list)
 
 
-# ─── Cup & Handle ────────────────────────────
-
 class TestCupAndHandle:
     def test_detects_cup_and_handle(self):
         prices = (
-            list(np.linspace(90, 100, 10)) +   # left rim up
-            list(np.linspace(100, 85, 15)) +    # left side of cup
-            list(np.linspace(85, 100, 15)) +    # right side of cup
-            list(np.linspace(100, 96, 5)) +     # handle dip
-            list(np.linspace(96, 105, 10)) +    # breakout
+            list(np.linspace(90, 100, 10)) +
+            list(np.linspace(100, 85, 15)) +
+            list(np.linspace(85, 100, 15)) +
+            list(np.linspace(100, 96, 5)) +
+            list(np.linspace(96, 105, 10)) +
             [105] * 15
         )
         df = make_ohlcv(prices)
@@ -306,14 +244,9 @@ class TestCupAndHandle:
             df["high"], df["low"], df["close"], sh, sl
         )
         assert isinstance(matches, list)
-        # At least no crash; geometry may or may not trigger
 
-
-# ─── DatetimeIndex regression ────────────────
 
 class TestDatetimeIndex:
-    """Regression tests: _get_swing_indices must return integer positions even
-    when the DataFrame carries a DatetimeIndex (not a RangeIndex)."""
 
     def _make_datetime_ohlcv(self, closes, volume=None, noise=0.5):
         df = make_ohlcv(closes, volume=volume, noise=noise)
@@ -325,13 +258,11 @@ class TestDatetimeIndex:
         df = self._make_datetime_ohlcv(prices)
         sh, sl = find_swing_points(df["high"], df["low"], lookback=3)
         indices = _get_swing_indices(sl)
-        # All returned values must be plain integers, not Timestamps
         assert all(isinstance(i, (int, np.integer)) for i in indices), (
             f"Expected integer positions, got: {[type(i) for i in indices]}"
         )
 
     def test_chart_pattern_core_with_datetime_index(self):
-        """chart_pattern_core must not raise TypeError with a DatetimeIndex."""
         prices = (
             list(np.linspace(80, 100, 20)) +
             list(np.linspace(100, 90, 15)) +
@@ -354,18 +285,10 @@ class TestDatetimeIndex:
         )
         df = self._make_datetime_ohlcv(prices)
         sh, sl = find_swing_points(df["high"], df["low"], lookback=3)
-        # Must not raise TypeError
         matches = detect_double_top(df["high"], df["low"], df["close"], sh, sl, tolerance=0.03)
         assert isinstance(matches, list)
 
     def test_detect_flag_pole_low_bar_with_datetime_index(self):
-        """Regression: `_detect_flag` computes `pole_low_bar` via
-        `segment.values.argmin() + pole_start`. Under a DatetimeIndex the
-        prior `.idxmin()`-based path returned a Timestamp and crashed when
-        the result was used with `.iloc[]`. This test exercises both bull
-        and bear flag paths end-to-end on a DatetimeIndex DataFrame.
-        """
-        # Bull flag: pole then mild pullback then breakout
         bull_prices = (
             list(np.linspace(80, 120, 15)) +
             list(np.linspace(120, 115, 10)) +
@@ -375,13 +298,11 @@ class TestDatetimeIndex:
         vol = [200] * 15 + [100] * (len(bull_prices) - 15)
         df_bull = self._make_datetime_ohlcv(bull_prices, volume=vol)
         sh_b, sl_b = find_swing_points(df_bull["high"], df_bull["low"], lookback=3)
-        # Must not raise TypeError on the pole_low_bar calculation
         bull_matches = detect_bull_flag(
             df_bull["high"], df_bull["low"], df_bull["close"], df_bull["volume"], sh_b, sl_b,
         )
         assert isinstance(bull_matches, list)
 
-        # Bear flag: symmetric drop then mild bounce then breakdown
         bear_prices = (
             list(np.linspace(120, 80, 15)) +
             list(np.linspace(80, 85, 10)) +
@@ -396,18 +317,7 @@ class TestDatetimeIndex:
         assert isinstance(bear_matches, list)
 
 
-# ─── Orchestrator ────────────────────────────
-
-# ─── Look-ahead regression (#732) ───────────────
-
 class TestLookaheadRegression:
-    """Each pattern detector receives swing series that are only complete
-    ``lookback`` bars after their swing position. The breakout bar must come
-    at least one bar after the trailing swing's confirmation window closes —
-    i.e. ``bar_index >= trailing_swing_bar + lookback + 1`` — otherwise the
-    detector is consuming a swing classification derived from data not yet
-    observable at signal time.
-    """
 
     def test_double_top_breakout_after_confirmation_window(self):
         lookback = 3
@@ -425,14 +335,8 @@ class TestLookaheadRegression:
             tolerance=0.03, lookback=lookback,
         )
         assert len(matches) >= 1
-        # Find the second peak's bar (h2_bar) and assert breakout is far
-        # enough out.
         sh_positions = sorted(np.where(sh.notna())[0])
         for m in matches:
-            # Identify h2_bar — the second of the two consecutive swing highs
-            # whose breakout produced this match. We don't reconstruct the
-            # exact pair, but assert that bar_index is at least lookback+1
-            # AFTER some swing high less than bar_index.
             prior_swings = [s for s in sh_positions if s < m.bar_index]
             assert prior_swings, "match should follow at least one swing high"
             latest_prior = max(prior_swings)
@@ -472,11 +376,6 @@ class TestLookaheadRegression:
             )
 
     def test_signal_independent_of_future_bars(self):
-        """For each bar K where the orchestrator emits a non-zero signal,
-        the same signal must arise from running the orchestrator on the
-        prefix df[:K+1]. The fix enforces that pattern breakouts only land at
-        bars where the trailing swing is fully past its centered-window
-        confirmation; that window is always contained in [0, K]."""
         prices = (
             list(np.linspace(80, 100, 20)) +
             list(np.linspace(100, 90, 15)) +
@@ -491,7 +390,6 @@ class TestLookaheadRegression:
         full = chart_pattern_core(df, pivot_lookback=3, tolerance=0.03, vol_multiplier=1.0)
 
         signal_bars = list(np.where(full["signal"].values != 0)[0])
-        # Test setup should actually produce at least one signal.
         assert len(signal_bars) >= 1
         for k in signal_bars:
             partial_df = df.iloc[: k + 1]
@@ -522,7 +420,6 @@ class TestChartPatternCore:
     def test_flat_data_no_signals(self):
         df = make_ohlcv([100.0] * 100, noise=0)
         result = chart_pattern_core(df, pivot_lookback=3)
-        # Flat data should produce no meaningful signals
         assert result["signal"].abs().sum() == 0
 
     def test_double_top_through_orchestrator(self):
@@ -534,7 +431,6 @@ class TestChartPatternCore:
             [85] * 30
         )
         vol = [100] * len(prices)
-        # Ensure breakout bar has high volume
         for i in range(50, 70):
             vol[i] = 200
         df = make_ohlcv(prices, volume=vol)
@@ -550,22 +446,16 @@ class TestChartPatternCore:
             list(np.linspace(99, 85, 20)) +
             [85] * 30
         )
-        # Very low volume on breakout bars
         vol = [200] * len(prices)
         for i in range(50, 70):
-            vol[i] = 10  # very low breakout volume
+            vol[i] = 10
         df = make_ohlcv(prices, volume=vol)
         result = chart_pattern_core(df, pivot_lookback=3, tolerance=0.03, vol_multiplier=3.0)
-        # With vol_multiplier=3.0 and low breakout volume, signals should be filtered
         sell_signals = result[result["signal"] == -1]
         assert len(sell_signals) == 0
 
 
-# ─── HTF Trend Gate (#982) ──────────────────
-
 def _double_top_fixture(prefix=None):
-    """The orchestrator double-top fixture (emits -1 sell signals), optionally
-    preceded by a price prefix that sets the HTF trend context."""
     prices = (
         list(np.linspace(80, 100, 20)) +
         list(np.linspace(100, 90, 15)) +
@@ -576,8 +466,6 @@ def _double_top_fixture(prefix=None):
     if prefix is not None:
         prices = list(prefix) + prices
     vol = [100.0] * len(prices)
-    # High volume across the double-top breakout region so the volume filter
-    # passes there (region sits after the prefix).
     off = len(prefix) if prefix is not None else 0
     for i in range(off + 50, off + 70):
         vol[i] = 200.0
@@ -601,14 +489,11 @@ class TestHTFGate:
         trend_up = _htf_gate_trend(up, 4, ema_fast=10, ema_slow=20)
         down = make_ohlcv(np.linspace(200, 50, 600))
         trend_down = _htf_gate_trend(down, 4, ema_fast=10, ema_slow=20)
-        # Neutral through EMA warmup (slow span in buckets), then directional.
         assert trend_up.iloc[0] == 0 and trend_down.iloc[0] == 0
         assert trend_up.iloc[-1] == 1
         assert trend_down.iloc[-1] == -1
 
     def test_veto_blocks_counter_trend_sell_in_uptrend(self):
-        # Long rising prefix puts the HTF trend firmly up when the double-top
-        # breakdown (-1) fires; veto mode must gate those sells to 0.
         df = _double_top_fixture(prefix=np.linspace(20, 80, 400))
         base = chart_pattern_core(df, pivot_lookback=3, tolerance=0.03, vol_multiplier=1.0)
         gated = chart_pattern_core(
@@ -616,7 +501,7 @@ class TestHTFGate:
             htf_gate_factor=4, htf_gate_ema_fast=10, htf_gate_ema_slow=20,
         )
         sell_bars = np.where(base["signal"].values == -1)[0]
-        assert len(sell_bars) >= 1  # fixture sanity
+        assert len(sell_bars) >= 1
         blocked = 0
         for k in sell_bars:
             trend_k = int(gated["htf_gate_trend"].iloc[k])
@@ -627,17 +512,12 @@ class TestHTFGate:
                 blocked += 1
             else:
                 assert gated["signal"].iloc[k] == base["signal"].iloc[k]
-        # Fixture sanity: the uptrend prefix must actually make the gate bite
-        # on at least one sell signal, else this test is vacuous.
         assert blocked >= 1
 
     def test_veto_passes_neutral_and_align_blocks_it(self):
-        # factor=30 with slow=40 needs 1200 bars of warmup; the 100-bar fixture
-        # keeps the HTF trend neutral throughout. Veto passes everything
-        # through unchanged; align (requires agreement) blocks everything.
         df = _double_top_fixture()
         base = chart_pattern_core(df, pivot_lookback=3, tolerance=0.03, vol_multiplier=1.0)
-        assert base["signal"].abs().sum() >= 1  # fixture sanity
+        assert base["signal"].abs().sum() >= 1
         veto = chart_pattern_core(
             df, pivot_lookback=3, tolerance=0.03, vol_multiplier=1.0,
             htf_gate_factor=30,
@@ -656,10 +536,6 @@ class TestHTFGate:
             chart_pattern_core(df, htf_gate_mode="bogus")
 
     def test_gated_signal_independent_of_future_bars(self):
-        # Same prefix-stability contract as the ungated orchestrator test,
-        # with the gate active on a DatetimeIndex (exercises the wall-clock
-        # resample path): the projected HTF trend must never read a bucket
-        # that has not closed by bar K.
         df = _double_top_fixture(prefix=np.linspace(20, 80, 400))
         df.index = pd.date_range("2024-01-01", periods=len(df), freq="1h")
         kwargs = dict(
@@ -669,17 +545,13 @@ class TestHTFGate:
         full = chart_pattern_core(df, **kwargs)
         base = chart_pattern_core(df, pivot_lookback=3, tolerance=0.03,
                                   vol_multiplier=1.0)
-        # Check every bar where the UNGATED strategy fires: the gated verdict
-        # there (pass or block) must be identical under truncation — a
-        # look-ahead in the projected trend would flip it either way.
         signal_bars = list(np.where(base["signal"].values != 0)[0])
-        assert len(signal_bars) >= 1  # fixture sanity
+        assert len(signal_bars) >= 1
         for k in signal_bars:
             partial = chart_pattern_core(df.iloc[: k + 1], **kwargs)
             assert partial["signal"].iloc[k] == full["signal"].iloc[k], (
                 f"gated signal at bar {k} flipped under truncation"
             )
-        # The visible trend series itself must also be prefix-stable.
         k = signal_bars[-1]
         partial = chart_pattern_core(df.iloc[: k + 1], **kwargs)
         assert (

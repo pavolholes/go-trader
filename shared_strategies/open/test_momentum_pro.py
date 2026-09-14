@@ -1,43 +1,29 @@
-"""Tests for momentum_pro.py — trend-pullback momentum strategy."""
 
 import numpy as np
 import pandas as pd
 import pytest
 
-from momentum_pro import momentum_pro_core
+from shared_strategies.open.conftest import load_module, make_ohlcv as make_frame
 
-
-def make_ohlcv(opens, highs, lows, closes, volume):
-    return pd.DataFrame({
-        "open": np.asarray(opens, dtype=float),
-        "high": np.asarray(highs, dtype=float),
-        "low": np.asarray(lows, dtype=float),
-        "close": np.asarray(closes, dtype=float),
-        "volume": np.asarray(volume, dtype=float),
-    })
+_MOMENTUM_PRO = load_module("_momentum_pro_test", __file__.replace("test_momentum_pro.py", "momentum_pro.py"))
+momentum_pro_core = _MOMENTUM_PRO.momentum_pro_core
 
 
 def build_uptrend_with_pullback():
-    """Stacked-EMA uptrend, a pullback that tags EMA(fast), then a resumption
-    bar that breaks the prior high on high volume."""
     n = 260
-    # Steady uptrend to stack the EMAs and build ADX.
     closes = list(np.linspace(100, 200, n - 6))
-    # Pullback: three down bars dipping toward the fast EMA.
     base = closes[-1]
     closes += [base - 4, base - 7, base - 9]
-    # Resumption: strong up bar that breaks the prior bar's high.
     closes += [base - 4, base + 6, base + 12]
     closes = np.array(closes, dtype=float)
     n = len(closes)
     highs = closes + 1.0
     lows = closes - 1.0
     opens = closes - 0.3
-    # Make the pullback lows actually reach down (so low <= ema_fast can hold).
     vol = np.full(n, 100.0)
     vol[-1] = 100.0
-    vol[-2] = 500.0  # volume spike on the resumption bar
-    return make_ohlcv(opens, highs, lows, closes, vol)
+    vol[-2] = 500.0
+    return make_frame(closes, volume=vol, opens=opens, highs=highs, lows=lows)
 
 
 def test_columns_present():
@@ -48,9 +34,9 @@ def test_columns_present():
 
 
 def test_warmup_returns_no_signal():
-    df = make_ohlcv(
-        opens=[100] * 30, highs=[101] * 30, lows=[99] * 30,
-        closes=[100] * 30, volume=[100] * 30,
+    df = make_frame(
+        [100] * 30, opens=[100] * 30, highs=[101] * 30,
+        lows=[99] * 30, volume=[100] * 30,
     )
     out = momentum_pro_core(df)
     assert (out["signal"] == 0).all()
@@ -70,29 +56,28 @@ def test_uptrend_pullback_fires_long():
 
 
 def test_volume_gate_blocks_when_unmet():
-    """A volume multiplier no bar can satisfy must suppress all entries."""
     df = build_uptrend_with_pullback()
     out = momentum_pro_core(df, vol_mult=1e6)
     assert (out["signal"] == 0).all()
 
 
 def test_flat_market_no_signal():
-    """No trend (flat) → ADX gate keeps it out."""
     n = 260
     closes = np.full(n, 100.0) + np.random.RandomState(0).randn(n) * 0.05
-    df = make_ohlcv(closes - 0.3, closes + 0.5, closes - 0.5, closes, np.full(n, 100.0))
+    df = make_frame(
+        closes, opens=closes - 0.3, highs=closes + 0.5,
+        lows=closes - 0.5, volume=np.full(n, 100.0),
+    )
     out = momentum_pro_core(df)
     assert (out["signal"] == 0).all()
 
 
 def test_downtrend_pullback_fires_short():
-    """Mirror image: stacked bearish EMAs, a rally to EMA(fast), then a
-    breakdown through the prior low."""
     n = 260
     closes = list(np.linspace(200, 100, n - 6))
     base = closes[-1]
-    closes += [base + 4, base + 7, base + 9]      # rally up into resistance
-    closes += [base + 4, base - 6, base - 12]     # breakdown
+    closes += [base + 4, base + 7, base + 9]
+    closes += [base + 4, base - 6, base - 12]
     closes = np.array(closes, dtype=float)
     n = len(closes)
     highs = closes + 1.0
@@ -100,12 +85,9 @@ def test_downtrend_pullback_fires_short():
     opens = closes + 0.3
     vol = np.full(n, 100.0)
     vol[-2] = 500.0
-    df = make_ohlcv(opens, highs, lows, closes, vol)
+    df = make_frame(closes, volume=vol, opens=opens, highs=highs, lows=lows)
     out = momentum_pro_core(df, vol_mult=1.2)
     assert (out["signal"] == -1).any(), "expected a short entry on the breakdown bar"
-
-
-# ─── #980: volatility-targeted entry sizing (default OFF) ────────────────────
 
 
 def test_vol_target_off_by_default_no_entry_fraction_column():
@@ -128,37 +110,25 @@ def test_vol_target_never_changes_signals():
     pd.testing.assert_series_equal(base["signal"], sized["signal"])
 
 
-def test_vol_target_emits_fraction_scaled_by_atr():
-    # Flat bars: high-low = 2 around close 100 → TR 2, ATR 2, ATR/close 0.02.
-    # Target 0.01 → fraction 0.5 once the ATR window is warm.
+def _flat_atr_frame():
     n = 260
     closes = np.full(n, 100.0)
-    df = make_ohlcv(closes, closes + 1.0, closes - 1.0, closes,
-                    np.full(n, 100.0))
-    out = momentum_pro_core(df, vol_target_atr_pct=0.01)
+    return make_frame(
+        closes, volume=np.full(n, 100.0), opens=closes,
+        highs=closes + 1.0, lows=closes - 1.0,
+    )
+
+
+@pytest.mark.parametrize("kwargs,expected", [
+    (dict(vol_target_atr_pct=0.01), 0.5),
+    (dict(vol_target_atr_pct=0.0001, vol_target_min_fraction=0.10), 0.10),
+    (dict(vol_target_atr_pct=0.50), 1.0),
+], ids=["scaled_by_atr", "floored_at_min_fraction", "capped_at_one"])
+def test_vol_target_entry_fraction(kwargs, expected):
+    out = momentum_pro_core(_flat_atr_frame(), **kwargs)
     assert "entry_fraction" in out.columns
     warm = out["entry_fraction"].iloc[50:]
     assert warm.notna().all()
-    assert warm.iloc[-1] == pytest.approx(0.5)
+    assert warm.iloc[-1] == pytest.approx(expected)
     assert ((warm > 0) & (warm <= 1)).all()
-
-
-def test_vol_target_fraction_floors_at_min_fraction():
-    n = 260
-    closes = np.full(n, 100.0)
-    df = make_ohlcv(closes, closes + 1.0, closes - 1.0, closes,
-                    np.full(n, 100.0))
-    out = momentum_pro_core(df, vol_target_atr_pct=0.0001,
-                            vol_target_min_fraction=0.10)
-    warm = out["entry_fraction"].iloc[50:]
-    assert np.allclose(warm, 0.10)
-
-
-def test_vol_target_caps_fraction_at_one_in_quiet_markets():
-    n = 260
-    closes = np.full(n, 100.0)
-    df = make_ohlcv(closes, closes + 1.0, closes - 1.0, closes,
-                    np.full(n, 100.0))
-    out = momentum_pro_core(df, vol_target_atr_pct=0.50)
-    warm = out["entry_fraction"].iloc[50:]
-    assert np.allclose(warm, 1.0)
+    assert np.allclose(warm, expected)

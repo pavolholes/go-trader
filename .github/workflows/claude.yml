@@ -10,34 +10,29 @@ on:
   pull_request_review:
     types: [submitted]
 
-# Serialize runs per issue/PR: both comment-patch steps rewrite "the latest
-# bot comment", so overlapping runs would stamp each other's comments. The
-# group is per workflow RUN, so the classify→review/implement jobs of one run
-# never overlap a second run on the same issue/PR.
 concurrency:
   group: claude-${{ github.event.issue.number || github.event.pull_request.number }}
   cancel-in-progress: false
 
-# Least-privilege split (#1178): classification and the two runner jobs.
-# The runner body is shared via claude-run.yml; only the permissions (and
-# mode) differ at the call sites below. The review job must never carry
-# contents: write or id-token: write — a review run reads untrusted,
-# potentially prompt-injected PR content, and id-token: write would let
-# injected code mint the Claude App installation token (which has push
-# rights) itself via the OIDC exchange, bypassing the job permissions.
 jobs:
   classify:
     if: |
-      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
-      (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+      (
+        (github.actor == 'claude[bot]' && github.event.issue.pull_request != null) ||
+        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association || github.event.review.author_association || github.event.issue.author_association)
+      ) && (
+        (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+        (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
+        (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
+        (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+      )
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions: {}
     outputs:
       invoked: ${{ steps.verify_invocation.outputs.invoked }}
       mode: ${{ steps.classify_mode.outputs.mode }}
+      flow: ${{ steps.resolve_model.outputs.flow }}
       model_id: ${{ steps.resolve_model.outputs.model_id }}
       effort: ${{ steps.resolve_model.outputs.effort }}
     steps:
@@ -48,8 +43,8 @@ jobs:
           COMMENT_BODY: ${{ github.event.comment.body }}
           REVIEW_BODY: ${{ github.event.review.body }}
           ISSUE_BODY: ${{ github.event.issue.body }}
+          TRIGGER_ACTOR: ${{ github.actor }}
         run: |
-          # Select body based on event type
           case "$EVENT_NAME" in
             issue_comment|pull_request_review_comment)
               BODY="$COMMENT_BODY"
@@ -62,17 +57,8 @@ jobs:
               ;;
           esac
 
-          # Strip fenced code blocks (``` ... ```) and inline code spans (` ... `)
-          # shellcheck disable=SC2016  # single quotes are intentional — Perl regex has no shell vars
           STRIPPED=$(printf '%s' "$BODY" | perl -0777 -pe 's/```.*?```//gs' | sed 's/`[^`]*`//g')
 
-          # Single source of truth for the stripped body: classify_mode (the
-          # token-split security gate) and resolve_model consume this output,
-          # so the text that gates "is @claude invoked" and the text that
-          # gates "does this run earn push access" can never diverge. The
-          # heredoc delimiter is random because the body is attacker-
-          # influenced — a fixed delimiter inside the body could inject
-          # additional outputs.
           DELIM="STRIPPED_$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
           {
             printf 'stripped<<%s\n' "$DELIM"
@@ -80,82 +66,113 @@ jobs:
             printf '%s\n' "$DELIM"
           } >> "$GITHUB_OUTPUT"
 
-          # @claude is a real invocation only when it appears at the start of a line
-          if printf '%s' "$STRIPPED" | grep -qE '(^|(\r?\n))[[:space:]]*@claude([[:space:]]|$)'; then
+          if [ "$TRIGGER_ACTOR" = "claude[bot]" ]; then
+            NONBLANK=$(printf '%s' "$STRIPPED" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e '/^$/d')
+            NONBLANK_LINES=$(printf '%s' "$NONBLANK" | awk 'END{print NR}')
+            if [ "$NONBLANK_LINES" -eq 1 ] && \
+               printf '%s' "$NONBLANK" | grep -qE '^@claude([[:space:]]+[a-z]+[0-9]*)?[[:space:]]+review([[:space:]]+effort:(low|medium|high|xhigh))?$'; then
+              echo "invoked=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "invoked=false" >> "$GITHUB_OUTPUT"
+              echo "::notice::claude[bot] comment is not an exact one-line @claude review trigger — skipping."
+            fi
+          elif printf '%s' "$STRIPPED" | grep -qE '(^|(\r?\n))[[:space:]]*@claude([[:space:]]|$)'; then
             echo "invoked=true" >> "$GITHUB_OUTPUT"
           else
             echo "invoked=false" >> "$GITHUB_OUTPUT"
             echo "::notice::@claude found but only inside code blocks or examples — skipping."
           fi
 
-      - name: Classify invocation as review or implement
-        if: steps.verify_invocation.outputs.invoked == 'true'
-        id: classify_mode
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          STRIPPED: ${{ steps.verify_invocation.outputs.stripped }}
-        run: |
-          # Fail-closed routing (#1178): when in doubt, classify as review —
-          # the review job cannot push, so a misrouted implementation ask
-          # fails with a 403 instead of a misrouted review ask running with
-          # contents: write while reading untrusted PR content.
-          #   - PR-review surfaces (pull_request_review, and inline
-          #     pull_request_review_comment) are always review-scoped, even
-          #     for inline "@claude fix X" asks.
-          #   - Elsewhere, any mention of the word "review" outside code
-          #     blocks routes to review ("@claude review and fix" loses push
-          #     on purpose; re-ask without "review" to implement).
-          # $STRIPPED is verify_invocation's code-fence-stripped body — the
-          # exact text the invocation gate saw, by construction.
-          case "$EVENT_NAME" in
-            pull_request_review|pull_request_review_comment)
-              echo "mode=review" >> "$GITHUB_OUTPUT"
-              echo "::notice::Mode: review (PR-review surface)"
-              exit 0
-              ;;
-          esac
-
-          if printf '%s' "$STRIPPED" | grep -qiE '\breview\b'; then
-            MODE=review
-          else
-            MODE=implement
-          fi
-          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
-          echo "::notice::Mode: $MODE"
-
       - name: Resolve model from @claude invocation
         if: steps.verify_invocation.outputs.invoked == 'true'
         id: resolve_model
         env:
+          EVENT_NAME: ${{ github.event_name }}
           STRIPPED: ${{ steps.verify_invocation.outputs.stripped }}
+          DOCS_RELEASE_ENABLED: ${{ vars.DOCS_RELEASE_ENABLED }}
         run: |
-          # $STRIPPED is verify_invocation's code-fence-stripped body — the
-          # exact text the invocation gate saw, by construction.
-
-          # Extract optional model shorthand after @claude on a line boundary
-          # e.g. "@claude sonnet fix this" → "sonnet"
-          MODEL_SHORT=$(printf '%s' "$STRIPPED" | grep -oE '(^|(\r?\n))[[:space:]]*@claude[[:space:]]+[a-z]+' | head -1 | awk '{print $NF}' || true)
+          MODEL_SHORT=$(printf '%s' "$STRIPPED" | grep -ioE '(^|(\r?\n))[[:space:]]*@claude[[:space:]]+[a-z]+[0-9]*' | head -1 | awk '{print $NF}' | tr '[:upper:]' '[:lower:]' || true)
 
           case "$MODEL_SHORT" in
-            opus)    MODEL_ID="claude-opus-4-8[1m]" ;;
-            sonnet)  MODEL_ID="claude-sonnet-5" ;;
-            fable)   MODEL_ID="claude-fable-5" ;;
-            *)       MODEL_ID="claude-opus-4-8[1m]" ;;  # default (no model specified)
+            opus|opus5)     MODEL_ID="claude-opus-5" ;;
+            sonnet|sonnet5) MODEL_ID="claude-sonnet-5" ;;
+            fable|fable5)   MODEL_ID="claude-fable-5" ;;
+            *)              MODEL_ID="claude-opus-4-8[1m]" ;;  # default (no model specified)
           esac
 
           echo "model_id=$MODEL_ID" >> "$GITHUB_OUTPUT"
           echo "::notice::Using model: $MODEL_ID"
 
-          # Extract optional effort level from comment: "effort:low", "effort:medium", "effort:high", "effort:xhigh"
           EFFORT_RAW=$(printf '%s' "$STRIPPED" | grep -oiE 'effort:(low|medium|xhigh|high)' | head -1 | tr '[:upper:]' '[:lower:]' | cut -d: -f2 || true)
           EFFORT="${EFFORT_RAW:-xhigh}"
           echo "effort=$EFFORT" >> "$GITHUB_OUTPUT"
           echo "::notice::Using effort: $EFFORT"
 
-  # Review runs read untrusted PR content: the job token is the hard boundary
-  # (the Bash allowlist is bypassable through allowed interpreters), so it
-  # gets contents: read only, and claude-run.yml binds the agent to this
-  # token via github_token. No id-token: write — see the note above.
+          FLOW=""
+          if [ "$EVENT_NAME" = "issue_comment" ] && [ "$DOCS_RELEASE_ENABLED" = "true" ]; then
+            for cand in create-release sync-docs; do
+              if printf '%s' "$STRIPPED" | grep -qiE "(^|(\r?\n))[[:space:]]*@claude([[:space:]]+(opus|opus5|sonnet|sonnet5|fable|fable5))?[[:space:]]+${cand}([[:space:]]|\$)"; then
+                FLOW="$cand"
+                break
+              fi
+            done
+          fi
+          echo "flow=$FLOW" >> "$GITHUB_OUTPUT"
+          if [ -n "$FLOW" ]; then
+            echo "::notice::Docs/release flow: $FLOW"
+          fi
+
+      - name: Classify invocation route (review, implement, or fix-pr)
+        if: steps.verify_invocation.outputs.invoked == 'true'
+        id: classify_mode
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_URL: ${{ github.event.issue.pull_request.url }}
+          FLOW: ${{ steps.resolve_model.outputs.flow }}
+          STRIPPED: ${{ steps.verify_invocation.outputs.stripped }}
+          PR_AUTHOR_ASSOC: ${{ github.event.issue.author_association }}
+          PR_AUTHOR_LOGIN: ${{ github.event.issue.user.login }}
+        run: |
+          IS_ISSUE=false
+          case "$EVENT_NAME" in
+            issues) IS_ISSUE=true ;;
+            issue_comment) if [ -z "$PR_URL" ]; then IS_ISSUE=true; fi ;;
+          esac
+
+          if [ -n "$FLOW" ] || [ "$IS_ISSUE" = "true" ]; then
+            MODE=implement
+          else
+            case "$EVENT_NAME" in
+              pull_request_review|pull_request_review_comment)
+                MODE=review
+                ;;
+              *)
+                KEYWORD=$(printf '%s' "$STRIPPED" | tr -d '\r' \
+                  | sed -n 's/^[[:space:]]*@claude[[:space:]]\{1,\}//p' | head -n 1 \
+                  | awk '{ if (tolower($1) ~ /^(opus|opus5|sonnet|sonnet5|fable|fable5)$/) { print $2 } else { print $1 } }' \
+                  | tr '[:upper:]' '[:lower:]')
+
+                PR_AUTHOR_TRUSTED=false
+                case "$PR_AUTHOR_ASSOC" in
+                  OWNER|MEMBER|COLLABORATOR) PR_AUTHOR_TRUSTED=true ;;
+                esac
+                if [ "$PR_AUTHOR_LOGIN" = "claude[bot]" ]; then
+                  PR_AUTHOR_TRUSTED=true
+                fi
+
+                if [ "$KEYWORD" = "review" ]; then
+                  MODE=review
+                elif [ "$PR_AUTHOR_TRUSTED" != "true" ]; then
+                  MODE=review
+                else
+                  MODE=fix-pr
+                fi
+                ;;
+            esac
+          fi
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "::notice::Route: $MODE"
+
   review:
     needs: classify
     if: needs.classify.outputs.invoked == 'true' && needs.classify.outputs.mode == 'review'
@@ -163,16 +180,17 @@ jobs:
       contents: read
       pull-requests: write
       issues: write
-    uses: ./.github/workflows/claude-run.yml
+    uses: richkuo/rk-skills/.github/workflows/claude-run.yml@main
     with:
       mode: review
+      flow: ''
       model_id: ${{ needs.classify.outputs.model_id }}
       effort: ${{ needs.classify.outputs.effort }}
+      timeout_minutes: 90
+      go_version: '1.26'
+      extra_allowed_tools: 'Bash(gofmt *),Bash(cd scheduler && gofmt *)'
     secrets: inherit
 
-  # Implementation runs legitimately commit and push, so they keep Claude App
-  # auth (id-token: write mints the app installation token) and contents:
-  # write for the checkout-side git operations.
   implement:
     needs: classify
     if: needs.classify.outputs.invoked == 'true' && needs.classify.outputs.mode == 'implement'
@@ -181,9 +199,38 @@ jobs:
       pull-requests: write
       issues: write
       id-token: write
-    uses: ./.github/workflows/claude-run.yml
+    uses: richkuo/rk-skills/.github/workflows/claude-run.yml@main
     with:
       mode: implement
+      flow: ${{ needs.classify.outputs.flow }}
       model_id: ${{ needs.classify.outputs.model_id }}
       effort: ${{ needs.classify.outputs.effort }}
+      timeout_minutes: 90
+      go_version: '1.26'
+      extra_allowed_tools: 'Bash(gofmt *),Bash(cd scheduler && gofmt *)'
+    secrets: inherit
+
+  fix-pr:
+    needs: classify
+    if: >
+      needs.classify.outputs.invoked == 'true' &&
+      needs.classify.outputs.mode == 'fix-pr' &&
+      (
+        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.issue.author_association) ||
+        github.event.issue.user.login == 'claude[bot]'
+      )
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+    uses: richkuo/rk-skills/.github/workflows/claude-run.yml@main
+    with:
+      mode: fix-pr
+      flow: ''
+      model_id: ${{ needs.classify.outputs.model_id }}
+      effort: ${{ needs.classify.outputs.effort }}
+      timeout_minutes: 90
+      go_version: '1.26'
+      extra_allowed_tools: 'Bash(gofmt *),Bash(cd scheduler && gofmt *)'
     secrets: inherit

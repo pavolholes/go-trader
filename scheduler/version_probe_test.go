@@ -7,9 +7,6 @@ import (
 	"testing"
 )
 
-// writeProbeStub creates a Python stub at <dir>/<name> that exits 0 when
-// --probe-only is in argv, otherwise echoes argparse-style rejection on
-// stderr and exits 2 (mimicking the May 7 outage signature).
 func writeProbeStub(t *testing.T, dir, name string, accept bool) string {
 	t.Helper()
 	path := filepath.Join(dir, name)
@@ -33,9 +30,6 @@ sys.exit(2)
 	return path
 }
 
-// runProbeWithCwd runs probeCheckScripts from a tmp cwd containing a
-// fake .venv/bin/python3 shim that just execs whichever script it's
-// handed. Returns the probe's error.
 func runProbeWithCwd(t *testing.T, cfg *Config) error {
 	t.Helper()
 	tmp := t.TempDir()
@@ -43,7 +37,6 @@ func runProbeWithCwd(t *testing.T, cfg *Config) error {
 	if err := os.MkdirAll(venvBin, 0o755); err != nil {
 		t.Fatalf("mkdir venv: %v", err)
 	}
-	// Shim: forward argv unchanged to the real python3 found on PATH.
 	shim := `#!/usr/bin/env bash
 exec /usr/bin/env python3 "$@"
 `
@@ -66,10 +59,6 @@ exec /usr/bin/env python3 "$@"
 	}
 	t.Cleanup(func() { _ = os.Chdir(prevCwd) })
 
-	// Script paths in cfg are already absolute (from writeProbeStub) and
-	// stay valid regardless of cwd; the chdir above only matters so the
-	// relative ".venv/bin/python3" path inside probeOneCheckScript hits
-	// the shim we just dropped in tmp/.venv/bin/.
 	return probeCheckScripts(cfg)
 }
 
@@ -135,10 +124,6 @@ func TestProbeIgnoresEmptyScripts(t *testing.T) {
 	}
 }
 
-// TestProbeRunsExtraArgvForHL verifies the extra --fetch-atr (#689) and
-// --execute (PR #769) probes are dispatched only for check_hyperliquid.py.
-// Stubs probeOneCheckScriptFn to record argv shapes per script without
-// requiring a real .venv.
 func TestProbeRunsExtraArgvForHL(t *testing.T) {
 	orig := probeOneCheckScriptFn
 	defer func() { probeOneCheckScriptFn = orig }()
@@ -157,9 +142,19 @@ func TestProbeRunsExtraArgvForHL(t *testing.T) {
 				mode = "limit-status"
 			case "--cancel-order":
 				mode = "cancel-order"
+			case "--batch-check":
+				mode = "batch-check"
 			}
 			if mode != "signal" {
 				break
+			}
+		}
+		if mode == "signal" {
+			for _, a := range argv {
+				if a == marketStdinFlag {
+					mode = "market-signal"
+					break
+				}
 			}
 		}
 		calls[script] = append(calls[script], mode)
@@ -175,7 +170,7 @@ func TestProbeRunsExtraArgvForHL(t *testing.T) {
 		t.Fatalf("probe failed: %v", err)
 	}
 	hl := calls["shared_scripts/check_hyperliquid.py"]
-	wantHL := []string{"signal", "signal", "fetch-atr", "execute", "limit-open", "limit-status", "cancel-order"}
+	wantHL := []string{"signal", "signal", "fetch-atr", "execute", "limit-open", "limit-status", "cancel-order", "batch-check", "market-signal", "market-signal"}
 	if len(hl) != len(wantHL) {
 		t.Errorf("HL should be probed %v, got %v", wantHL, hl)
 	} else {
@@ -204,17 +199,14 @@ func TestProbeRunsExtraArgvForHL(t *testing.T) {
 }
 
 func TestFormatProbeFailureFallsBackThroughChannels(t *testing.T) {
-	// stderr present -> uses stderr
 	err := formatProbeFailure("check.py", os.ErrInvalid, " stderr-msg\n", "stdout-msg")
 	if !strings.Contains(err.Error(), "stderr-msg") {
 		t.Errorf("should prefer stderr; got %q", err.Error())
 	}
-	// stderr empty -> falls back to stdout
 	err = formatProbeFailure("check.py", os.ErrInvalid, "  ", "stdout-msg")
 	if !strings.Contains(err.Error(), "stdout-msg") {
 		t.Errorf("should fall back to stdout when stderr empty; got %q", err.Error())
 	}
-	// both empty -> falls back to runErr
 	err = formatProbeFailure("check.py", os.ErrInvalid, "", "")
 	if !strings.Contains(err.Error(), os.ErrInvalid.Error()) {
 		t.Errorf("should fall back to runErr; got %q", err.Error())

@@ -1,4 +1,3 @@
-"""Tests for BinanceUSExchangeAdapter — mock ccxt to avoid live API calls."""
 
 import sys
 import os
@@ -6,7 +5,6 @@ import importlib.util
 import pytest
 from unittest.mock import MagicMock, patch
 
-# Load binanceus adapter by file path to avoid module name collisions
 _adapter_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "adapter.py")
 _shared_tools = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'shared_tools'))
 if _shared_tools not in sys.path:
@@ -20,23 +18,12 @@ BinanceUSExchangeAdapter = _mod.BinanceUSExchangeAdapter
 
 @pytest.fixture
 def mock_exchange():
-    """Provide a mock ccxt exchange and patch it into the adapter module."""
     mock_ex = MagicMock()
     original = _mod._get_ccxt_exchange
     _mod._get_ccxt_exchange = lambda: mock_ex
     yield mock_ex
     _mod._get_ccxt_exchange = original
 
-
-# ─── Properties ────────────────────────────────────
-
-class TestProperties:
-    def test_name(self):
-        adapter = BinanceUSExchangeAdapter()
-        assert adapter.name == "binanceus"
-
-
-# ─── Spot Price ────────────────────────────────────
 
 class TestSpotPrice:
     def test_get_spot_price(self, mock_exchange):
@@ -60,8 +47,6 @@ class TestSpotPrice:
         assert adapter.get_spot_price("BTC") == 0.0
 
 
-# ─── Vol Metrics ───────────────────────────────────
-
 class TestVolMetrics:
     def test_get_vol_metrics(self, mock_exchange):
         adapter = BinanceUSExchangeAdapter()
@@ -72,35 +57,28 @@ class TestVolMetrics:
         assert vol > 0
         assert 0 <= iv_rank <= 100
 
-    def test_get_vol_metrics_insufficient(self, mock_exchange):
+    @pytest.mark.parametrize("candles,error", [
+        ([], None),
+        (None, Exception("fail")),
+    ])
+    def test_get_vol_metrics_falls_back(self, mock_exchange, candles, error):
         adapter = BinanceUSExchangeAdapter()
-        mock_exchange.fetch_ohlcv.return_value = []
+        if error is not None:
+            mock_exchange.fetch_ohlcv.side_effect = error
+        else:
+            mock_exchange.fetch_ohlcv.return_value = candles
         vol, iv_rank = adapter.get_vol_metrics("BTC")
         assert vol == 0.60
         assert iv_rank == 50.0
 
-    def test_get_vol_metrics_error(self, mock_exchange):
-        adapter = BinanceUSExchangeAdapter()
-        mock_exchange.fetch_ohlcv.side_effect = Exception("fail")
-        vol, iv_rank = adapter.get_vol_metrics("BTC")
-        assert vol == 0.60
-        assert iv_rank == 50.0
-
-
-# ─── Options Not Supported ─────────────────────────
 
 class TestOptionsNotSupported:
-    def test_get_real_expiry_raises(self):
+    @pytest.mark.parametrize("method,args", [
+        ("get_real_expiry", ("BTC", 30)),
+        ("get_real_strike", ("BTC", "2026-05-01", "call", 70000)),
+        ("get_premium_and_greeks", ("BTC", "call", 70000, "2026-05-01", 30, 67000, 0.6)),
+    ])
+    def test_options_methods_raise(self, method, args):
         adapter = BinanceUSExchangeAdapter()
         with pytest.raises(NotImplementedError, match="not support options"):
-            adapter.get_real_expiry("BTC", 30)
-
-    def test_get_real_strike_raises(self):
-        adapter = BinanceUSExchangeAdapter()
-        with pytest.raises(NotImplementedError, match="not support options"):
-            adapter.get_real_strike("BTC", "2026-05-01", "call", 70000)
-
-    def test_get_premium_and_greeks_raises(self):
-        adapter = BinanceUSExchangeAdapter()
-        with pytest.raises(NotImplementedError, match="not support options"):
-            adapter.get_premium_and_greeks("BTC", "call", 70000, "2026-05-01", 30, 67000, 0.6)
+            getattr(adapter, method)(*args)

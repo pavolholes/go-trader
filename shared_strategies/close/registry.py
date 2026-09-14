@@ -1,4 +1,3 @@
-"""Registry for position-aware close strategy evaluators."""
 
 from __future__ import annotations
 
@@ -29,7 +28,6 @@ from avwap_stop import evaluate as avwap_stop_evaluate
 
 VALID_PLATFORMS: Tuple[str, ...] = ("spot", "futures", "options")
 
-# name -> {fn, description, default_params, platforms}
 STRATEGIES: Dict[str, Dict[str, Any]] = {}
 
 
@@ -112,7 +110,6 @@ def _normalize_result(name: str, result: Optional[dict]) -> dict:
 
 
 def _rewrite_deprecated_close(name: str, params: Optional[dict]) -> tuple[str, dict]:
-    """One-window shim: tp_at_pct → single-tier tiered_tp_pct (#841)."""
     if name != "tp_at_pct":
         return name, dict(params or {})
     warn_deprecated_close_key("tp_at_pct", "tiered_tp_pct")
@@ -160,9 +157,6 @@ register(
 register(
     "tiered_tp_atr_regime",
     "Regime-aware tiered TP — ATR multiples resolved at open via Position.Regime (#733)",
-    # default_params intentionally empty: the Go config loader expands
-    # `use_defaults: true` into a concrete tier list before evaluator
-    # invocation, and any other shape must be operator-supplied.
     {},
 )(tiered_tp_atr_regime_evaluate)
 
@@ -190,7 +184,6 @@ register(
     {},
 )(trailing_tp_ratchet_regime_evaluate)
 
-# #997 M3 exit-quality knobs — default-off; backtest-wired, live wiring deferred.
 register(
     "time_stop",
     "Holding-time cap — full close after max_bars held (default-off; needs bars_held context)",
@@ -209,9 +202,6 @@ register(
     {"lookback": 0, "z_target": 0.0},
 )(zscore_target_evaluate)
 
-# #1196 AVWAP loss-of-line exit. Reads market["avwap"] — the live re-anchored
-# line injected from the AVWAP-family open strategy's own `avwap` column by
-# evaluate_open_close (live) and the backtester; fails safe (no-op) without it.
 register(
     "avwap_stop",
     "AVWAP loss-of-line exit — full close when the mark breaches the anchored VWAP by buffer_atr_mult ATR (needs market avwap context; atr_source: live|entry)",

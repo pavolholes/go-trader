@@ -1,11 +1,11 @@
-# backtest/regime_hmm.py
-"""Label-anchored Gaussian HMM: closed-form fit + causal forward-filter (#1065)."""
 from __future__ import annotations
 import numpy as np
 
 MODEL_TYPE = "label_anchored_hmm"
 MODEL_VERSION = 1
 FEATURES = ["return_eff", "range_eff", "efficiency", "adx"]
+DECODE_MIN_DWELL_KEY = "decode_min_dwell"
+DECODE_STICKINESS_KEY = "decode_stickiness"
 
 
 def stationary_distribution(transition: np.ndarray) -> np.ndarray:
@@ -32,17 +32,13 @@ def fit_label_anchored_hmm(features, labels, states, *, filter_window,
         zs = z[y == s]
         if len(zs) >= 2:
             em_mean, em_var = zs.mean(0), zs.var(0)
-        else:  # degenerate: anchor at standardized origin, unit variance (flagged by n)
+        else:
             em_mean, em_var = np.zeros(z.shape[1]), np.ones(z.shape[1])
         em_var = np.maximum(em_var, var_floor)
         emissions.append({"mean": em_mean.tolist(), "var": em_var.tolist(), "n": int(len(zs))})
     si = {s: i for i, s in enumerate(states)}
     k = len(states)
     A = np.full((k, k), float(laplace))
-    # Transition counts only between bars adjacent in the ORIGINAL series AND both retained
-    # (non-NaN features). The old NaN-dropped zip spliced a mid-series NaN (low-ATR) bar's
-    # pre- and post-NaN neighbours into a spurious adjacency; pairs spanning a dropped bar
-    # are now skipped so the fitted transition matrix matches true bar-to-bar dynamics (#1078).
     for i in range(len(mask) - 1):
         if mask[i] and mask[i + 1]:
             A[si[labels[i]], si[labels[i + 1]]] += 1.0
@@ -71,30 +67,51 @@ def forward_filter_labels(features: np.ndarray, model: dict):
     em_mean = np.array([e["mean"] for e in model["emissions"]], dtype=float)
     em_var = np.array([e["var"] for e in model["emissions"]], dtype=float)
     log_init = np.log(np.asarray(model["init"], dtype=float) + 1e-300)
-    log_A = np.log(np.asarray(model["transition"], dtype=float) + 1e-300)
+    A = np.asarray(model["transition"], dtype=float)
+    stickiness = float(model.get(DECODE_STICKINESS_KEY) or 0.0)
+    if stickiness < 0:
+        raise ValueError(f"{DECODE_STICKINESS_KEY} must be >= 0")
+    if stickiness > 0:
+        A = A + stickiness * np.eye(k)
+        A = A / A.sum(1, keepdims=True)
+    log_A = np.log(A + 1e-300)
     w = int(model["filter_window"])
+    min_dwell = int(model.get(DECODE_MIN_DWELL_KEY) or 0)
+    if min_dwell < 0:
+        raise ValueError(f"{DECODE_MIN_DWELL_KEY} must be >= 0")
     default_label = states[int(np.argmax(model["init"]))]
 
     labels = np.array([default_label] * n, dtype=object)
     conf = np.zeros(n, dtype=float)
+    held, pending, pending_run = None, None, 0
     for i in range(n):
         lo = max(0, i - w + 1)
         alpha = log_init.copy()
         seen = False
         for t in range(lo, i + 1):
             x = features[t]
-            # predict: alpha'_j = logsumexp_i(alpha_i + log_A[i,j])
             pred = np.array([_logsumexp(alpha + log_A[:, j]) for j in range(k)])
             if np.isnan(x).any():
-                alpha = pred  # carry: transition only, no emission
+                alpha = pred
                 continue
             z = (x - mean) / std
             log_emit = -0.5 * (np.log(2 * np.pi * em_var) + (z - em_mean) ** 2 / em_var).sum(1)
             alpha = pred + log_emit
-            alpha -= _logsumexp(alpha)  # normalize
+            alpha -= _logsumexp(alpha)
             seen = True
         if seen:
             j = int(np.argmax(alpha))
+            if min_dwell > 1:
+                if held is None or j == held:
+                    pending, pending_run = None, 0
+                else:
+                    pending_run = pending_run + 1 if pending == j else 1
+                    pending = j
+                    if pending_run >= min_dwell:
+                        pending, pending_run = None, 0
+                    else:
+                        j = held
+                held = j
             labels[i] = states[j]
             conf[i] = float(np.exp(alpha[j] - _logsumexp(alpha)))
     return labels, conf

@@ -4,8 +4,10 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func writeTestConfig(t *testing.T, dir, content string) string {
@@ -323,7 +325,7 @@ func TestLoadConfigInvalidJSON(t *testing.T) {
 	}
 }
 
-func TestValidateConfigErrors(t *testing.T) {
+func TestConfigValidationErrors(t *testing.T) {
 	cases := []struct {
 		name    string
 		cfg     Config
@@ -433,7 +435,7 @@ func TestValidateConfigErrors(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := ValidateConfig(&tc.cfg)
+			err := validateConfig(&tc.cfg, false)
 			if err == nil {
 				t.Fatal("expected validation error")
 			}
@@ -444,7 +446,7 @@ func TestValidateConfigErrors(t *testing.T) {
 	}
 }
 
-func TestValidateConfigValidConfig(t *testing.T) {
+func TestConfigValidationValidConfig(t *testing.T) {
 	cfg := Config{
 		Strategies: []StrategyConfig{{
 			ID:             "test-spot",
@@ -459,12 +461,12 @@ func TestValidateConfigValidConfig(t *testing.T) {
 		},
 	}
 
-	if err := ValidateConfig(&cfg); err != nil {
+	if err := validateConfig(&cfg, false); err != nil {
 		t.Errorf("expected no error, got: %v", err)
 	}
 }
 
-func TestValidateConfigOpenCloseFields(t *testing.T) {
+func TestConfigValidationOpenCloseFields(t *testing.T) {
 	cfg := Config{
 		Strategies: []StrategyConfig{{
 			ID:             "test-spot",
@@ -479,14 +481,11 @@ func TestValidateConfigOpenCloseFields(t *testing.T) {
 		}},
 		PortfolioRisk: &PortfolioRiskConfig{MaxDrawdownPct: 25, WarnThresholdPct: 80},
 	}
-	if err := ValidateConfig(&cfg); err != nil {
+	if err := validateConfig(&cfg, false); err != nil {
 		t.Fatalf("expected valid open/close config, got: %v", err)
 	}
 }
 
-// #842: a legacy close_strategies array with >1 entry no longer composes via
-// max close_fraction — LoadConfig must reject it with the strategy id so the
-// operator collapses to a single profit-taking close.
 func TestLoadConfigRejectsMultipleCloseStrategies(t *testing.T) {
 	dir := t.TempDir()
 	cfgJSON := `{
@@ -513,7 +512,7 @@ func TestLoadConfigRejectsMultipleCloseStrategies(t *testing.T) {
 	}
 }
 
-func TestValidateConfigOpenCloseRejectsOptions(t *testing.T) {
+func TestConfigValidationOpenCloseRejectsOptions(t *testing.T) {
 	cfg := Config{
 		Strategies: []StrategyConfig{{
 			ID:             "test-options",
@@ -527,7 +526,7 @@ func TestValidateConfigOpenCloseRejectsOptions(t *testing.T) {
 		}},
 		PortfolioRisk: &PortfolioRiskConfig{MaxDrawdownPct: 25, WarnThresholdPct: 80},
 	}
-	err := ValidateConfig(&cfg)
+	err := validateConfig(&cfg, false)
 	if err == nil {
 		t.Fatal("expected options open/close validation error")
 	}
@@ -536,7 +535,7 @@ func TestValidateConfigOpenCloseRejectsOptions(t *testing.T) {
 	}
 }
 
-func TestValidateConfigCloseStrategyName(t *testing.T) {
+func TestConfigValidationCloseStrategyName(t *testing.T) {
 	cfg := Config{
 		Strategies: []StrategyConfig{{
 			ID:             "test-spot",
@@ -550,7 +549,7 @@ func TestValidateConfigCloseStrategyName(t *testing.T) {
 		}},
 		PortfolioRisk: &PortfolioRiskConfig{MaxDrawdownPct: 25, WarnThresholdPct: 80},
 	}
-	err := ValidateConfig(&cfg)
+	err := validateConfig(&cfg, false)
 	if err == nil {
 		t.Fatal("expected close strategy name validation error")
 	}
@@ -559,7 +558,7 @@ func TestValidateConfigCloseStrategyName(t *testing.T) {
 	}
 }
 
-func TestValidateConfigOpenCloseDefersRegistryLookupToCheckScript(t *testing.T) {
+func TestConfigValidationOpenCloseDefersRegistryLookupToCheckScript(t *testing.T) {
 	cfg := Config{
 		Strategies: []StrategyConfig{{
 			ID:             "test-spot",
@@ -574,23 +573,23 @@ func TestValidateConfigOpenCloseDefersRegistryLookupToCheckScript(t *testing.T) 
 		}},
 		PortfolioRisk: &PortfolioRiskConfig{MaxDrawdownPct: 25, WarnThresholdPct: 80},
 	}
-	if err := ValidateConfig(&cfg); err != nil {
+	if err := validateConfig(&cfg, false); err != nil {
 		t.Fatalf("syntactically valid strategy names should be accepted by config validation: %v", err)
 	}
 }
 
-func TestValidateConfigPortfolioRisk(t *testing.T) {
+func TestConfigValidationPortfolioRisk(t *testing.T) {
 	cfg := Config{
 		Strategies: []StrategyConfig{{
 			ID: "test", Type: "spot", Script: "check.py", Capital: 100, MaxDrawdownPct: 10,
 		}},
 		PortfolioRisk: &PortfolioRiskConfig{
-			MaxDrawdownPct:   0, // invalid
+			MaxDrawdownPct:   0,
 			WarnThresholdPct: 80,
 		},
 	}
 
-	err := ValidateConfig(&cfg)
+	err := validateConfig(&cfg, false)
 	if err == nil {
 		t.Fatal("expected error for invalid portfolio risk")
 	}
@@ -633,7 +632,7 @@ func TestParseLeaderboardPostTime(t *testing.T) {
 	}
 }
 
-func TestValidateConfigLeaderboardPostTime(t *testing.T) {
+func TestConfigValidationLeaderboardPostTime(t *testing.T) {
 	base := Config{
 		Strategies: []StrategyConfig{{
 			ID: "test", Type: "spot", Script: "shared_scripts/check_strategy.py",
@@ -643,24 +642,21 @@ func TestValidateConfigLeaderboardPostTime(t *testing.T) {
 		PortfolioRisk: &PortfolioRiskConfig{MaxDrawdownPct: 25, WarnThresholdPct: 80},
 	}
 
-	// Valid time should pass.
 	cfg := base
 	cfg.LeaderboardPostTime = "11:00"
-	if err := ValidateConfig(&cfg); err != nil {
+	if err := validateConfig(&cfg, false); err != nil {
 		t.Errorf("expected valid config with leaderboard_post_time=11:00, got: %v", err)
 	}
 
-	// Empty (disabled) should pass.
 	cfg2 := base
 	cfg2.LeaderboardPostTime = ""
-	if err := ValidateConfig(&cfg2); err != nil {
+	if err := validateConfig(&cfg2, false); err != nil {
 		t.Errorf("expected valid config with empty leaderboard_post_time, got: %v", err)
 	}
 
-	// Invalid format should fail.
 	cfg3 := base
 	cfg3.LeaderboardPostTime = "noon"
-	err := ValidateConfig(&cfg3)
+	err := validateConfig(&cfg3, false)
 	if err == nil {
 		t.Fatal("expected error for invalid leaderboard_post_time")
 	}
@@ -733,7 +729,21 @@ func TestEffectiveInitialCapital(t *testing.T) {
 	}
 }
 
-func TestValidateConfigInitialCapitalNegative(t *testing.T) {
+func TestEffectiveInitialCapital_SharedWalletPoolHasNoAllocationBaseline(t *testing.T) {
+	marginCap := 100.0
+	sc := StrategyConfig{
+		Platform: "hyperliquid", Type: "perps",
+		Args:                   []string{"sma", "BTC", "1h", "--mode=live"},
+		MarginPerTradeUSD:      &marginCap,
+		sharedWalletPoolBudget: true,
+	}
+	ss := &StrategyState{InitialCapital: 500}
+	if got := EffectiveInitialCapital(sc, ss); got != 0 {
+		t.Fatalf("pooled initial capital=%v, want 0 even with a legacy persisted baseline", got)
+	}
+}
+
+func TestConfigValidationInitialCapitalNegative(t *testing.T) {
 	cfg := &Config{
 		Strategies: []StrategyConfig{{
 			ID:             "test",
@@ -744,7 +754,7 @@ func TestValidateConfigInitialCapitalNegative(t *testing.T) {
 			MaxDrawdownPct: 10,
 		}},
 	}
-	err := ValidateConfig(cfg)
+	err := validateConfig(cfg, false)
 	if err == nil {
 		t.Fatal("expected error for negative initial_capital")
 	}
@@ -1010,101 +1020,21 @@ func TestLoadConfigMarginPerTradeUSDAccepted(t *testing.T) {
 	if got := EffectiveMarginPerTradeUSD(sc); got != 56 {
 		t.Errorf("EffectiveMarginPerTradeUSD = %g, want 56", got)
 	}
-	// The full sizing wrapper should reflect the margin formula.
 	if got := ComputePerpsOpenNotional(sc, 1000); got != 1120 {
 		t.Errorf("ComputePerpsOpenNotional(cash=1000) = %g, want 1120 (56 × 20)", got)
 	}
 }
 
-func TestLoadConfigMarginPerTradeUSDRejectsSpot(t *testing.T) {
-	dir := t.TempDir()
-	cfgJSON := `{
-		"strategies": [{
-			"id": "test-spot",
-			"type": "spot",
-			"script": "shared_scripts/check_strategy.py",
-			"args": ["sma_crossover", "BTC/USDT", "1h"],
-			"capital": 1000,
-			"margin_per_trade_usd": 100
-		}]
-	}`
-	path := writeTestConfig(t, dir, cfgJSON)
-	_, err := LoadConfig(path)
-	if err == nil {
-		t.Fatal("expected validation error for margin_per_trade_usd on spot strategy")
-	}
-	if !strings.Contains(err.Error(), "margin_per_trade_usd is only supported for perps") {
-		t.Errorf("error = %v, want 'margin_per_trade_usd is only supported for perps'", err)
-	}
-}
-
-func TestLoadConfigMarginPerTradeUSDRejectsNonPositive(t *testing.T) {
-	dir := t.TempDir()
-	cfgJSON := `{
-		"strategies": [{
-			"id": "hl-test-eth",
-			"type": "perps",
-			"platform": "hyperliquid",
-			"script": "shared_scripts/check_hyperliquid.py",
-			"args": ["sma_crossover", "ETH", "1h", "--mode=paper"],
-			"capital": 1000,
-			"leverage": 20,
-			"margin_per_trade_usd": 0
-		}]
-	}`
-	path := writeTestConfig(t, dir, cfgJSON)
-	_, err := LoadConfig(path)
-	if err == nil {
-		t.Fatal("expected validation error for margin_per_trade_usd=0")
-	}
-	if !strings.Contains(err.Error(), "margin_per_trade_usd must be positive") {
-		t.Errorf("error = %v, want 'margin_per_trade_usd must be positive'", err)
-	}
-}
-
-// #518: an omitted margin_per_trade_usd leaves the legacy sizing_leverage
-// formula in effect — the field is purely additive opt-in.
 func TestEffectiveMarginPerTradeUSDOmittedReturnsZero(t *testing.T) {
 	sc := StrategyConfig{Type: "perps", Leverage: 20, SizingLeverage: 1}
 	if got := EffectiveMarginPerTradeUSD(sc); got != 0 {
 		t.Errorf("EffectiveMarginPerTradeUSD(omitted) = %g, want 0", got)
 	}
-	// And ComputePerpsOpenNotional should still use the legacy formula.
 	if got := ComputePerpsOpenNotional(sc, 1000); got != 1000 {
 		t.Errorf("ComputePerpsOpenNotional with omitted margin_per_trade_usd = %g, want 1000 (cash × sizing_leverage)", got)
 	}
 }
 
-// #486: HL perps strategies default to isolated margin mode.
-func TestLoadConfigHLPerpsDefaultsToIsolatedMargin(t *testing.T) {
-	dir := t.TempDir()
-	cfgJSON := `{
-		"strategies": [{
-			"id": "hl-test-eth",
-			"type": "perps",
-			"platform": "hyperliquid",
-			"script": "shared_scripts/check_hyperliquid.py",
-			"args": ["sma_crossover", "ETH", "1h", "--mode=paper"],
-			"capital": 1000
-		}]
-	}`
-	path := writeTestConfig(t, dir, cfgJSON)
-	cfg, err := LoadConfig(path)
-	if err != nil {
-		t.Fatalf("LoadConfig failed: %v", err)
-	}
-	if cfg.Strategies[0].MarginMode != "isolated" {
-		t.Errorf("MarginMode = %q, want %q (default)", cfg.Strategies[0].MarginMode, "isolated")
-	}
-}
-
-// #494/#562/#605: a single HL perps strategy on a coin gets the top-level
-// default_stop_loss_atr_mult when no stop_loss_* / trailing_stop_* fields are
-// configured. EffectiveStopLossPct returns 0 at order-placement time because
-// the price-% can only be derived from the per-position EntryATR/AvgCost; the
-// arming step runs on the cycle after open. Setting an explicit stop_loss_pct
-// or stop_loss_margin_pct still falls through to the original auto-derive
-// path (max_drawdown_pct fallback) when those are also omitted.
 func TestLoadConfigHLPerpsSingleStrategyAutoDerivesStopLoss(t *testing.T) {
 	dir := t.TempDir()
 	cfgJSON := `{
@@ -1136,158 +1066,6 @@ func TestLoadConfigHLPerpsSingleStrategyAutoDerivesStopLoss(t *testing.T) {
 	}
 }
 
-// #691/#1121: type=manual HL strategies default to stop_loss_atr_mult=2.0 (wider
-// than the 1.0× HL perps default) when no stop fields are configured.
-func TestLoadConfigManualDefaultsStopLossATRMultTo2Point0(t *testing.T) {
-	dir := t.TempDir()
-	cfgJSON := `{
-		"strategies": [{
-			"id": "hl-manual-eth-live",
-			"type": "manual",
-			"platform": "hyperliquid",
-			"symbol": "ETH",
-			"timeframe": "1h",
-			"capital": 1000,
-			"leverage": 20,
-			"max_drawdown_pct": 20
-		}]
-	}`
-	path := writeTestConfig(t, dir, cfgJSON)
-	cfg, err := LoadConfig(path)
-	if err != nil {
-		t.Fatalf("LoadConfig failed: %v", err)
-	}
-	sc := cfg.Strategies[0]
-	if sc.StopLossATRMult == nil {
-		t.Fatal("StopLossATRMult = nil, want 2.0 default applied")
-	}
-	if got := *sc.StopLossATRMult; got != defaultManualStopLossATRMult {
-		t.Errorf("StopLossATRMult = %g, want %g", got, defaultManualStopLossATRMult)
-	}
-}
-
-// #691 / PR #692 review: default_stop_loss_atr_mult=0 opts manual strategies
-// out of the auto-default just like non-manual HL perps. Without this gate,
-// the operator-facing INFO message advertising =0 as the global switch would
-// be a half-truth for type=manual.
-func TestLoadConfigManualOptsOutWhenGlobalDefaultIsZero(t *testing.T) {
-	dir := t.TempDir()
-	cfgJSON := `{
-		"default_stop_loss_atr_mult": 0,
-		"strategies": [{
-			"id": "hl-manual-eth-live",
-			"type": "manual",
-			"platform": "hyperliquid",
-			"symbol": "ETH",
-			"timeframe": "1h",
-			"capital": 1000,
-			"leverage": 20,
-			"max_drawdown_pct": 20
-		}]
-	}`
-	path := writeTestConfig(t, dir, cfgJSON)
-	cfg, err := LoadConfig(path)
-	if err != nil {
-		t.Fatalf("LoadConfig failed: %v", err)
-	}
-	sc := cfg.Strategies[0]
-	if sc.StopLossATRMult != nil {
-		t.Errorf("StopLossATRMult = %v, want nil (default_stop_loss_atr_mult=0 is the global opt-out)", *sc.StopLossATRMult)
-	}
-}
-
-// #691: explicit stop_loss_atr_mult on a manual strategy is preserved
-// verbatim — the hardcoded default must not overwrite operator intent.
-func TestLoadConfigManualExplicitATRMultPreserved(t *testing.T) {
-	dir := t.TempDir()
-	cfgJSON := `{
-		"strategies": [{
-			"id": "hl-manual-eth-live",
-			"type": "manual",
-			"platform": "hyperliquid",
-			"symbol": "ETH",
-			"timeframe": "1h",
-			"capital": 1000,
-			"leverage": 20,
-			"max_drawdown_pct": 20,
-			"stop_loss_atr_mult": 2.5
-		}]
-	}`
-	path := writeTestConfig(t, dir, cfgJSON)
-	cfg, err := LoadConfig(path)
-	if err != nil {
-		t.Fatalf("LoadConfig failed: %v", err)
-	}
-	sc := cfg.Strategies[0]
-	if sc.StopLossATRMult == nil {
-		t.Fatal("StopLossATRMult = nil, want explicit 2.5 preserved")
-	}
-	if got := *sc.StopLossATRMult; got != 2.5 {
-		t.Errorf("StopLossATRMult = %g, want 2.5 (explicit value)", got)
-	}
-}
-
-// #696/#1135: user_defaults.manual.stop_loss_atr_mult overrides the hardcoded fallback.
-func TestLoadConfigManualDefaultsStopLossATRMultOverride(t *testing.T) {
-	dir := t.TempDir()
-	cfgJSON := `{
-		"user_defaults": {"manual": {"stop_loss_atr_mult": 2.25}},
-		"strategies": [{
-			"id": "hl-manual-eth-live",
-			"type": "manual",
-			"platform": "hyperliquid",
-			"symbol": "ETH",
-			"timeframe": "1h",
-			"capital": 1000,
-			"leverage": 20,
-			"max_drawdown_pct": 20
-		}]
-	}`
-	path := writeTestConfig(t, dir, cfgJSON)
-	cfg, err := LoadConfig(path)
-	if err != nil {
-		t.Fatalf("LoadConfig failed: %v", err)
-	}
-	sc := cfg.Strategies[0]
-	if sc.StopLossATRMult == nil {
-		t.Fatal("StopLossATRMult = nil, want 2.25 from user_defaults.manual")
-	}
-	if got := *sc.StopLossATRMult; got != 2.25 {
-		t.Errorf("StopLossATRMult = %g, want 2.25 (user_defaults.manual override)", got)
-	}
-}
-
-// #696/#1135: user_defaults.manual.stop_loss_atr_mult=0 opts manual strategies
-// out of the auto-default just like the fleet-wide default_stop_loss_atr_mult=0.
-// Lets operators disable the manual SL default without affecting non-manual perps.
-func TestLoadConfigManualDefaultsStopLossATRMultZeroOptsOut(t *testing.T) {
-	dir := t.TempDir()
-	cfgJSON := `{
-		"user_defaults": {"manual": {"stop_loss_atr_mult": 0}},
-		"strategies": [{
-			"id": "hl-manual-eth-live",
-			"type": "manual",
-			"platform": "hyperliquid",
-			"symbol": "ETH",
-			"timeframe": "1h",
-			"capital": 1000,
-			"leverage": 20,
-			"max_drawdown_pct": 20
-		}]
-	}`
-	path := writeTestConfig(t, dir, cfgJSON)
-	cfg, err := LoadConfig(path)
-	if err != nil {
-		t.Fatalf("LoadConfig failed: %v", err)
-	}
-	sc := cfg.Strategies[0]
-	if sc.StopLossATRMult != nil {
-		t.Errorf("StopLossATRMult = %v, want nil (user_defaults.manual.stop_loss_atr_mult=0 opts manual strategies out)", *sc.StopLossATRMult)
-	}
-}
-
-// #696/#1135: user_defaults.manual.tp_tiers overrides the hardcoded 2×/3× tier literal
-// for tiered_tp_atr* close strategies.
 func TestLoadConfigManualDefaultsTPTiersOverride(t *testing.T) {
 	dir := t.TempDir()
 	cfgJSON := `{
@@ -1345,12 +1123,8 @@ func TestLoadConfigManualDefaultsTPTiersOverride(t *testing.T) {
 	}
 }
 
-// #696/#1135: explicit `tiers` on a close-strategy ref wins over user_defaults.manual.tp_tiers
-// so per-strategy operator intent is preserved.
 func TestLoadConfigManualDefaultsTPTiersDoesNotOverrideExplicit(t *testing.T) {
 	dir := t.TempDir()
-	// config_version: 14 skips the v13 migration so the object-shaped
-	// close_strategies entry isn't dropped.
 	cfgJSON := `{
 		"config_version": 14,
 		"user_defaults": {
@@ -1388,8 +1162,6 @@ func TestLoadConfigManualDefaultsTPTiersDoesNotOverrideExplicit(t *testing.T) {
 	}
 }
 
-// #696/#1121: absent user_defaults.manual block uses the hardcoded 2.0× SL and
-// 1×/2× tier defaults.
 func TestLoadConfigManualDefaultsAbsentPreservesHardcodedDefaults(t *testing.T) {
 	dir := t.TempDir()
 	cfgJSON := `{
@@ -1427,7 +1199,6 @@ func TestLoadConfigManualDefaultsAbsentPreservesHardcodedDefaults(t *testing.T) 
 	}
 }
 
-// #696/#1135: user_defaults.manual validation rejects invalid values.
 func TestLoadConfigManualDefaultsValidation(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -1470,7 +1241,6 @@ func TestLoadConfigManualDefaultsValidation(t *testing.T) {
 	}
 }
 
-// #696: resolveManual* helpers fall back to hardcoded defaults when block absent.
 func TestConfigResolveManualHelpersFallback(t *testing.T) {
 	var cfg Config
 	if got := cfg.resolveManualMarginUSD(); got != defaultManualMarginUSD {
@@ -1491,7 +1261,6 @@ func TestConfigResolveManualHelpersFallback(t *testing.T) {
 	}
 }
 
-// #696/#1135: resolveManual* helpers honor populated user_defaults.manual block.
 func TestConfigResolveManualHelpersFromConfig(t *testing.T) {
 	margin := 125.0
 	slMult := 2.0
@@ -1542,558 +1311,7 @@ func TestConfigResolveManualRatchetFallbackIgnoresZeroScalarOptOut(t *testing.T)
 	}
 }
 
-// #486: explicit cross margin mode is preserved.
-func TestLoadConfigHLPerpsExplicitCross(t *testing.T) {
-	dir := t.TempDir()
-	cfgJSON := `{
-		"strategies": [{
-			"id": "hl-test-eth",
-			"type": "perps",
-			"platform": "hyperliquid",
-			"script": "shared_scripts/check_hyperliquid.py",
-			"args": ["sma_crossover", "ETH", "1h", "--mode=paper"],
-			"capital": 1000,
-			"margin_mode": "cross"
-		}]
-	}`
-	path := writeTestConfig(t, dir, cfgJSON)
-	cfg, err := LoadConfig(path)
-	if err != nil {
-		t.Fatalf("LoadConfig failed: %v", err)
-	}
-	if cfg.Strategies[0].MarginMode != "cross" {
-		t.Errorf("MarginMode = %q, want %q", cfg.Strategies[0].MarginMode, "cross")
-	}
-}
-
-// #486: invalid margin_mode rejected.
-func TestLoadConfigMarginModeRejectsInvalidValue(t *testing.T) {
-	dir := t.TempDir()
-	cfgJSON := `{
-		"strategies": [{
-			"id": "hl-test-eth",
-			"type": "perps",
-			"platform": "hyperliquid",
-			"script": "shared_scripts/check_hyperliquid.py",
-			"args": ["sma_crossover", "ETH", "1h", "--mode=paper"],
-			"capital": 1000,
-			"margin_mode": "portfolio"
-		}]
-	}`
-	path := writeTestConfig(t, dir, cfgJSON)
-	_, err := LoadConfig(path)
-	if err == nil {
-		t.Fatal("expected validation error for margin_mode=portfolio")
-	}
-	if !strings.Contains(err.Error(), "margin_mode must be") {
-		t.Errorf("error = %v, want 'margin_mode must be'", err)
-	}
-}
-
-// #486: margin_mode is HL-perps-only (rejected on spot).
-func TestLoadConfigMarginModeRejectsSpot(t *testing.T) {
-	dir := t.TempDir()
-	cfgJSON := `{
-		"strategies": [{
-			"id": "test-spot",
-			"type": "spot",
-			"script": "shared_scripts/check_strategy.py",
-			"args": ["sma_crossover", "BTC/USDT", "1h"],
-			"capital": 1000,
-			"margin_mode": "isolated"
-		}]
-	}`
-	path := writeTestConfig(t, dir, cfgJSON)
-	_, err := LoadConfig(path)
-	if err == nil {
-		t.Fatal("expected validation error for margin_mode on spot")
-	}
-	if !strings.Contains(err.Error(), "margin_mode is only supported for HL perps") {
-		t.Errorf("error = %v, want 'margin_mode is only supported for HL perps'", err)
-	}
-}
-
-// #491: two HL perps strategies on the same coin must agree on margin_mode
-// and leverage — HL aggregates positions per coin per account, so peers
-// share a single on-chain position. Matching peers load successfully.
-func TestLoadConfigHLPerpsPeersOnSameCoinMatching(t *testing.T) {
-	dir := t.TempDir()
-	// #494: omitted stop_loss_* on same-coin peers is normalized to opt-out so
-	// existing multi-strategy configs don't all become stop-loss owners.
-	cfgJSON := `{
-		"strategies": [
-			{
-				"id": "hl-eth-trend",
-				"type": "perps",
-				"platform": "hyperliquid",
-				"script": "shared_scripts/check_hyperliquid.py",
-				"args": ["sma_crossover", "ETH", "1h", "--mode=paper"],
-				"capital": 1000,
-				"leverage": 5,
-				"margin_mode": "isolated"
-			},
-			{
-				"id": "hl-eth-breakout",
-				"type": "perps",
-				"platform": "hyperliquid",
-				"script": "shared_scripts/check_hyperliquid.py",
-				"args": ["donchian_breakout", "ETH", "4h", "--mode=paper"],
-				"capital": 500,
-				"leverage": 5,
-				"margin_mode": "isolated"
-			}
-		]
-	}`
-	path := writeTestConfig(t, dir, cfgJSON)
-	cfg, err := LoadConfig(path)
-	if err != nil {
-		t.Fatalf("LoadConfig failed: %v", err)
-	}
-	if len(cfg.Strategies) != 2 {
-		t.Fatalf("expected 2 strategies, got %d", len(cfg.Strategies))
-	}
-	for _, sc := range cfg.Strategies {
-		if got := EffectiveStopLossPct(sc); got != 0 {
-			t.Errorf("%s EffectiveStopLossPct = %g, want 0 for omitted same-coin peer", sc.ID, got)
-		}
-	}
-}
-
-// #491: peers on the same coin with mismatched margin_mode are rejected.
-func TestLoadConfigHLPerpsPeersMismatchedMarginMode(t *testing.T) {
-	dir := t.TempDir()
-	cfgJSON := `{
-		"strategies": [
-			{
-				"id": "hl-eth-trend",
-				"type": "perps",
-				"platform": "hyperliquid",
-				"script": "shared_scripts/check_hyperliquid.py",
-				"args": ["sma_crossover", "ETH", "1h", "--mode=paper"],
-				"capital": 1000,
-				"leverage": 5,
-				"margin_mode": "isolated"
-			},
-			{
-				"id": "hl-eth-breakout",
-				"type": "perps",
-				"platform": "hyperliquid",
-				"script": "shared_scripts/check_hyperliquid.py",
-				"args": ["donchian_breakout", "ETH", "4h", "--mode=paper"],
-				"capital": 500,
-				"leverage": 5,
-				"margin_mode": "cross"
-			}
-		]
-	}`
-	path := writeTestConfig(t, dir, cfgJSON)
-	_, err := LoadConfig(path)
-	if err == nil {
-		t.Fatal("expected validation error for mismatched margin_mode on peers")
-	}
-	if !strings.Contains(err.Error(), "disagree on margin_mode") {
-		t.Errorf("error = %v, want 'disagree on margin_mode'", err)
-	}
-	if !strings.Contains(err.Error(), "ETH") {
-		t.Errorf("error = %v, want mention of coin ETH", err)
-	}
-}
-
-// #491: peers on the same coin with mismatched leverage are rejected.
-func TestLoadConfigHLPerpsPeersMismatchedLeverage(t *testing.T) {
-	dir := t.TempDir()
-	cfgJSON := `{
-		"strategies": [
-			{
-				"id": "hl-eth-trend",
-				"type": "perps",
-				"platform": "hyperliquid",
-				"script": "shared_scripts/check_hyperliquid.py",
-				"args": ["sma_crossover", "ETH", "1h", "--mode=paper"],
-				"capital": 1000,
-				"leverage": 5,
-				"margin_mode": "isolated"
-			},
-			{
-				"id": "hl-eth-breakout",
-				"type": "perps",
-				"platform": "hyperliquid",
-				"script": "shared_scripts/check_hyperliquid.py",
-				"args": ["donchian_breakout", "ETH", "4h", "--mode=paper"],
-				"capital": 500,
-				"leverage": 10,
-				"margin_mode": "isolated"
-			}
-		]
-	}`
-	path := writeTestConfig(t, dir, cfgJSON)
-	_, err := LoadConfig(path)
-	if err == nil {
-		t.Fatal("expected validation error for mismatched leverage on peers")
-	}
-	if !strings.Contains(err.Error(), "disagree on leverage") {
-		t.Errorf("error = %v, want 'disagree on leverage'", err)
-	}
-}
-
-// #601: multiple shared-coin peers may carry stop_loss_pct because protection
-// orders are now sized per strategy.
-func TestLoadConfigHLPerpsPeersMultipleStopLossAllowed(t *testing.T) {
-	dir := t.TempDir()
-	cfgJSON := `{
-		"strategies": [
-			{
-				"id": "hl-eth-trend",
-				"type": "perps",
-				"platform": "hyperliquid",
-				"script": "shared_scripts/check_hyperliquid.py",
-				"args": ["sma_crossover", "ETH", "1h", "--mode=paper"],
-				"capital": 1000,
-				"leverage": 5,
-				"margin_mode": "isolated",
-				"stop_loss_pct": 3.0
-			},
-			{
-				"id": "hl-eth-breakout",
-				"type": "perps",
-				"platform": "hyperliquid",
-				"script": "shared_scripts/check_hyperliquid.py",
-				"args": ["donchian_breakout", "ETH", "4h", "--mode=paper"],
-				"capital": 500,
-				"leverage": 5,
-				"margin_mode": "isolated",
-				"stop_loss_pct": 5.0
-			}
-		]
-	}`
-	path := writeTestConfig(t, dir, cfgJSON)
-	_, err := LoadConfig(path)
-	if err != nil {
-		t.Fatalf("LoadConfig failed: %v", err)
-	}
-}
-
-// #491: a single peer with stop_loss_pct is fine; the guard only fires when
-// two or more peers configure SLs that would race on the shared position.
-func TestLoadConfigHLPerpsPeersSingleStopLossAllowed(t *testing.T) {
-	dir := t.TempDir()
-	// #494: an omitted same-coin peer is normalized to opt-out, while the
-	// explicit positive stop_loss_pct remains the sole trigger owner.
-	cfgJSON := `{
-		"strategies": [
-			{
-				"id": "hl-eth-trend",
-				"type": "perps",
-				"platform": "hyperliquid",
-				"script": "shared_scripts/check_hyperliquid.py",
-				"args": ["sma_crossover", "ETH", "1h", "--mode=paper"],
-				"capital": 1000,
-				"leverage": 5,
-				"margin_mode": "isolated",
-				"stop_loss_pct": 3.0
-			},
-			{
-				"id": "hl-eth-breakout",
-				"type": "perps",
-				"platform": "hyperliquid",
-				"script": "shared_scripts/check_hyperliquid.py",
-				"args": ["donchian_breakout", "ETH", "4h", "--mode=paper"],
-				"capital": 500,
-				"leverage": 5,
-				"margin_mode": "isolated"
-			}
-		]
-	}`
-	path := writeTestConfig(t, dir, cfgJSON)
-	cfg, err := LoadConfig(path)
-	if err != nil {
-		t.Fatalf("LoadConfig failed: %v", err)
-	}
-	got := map[string]float64{}
-	for _, sc := range cfg.Strategies {
-		got[sc.ID] = EffectiveStopLossPct(sc)
-	}
-	if got["hl-eth-trend"] != 3 {
-		t.Errorf("explicit owner EffectiveStopLossPct = %g, want 3", got["hl-eth-trend"])
-	}
-	if got["hl-eth-breakout"] != 0 {
-		t.Errorf("omitted peer EffectiveStopLossPct = %g, want 0", got["hl-eth-breakout"])
-	}
-}
-
-// #491: peer-validation only applies within a single coin — strategies on
-// different coins don't constrain each other.
-func TestLoadConfigHLPerpsPeersDifferentCoinsIndependent(t *testing.T) {
-	dir := t.TempDir()
-	cfgJSON := `{
-		"strategies": [
-			{
-				"id": "hl-eth-trend",
-				"type": "perps",
-				"platform": "hyperliquid",
-				"script": "shared_scripts/check_hyperliquid.py",
-				"args": ["sma_crossover", "ETH", "1h", "--mode=paper"],
-				"capital": 1000,
-				"leverage": 5,
-				"margin_mode": "isolated"
-			},
-			{
-				"id": "hl-btc-trend",
-				"type": "perps",
-				"platform": "hyperliquid",
-				"script": "shared_scripts/check_hyperliquid.py",
-				"args": ["sma_crossover", "BTC", "1h", "--mode=paper"],
-				"capital": 1000,
-				"leverage": 10,
-				"margin_mode": "cross"
-			}
-		]
-	}`
-	path := writeTestConfig(t, dir, cfgJSON)
-	if _, err := LoadConfig(path); err != nil {
-		t.Fatalf("LoadConfig failed: %v", err)
-	}
-}
-
-// #491/#494: peers that disable SL via explicit stop_loss_pct:0 must not trip
-// the conflict guard. Explicit zero remains an opt-out even though omitted
-// same-coin peers are also normalized to opt-out.
-func TestLoadConfigHLPerpsPeersNoStopLossAllowed(t *testing.T) {
-	dir := t.TempDir()
-	cfgJSON := `{
-		"strategies": [
-			{
-				"id": "hl-eth-trend",
-				"type": "perps",
-				"platform": "hyperliquid",
-				"script": "shared_scripts/check_hyperliquid.py",
-				"args": ["sma_crossover", "ETH", "1h", "--mode=paper"],
-				"capital": 1000,
-				"leverage": 5,
-				"margin_mode": "isolated",
-				"stop_loss_pct": 0
-			},
-			{
-				"id": "hl-eth-breakout",
-				"type": "perps",
-				"platform": "hyperliquid",
-				"script": "shared_scripts/check_hyperliquid.py",
-				"args": ["donchian_breakout", "ETH", "4h", "--mode=paper"],
-				"capital": 500,
-				"leverage": 5,
-				"margin_mode": "isolated",
-				"stop_loss_pct": 0
-			}
-		]
-	}`
-	path := writeTestConfig(t, dir, cfgJSON)
-	if _, err := LoadConfig(path); err != nil {
-		t.Fatalf("LoadConfig failed for two peers with stop_loss_pct:0: %v", err)
-	}
-}
-
-// #491: margin_mode defaulting (empty -> "isolated") happens at LoadConfig
-// time, so peer comparison must see normalized values. A peer with
-// margin_mode:"" should match a peer with margin_mode:"isolated".
-func TestLoadConfigHLPerpsPeersDefaultedMarginModeMatches(t *testing.T) {
-	dir := t.TempDir()
-	cfgJSON := `{
-		"strategies": [
-			{
-				"id": "hl-eth-trend",
-				"type": "perps",
-				"platform": "hyperliquid",
-				"script": "shared_scripts/check_hyperliquid.py",
-				"args": ["sma_crossover", "ETH", "1h", "--mode=paper"],
-				"capital": 1000,
-				"leverage": 5
-			},
-			{
-				"id": "hl-eth-breakout",
-				"type": "perps",
-				"platform": "hyperliquid",
-				"script": "shared_scripts/check_hyperliquid.py",
-				"args": ["donchian_breakout", "ETH", "4h", "--mode=paper"],
-				"capital": 500,
-				"leverage": 5,
-				"margin_mode": "isolated"
-			}
-		]
-	}`
-	path := writeTestConfig(t, dir, cfgJSON)
-	cfg, err := LoadConfig(path)
-	if err != nil {
-		t.Fatalf("LoadConfig failed for defaulted vs explicit margin_mode peers: %v", err)
-	}
-	for _, sc := range cfg.Strategies {
-		if sc.MarginMode != "isolated" {
-			t.Errorf("strategy %s margin_mode = %q, want %q", sc.ID, sc.MarginMode, "isolated")
-		}
-	}
-}
-
-// #494: two peers that both omit stop_loss_* on the same coin are normalized
-// to explicit opt-out so old multi-strategy configs keep loading after v9.
-func TestLoadConfigHLPerpsPeersOmittedStopLossDoesNotConflict(t *testing.T) {
-	dir := t.TempDir()
-	cfgJSON := `{
-		"strategies": [
-			{
-				"id": "hl-eth-trend",
-				"type": "perps",
-				"platform": "hyperliquid",
-				"script": "shared_scripts/check_hyperliquid.py",
-				"args": ["sma_crossover", "ETH", "1h", "--mode=paper"],
-				"capital": 1000,
-				"leverage": 5,
-				"margin_mode": "isolated"
-			},
-			{
-				"id": "hl-eth-breakout",
-				"type": "perps",
-				"platform": "hyperliquid",
-				"script": "shared_scripts/check_hyperliquid.py",
-				"args": ["donchian_breakout", "ETH", "4h", "--mode=paper"],
-				"capital": 500,
-				"leverage": 5,
-				"margin_mode": "isolated"
-			}
-		]
-	}`
-	path := writeTestConfig(t, dir, cfgJSON)
-	cfg, err := LoadConfig(path)
-	if err != nil {
-		t.Fatalf("LoadConfig failed for omitted same-coin stop_loss_* peers: %v", err)
-	}
-	for _, sc := range cfg.Strategies {
-		if got := EffectiveStopLossPct(sc); got != 0 {
-			t.Errorf("%s EffectiveStopLossPct = %g, want 0", sc.ID, got)
-		}
-	}
-}
-
-func TestValidateConfigDMChannelsInvalidKey(t *testing.T) {
-	dir := t.TempDir()
-	cfgJSON := `{
-		"strategies": [{
-			"id": "t-spot",
-			"type": "spot",
-			"script": "shared_scripts/check_strategy.py",
-			"args": ["sma_crossover", "BTC/USDT", "1h"],
-			"capital": 1000,
-			"max_drawdown_pct": 60
-		}],
-		"discord": {
-			"enabled": false,
-			"channels": {},
-			"dm_channels": { "hyperliquid-paper-extra": "123456789" }
-		}
-	}`
-	path := writeTestConfig(t, dir, cfgJSON)
-	_, err := LoadConfig(path)
-	if err == nil {
-		t.Fatal("expected validation error for invalid dm_channels key")
-	}
-	if !strings.Contains(err.Error(), "dm_channels key") {
-		t.Errorf("error = %v, want mention of dm_channels key", err)
-	}
-}
-
-func TestValidateConfigDMChannelsEmptyValue(t *testing.T) {
-	dir := t.TempDir()
-	cfgJSON := `{
-		"strategies": [{
-			"id": "t-spot",
-			"type": "spot",
-			"script": "shared_scripts/check_strategy.py",
-			"args": ["sma_crossover", "BTC/USDT", "1h"],
-			"capital": 1000,
-			"max_drawdown_pct": 60
-		}],
-		"discord": {
-			"enabled": false,
-			"channels": {},
-			"dm_channels": { "hyperliquid-paper": "" }
-		}
-	}`
-	path := writeTestConfig(t, dir, cfgJSON)
-	_, err := LoadConfig(path)
-	if err == nil {
-		t.Fatal("expected validation error for empty dm_channels value")
-	}
-	if !strings.Contains(err.Error(), "dm_channels[\"hyperliquid-paper\"]") {
-		t.Errorf("error = %v", err)
-	}
-}
-
-func TestValidateConfigDMChannelsValidKeys(t *testing.T) {
-	dir := t.TempDir()
-	cfgJSON := `{
-		"strategies": [{
-			"id": "hl-test",
-			"type": "perps",
-			"platform": "hyperliquid",
-			"script": "shared_scripts/check_hyperliquid.py",
-			"args": ["sma_crossover", "BTC", "1h", "--mode=paper"],
-			"capital": 1000,
-			"max_drawdown_pct": 50
-		}],
-		"discord": {
-			"enabled": false,
-			"channels": {},
-			"dm_channels": {
-				"hyperliquid": "111",
-				"hyperliquid-paper": "222",
-				"deribit": "333"
-			}
-		},
-		"telegram": {
-			"enabled": false,
-			"channels": {},
-			"dm_channels": { "okx-paper": "444" }
-		}
-	}`
-	path := writeTestConfig(t, dir, cfgJSON)
-	loaded, err := LoadConfig(path)
-	if err != nil {
-		t.Fatalf("LoadConfig: %v", err)
-	}
-	if loaded.Discord.DMChannels["hyperliquid"] != "111" || loaded.Discord.DMChannels["hyperliquid-paper"] != "222" {
-		t.Errorf("discord dm_channels mismatch: %#v", loaded.Discord.DMChannels)
-	}
-	if loaded.Telegram.DMChannels["okx-paper"] != "444" {
-		t.Errorf("telegram dm_channels mismatch: %#v", loaded.Telegram.DMChannels)
-	}
-}
-
-func TestValidateConfigDMChannelsOrphanSuffix(t *testing.T) {
-	dir := t.TempDir()
-	cfgJSON := `{
-		"strategies": [{
-			"id": "t-spot",
-			"type": "spot",
-			"script": "shared_scripts/check_strategy.py",
-			"args": ["sma_crossover", "BTC/USDT", "1h"],
-			"capital": 1000,
-			"max_drawdown_pct": 60
-		}],
-		"discord": {
-			"enabled": false,
-			"channels": {},
-			"dm_channels": { "-paper": "123" }
-		}
-	}`
-	path := writeTestConfig(t, dir, cfgJSON)
-	_, err := LoadConfig(path)
-	if err == nil {
-		t.Fatal("expected validation error for orphan -paper key")
-	}
-	if !strings.Contains(err.Error(), "platform prefix is empty") {
-		t.Errorf("error = %v, want mention of empty platform prefix", err)
-	}
-}
-
-func TestValidateConfigLeaderboardSummariesInvalid(t *testing.T) {
+func TestConfigValidationLeaderboardSummariesInvalid(t *testing.T) {
 	tests := []struct {
 		name string
 		lc   LeaderboardSummaryConfig
@@ -2112,7 +1330,7 @@ func TestValidateConfigLeaderboardSummariesInvalid(t *testing.T) {
 				Strategies:           []StrategyConfig{{ID: "s1", Type: "spot", Platform: "binanceus", Capital: 100, MaxDrawdownPct: 10, Script: "x.py"}},
 				LeaderboardSummaries: []LeaderboardSummaryConfig{tt.lc},
 			}
-			err := ValidateConfig(cfg)
+			err := validateConfig(cfg, false)
 			if err == nil {
 				t.Fatalf("expected error for %s, got nil", tt.name)
 			}
@@ -2123,11 +1341,7 @@ func TestValidateConfigLeaderboardSummariesInvalid(t *testing.T) {
 	}
 }
 
-// TestValidateConfigLeaderboardSummariesDuplicateKey covers review item 4 on
-// #309: two entries with identical platform/ticker/channel share a single
-// LastLeaderboardSummaries timestamp, so whichever posts first silently blocks
-// the other. Detect the collision at config load instead.
-func TestValidateConfigLeaderboardSummariesDuplicateKey(t *testing.T) {
+func TestConfigValidationLeaderboardSummariesDuplicateKey(t *testing.T) {
 	cfg := &Config{
 		IntervalSeconds: 60,
 		Strategies: []StrategyConfig{
@@ -2135,11 +1349,10 @@ func TestValidateConfigLeaderboardSummariesDuplicateKey(t *testing.T) {
 		},
 		LeaderboardSummaries: []LeaderboardSummaryConfig{
 			{Platform: "hyperliquid", Ticker: "ETH", Channel: "chan-1", Frequency: "6h"},
-			// Case-insensitive collision — Key() normalizes to lowercase.
 			{Platform: "Hyperliquid", Ticker: "eth", Channel: "chan-1", Frequency: "12h"},
 		},
 	}
-	err := ValidateConfig(cfg)
+	err := validateConfig(cfg, false)
 	if err == nil {
 		t.Fatal("expected duplicate-key validation error, got nil")
 	}
@@ -2151,26 +1364,23 @@ func TestValidateConfigLeaderboardSummariesDuplicateKey(t *testing.T) {
 	}
 }
 
-// TestValidateConfigLeaderboardSummariesDistinctTickersSameChannel confirms we
-// don't flag legitimate configurations where the same channel hosts multiple
-// leaderboards scoped by distinct tickers.
-func TestValidateConfigLeaderboardSummariesDistinctTickersSameChannel(t *testing.T) {
+func TestConfigValidationLeaderboardSummariesDistinctTickersSameChannel(t *testing.T) {
 	cfg := &Config{
 		IntervalSeconds: 60,
 		Strategies: []StrategyConfig{
 			{ID: "s1", Type: "spot", Platform: "binanceus", Capital: 100, MaxDrawdownPct: 10, Script: "x.py"},
 		},
 		LeaderboardSummaries: []LeaderboardSummaryConfig{
-			{Platform: "hyperliquid", Channel: "hl-ch", Frequency: "6h"},                 // unfiltered
-			{Platform: "hyperliquid", Ticker: "ETH", Channel: "hl-ch", Frequency: "12h"}, // ticker-scoped
+			{Platform: "hyperliquid", Channel: "hl-ch", Frequency: "6h"},
+			{Platform: "hyperliquid", Ticker: "ETH", Channel: "hl-ch", Frequency: "12h"},
 		},
 	}
-	if err := ValidateConfig(cfg); err != nil {
+	if err := validateConfig(cfg, false); err != nil {
 		t.Errorf("expected distinct-ticker same-channel config to validate, got: %v", err)
 	}
 }
 
-func TestValidateConfigLeaderboardSummariesValid(t *testing.T) {
+func TestConfigValidationLeaderboardSummariesValid(t *testing.T) {
 	cfg := &Config{
 		IntervalSeconds: 60,
 		Strategies: []StrategyConfig{
@@ -2179,10 +1389,10 @@ func TestValidateConfigLeaderboardSummariesValid(t *testing.T) {
 		LeaderboardSummaries: []LeaderboardSummaryConfig{
 			{Platform: "hyperliquid", TopN: 10, Channel: "chan-1", Frequency: "6h"},
 			{Platform: "hyperliquid", Ticker: "eth", TopN: 5, Channel: "chan-2", Frequency: "12h"},
-			{Platform: "binanceus", TopN: 5, Channel: "chan-3"}, // no freq = on-demand only
+			{Platform: "binanceus", TopN: 5, Channel: "chan-3"},
 		},
 	}
-	if err := ValidateConfig(cfg); err != nil {
+	if err := validateConfig(cfg, false); err != nil {
 		t.Errorf("expected valid config, got: %v", err)
 	}
 }
@@ -2220,9 +1430,6 @@ func TestLoadConfigLeaderboardSummaries(t *testing.T) {
 	}
 }
 
-// TestStrategyIntervalExceedsGlobalWarning covers #409: per-strategy
-// interval_seconds greater than the top-level interval should emit a warning
-// describing the "every Nth portfolio cycle" cadence.
 func TestStrategyIntervalExceedsGlobalWarning(t *testing.T) {
 	cases := []struct {
 		name           string
@@ -2310,7 +1517,6 @@ func TestStrategyIntervalExceedsGlobalWarning(t *testing.T) {
 	}
 }
 
-// TestOrdinal spot-checks the ordinal suffix helper used by the #409 warning.
 func TestOrdinal(t *testing.T) {
 	cases := map[int]string{
 		1:   "1st",
@@ -2335,10 +1541,7 @@ func TestOrdinal(t *testing.T) {
 	}
 }
 
-// TestValidateConfigManualSymbolSharingAllowed covers issue #619: manual
-// strategies may share a coin with manual or automated perps peers because
-// close paths now use the same sized-close sole-peer guard as perps.
-func TestValidateConfigManualSymbolSharingAllowed(t *testing.T) {
+func TestConfigValidationManualSymbolSharingAllowed(t *testing.T) {
 	cases := []struct {
 		name  string
 		other StrategyConfig
@@ -2402,7 +1605,7 @@ func TestValidateConfigManualSymbolSharingAllowed(t *testing.T) {
 				},
 				PortfolioRisk: &PortfolioRiskConfig{MaxDrawdownPct: 25, WarnThresholdPct: 80},
 			}
-			err := ValidateConfig(&cfg)
+			err := validateConfig(&cfg, false)
 			if err != nil {
 				t.Fatalf("expected no error, got: %v", err)
 			}
@@ -2410,77 +1613,7 @@ func TestValidateConfigManualSymbolSharingAllowed(t *testing.T) {
 	}
 }
 
-func TestValidateConfigManualPerpsPeerLeverageMismatchRejected(t *testing.T) {
-	cfg := Config{
-		Strategies: []StrategyConfig{
-			{
-				ID:             "hl-manual-eth",
-				Type:           "manual",
-				Platform:       "hyperliquid",
-				Symbol:         "ETH",
-				Timeframe:      "1h",
-				Leverage:       10,
-				Capital:        1000,
-				MaxDrawdownPct: 60,
-			},
-			{
-				ID:             "hl-perps-eth-live",
-				Type:           "perps",
-				Platform:       "hyperliquid",
-				Script:         "shared_scripts/check_hyperliquid.py",
-				Args:           []string{"sma_crossover", "ETH", "1h", "--mode=paper"},
-				Capital:        1000,
-				Leverage:       5,
-				MaxDrawdownPct: 60,
-			},
-		},
-		PortfolioRisk: &PortfolioRiskConfig{MaxDrawdownPct: 25, WarnThresholdPct: 80},
-	}
-	err := ValidateConfig(&cfg)
-	if err == nil || !strings.Contains(err.Error(), "disagree on leverage") {
-		t.Fatalf("expected leverage peer error, got: %v", err)
-	}
-}
-
-// TestValidateConfigManualPerpsPeerMarginModeMismatchRejected covers the
-// type-set widening in hyperliquidPeerStrategyErrors (#619/#620): manual peers
-// must share margin_mode with co-resident perps peers because HL aggregates
-// per coin per account.
-func TestValidateConfigManualPerpsPeerMarginModeMismatchRejected(t *testing.T) {
-	cfg := Config{
-		Strategies: []StrategyConfig{
-			{
-				ID:             "hl-manual-eth",
-				Type:           "manual",
-				Platform:       "hyperliquid",
-				Symbol:         "ETH",
-				Timeframe:      "1h",
-				Leverage:       5,
-				MarginMode:     "isolated",
-				Capital:        1000,
-				MaxDrawdownPct: 60,
-			},
-			{
-				ID:             "hl-perps-eth-live",
-				Type:           "perps",
-				Platform:       "hyperliquid",
-				Script:         "shared_scripts/check_hyperliquid.py",
-				Args:           []string{"sma_crossover", "ETH", "1h", "--mode=paper"},
-				Capital:        1000,
-				Leverage:       5,
-				MarginMode:     "cross",
-				MaxDrawdownPct: 60,
-			},
-		},
-		PortfolioRisk: &PortfolioRiskConfig{MaxDrawdownPct: 25, WarnThresholdPct: 80},
-	}
-	err := ValidateConfig(&cfg)
-	if err == nil || !strings.Contains(err.Error(), "disagree on margin_mode") {
-		t.Fatalf("expected margin_mode peer error, got: %v", err)
-	}
-}
-
-func TestValidateConfigManualPerpsMultipleTrailingStopOwnersAllowed(t *testing.T) {
+func TestConfigValidationManualPerpsMultipleTrailingStopOwnersAllowed(t *testing.T) {
 	manualTrailing := 1.5
 	perpsTrailingPct := 0.02
 	cfg := Config{
@@ -2511,13 +1644,13 @@ func TestValidateConfigManualPerpsMultipleTrailingStopOwnersAllowed(t *testing.T
 		},
 		PortfolioRisk: &PortfolioRiskConfig{MaxDrawdownPct: 25, WarnThresholdPct: 80},
 	}
-	err := ValidateConfig(&cfg)
+	err := validateConfig(&cfg, false)
 	if err != nil {
 		t.Fatalf("expected manual+perps trailing peers to validate, got: %v", err)
 	}
 }
 
-func TestValidateConfigMultipleTrailingRatchetRegimeOwnersAllowed(t *testing.T) {
+func TestConfigValidationMultipleTrailingRatchetRegimeOwnersAllowed(t *testing.T) {
 	regimeTrail := func() *RegimeATRBlock {
 		return &RegimeATRBlock{raw: map[string]interface{}{
 			"trend_regime": map[string]interface{}{
@@ -2531,43 +1664,38 @@ func TestValidateConfigMultipleTrailingRatchetRegimeOwnersAllowed(t *testing.T) 
 		Regime: &RegimeConfig{Enabled: true, Period: 14, ADXThreshold: 20},
 		Strategies: []StrategyConfig{
 			{
-				ID:                    "hl-ratchet-a",
-				Type:                  "perps",
-				Platform:              "hyperliquid",
-				Script:                "shared_scripts/check_hyperliquid.py",
-				Args:                  []string{"tema", "ETH", "1h", "--mode=paper"},
-				Capital:               1000,
-				Leverage:              5,
-				MaxDrawdownPct:        60,
-				TrailingStopATRRegime: regimeTrail(),
-				CloseStrategy:         &StrategyRef{Name: "trailing_tp_ratchet_regime", Params: map[string]interface{}{"use_defaults": true}},
+				ID:                        "hl-ratchet-a",
+				Type:                      "perps",
+				Platform:                  "hyperliquid",
+				Script:                    "shared_scripts/check_hyperliquid.py",
+				Args:                      []string{"tema", "ETH", "1h", "--mode=paper"},
+				Capital:                   1000,
+				Leverage:                  5,
+				MaxDrawdownPct:            60,
+				TrailingStopATRMultRegime: regimeTrail(),
+				CloseStrategy:             &StrategyRef{Name: "trailing_tp_ratchet_regime", Params: map[string]interface{}{"use_defaults": true}},
 			},
 			{
-				ID:                    "hl-ratchet-b",
-				Type:                  "perps",
-				Platform:              "hyperliquid",
-				Script:                "shared_scripts/check_hyperliquid.py",
-				Args:                  []string{"rmc", "ETH", "1h", "--mode=paper"},
-				Capital:               1000,
-				Leverage:              5,
-				MaxDrawdownPct:        60,
-				TrailingStopATRRegime: regimeTrail(),
-				CloseStrategy:         &StrategyRef{Name: "trailing_tp_ratchet_regime", Params: map[string]interface{}{"use_defaults": true}},
+				ID:                        "hl-ratchet-b",
+				Type:                      "perps",
+				Platform:                  "hyperliquid",
+				Script:                    "shared_scripts/check_hyperliquid.py",
+				Args:                      []string{"rmc", "ETH", "1h", "--mode=paper"},
+				Capital:                   1000,
+				Leverage:                  5,
+				MaxDrawdownPct:            60,
+				TrailingStopATRMultRegime: regimeTrail(),
+				CloseStrategy:             &StrategyRef{Name: "trailing_tp_ratchet_regime", Params: map[string]interface{}{"use_defaults": true}},
 			},
 		},
 		PortfolioRisk: &PortfolioRiskConfig{MaxDrawdownPct: 25, WarnThresholdPct: 80},
 	}
-	if err := ValidateConfig(&cfg); err != nil {
+	if err := validateConfig(&cfg, false); err != nil {
 		t.Fatalf("expected multiple trailing_tp_ratchet_regime owners to validate, got: %v", err)
 	}
 }
 
-// TestValidateConfigInvertSignal covers #775: invert_signal must be accepted
-// on HL perps/manual regardless of direction (long/short/both compose with
-// invert at different signal layers — invert runs in the Go executor before
-// direction interprets the sign), but must still be rejected on platforms or
-// strategy types where the Go layer never sees a numeric +1/-1 signal to flip.
-func TestValidateConfigInvertSignal(t *testing.T) {
+func TestConfigValidationInvertSignal(t *testing.T) {
 	hlPerps := func(direction string, invert bool) StrategyConfig {
 		return StrategyConfig{
 			ID:             "hl-test-eth",
@@ -2602,7 +1730,7 @@ func TestValidateConfigInvertSignal(t *testing.T) {
 			Strategies:    []StrategyConfig{hlPerps(DirectionShort, true)},
 			PortfolioRisk: &PortfolioRiskConfig{MaxDrawdownPct: 25, WarnThresholdPct: 80},
 		}
-		if err := ValidateConfig(&cfg); err != nil {
+		if err := validateConfig(&cfg, false); err != nil {
 			t.Fatalf("expected no error, got: %v", err)
 		}
 	})
@@ -2612,7 +1740,7 @@ func TestValidateConfigInvertSignal(t *testing.T) {
 			Strategies:    []StrategyConfig{hlPerps(DirectionLong, true)},
 			PortfolioRisk: &PortfolioRiskConfig{MaxDrawdownPct: 25, WarnThresholdPct: 80},
 		}
-		if err := ValidateConfig(&cfg); err != nil {
+		if err := validateConfig(&cfg, false); err != nil {
 			t.Fatalf("expected no error, got: %v", err)
 		}
 	})
@@ -2622,7 +1750,7 @@ func TestValidateConfigInvertSignal(t *testing.T) {
 			Strategies:    []StrategyConfig{hlPerps(DirectionBoth, true)},
 			PortfolioRisk: &PortfolioRiskConfig{MaxDrawdownPct: 25, WarnThresholdPct: 80},
 		}
-		if err := ValidateConfig(&cfg); err != nil {
+		if err := validateConfig(&cfg, false); err != nil {
 			t.Fatalf("expected no error, got: %v", err)
 		}
 	})
@@ -2632,7 +1760,7 @@ func TestValidateConfigInvertSignal(t *testing.T) {
 			Strategies:    []StrategyConfig{hlManual(DirectionShort, true)},
 			PortfolioRisk: &PortfolioRiskConfig{MaxDrawdownPct: 25, WarnThresholdPct: 80},
 		}
-		if err := ValidateConfig(&cfg); err != nil {
+		if err := validateConfig(&cfg, false); err != nil {
 			t.Fatalf("expected no error, got: %v", err)
 		}
 	})
@@ -2650,7 +1778,7 @@ func TestValidateConfigInvertSignal(t *testing.T) {
 			}},
 			PortfolioRisk: &PortfolioRiskConfig{MaxDrawdownPct: 25, WarnThresholdPct: 80},
 		}
-		err := ValidateConfig(&cfg)
+		err := validateConfig(&cfg, false)
 		if err == nil || !strings.Contains(err.Error(), "invert_signal is only supported for HL perps/manual") {
 			t.Fatalf("expected HL-perps/manual-only error, got: %v", err)
 		}
@@ -2671,15 +1799,14 @@ func TestValidateConfigInvertSignal(t *testing.T) {
 			}},
 			PortfolioRisk: &PortfolioRiskConfig{MaxDrawdownPct: 25, WarnThresholdPct: 80},
 		}
-		err := ValidateConfig(&cfg)
+		err := validateConfig(&cfg, false)
 		if err == nil || !strings.Contains(err.Error(), "invert_signal is only supported for HL perps/manual") {
 			t.Fatalf("expected HL-perps/manual-only error, got: %v", err)
 		}
 	})
 }
 
-// #787: normal startup still requires live credentials in the environment.
-func TestValidateConfigHLLiveRequiresSecretKey(t *testing.T) {
+func TestConfigValidationHLLiveRequiresSecretKey(t *testing.T) {
 	t.Setenv("HYPERLIQUID_SECRET_KEY", "")
 	cfg := Config{
 		Strategies: []StrategyConfig{{
@@ -2692,14 +1819,12 @@ func TestValidateConfigHLLiveRequiresSecretKey(t *testing.T) {
 			MaxDrawdownPct: 60,
 		}},
 	}
-	err := ValidateConfig(&cfg)
+	err := validateConfig(&cfg, false)
 	if err == nil || !strings.Contains(err.Error(), "HYPERLIQUID_SECRET_KEY") {
 		t.Fatalf("expected live secret error, got: %v", err)
 	}
 }
 
-// #787: probe/update.sh loads config without shell secrets when the running
-// process has them via systemd EnvironmentFile, etc.
 func TestLoadConfigForProbeSkipsLiveCredentialChecks(t *testing.T) {
 	t.Setenv("HYPERLIQUID_SECRET_KEY", "")
 	t.Setenv("HYPERLIQUID_ACCOUNT_ADDRESS", "")
@@ -2746,8 +1871,6 @@ func TestLoadConfigForProbeSkipsLiveCredentialChecks(t *testing.T) {
 	}
 }
 
-// #1048: CircuitBreakerEnabled defaults to true (safe default) for nil receiver
-// and nil field; explicit true/false are honored.
 func TestCircuitBreakerEnabled_DefaultsToTrue(t *testing.T) {
 	var nilSC *StrategyConfig
 	if !nilSC.CircuitBreakerEnabled() {
@@ -2769,12 +1892,120 @@ func TestCircuitBreakerEnabled_DefaultsToTrue(t *testing.T) {
 	}
 }
 
+func TestCircuitBreakerOverrideAccessors(t *testing.T) {
+	for name, sc := range map[string]*StrategyConfig{"nil receiver": nil, "nil fields": {}} {
+		if got := sc.CircuitBreakerDrawdownCooldown(); got != 24*time.Hour {
+			t.Errorf("%s: drawdown cooldown = %v, want 24h", name, got)
+		}
+		if got := sc.CircuitBreakerLossStreakThreshold(); got != 5 {
+			t.Errorf("%s: loss-streak threshold = %d, want 5", name, got)
+		}
+		if got := sc.CircuitBreakerLossStreakCooldown(); got != time.Hour {
+			t.Errorf("%s: loss-streak cooldown = %v, want 1h", name, got)
+		}
+	}
+	dd, th, lc := 720, 3, 30
+	sc := &StrategyConfig{CBDrawdownCooldownMinutes: &dd, CBLossStreakThreshold: &th, CBLossStreakCooldownMinutes: &lc}
+	if got := sc.CircuitBreakerDrawdownCooldown(); got != 12*time.Hour {
+		t.Errorf("override drawdown cooldown = %v, want 12h", got)
+	}
+	if got := sc.CircuitBreakerLossStreakThreshold(); got != 3 {
+		t.Errorf("override loss-streak threshold = %d, want 3", got)
+	}
+	if got := sc.CircuitBreakerLossStreakCooldown(); got != 30*time.Minute {
+		t.Errorf("override loss-streak cooldown = %v, want 30m", got)
+	}
+}
+
+func TestConfigValidationCBOverrides(t *testing.T) {
+	intp := func(v int) *int { return &v }
+	mk := func(mut func(*StrategyConfig)) Config {
+		sc := StrategyConfig{
+			ID: "test-spot", Type: "spot", Platform: "binanceus",
+			Script:  "shared_scripts/check_strategy.py",
+			Args:    []string{"sma_crossover", "BTC/USDT", "1h"},
+			Capital: 1000, MaxDrawdownPct: 60,
+		}
+		mut(&sc)
+		return Config{
+			Strategies:    []StrategyConfig{sc},
+			PortfolioRisk: &PortfolioRiskConfig{MaxDrawdownPct: 25, WarnThresholdPct: 80},
+		}
+	}
+
+	valid := mk(func(sc *StrategyConfig) {
+		sc.CBDrawdownCooldownMinutes = intp(720)
+		sc.CBLossStreakThreshold = intp(3)
+		sc.CBLossStreakCooldownMinutes = intp(30)
+	})
+	if err := validateConfig(&valid, false); err != nil {
+		t.Fatalf("in-bounds cb_* overrides should validate: %v", err)
+	}
+	boundary := mk(func(sc *StrategyConfig) {
+		sc.CBDrawdownCooldownMinutes = intp(30 * 24 * 60)
+		sc.CBLossStreakThreshold = intp(100)
+		sc.CBLossStreakCooldownMinutes = intp(1)
+	})
+	if err := validateConfig(&boundary, false); err != nil {
+		t.Fatalf("boundary cb_* overrides should validate: %v", err)
+	}
+
+	cases := []struct {
+		name    string
+		mut     func(*StrategyConfig)
+		wantErr string
+	}{
+		{"zero drawdown cooldown", func(sc *StrategyConfig) { sc.CBDrawdownCooldownMinutes = intp(0) }, "cb_drawdown_cooldown_minutes must be positive"},
+		{"negative loss threshold", func(sc *StrategyConfig) { sc.CBLossStreakThreshold = intp(-1) }, "cb_loss_streak_threshold must be positive"},
+		{"zero loss cooldown", func(sc *StrategyConfig) { sc.CBLossStreakCooldownMinutes = intp(0) }, "cb_loss_streak_cooldown_minutes must be positive"},
+		{"loss threshold above cap", func(sc *StrategyConfig) { sc.CBLossStreakThreshold = intp(101) }, "cb_loss_streak_threshold must be <= 100"},
+		{"drawdown cooldown above 30 days", func(sc *StrategyConfig) { sc.CBDrawdownCooldownMinutes = intp(30*24*60 + 1) }, "cb_drawdown_cooldown_minutes must be <= 43200"},
+		{"loss cooldown above 30 days", func(sc *StrategyConfig) { sc.CBLossStreakCooldownMinutes = intp(30*24*60 + 1) }, "cb_loss_streak_cooldown_minutes must be <= 43200"},
+		{"manual rejects drawdown cooldown", func(sc *StrategyConfig) {
+			sc.Type = "manual"
+			sc.Platform = "hyperliquid"
+			sc.Symbol = "ETH"
+			sc.Timeframe = "1h"
+			sc.Leverage = 2
+			sc.CBDrawdownCooldownMinutes = intp(720)
+		}, "cb_drawdown_cooldown_minutes is not supported for manual strategies"},
+		{"manual rejects loss threshold", func(sc *StrategyConfig) {
+			sc.Type = "manual"
+			sc.Platform = "hyperliquid"
+			sc.Symbol = "ETH"
+			sc.Timeframe = "1h"
+			sc.Leverage = 2
+			sc.CBLossStreakThreshold = intp(3)
+		}, "cb_loss_streak_threshold is not supported for manual strategies"},
+		{"manual rejects loss cooldown", func(sc *StrategyConfig) {
+			sc.Type = "manual"
+			sc.Platform = "hyperliquid"
+			sc.Symbol = "ETH"
+			sc.Timeframe = "1h"
+			sc.Leverage = 2
+			sc.CBLossStreakCooldownMinutes = intp(30)
+		}, "cb_loss_streak_cooldown_minutes is not supported for manual strategies"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := mk(tc.mut)
+			err := validateConfig(&cfg, false)
+			if err == nil {
+				t.Fatal("expected validation error")
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("error %q should contain %q", err.Error(), tc.wantErr)
+			}
+		})
+	}
+}
+
 func TestStrategyNotifyRatchetTriggersEnabled_TwoLayerResolve(t *testing.T) {
 	tr := true
 	f := false
 	globalFalse := &Config{NotifyRatchetTriggers: &f}
 	globalTrue := &Config{NotifyRatchetTriggers: &tr}
-	globalDefault := &Config{} // nil field → global resolves to true
+	globalDefault := &Config{}
 
 	cases := []struct {
 		name     string
@@ -2827,5 +2058,338 @@ func TestLoadConfigDiscordChannelEnvDefaults(t *testing.T) {
 	}
 	if loaded2.Discord.TradeAlertChannels["default"] != "ch-legacy" {
 		t.Errorf("legacy alias: got %q, want ch-legacy", loaded2.Discord.TradeAlertChannels["default"])
+	}
+}
+
+const testSpotStrategyHead = `"id": "test-spot", "type": "spot", "script": "shared_scripts/check_strategy.py", "args": ["sma_crossover", "BTC/USDT", "1h"], "capital": 1000`
+
+const testHLPerpsStrategyHead = `"id": "hl-test-eth", "type": "perps", "platform": "hyperliquid", "script": "shared_scripts/check_hyperliquid.py", "args": ["sma_crossover", "ETH", "1h", "--mode=paper"], "capital": 1000`
+
+func TestLoadConfigPerpsSizingFieldRejections(t *testing.T) {
+	cases := []struct {
+		name    string
+		head    string
+		extra   string
+		wantErr string
+	}{
+		{"leverage on spot", testSpotStrategyHead, `"leverage": 5`, "leverage is only supported for perps"},
+		{"leverage out of range", testHLPerpsStrategyHead, `"leverage": 150`, "leverage must be in"},
+		{"sizing_leverage on spot", testSpotStrategyHead, `"sizing_leverage": 2`, "sizing_leverage is only supported for perps"},
+		{"sizing_leverage out of range", testHLPerpsStrategyHead, `"leverage": 20, "sizing_leverage": 200`, "sizing_leverage must be in"},
+		{"margin_per_trade_usd on spot", testSpotStrategyHead, `"margin_per_trade_usd": 100`, "margin_per_trade_usd is only supported for perps"},
+		{"margin_per_trade_usd zero", testHLPerpsStrategyHead, `"leverage": 20, "margin_per_trade_usd": 0`, "margin_per_trade_usd must be positive"},
+		{"margin_mode invalid value", testHLPerpsStrategyHead, `"margin_mode": "portfolio"`, "margin_mode must be"},
+		{"margin_mode on spot", testSpotStrategyHead, `"margin_mode": "isolated"`, "margin_mode is only supported for HL perps"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeTestConfig(t, t.TempDir(), `{"strategies": [{`+tc.head+`, `+tc.extra+`}]}`)
+			_, err := LoadConfig(path)
+			if err == nil {
+				t.Fatalf("expected validation error for %s", tc.name)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Errorf("error = %v, want %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestLoadConfigPerpsSizingFieldsAccepted(t *testing.T) {
+	cases := []struct {
+		name  string
+		extra string
+		check func(t *testing.T, sc StrategyConfig)
+	}{
+		{"leverage defaults to 1", ``, func(t *testing.T, sc StrategyConfig) {
+			if sc.Leverage != 1 {
+				t.Errorf("Leverage = %g, want 1 (default)", sc.Leverage)
+			}
+		}},
+		{"explicit leverage also seeds sizing_leverage", `"leverage": 10`, func(t *testing.T, sc StrategyConfig) {
+			if sc.Leverage != 10 {
+				t.Errorf("Leverage = %g, want 10", sc.Leverage)
+			}
+			if sc.SizingLeverage != 10 {
+				t.Errorf("SizingLeverage = %g, want 10 (defaults to leverage)", sc.SizingLeverage)
+			}
+		}},
+		{"explicit sizing_leverage splits exchange and sizing leverage", `"leverage": 20, "sizing_leverage": 2`, func(t *testing.T, sc StrategyConfig) {
+			if got := EffectiveExchangeLeverage(sc); got != 20 {
+				t.Errorf("EffectiveExchangeLeverage = %g, want 20", got)
+			}
+			if got := EffectiveSizingLeverage(sc); got != 2 {
+				t.Errorf("EffectiveSizingLeverage = %g, want 2", got)
+			}
+		}},
+		{"fractional sizing_leverage accepted", `"leverage": 20, "sizing_leverage": 0.5`, func(t *testing.T, sc StrategyConfig) {
+			if sc.SizingLeverage != 0.5 {
+				t.Errorf("SizingLeverage = %g, want 0.5", sc.SizingLeverage)
+			}
+		}},
+		{"margin_mode defaults to isolated", ``, func(t *testing.T, sc StrategyConfig) {
+			if sc.MarginMode != "isolated" {
+				t.Errorf("MarginMode = %q, want %q (default)", sc.MarginMode, "isolated")
+			}
+		}},
+		{"explicit cross margin_mode preserved", `"margin_mode": "cross"`, func(t *testing.T, sc StrategyConfig) {
+			if sc.MarginMode != "cross" {
+				t.Errorf("MarginMode = %q, want %q", sc.MarginMode, "cross")
+			}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := `{"strategies": [{` + testHLPerpsStrategyHead
+			if tc.extra != "" {
+				body += `, ` + tc.extra
+			}
+			body += `}]}`
+			cfg, err := LoadConfig(writeTestConfig(t, t.TempDir(), body))
+			if err != nil {
+				t.Fatalf("LoadConfig failed: %v", err)
+			}
+			tc.check(t, cfg.Strategies[0])
+		})
+	}
+}
+
+const testHLManualStrategyHead = `"id": "hl-manual-eth-live", "type": "manual", "platform": "hyperliquid", "symbol": "ETH", "timeframe": "1h", "capital": 1000, "leverage": 20, "max_drawdown_pct": 20`
+
+func TestLoadConfigManualStopLossATRMultResolution(t *testing.T) {
+	want := func(v float64) *float64 { return &v }
+	cases := []struct {
+		name     string
+		topLevel string
+		extra    string
+		want     *float64
+	}{
+		{"default_stop_loss_atr_mult=0 is the global opt-out", `"default_stop_loss_atr_mult": 0,`, ``, nil},
+		{"explicit stop_loss_atr_mult preserved", ``, `, "stop_loss_atr_mult": 2.5`, want(2.5)},
+		{"user_defaults.manual override applied", `"user_defaults": {"manual": {"stop_loss_atr_mult": 2.25}},`, ``, want(2.25)},
+		{"user_defaults.manual zero opts manual out", `"user_defaults": {"manual": {"stop_loss_atr_mult": 0}},`, ``, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := `{` + tc.topLevel + `"strategies": [{` + testHLManualStrategyHead + tc.extra + `}]}`
+			cfg, err := LoadConfig(writeTestConfig(t, t.TempDir(), body))
+			if err != nil {
+				t.Fatalf("LoadConfig failed: %v", err)
+			}
+			got := cfg.Strategies[0].StopLossATRMult
+			switch {
+			case tc.want == nil && got != nil:
+				t.Errorf("StopLossATRMult = %v, want nil", *got)
+			case tc.want != nil && got == nil:
+				t.Fatalf("StopLossATRMult = nil, want %g", *tc.want)
+			case tc.want != nil && *got != *tc.want:
+				t.Errorf("StopLossATRMult = %g, want %g", *got, *tc.want)
+			}
+		})
+	}
+}
+
+func TestLoadConfigHLPerpsPeers(t *testing.T) {
+	peer := func(id, strat, coin, tf string, capital int, extra string) string {
+		return `{"id": "` + id + `", "type": "perps", "platform": "hyperliquid", "script": "shared_scripts/check_hyperliquid.py", "args": ["` + strat + `", "` + coin + `", "` + tf + `", "--mode=paper"], "capital": ` + itoa(capital) + extra + `}`
+	}
+	trend := func(extra string) string { return peer("hl-eth-trend", "sma_crossover", "ETH", "1h", 1000, extra) }
+	breakout := func(extra string) string {
+		return peer("hl-eth-breakout", "donchian_breakout", "ETH", "4h", 500, extra)
+	}
+	stopPcts := func(t *testing.T, cfg *Config) map[string]float64 {
+		got := map[string]float64{}
+		for _, sc := range cfg.Strategies {
+			got[sc.ID] = EffectiveStopLossPct(sc)
+		}
+		return got
+	}
+	cases := []struct {
+		name     string
+		peers    []string
+		wantErrs []string
+		check    func(t *testing.T, cfg *Config)
+	}{
+		{
+			name:  "omitted stop_loss_* on both same-coin peers does not conflict",
+			peers: []string{trend(`, "leverage": 5, "margin_mode": "isolated"`), breakout(`, "leverage": 5, "margin_mode": "isolated"`)},
+			check: func(t *testing.T, cfg *Config) {
+				if len(cfg.Strategies) != 2 {
+					t.Fatalf("expected 2 strategies, got %d", len(cfg.Strategies))
+				}
+				for id, got := range stopPcts(t, cfg) {
+					if got != 0 {
+						t.Errorf("%s EffectiveStopLossPct = %g, want 0 for omitted same-coin peer", id, got)
+					}
+				}
+			},
+		},
+		{
+			name:     "mismatched margin_mode rejected naming the coin",
+			peers:    []string{trend(`, "leverage": 5, "margin_mode": "isolated"`), breakout(`, "leverage": 5, "margin_mode": "cross"`)},
+			wantErrs: []string{"disagree on margin_mode", "ETH"},
+		},
+		{
+			name:     "mismatched leverage rejected",
+			peers:    []string{trend(`, "leverage": 5, "margin_mode": "isolated"`), breakout(`, "leverage": 10, "margin_mode": "isolated"`)},
+			wantErrs: []string{"disagree on leverage"},
+		},
+		{
+			name:  "multiple stop_loss_pct owners allowed",
+			peers: []string{trend(`, "leverage": 5, "margin_mode": "isolated", "stop_loss_pct": 3.0`), breakout(`, "leverage": 5, "margin_mode": "isolated", "stop_loss_pct": 5.0`)},
+		},
+		{
+			name:  "single stop_loss_pct owner keeps its stop; omitted peer stays 0",
+			peers: []string{trend(`, "leverage": 5, "margin_mode": "isolated", "stop_loss_pct": 3.0`), breakout(`, "leverage": 5, "margin_mode": "isolated"`)},
+			check: func(t *testing.T, cfg *Config) {
+				got := stopPcts(t, cfg)
+				if got["hl-eth-trend"] != 3 {
+					t.Errorf("explicit owner EffectiveStopLossPct = %g, want 3", got["hl-eth-trend"])
+				}
+				if got["hl-eth-breakout"] != 0 {
+					t.Errorf("omitted peer EffectiveStopLossPct = %g, want 0", got["hl-eth-breakout"])
+				}
+			},
+		},
+		{
+			name:  "different coins are independent",
+			peers: []string{trend(`, "leverage": 5, "margin_mode": "isolated"`), peer("hl-btc-trend", "sma_crossover", "BTC", "1h", 1000, `, "leverage": 10, "margin_mode": "cross"`)},
+		},
+		{
+			name:  "stop_loss_pct 0 on both peers allowed",
+			peers: []string{trend(`, "leverage": 5, "margin_mode": "isolated", "stop_loss_pct": 0`), breakout(`, "leverage": 5, "margin_mode": "isolated", "stop_loss_pct": 0`)},
+		},
+		{
+			name:  "defaulted margin_mode matches explicit isolated peer",
+			peers: []string{trend(`, "leverage": 5`), breakout(`, "leverage": 5, "margin_mode": "isolated"`)},
+			check: func(t *testing.T, cfg *Config) {
+				for _, sc := range cfg.Strategies {
+					if sc.MarginMode != "isolated" {
+						t.Errorf("strategy %s margin_mode = %q, want %q", sc.ID, sc.MarginMode, "isolated")
+					}
+				}
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeTestConfig(t, t.TempDir(), `{"strategies": [`+strings.Join(tc.peers, ",")+`]}`)
+			cfg, err := LoadConfig(path)
+			if len(tc.wantErrs) > 0 {
+				if err == nil {
+					t.Fatalf("expected validation error for %s", tc.name)
+				}
+				for _, w := range tc.wantErrs {
+					if !strings.Contains(err.Error(), w) {
+						t.Errorf("error = %v, want %q", err, w)
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("LoadConfig failed: %v", err)
+			}
+			if tc.check != nil {
+				tc.check(t, cfg)
+			}
+		})
+	}
+}
+
+func itoa(n int) string { return strconv.Itoa(n) }
+
+func TestConfigValidationDMChannels(t *testing.T) {
+	spotStrategies := `"strategies": [{"id": "t-spot", "type": "spot", "script": "shared_scripts/check_strategy.py", "args": ["sma_crossover", "BTC/USDT", "1h"], "capital": 1000, "max_drawdown_pct": 60}]`
+	cases := []struct {
+		name    string
+		body    string
+		wantErr string
+		check   func(t *testing.T, cfg *Config)
+	}{
+		{
+			name:    "invalid key rejected",
+			body:    `{` + spotStrategies + `, "discord": {"enabled": false, "channels": {}, "dm_channels": {"hyperliquid-paper-extra": "123456789"}}}`,
+			wantErr: "dm_channels key",
+		},
+		{
+			name:    "empty value rejected",
+			body:    `{` + spotStrategies + `, "discord": {"enabled": false, "channels": {}, "dm_channels": {"hyperliquid-paper": ""}}}`,
+			wantErr: `dm_channels["hyperliquid-paper"]`,
+		},
+		{
+			name:    "orphan -paper suffix rejected",
+			body:    `{` + spotStrategies + `, "discord": {"enabled": false, "channels": {}, "dm_channels": {"-paper": "123"}}}`,
+			wantErr: "platform prefix is empty",
+		},
+		{
+			name: "valid keys load on discord and telegram",
+			body: `{
+				"strategies": [{"id": "hl-test", "type": "perps", "platform": "hyperliquid", "script": "shared_scripts/check_hyperliquid.py", "args": ["sma_crossover", "BTC", "1h", "--mode=paper"], "capital": 1000, "max_drawdown_pct": 50}],
+				"discord": {"enabled": false, "channels": {}, "dm_channels": {"hyperliquid": "111", "hyperliquid-paper": "222", "deribit": "333"}},
+				"telegram": {"enabled": false, "channels": {}, "dm_channels": {"okx-paper": "444"}}
+			}`,
+			check: func(t *testing.T, cfg *Config) {
+				if cfg.Discord.DMChannels["hyperliquid"] != "111" || cfg.Discord.DMChannels["hyperliquid-paper"] != "222" {
+					t.Errorf("discord dm_channels mismatch: %#v", cfg.Discord.DMChannels)
+				}
+				if cfg.Telegram.DMChannels["okx-paper"] != "444" {
+					t.Errorf("telegram dm_channels mismatch: %#v", cfg.Telegram.DMChannels)
+				}
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := LoadConfig(writeTestConfig(t, t.TempDir(), tc.body))
+			if tc.wantErr != "" {
+				if err == nil {
+					t.Fatalf("expected validation error for %s", tc.name)
+				}
+				if !strings.Contains(err.Error(), tc.wantErr) {
+					t.Errorf("error = %v, want %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("LoadConfig: %v", err)
+			}
+			tc.check(t, cfg)
+		})
+	}
+}
+
+func TestConfigValidationManualPerpsPeerMismatchRejected(t *testing.T) {
+	cases := []struct {
+		name       string
+		manualLev  float64
+		manualMode string
+		perpsLev   float64
+		perpsMode  string
+		wantErr    string
+	}{
+		{"leverage mismatch", 10, "", 5, "", "disagree on leverage"},
+		{"margin_mode mismatch", 5, "isolated", 5, "cross", "disagree on margin_mode"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Config{
+				Strategies: []StrategyConfig{
+					{
+						ID: "hl-manual-eth", Type: "manual", Platform: "hyperliquid", Symbol: "ETH", Timeframe: "1h",
+						Leverage: tc.manualLev, MarginMode: tc.manualMode, Capital: 1000, MaxDrawdownPct: 60,
+					},
+					{
+						ID: "hl-perps-eth-live", Type: "perps", Platform: "hyperliquid",
+						Script: "shared_scripts/check_hyperliquid.py", Args: []string{"sma_crossover", "ETH", "1h", "--mode=paper"},
+						Capital: 1000, Leverage: tc.perpsLev, MarginMode: tc.perpsMode, MaxDrawdownPct: 60,
+					},
+				},
+				PortfolioRisk: &PortfolioRiskConfig{MaxDrawdownPct: 25, WarnThresholdPct: 80},
+			}
+			err := validateConfig(&cfg, false)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("expected %q peer error, got: %v", tc.wantErr, err)
+			}
+		})
 	}
 }

@@ -538,7 +538,7 @@ func (ss *StatusServer) buildSummary() UISummary {
 	}
 }
 
-func buildDailyPnLHistory(sdb *StateDB, days int) []UIDailyPnLPoint {
+func buildDailyPnLHistory(st *StateStore, days int) []UIDailyPnLPoint {
 	if days <= 0 {
 		return []UIDailyPnLPoint{}
 	}
@@ -549,10 +549,11 @@ func buildDailyPnLHistory(sdb *StateDB, days int) []UIDailyPnLPoint {
 		day := start.AddDate(0, 0, i)
 		out = append(out, UIDailyPnLPoint{Date: day.Format("2006-01-02")})
 	}
-	if sdb == nil || sdb.db == nil {
+	db := st.primary()
+	if db == nil || db.db == nil {
 		return out
 	}
-	rows, err := sdb.db.Query(`SELECT substr(closed_at, 1, 10) AS day, COALESCE(SUM(realized_pnl), 0) AS pnl, COUNT(*) AS trades
+	rows, err := db.db.Query(`SELECT substr(closed_at, 1, 10) AS day, COALESCE(SUM(realized_pnl), 0) AS pnl, COUNT(*) AS trades
 		FROM closed_positions
 		WHERE closed_at >= ?
 		GROUP BY day

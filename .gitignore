@@ -18,14 +18,12 @@ scheduler/config.json
 scheduler/state.json
 scheduler/state.db
 .worktrees/
-.claude/
+.claude/*
 local/
 
 # macOS
 .DS_Store
 architecture.md
-# ...but the canonical project architecture reference is tracked
-!docs/ARCHITECTURE.md
 
 # consolidation research generated output (regenerable)
 backtest/consolidation_out/

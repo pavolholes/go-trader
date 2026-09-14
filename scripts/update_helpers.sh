@@ -1,8 +1,4 @@
-# shellcheck shell=bash
-# Pure helpers sourced by update.sh (and test_update_helpers.sh).
 
-# Emit the filesystem path to check for one EnvironmentFiles line from systemctl show.
-# Returns empty when the entry is optional (-prefix), malformed, or only metadata.
 update_systemd_envfile_check_path() {
     local entry="$1"
     local path="$entry"
@@ -11,7 +7,6 @@ update_systemd_envfile_check_path() {
     if [[ "$path" == '('* ]]; then
         return 0
     fi
-    # EnvironmentFile=-/path — operator declared missing file tolerable.
     if [[ "$path" == -* ]]; then
         return 0
     fi
@@ -22,7 +17,6 @@ update_systemd_envfile_check_path() {
     printf '%s' "$path"
 }
 
-# Read EnvironmentFiles lines on stdin; warn on stderr for required missing paths.
 warn_missing_systemd_environment_files_from_text() {
     local unit="$1"
     local entry path
@@ -41,14 +35,98 @@ warn_missing_systemd_environment_files() {
         | warn_missing_systemd_environment_files_from_text "$unit"
 }
 
-# Decide whether signal-mode restart must be redirected to systemctl to avoid an
-# out-of-cgroup duplicate (#850). Inputs (pre-resolved by the caller):
-#   is_active      — `systemctl is-active <unit>` output ("active" when running)
-#   exec_bin_abs   — canonicalized ExecStart binary path for the unit
-#   swap_bin_abs   — canonicalized swap-target binary (this deployment's ./go-trader)
-# Echoes "redirect" only when the unit is active AND its ExecStart binary matches
-# this deployment's binary (so a sibling worktree's active unit does not redirect a
-# legitimate signal-mode restart of a different instance); echoes "" otherwise.
+update_unit_source_path() {
+    local repo_root="${1%/}" unit="$2"
+    [[ -n "$repo_root" && -n "$unit" ]] || { printf ''; return 0; }
+    if [[ "$unit" != *.* ]]; then
+        unit="${unit}.service"
+    fi
+    if [[ "$unit" != *.service ]]; then
+        printf ''
+        return 0
+    fi
+    local base="${unit%.service}"
+    if [[ "$base" == "go-trader" ]]; then
+        printf '%s/go-trader.service' "$repo_root"
+        return 0
+    fi
+    if [[ "$base" == go-trader@* ]]; then
+        local instance="${base#go-trader@}"
+        if [[ "$(update_validate_instance_name "$instance")" == "ok" ]]; then
+            printf '%s/systemd/go-trader@.service' "$repo_root"
+            return 0
+        fi
+    fi
+    printf ''
+}
+
+update_unit_fragment_scope() {
+    local path="$1"
+    [[ -n "$path" ]] || { printf ''; return 0; }
+    if [[ "$path" != /* ]]; then
+        printf 'other'
+        return 0
+    fi
+    if [[ "${path%/*}" == "/etc/systemd/system" ]]; then
+        printf 'etc'
+    else
+        printf 'other'
+    fi
+}
+
+update_unit_sync_decision() {
+    local installed="$1" source_path="$2" needs_reload="$3"
+    [[ -n "$installed" && -n "$source_path" ]] || { printf 'none'; return 0; }
+    [[ -f "$source_path" ]] || { printf 'none'; return 0; }
+    if ! cmp -s "$installed" "$source_path"; then
+        if [[ -L "$installed" ]]; then
+            printf 'skip'
+        else
+            printf 'install'
+        fi
+        return 0
+    fi
+    case "$needs_reload" in
+        yes|true) printf 'reload' ;;
+        *) printf 'none' ;;
+    esac
+}
+
+update_unit_sudo() {
+    if [[ -n "${UPDATE_UNIT_SUDO+set}" ]]; then
+        if [[ -z "$UPDATE_UNIT_SUDO" ]]; then
+            "$@"
+            return $?
+        fi
+        "$UPDATE_UNIT_SUDO" "$@"
+        return $?
+    fi
+    sudo "$@"
+}
+
+update_unit_install_with_backup() {
+    local installed="$1" source_path="$2"
+    [[ -n "$installed" && -n "$source_path" && -f "$source_path" ]] || return 1
+    local backup=""
+    if [[ -f "$installed" ]]; then
+        backup="${installed}.prev"
+        update_unit_sudo cp -p "$installed" "$backup" || return 1
+    fi
+    if ! update_unit_sudo install -m 0644 "$source_path" "$installed"; then
+        if [[ -n "$backup" ]]; then
+            update_unit_sudo rm -f "$backup" || true
+        fi
+        return 1
+    fi
+    printf '%s' "$backup"
+}
+
+update_unit_restore_backup() {
+    local installed="$1" backup="$2"
+    [[ -n "$installed" && -n "$backup" && -f "$backup" ]] || return 1
+    update_unit_sudo mv -f "$backup" "$installed"
+}
+
 update_signal_redirect_decision() {
     local is_active="$1" exec_bin_abs="$2" swap_bin_abs="$3"
     [[ "$is_active" == "active" ]] || { printf ''; return 0; }
@@ -61,11 +139,6 @@ update_signal_redirect_decision() {
     printf ''
 }
 
-# Pure predicate for the rollback stray-process sweep (#850): should a candidate
-# pid be SIGTERM'd as a leftover of THIS instance? Matches a go-trader process
-# whose working directory is this deployment dir (i.e. it shares this instance's
-# state DB), which catches a failed new process surviving on a fallback port.
-# cwd-matching deliberately spares other worktrees' traders. Echoes "sweep" or "".
 update_should_sweep_proc() {
     local comm="$1" pid_cwd="$2" repo_abs="$3"
     [[ "$comm" == "go-trader" ]] || { printf ''; return 0; }
@@ -73,31 +146,16 @@ update_should_sweep_proc() {
     printf 'sweep'
 }
 
-# Unit name-patterns --all matches when auto-discovering deployments from systemd
-# (#1055). Covers the primary unit (go-trader.service), plain per-deployment units
-# (go-trader-live.service), and template instances (go-trader@live.service). The
-# bare template file go-trader@.service is never listed by `systemctl list-units`
-# (only loaded instances are), so it cannot leak an empty WorkingDirectory here.
 update_systemd_unit_globs() {
     printf '%s\n' 'go-trader.service' 'go-trader-*.service' 'go-trader@*.service'
 }
 
-# Normalize systemd WorkingDirectory values (one per line on stdin) into the
-# deployment-dir list update.sh --all iterates (#1055). Drops empty/unset and
-# relative values, collapses to exactly one trailing slash (the --all loop reads
-# "${d}scheduler/config.json"), and de-duplicates preserving first-seen order.
-# Pure: no systemctl, no filesystem access — unit-testable.
 normalize_systemd_deployment_dirs() {
-    # Newline-delimited "seen" accumulator instead of an associative array, so the
-    # helper runs under bash 3.2 (macOS dev/CI) as well as Linux deployments.
     local line seen=$'\n'
     while IFS= read -r line || [[ -n "$line" ]]; do
-        # trim surrounding whitespace (helper is sourced standalone in tests, so
-        # it cannot rely on update.sh's trim_space).
         line="${line#"${line%%[![:space:]]*}"}"
         line="${line%"${line##*[![:space:]]}"}"
         [[ -n "$line" ]] || continue
-        # WorkingDirectory must be absolute; systemctl prints empty for unset.
         [[ "$line" == /* ]] || continue
         line="${line%/}/"
         case "$seen" in
@@ -108,18 +166,6 @@ normalize_systemd_deployment_dirs() {
     done
 }
 
-# Auto-discover deployment dirs for --all from systemd unit WorkingDirectory
-# (#1055) — canonical and layout-independent (works regardless of where each
-# deployment lives, even across different parent dirs). Emits normalized dirs on
-# stdout, one per line; emits nothing when systemctl is absent or no matching
-# ACTIVE units exist, so the caller can union with / fall back to the glob.
-#
-# --state=active (NOT --all): only currently-running units are surfaced. --all is
-# a fan-out of `--restart`, so discovering a loaded-but-inactive unit would let the
-# child `systemctl restart` START a deliberately stopped/failed trading bot (#1055
-# review). Restricting to active units means auto-discovery never changes a
-# deployment's run/stop state; stopped deployments must be named via the glob root
-# (--update-all-root) if the operator really intends to (re)start them.
 discover_deployment_dirs_from_systemd() {
     command -v systemctl >/dev/null 2>&1 || return 0
     local -a globs=()
@@ -138,15 +184,41 @@ discover_deployment_dirs_from_systemd() {
     done | normalize_systemd_deployment_dirs
 }
 
-# Canonicalize a discovered deployment dir to its PHYSICAL path (resolving symlinks,
-# /./ and // segments) with a single trailing slash, so two different spellings of
-# the same directory — a systemd WorkingDirectory taken verbatim from the unit file
-# vs. a glob hit under $scan_root — collapse under the --all `sort -u` dedup. Without
-# this the same live trading process would be updated AND restarted twice (#1055
-# review). `cd … && pwd -P` is the portable resolver (bash 3.2, no realpath needed).
-# A path that is not an existing directory cannot be resolved — it is returned
-# trailing-slash-normalized only (the --all loop then reports/skips it); two genuinely
-# distinct dirs never collapse because their physical paths differ.
+discover_deployment_unit_map() {
+    command -v systemctl >/dev/null 2>&1 || return 0
+    local -a globs=()
+    local g
+    while IFS= read -r g; do
+        [[ -n "$g" ]] && globs+=("$g")
+    done < <(update_systemd_unit_globs)
+    local -a units=()
+    local unit
+    while IFS= read -r unit; do
+        [[ -n "$unit" ]] && units+=("$unit")
+    done < <(systemctl list-units --type=service --state=active --no-legend --plain "${globs[@]}" 2>/dev/null | awk '{print $1}')
+    [[ ${#units[@]} -gt 0 ]] || return 0
+    local wd canon
+    for unit in "${units[@]}"; do
+        wd=$(systemctl show "$unit" -p WorkingDirectory --value 2>/dev/null)
+        [[ -n "$wd" ]] || continue
+        canon=$(canonicalize_deployment_dir "$wd")
+        printf '%s|%s\n' "$canon" "$unit"
+    done
+}
+
+update_execstart_config_path() {
+    local execstart="$1"
+    if [[ "$execstart" =~ --config=([^[:space:]\;]+) ]]; then
+        printf '%s' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    if [[ "$execstart" =~ --config[[:space:]]+([^[:space:]\;]+) ]]; then
+        printf '%s' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    printf ''
+}
+
 canonicalize_deployment_dir() {
     local d="$1" phys
     if [[ -d "$d" ]] && phys=$(cd "$d" 2>/dev/null && pwd -P); then
@@ -156,13 +228,6 @@ canonicalize_deployment_dir() {
     fi
 }
 
-# Classify a config path for the out-of-tree migration (#1056). Echoes:
-#   symlink  — already a symlink (migration done; idempotent no-op). Checked
-#              FIRST so a DANGLING symlink (target moved/removed) still reports
-#              'symlink', never 'missing' — re-migrating would clobber the live
-#              config pointer.
-#   regular  — a real file still in the deployment tree (needs migrating)
-#   missing  — nothing there
 update_config_migration_state() {
     local path="$1"
     if [[ -L "$path" ]]; then
@@ -176,12 +241,6 @@ update_config_migration_state() {
     printf 'missing'
 }
 
-# Validate a systemd/path instance name for the #1056 migration. Echoes 'ok' or
-# 'bad'. The bare char-class [A-Za-z0-9_.-] is not enough: '.' and '..' are
-# composed only of allowed chars yet escape the target dir ($base/.. writes
-# outside the intended tree), and a leading '-' misparses as a flag downstream
-# (install-service.sh, systemctl). Empty is 'bad' here — the caller treats an
-# empty --instance as the no-instance default and must not route it through this.
 update_validate_instance_name() {
     local name="$1"
     [[ -n "$name" ]] || { printf 'bad'; return 0; }
@@ -196,13 +255,6 @@ update_validate_instance_name() {
     printf 'ok'
 }
 
-# Emit the systemd directive that makes the #1056 config directory writable
-# under ProtectSystem=strict, given the migration --base and --instance. A base
-# under /var/lib maps to StateDirectory (systemd creates+owns the dir on start);
-# ANY other base must use ReadWritePaths (the operator created the dir) because
-# StateDirectory is always relative to /var/lib and would otherwise grant the
-# wrong directory while the real config dir stays read-only. Keeps the migration
-# script's printed unit edits valid for every --base value it accepts.
 update_config_writable_directive() {
     local base="$1" instance="$2" sub=""
     [[ -n "$instance" ]] && sub="/$instance"
@@ -213,12 +265,231 @@ update_config_writable_directive() {
     fi
 }
 
-# Static, extension-based DB rsync excludes (#1012). Emits one glob per line so
-# any .db / SQLite sidecar / lock file at ANY path survives --rsync-from's
-# --delete, independent of the config-resolved db_file. These globs are
-# unanchored (no leading slash), so rsync matches them at every directory depth.
-# Defense-in-depth: run_rsync_from still adds the config-resolved db_excl for
-# DBs whose name doesn't end in .db. Keep in sync with .gitignore's *.db family.
 update_db_rsync_excludes() {
     printf '%s\n' '*.db' '*.db-wal' '*.db-shm' '*.db.lock'
+}
+
+# Prints every configured state-file path, one per line: db_file first, then
+# paper_db_file when the split live/paper layout is configured (#1523).
+update_resolve_db_exclude() {
+    local db_paths="scheduler/state.db"
+    if [[ -f ${GO_TRADER_UPDATE_CONFIG:-scheduler/config.json} && -x "${GO_TRADER_UPDATE_PYTHON:-.venv/bin/python3}" ]]; then
+        local custom
+        custom=$("${GO_TRADER_UPDATE_PYTHON:-.venv/bin/python3}" -c '
+import json, os
+try:
+    cfg = json.load(open(os.environ.get("GO_TRADER_UPDATE_CONFIG", "scheduler/config.json")))
+    out = []
+    p = cfg.get("db_file") or ""
+    out.append(p.strip() if isinstance(p, str) and p.strip() else "scheduler/state.db")
+    q = cfg.get("paper_db_file") or ""
+    if isinstance(q, str) and q.strip():
+        out.append(q.strip())
+    print("\n".join(out))
+except Exception:
+    pass
+' 2>/dev/null || true)
+        if [[ -n "$custom" ]]; then
+            db_paths="$custom"
+        fi
+    fi
+    printf '%s\n' "$db_paths"
+}
+
+update_canonical_db_path() {
+    python3 -c '
+import os, sys
+p = os.path.abspath(sys.argv[1])
+try:
+    os.stat(p)
+    p = os.path.realpath(p)
+except OSError:
+    pass
+print(p)
+' "$1"
+}
+
+update_state_lock_paths() {
+    local canon
+    canon=$(update_canonical_db_path "$1")
+    printf '%s\n' "${canon}.lock" "${canon}.manual-action.lock"
+}
+
+update_file_fingerprint() {
+    local path="$1"
+    if [[ ! -e "$path" ]]; then
+        printf 'absent'
+        return 0
+    fi
+    python3 -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$path"
+}
+
+update_db_fingerprint() {
+    local canon
+    canon=$(update_canonical_db_path "$1")
+    local wal="${canon}-wal" wal_fp
+    if [[ -s "$wal" ]]; then
+        wal_fp=$(update_file_fingerprint "$wal")
+    else
+        wal_fp="none"
+    fi
+    printf 'db=%s\nwal=%s\n' "$(update_file_fingerprint "$canon")" "$wal_fp"
+}
+
+update_resolve_config_db_path() {
+    local deploy_dir="$1" db_path="$2"
+    if [[ "$db_path" == /* ]]; then
+        printf '%s' "$db_path"
+    else
+        printf '%s/%s' "${deploy_dir%/}" "$db_path"
+    fi
+}
+
+update_unit_dropin_path() {
+    local unit_dir="$1" unit="$2" name="$3"
+    printf '%s/%s.d/%s.conf' "${unit_dir%/}" "$unit" "$name"
+}
+
+update_paper_override_directive() {
+    local dir="${1%/}"
+    if [[ "$dir" == /var/lib/*/* ]]; then
+        update_config_writable_directive "${dir%/*}" "${dir##*/}"
+    else
+        update_config_writable_directive "$dir" ""
+    fi
+}
+
+UPDATE_LOCK_HOLDER_PY='
+import fcntl, os, sys
+paths = sys.argv[1:]
+held = []
+warnings = []
+def lock_owner(p):
+    for suffix in (".manual-action.lock", ".lock"):
+        if p.endswith(suffix):
+            db = p[:-len(suffix)]
+            break
+    else:
+        db = p
+    for cand in (db, os.path.dirname(p)):
+        try:
+            st = os.stat(cand)
+        except OSError:
+            continue
+        return st.st_uid, st.st_gid
+    return None
+for p in paths:
+    existed = os.path.exists(p)
+    fd = os.open(p, os.O_CREAT | os.O_RDWR, 0o644)
+    if not existed:
+        owner = lock_owner(p)
+        if owner is not None and owner != (os.geteuid(), os.getegid()):
+            try:
+                os.fchown(fd, owner[0], owner[1])
+            except OSError as exc:
+                warnings.append("WARN %s created but could not be given to uid %d gid %d: %s" % (p, owner[0], owner[1], exc))
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        pid = ""
+        try:
+            pid = os.read(fd, 32).decode("utf-8", "replace").strip()
+        except OSError:
+            pass
+        print("CONTENDED %s pid=%s" % (p, pid or "unknown"))
+        sys.stdout.flush()
+        sys.exit(1)
+    held.append((p, fd))
+for p, fd in held:
+    if p.endswith(".manual-action.lock"):
+        continue
+    os.ftruncate(fd, 0)
+    os.lseek(fd, 0, os.SEEK_SET)
+    os.write(fd, ("%d\n" % os.getpid()).encode())
+    os.fsync(fd)
+print("HELD %d" % os.getpid())
+for w in warnings:
+    print(w)
+sys.stdout.flush()
+sys.stdin.read()
+'
+
+update_start_state_lock_holder() {
+    local -a locks=()
+    local db
+    for db in "$@"; do
+        while IFS= read -r line; do
+            locks+=("$line")
+        done < <(update_state_lock_paths "$db")
+    done
+    local fifo out
+    fifo=$(mktemp -u "${TMPDIR:-/tmp}/go-trader-lock-holder.XXXXXX")
+    mkfifo "$fifo"
+    out=$(mktemp "${TMPDIR:-/tmp}/go-trader-lock-holder-out.XXXXXX")
+    python3 -c "$UPDATE_LOCK_HOLDER_PY" "${locks[@]}" <"$fifo" >"$out" 2>&1 &
+    UPDATE_LOCK_HOLDER_PID=$!
+    exec {UPDATE_LOCK_HOLDER_FD}>"$fifo"
+    rm -f "$fifo"
+    local i status=""
+    for i in $(seq 1 200); do
+        status=$(head -n 1 "$out" 2>/dev/null || true)
+        [[ -n "$status" ]] && break
+        sleep 0.05
+    done
+    if [[ "$status" != HELD* ]]; then
+        exec {UPDATE_LOCK_HOLDER_FD}>&-
+        wait "$UPDATE_LOCK_HOLDER_PID" 2>/dev/null || true
+        cat "$out" >&2
+        rm -f "$out"
+        unset UPDATE_LOCK_HOLDER_PID UPDATE_LOCK_HOLDER_FD
+        return 1
+    fi
+    tail -n +2 "$out" >&2
+    rm -f "$out"
+}
+
+update_stop_state_lock_holder() {
+    if [[ -n "${UPDATE_LOCK_HOLDER_FD:-}" ]]; then
+        exec {UPDATE_LOCK_HOLDER_FD}>&-
+    fi
+    if [[ -n "${UPDATE_LOCK_HOLDER_PID:-}" ]]; then
+        wait "$UPDATE_LOCK_HOLDER_PID" 2>/dev/null || true
+    fi
+    unset UPDATE_LOCK_HOLDER_PID UPDATE_LOCK_HOLDER_FD
+}
+
+strip_unit_flags_from_argv() {
+    declare -a out=()
+    local skip_next=0
+    local a
+    for a in "$@"; do
+        if [[ "$skip_next" == "1" ]]; then
+            skip_next=0
+            continue
+        fi
+        case "$a" in
+            --unit|--service)
+                skip_next=1
+                continue
+                ;;
+            --unit=*|--service=*)
+                continue
+                ;;
+        esac
+        out+=("$a")
+    done
+    printf '%s\n' "${out[@]}"
+}
+
+resolve_child_unit_override() {
+    local parent_service_unit="$1"
+    local mapped_unit="$2"
+    shift 2
+    if [[ -n "$mapped_unit" ]]; then
+        printf '%s\n' "$mapped_unit"
+        strip_unit_flags_from_argv "$@"
+    else
+        printf '%s\n' "$parent_service_unit"
+        printf '%s\n' "$@"
+    fi
 }

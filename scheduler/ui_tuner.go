@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 )
 
 type UIEditableField struct {
@@ -37,6 +38,8 @@ type UIStrategyConfigResponse struct {
 	AllowedRegimes       []string               `json:"allowed_regimes,omitempty"`
 	StopLossPct          *float64               `json:"stop_loss_pct,omitempty"`
 	StopLossATRMult      *float64               `json:"stop_loss_atr_mult,omitempty"`
+	Paused               bool                   `json:"paused"`
+	NotifyRatchet        *bool                  `json:"notify_ratchet_triggers"`
 	DefaultParams        map[string]interface{} `json:"default_params"`
 	EditableFields       []UIEditableField      `json:"editable_fields"`
 	HasOpenPosition      bool                   `json:"has_open_position"`
@@ -67,12 +70,18 @@ type UIApplyConfigResponse struct {
 	Message         string `json:"message"`
 }
 
-func (ss *StatusServer) SetConfigContext(configPath string, regime *RegimeConfig) {
-	if ss == nil {
+func (ss *StatusServer) SetConfigContext(configPath string, cfg *Config) {
+	if ss == nil || cfg == nil {
 		return
 	}
 	ss.configPath = configPath
-	ss.regime = regime
+	ss.regime = cfg.Regime
+	ss.strategiesMu.Lock()
+	ss.uiCfg = cfg
+	ss.intervalSeconds = cfg.IntervalSeconds
+	ss.userCloseDefaults = cfg.userDefaultsClose()
+	ss.globalNotifyRatchet = cfg.NotifyRatchetTriggers
+	ss.strategiesMu.Unlock()
 }
 
 func (ss *StatusServer) handleAPIStrategyConfig(w http.ResponseWriter, r *http.Request, id string) {
@@ -141,6 +150,9 @@ func (ss *StatusServer) handleAPIStrategySimulate(w http.ResponseWriter, r *http
 
 	livePayload := simulateConfigPayload(liveCfg, ss.regime)
 	simPayload := simulateConfigPayload(simCfg, ss.regime)
+	uiCfg := ss.uiTradeConfig()
+	livePayload["atr_method"] = resolveATRMethod(liveCfg, uiCfg)
+	simPayload["atr_method"] = resolveATRMethod(simCfg, uiCfg)
 	markersByLabel, simErr := runStrategySimulate(candles, map[string]map[string]interface{}{
 		"live":      livePayload,
 		"simulated": simPayload,
@@ -263,10 +275,6 @@ func (ss *StatusServer) strategyHasOpenPosition(id string) bool {
 }
 
 func (ss *StatusServer) requireMutatingAPIAuth(w http.ResponseWriter, r *http.Request) bool {
-	if strings.TrimSpace(ss.statusToken) == "" {
-		writeJSONError(w, http.StatusForbidden, "config apply requires status_token")
-		return false
-	}
 	return ss.requireAPIAuth(w, r)
 }
 
@@ -296,11 +304,36 @@ type pythonErrorResponse struct {
 	Error string `json:"error,omitempty"`
 }
 
-func fetchStrategyDefaultParams(sc StrategyConfig) (map[string]interface{}, string, error) {
-	name := effectiveOpenStrategy(sc)
-	if name == "" {
-		return map[string]interface{}{}, "", nil
+type strategySchemaCacheEntry struct {
+	defaults map[string]interface{}
+	desc     string
+}
+
+var (
+	strategySchemaCacheMu sync.Mutex
+	strategySchemaCache   = map[string]strategySchemaCacheEntry{}
+)
+
+func strategySchemaCacheKey(typ, openName string) string {
+	return typ + "\x00" + openName
+}
+
+func cloneStringAnyMap(in map[string]interface{}) map[string]interface{} {
+	out := make(map[string]interface{}, len(in))
+	for k, v := range in {
+		out[k] = v
 	}
+	return out
+}
+
+func clearStrategySchemaCacheForTest() {
+	strategySchemaCacheMu.Lock()
+	defer strategySchemaCacheMu.Unlock()
+	strategySchemaCache = map[string]strategySchemaCacheEntry{}
+}
+
+func loadStrategyTunerSchema(sc StrategyConfig) (map[string]interface{}, string, error) {
+	name := effectiveOpenStrategy(sc)
 	args := []string{
 		"--type", sc.Type,
 		"--strategy", name,
@@ -327,6 +360,46 @@ func fetchStrategyDefaultParams(sc StrategyConfig) (map[string]interface{}, stri
 		resp.DefaultParams = map[string]interface{}{}
 	}
 	return resp.DefaultParams, resp.Description, nil
+}
+
+func fetchStrategyDefaultParams(sc StrategyConfig) (map[string]interface{}, string, error) {
+	return fetchStrategyDefaultParamsWith(sc, loadStrategyTunerSchema)
+}
+
+func fetchStrategyDefaultParamsWith(
+	sc StrategyConfig,
+	load func(StrategyConfig) (map[string]interface{}, string, error),
+) (map[string]interface{}, string, error) {
+	name := effectiveOpenStrategy(sc)
+	if name == "" {
+		return map[string]interface{}{}, "", nil
+	}
+	key := strategySchemaCacheKey(sc.Type, name)
+
+	strategySchemaCacheMu.Lock()
+	if cached, ok := strategySchemaCache[key]; ok {
+		defaults := cloneStringAnyMap(cached.defaults)
+		desc := cached.desc
+		strategySchemaCacheMu.Unlock()
+		return defaults, desc, nil
+	}
+	strategySchemaCacheMu.Unlock()
+
+	defaults, desc, err := load(sc)
+	if err != nil {
+		return nil, "", err
+	}
+	if defaults == nil {
+		defaults = map[string]interface{}{}
+	}
+
+	strategySchemaCacheMu.Lock()
+	strategySchemaCache[key] = strategySchemaCacheEntry{
+		defaults: cloneStringAnyMap(defaults),
+		desc:     desc,
+	}
+	strategySchemaCacheMu.Unlock()
+	return cloneStringAnyMap(defaults), desc, nil
 }
 
 func buildUIStrategyConfig(sc StrategyConfig, defaults map[string]interface{}, _ string, hasOpen bool) UIStrategyConfigResponse {
@@ -362,6 +435,8 @@ func buildUIStrategyConfig(sc StrategyConfig, defaults map[string]interface{}, _
 		AllowedRegimes:       append([]string(nil), sc.AllowedRegimes...),
 		StopLossPct:          sc.StopLossPct,
 		StopLossATRMult:      sc.StopLossATRMult,
+		Paused:               sc.Paused,
+		NotifyRatchet:        sc.NotifyRatchetTriggers,
 		DefaultParams:        defaults,
 		EditableFields:       fields,
 		HasOpenPosition:      hasOpen,
@@ -524,6 +599,20 @@ func mergeStrategyTunerOverrides(base StrategyConfig, overrides map[string]json.
 			out.StopLossPct = nil
 		}
 	}
+	if raw, ok := overrides["paused"]; ok {
+		var v bool
+		if err := json.Unmarshal(raw, &v); err != nil {
+			return out, fmt.Errorf("paused: %w", err)
+		}
+		out.Paused = v
+	}
+	if raw, ok := overrides["notify_ratchet_triggers"]; ok {
+		v, err := decodeOptionalBool(raw)
+		if err != nil {
+			return out, fmt.Errorf("notify_ratchet_triggers: %w", err)
+		}
+		out.NotifyRatchetTriggers = v
+	}
 	if raw, ok := overrides["open_strategy"]; ok {
 		var ref StrategyRef
 		if err := json.Unmarshal(raw, &ref); err != nil {
@@ -582,6 +671,17 @@ func mergeStrategyTunerOverrides(base StrategyConfig, overrides map[string]json.
 	return out, nil
 }
 
+func decodeOptionalBool(raw json.RawMessage) (*bool, error) {
+	if string(raw) == "null" {
+		return nil, nil
+	}
+	var v bool
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return nil, err
+	}
+	return &v, nil
+}
+
 func decodeOptionalFloat(raw json.RawMessage) (*float64, error) {
 	if string(raw) == "null" {
 		return nil, nil
@@ -617,11 +717,11 @@ func simulateConfigPayload(sc StrategyConfig, regime *RegimeConfig) map[string]i
 	if sc.TrailingStopATRMult != nil {
 		payload["trailing_stop_atr_mult"] = *sc.TrailingStopATRMult
 	}
-	if sc.StopLossATRRegime != nil {
-		payload["stop_loss_atr_regime"] = sc.StopLossATRRegime
+	if sc.StopLossATRMultRegime != nil {
+		payload["stop_loss_atr_mult_regime"] = sc.StopLossATRMultRegime
 	}
-	if sc.TrailingStopATRRegime != nil {
-		payload["trailing_stop_atr_regime"] = sc.TrailingStopATRRegime
+	if sc.TrailingStopATRMultRegime != nil {
+		payload["trailing_stop_atr_mult_regime"] = sc.TrailingStopATRMultRegime
 	}
 	if regime != nil {
 		payload["regime"] = map[string]interface{}{
@@ -836,6 +936,24 @@ func patchStrategyJSON(item map[string]json.RawMessage, merged StrategyConfig, o
 		}
 		if _, keep := overrides["stop_loss_pct"]; !keep {
 			deleteKey("stop_loss_pct")
+		}
+	}
+	if _, ok := overrides["paused"]; ok {
+		if merged.Paused {
+			if err := set("paused", true); err != nil {
+				return item, err
+			}
+		} else {
+			deleteKey("paused")
+		}
+	}
+	if _, ok := overrides["notify_ratchet_triggers"]; ok {
+		if merged.NotifyRatchetTriggers != nil {
+			if err := set("notify_ratchet_triggers", *merged.NotifyRatchetTriggers); err != nil {
+				return item, err
+			}
+		} else {
+			deleteKey("notify_ratchet_triggers")
 		}
 	}
 

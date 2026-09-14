@@ -7,9 +7,6 @@ import (
 	"testing"
 )
 
-// TestRunProbeMissingConfig: a missing config file fails fast with exit 1
-// rather than blowing up in some confusing place — this is the path
-// scripts/update.sh hits if config.json is genuinely absent on a fresh box.
 func TestRunProbeMissingConfig(t *testing.T) {
 	tmp := t.TempDir()
 	missing := filepath.Join(tmp, "no-such.json")
@@ -19,8 +16,6 @@ func TestRunProbeMissingConfig(t *testing.T) {
 	}
 }
 
-// TestRunProbeReturnsExitProbeFailureOnScriptFailure locks the exit code
-// update.sh and systemd RestartPreventExitStatus= depend on.
 func TestRunProbeReturnsExitProbeFailureOnScriptFailure(t *testing.T) {
 	orig := probeOneCheckScriptFn
 	defer func() { probeOneCheckScriptFn = orig }()
@@ -52,9 +47,6 @@ func TestRunProbeReturnsExitProbeFailureOnScriptFailure(t *testing.T) {
 	}
 }
 
-// TestRunProbeNoStrategies: an empty strategies list means no scripts to
-// probe, so probe trivially succeeds — this is acceptable: a config with no
-// configured strategies has no Python contract to validate.
 func TestRunProbeNoStrategies(t *testing.T) {
 	tmp := t.TempDir()
 	cfgPath := filepath.Join(tmp, "config.json")
@@ -71,16 +63,12 @@ func TestRunProbeNoStrategies(t *testing.T) {
 	}
 }
 
-// TestRunProbeHappyPath: a config with two strategies sharing one script and
-// one with a distinct script produces exactly two probe invocations (one per
-// unique script) and runProbe returns 0. Stubs probeOneCheckScriptFn because
-// Go CI should not depend on a real Python runtime for this command-level test.
 func TestRunProbeHappyPath(t *testing.T) {
 	orig := probeOneCheckScriptFn
 	defer func() { probeOneCheckScriptFn = orig }()
 	type probeCall struct {
 		script string
-		mode   string // "signal" or "fetch-atr"
+		mode   string
 	}
 	var probed []probeCall
 	probeOneCheckScriptFn = func(script string, argv []string) error {
@@ -97,9 +85,19 @@ func TestRunProbeHappyPath(t *testing.T) {
 				mode = "limit-status"
 			case "--cancel-order":
 				mode = "cancel-order"
+			case "--batch-check":
+				mode = "batch-check"
 			}
 			if mode != "signal" {
 				break
+			}
+		}
+		if mode == "signal" {
+			for _, a := range argv {
+				if a == marketStdinFlag {
+					mode = "market-signal"
+					break
+				}
 			}
 		}
 		probed = append(probed, probeCall{script, mode})
@@ -146,18 +144,16 @@ func TestRunProbeHappyPath(t *testing.T) {
 	if rc != 0 {
 		t.Fatalf("happy-path probe should return 0, got %d", rc)
 	}
-	// Expect 13 invocations: HL signal-check (adx+composite), HL --fetch-atr (#689),
-	// HL --execute (PR #769), spot signal-check (adx+composite), dashboard helpers,
-	// 3 #883 limit-order shapes (limit-open/limit-status/cancel-order), and the
-	// #879 check_regime.py bundle helper.
-	if len(probed) != 13 {
-		t.Fatalf("expected 13 probe invocations, got %d: %v", len(probed), probed)
+	if len(probed) != 17 {
+		t.Fatalf("expected 17 probe invocations, got %d: %v", len(probed), probed)
 	}
-	var hlSignal, hlFetchATR, hlExecute, hlLimitOpen, hlLimitStatus, hlCancelOrder, spotSignal, candleHelper, schemaHelper, simulateHelper, regimeHelper int
+	var hlSignal, hlMarketSignal, hlFetchATR, hlExecute, hlLimitOpen, hlLimitStatus, hlCancelOrder, hlBatchCheck, spotSignal, candleHelper, schemaHelper, simulateHelper, regimeHelper, regimeMarketHelper int
 	for _, p := range probed {
 		switch {
 		case p.script == "shared_scripts/check_hyperliquid.py" && p.mode == "signal":
 			hlSignal++
+		case p.script == "shared_scripts/check_hyperliquid.py" && p.mode == "market-signal":
+			hlMarketSignal++
 		case p.script == "shared_scripts/check_hyperliquid.py" && p.mode == "fetch-atr":
 			hlFetchATR++
 		case p.script == "shared_scripts/check_hyperliquid.py" && p.mode == "execute":
@@ -168,6 +164,8 @@ func TestRunProbeHappyPath(t *testing.T) {
 			hlLimitStatus++
 		case p.script == "shared_scripts/check_hyperliquid.py" && p.mode == "cancel-order":
 			hlCancelOrder++
+		case p.script == "shared_scripts/check_hyperliquid.py" && p.mode == "batch-check":
+			hlBatchCheck++
 		case p.script == "shared_scripts/check_strategy.py" && p.mode == "signal":
 			spotSignal++
 		case p.script == "shared_scripts/fetch_candles.py" && p.mode == "signal":
@@ -178,15 +176,16 @@ func TestRunProbeHappyPath(t *testing.T) {
 			simulateHelper++
 		case p.script == "shared_scripts/check_regime.py" && p.mode == "signal":
 			regimeHelper++
+		case p.script == "shared_scripts/check_regime.py" && p.mode == "market-signal":
+			regimeMarketHelper++
 		}
 	}
-	if hlSignal != 2 || hlFetchATR != 1 || hlExecute != 1 || hlLimitOpen != 1 || hlLimitStatus != 1 || hlCancelOrder != 1 || spotSignal != 2 || candleHelper != 1 || schemaHelper != 1 || simulateHelper != 1 || regimeHelper != 1 {
-		t.Fatalf("expected hl-signal=2, hl-fetch-atr=1, hl-execute=1, hl-limit-open=1, hl-limit-status=1, hl-cancel-order=1, spot-signal=2, candle-helper=1, schema=1, simulate=1, regime=1; got %d/%d/%d/%d/%d/%d/%d/%d/%d/%d/%d (probed=%v)",
-			hlSignal, hlFetchATR, hlExecute, hlLimitOpen, hlLimitStatus, hlCancelOrder, spotSignal, candleHelper, schemaHelper, simulateHelper, regimeHelper, probed)
+	if hlSignal != 2 || hlMarketSignal != 2 || hlFetchATR != 1 || hlExecute != 1 || hlLimitOpen != 1 || hlLimitStatus != 1 || hlCancelOrder != 1 || hlBatchCheck != 1 || spotSignal != 2 || candleHelper != 1 || schemaHelper != 1 || simulateHelper != 1 || regimeHelper != 1 || regimeMarketHelper != 1 {
+		t.Fatalf("expected hl-signal=2, hl-market-signal=2, hl-fetch-atr=1, hl-execute=1, hl-limit-open=1, hl-limit-status=1, hl-cancel-order=1, hl-batch-check=1, spot-signal=2, candle-helper=1, schema=1, simulate=1, regime=1, regime-market=1; got %d/%d/%d/%d/%d/%d/%d/%d/%d/%d/%d/%d/%d/%d (probed=%v)",
+			hlSignal, hlMarketSignal, hlFetchATR, hlExecute, hlLimitOpen, hlLimitStatus, hlCancelOrder, hlBatchCheck, spotSignal, candleHelper, schemaHelper, simulateHelper, regimeHelper, regimeMarketHelper, probed)
 	}
 }
 
-// #787: update.sh probe must load live HL configs without shell secrets.
 func TestRunProbeSkipsLiveCredentialChecks(t *testing.T) {
 	t.Setenv("HYPERLIQUID_SECRET_KEY", "")
 

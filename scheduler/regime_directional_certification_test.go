@@ -51,7 +51,6 @@ func TestCertifiedActiveAndExpired(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse active: %v", err)
 	}
-	// Live HL args use "BTC"; artifact uses "BTC/USDT" — must reconcile.
 	states, ok := set.Certified("BTC", "1h", "composite", now)
 	if !ok {
 		t.Fatal("expected active certification for BTC/1h/composite")
@@ -62,7 +61,6 @@ func TestCertifiedActiveAndExpired(t *testing.T) {
 	if st := set.Status("btc", "1h", "composite", now); st != CertActive {
 		t.Fatalf("status = %v, want CertActive", st)
 	}
-	// Wrong classifier / timeframe / asset must all miss.
 	if _, ok := set.Certified("BTC", "1h", "adx", now); ok {
 		t.Fatal("classifier mismatch must not certify")
 	}
@@ -104,8 +102,60 @@ func TestParseRejectsBadDirectionAndSchema(t *testing.T) {
 	}
 }
 
+func TestParseToleratesNestedCriteriaProvenance(t *testing.T) {
+	art := []byte(`{
+		"schema_version": 1,
+		"generated_at": "2026-08-22T00:00:00Z",
+		"generator": "backtest/research/regime_1076_certify.py",
+		"source_evidence": "backtest/research/README_1076_directional_premise.md",
+		"criteria": {
+			"global_correction": "benjamini-hochberg",
+			"fdr_q": 0.05,
+			"held_out_windows": ["is", "oos"],
+			"screened_family_size": 2436,
+			"n_perm": 30000,
+			"permutation_p_floor": 3.333e-05,
+			"data_sources": {"BTC/USDT": "binanceus", "HYPE/USDC:USDC": "hyperliquid"},
+			"universe": {
+				"symbols": ["BTC/USDT", "ETH/USDT", "SOL/USDT", "HYPE/USDC:USDC"],
+				"timeframes": ["1h", "4h"],
+				"windows": ["is", "oos", "2023", "2024", "2025H1"],
+				"classifiers": ["adx", "composite"],
+				"horizons": [1, 4, 8, 12, 24, 48, 72]
+			}
+		},
+		"default_ttl_days": 90,
+		"certified": [
+			{"asset":"HYPE","timeframe":"1h","classifier":"composite",
+			 "generated_at":"2026-08-22T00:00:00Z","expires_at":"2026-11-20T00:00:00Z",
+			 "states":{"trending_down":"short"}}]}`)
+	set, err := parseDirectionalCertSet(art)
+	if err != nil {
+		t.Fatalf("nested criteria provenance must parse, got %v", err)
+	}
+	if got := set.Criteria["screened_family_size"]; got != float64(2436) {
+		t.Fatalf("screened_family_size not preserved: %v", got)
+	}
+	entry, ok := set.Certified("HYPE/USDC:USDC", "1h", "composite",
+		time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC))
+	if !ok {
+		t.Fatal("HYPE cell must certify through the normalized asset key")
+	}
+	if entry["trending_down"] != DirectionShort {
+		t.Fatalf("unexpected states: %v", entry)
+	}
+}
+
+func TestParseRejectsProvenanceAtTopLevel(t *testing.T) {
+	for _, key := range []string{"screened_family_size", "data_sources", "universe", "n_perm"} {
+		art := []byte(`{"schema_version":1,"` + key + `":{},"certified":[]}`)
+		if _, err := parseDirectionalCertSet(art); err == nil {
+			t.Fatalf("top-level %q must be rejected by DisallowUnknownFields", key)
+		}
+	}
+}
+
 func TestLoadFailClosedOnMissingAndMalformed(t *testing.T) {
-	// Missing file -> empty set, no warn, no error.
 	set, err := LoadDirectionalCertSet("/nonexistent/regime_directional_certifications.json")
 	if err != nil {
 		t.Fatalf("missing file should not error, got %v", err)
@@ -114,7 +164,6 @@ func TestLoadFailClosedOnMissingAndMalformed(t *testing.T) {
 		t.Fatal("missing file should yield empty set")
 	}
 
-	// Malformed -> fail-closed wrapper returns empty + warns.
 	dir := t.TempDir()
 	path := dir + "/cert.json"
 	if err := os.WriteFile(path, []byte("{not json"), 0o644); err != nil {
@@ -158,7 +207,6 @@ func TestDirectionalCertIdentity(t *testing.T) {
 		t.Fatalf("override identity = (%q,%q,%q), want (BTC,1d,composite)", asset, tf, classifier)
 	}
 
-	// No symbol/timeframe -> not resolvable.
 	if _, _, _, ok := directionalCertIdentity(StrategyConfig{Args: []string{"hold"}}, nil); ok {
 		t.Fatal("expected unresolvable identity for short args")
 	}
@@ -171,7 +219,6 @@ func TestApplyRegimeDirectionalPolicyDefaultOffWhenUncertified(t *testing.T) {
 			"trending_up":   {Direction: DirectionLong},
 			"ranging":       {Direction: DirectionLong},
 		}}}
-	// certified=false → default-off: policy not applied, base config preserved.
 	_, applied, _ := applyRegimeDirectionalPolicy(&sc, "trending_down", "", 0, nil)
 	if applied {
 		t.Fatal("uncertified policy must not apply (default-off)")
@@ -179,7 +226,6 @@ func TestApplyRegimeDirectionalPolicyDefaultOffWhenUncertified(t *testing.T) {
 	if sc.Direction != DirectionLong || sc.InvertSignal {
 		t.Fatalf("sc must stay at base, got dir=%q invert=%t", sc.Direction, sc.InvertSignal)
 	}
-	// certified=true → applied, sc mutated to the regime's direction.
 	entry, applied, _ := applyRegimeDirectionalPolicy(&sc, "trending_down", "", 0, map[string]string{"trending_down": DirectionShort, "trending_up": DirectionLong, "ranging": DirectionLong})
 	if !applied || entry.Direction != DirectionShort || sc.Direction != DirectionShort {
 		t.Fatalf("certified policy must apply short, got applied=%t entry=%+v dir=%q", applied, entry, sc.Direction)
@@ -199,7 +245,6 @@ func TestStrategyDirectionalCertifiedUsesStore(t *testing.T) {
 	setDirectionalCertStore(set)
 	defer setDirectionalCertStore(prev)
 
-	// rc=nil → classifier defaults to adx, matching the entry.
 	sc := StrategyConfig{Type: "perps", Args: []string{"vwap", "BTC", "1h"}}
 	if _, ok := strategyDirectionalCertified(sc, nil, now); !ok {
 		t.Fatal("BTC/1h/adx should be certified via store")
@@ -219,7 +264,7 @@ func TestDirectionalCertStartupSummary(t *testing.T) {
 	defer setDirectionalCertStore(prev)
 
 	cfg := &Config{Strategies: []StrategyConfig{
-		{ID: "plain", Type: "perps", Args: []string{"vwap", "BTC", "1h"}}, // no policy → no line
+		{ID: "plain", Type: "perps", Args: []string{"vwap", "BTC", "1h"}},
 		{ID: "dir", Type: "perps", Args: []string{"vwap", "BTC", "1h"}, RegimeDirectionalPolicy: &RegimeDirectionalPolicy{
 			TrendRegime: map[string]RegimeDirectionalEntry{"trending_up": {Direction: DirectionLong}},
 		}},
@@ -314,10 +359,6 @@ func TestDirectionalCertOperatorNotes(t *testing.T) {
 	}
 }
 
-// Review finding 1: DirectionCertifiedAtOpen must survive a daemon restart
-// (SQLite round-trip). Without persistence a CERTIFIED-at-open position reloads
-// as false and is migrated to base direction (req-2 violation). Covers both
-// the true and false ("inverse") cases in one save/load.
 func TestDirectionCertifiedAtOpenDBRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	sdb, err := OpenStateDB(dir + "/state.db")
@@ -361,15 +402,6 @@ func TestDirectionCertifiedAtOpenDBRoundTrip(t *testing.T) {
 	}
 }
 
-// Review finding 2 (re-review): the directional-cert stamp must be WRITE-ONCE at
-// the ENTRY INSTANT — frozen by stampDirectionCertifiedAtOpenIfOpened the cycle a
-// genuine open Trade is produced (OpenTrade != nil), and NEVER re-derived after.
-// The prior approach tied the stamp to stampPositionRegimeFromPayload (the regime
-// LABEL stamp); in multi-window mode the label warms up over several cycles, so a
-// SIGHUP cert change landing between open and label-record corrupted the stamp.
-// The stamp is now fully decoupled from the label: NO stampPositionRegimeIfOpened
-// call (any payload, any store state) may move it. Covers the bot's must-survive
-// cases (a)/(b)/(c) plus (d) the exact multi-window warmup race.
 func TestDirectionCertifiedAtOpenIsWriteOnce(t *testing.T) {
 	rc := &RegimeConfig{Enabled: true, Period: 14, ADXThreshold: 20}
 	policy := &RegimeDirectionalPolicy{TrendRegime: map[string]RegimeDirectionalEntry{
@@ -397,11 +429,9 @@ func TestDirectionCertifiedAtOpenIsWriteOnce(t *testing.T) {
 	prev := getDirectionalCertStore()
 	defer setDirectionalCertStore(prev)
 
-	// (a) Uncertified at open → false; a later SIGHUP certification AND the cycle
-	// that finally records the regime label must NOT flip it.
 	setDirectionalCertStore(emptyDirectionalCertSet())
 	ssA := newState()
-	stampDirectionCertifiedAtOpenIfOpened(ssA, "BTC", true /*opened*/, sc, rc)
+	stampDirectionCertifiedAtOpenIfOpened(ssA, "BTC", true, sc, rc)
 	if ssA.Positions["BTC"].DirectionCertifiedAtOpen {
 		t.Fatal("(a) uncertified-at-open must stamp false")
 	}
@@ -409,7 +439,7 @@ func TestDirectionCertifiedAtOpenIsWriteOnce(t *testing.T) {
 		t.Fatal("(a) uncertified-at-open must freeze a nil per-state map")
 	}
 	setDirectionalCertStore(certifiedStore())
-	stampDirectionCertifiedAtOpenIfOpened(ssA, "BTC", false /*no new open*/, sc, rc)
+	stampDirectionCertifiedAtOpenIfOpened(ssA, "BTC", false, sc, rc)
 	stampPositionRegimeIfOpened(ssA, "BTC", RegimePayload{Legacy: "ranging"}, sc, rc)
 	if ssA.Positions["BTC"].DirectionCertifiedAtOpen {
 		t.Fatal("(a) a later SIGHUP certification / label-record cycle must NOT flip an open position to true")
@@ -421,7 +451,6 @@ func TestDirectionCertifiedAtOpenIsWriteOnce(t *testing.T) {
 		t.Fatal("(a) a later SIGHUP/label cycle must not populate the frozen per-state map")
 	}
 
-	// (b) Certified at open → true; later de-certification + label-record must NOT flip it.
 	setDirectionalCertStore(certifiedStore())
 	ssB := newState()
 	stampDirectionCertifiedAtOpenIfOpened(ssB, "BTC", true, sc, rc)
@@ -441,8 +470,6 @@ func TestDirectionCertifiedAtOpenIsWriteOnce(t *testing.T) {
 		t.Fatal("(b) de-cert/label cycle must not clear the frozen per-state map")
 	}
 
-	// (c) A position whose regime label records on the first post-open cycle still
-	// stamps the OPEN-cycle verdict (verdict frozen at open, label stamps alongside).
 	setDirectionalCertStore(certifiedStore())
 	ssC := newState()
 	stampDirectionCertifiedAtOpenIfOpened(ssC, "BTC", true, sc, rc)
@@ -454,11 +481,6 @@ func TestDirectionCertifiedAtOpenIsWriteOnce(t *testing.T) {
 		t.Fatal("(c) the stamp must equal the open-cycle verdict (certified)")
 	}
 
-	// (d) The exact finding-2 multi-window warmup race: a position opens while the
-	// gate/primary window label is still empty (payload non-empty because a
-	// shorter window is present but unlabeled), a SIGHUP certifies the cell, and
-	// THEN the primary window fills and the label records. The stamp must reflect
-	// the OPEN-instant (uncertified) verdict, not the SIGHUP-changed one.
 	rcMW := &RegimeConfig{Enabled: true, Period: 14, Windows: RegimeWindowsMap{
 		"short":  {Classifier: "adx", Period: 14},
 		"medium": {Classifier: "composite", Period: 48},
@@ -472,23 +494,17 @@ func TestDirectionCertifiedAtOpenIsWriteOnce(t *testing.T) {
 		}
 		return s
 	}
-	// This multi-window config keys the cert on the composite directional window —
-	// so a wrongful re-evaluation against certifiedMW WOULD flip the stamp; the fix
-	// prevents that.
 	if _, _, cls, ok := directionalCertIdentity(sc, rcMW); !ok || cls != "composite" {
 		t.Fatalf("(d) expected composite directional classifier, got %q ok=%v", cls, ok)
 	}
 	setDirectionalCertStore(emptyDirectionalCertSet())
 	ssD := newState()
-	stampDirectionCertifiedAtOpenIfOpened(ssD, "BTC", true /*open instant*/, sc, rcMW)
-	// Warmup cycle: only "short" present and unlabeled → gate AND primary labels
-	// resolve empty → the regime label must NOT record yet, cert untouched.
+	stampDirectionCertifiedAtOpenIfOpened(ssD, "BTC", true, sc, rcMW)
 	warmup := RegimePayload{MultiMode: true, Windows: map[string]RegimeSnapshot{"short": {Regime: ""}}}
 	stampPositionRegimeIfOpened(ssD, "BTC", warmup, sc, rcMW)
 	if ssD.Positions["BTC"].Regime != "" {
 		t.Fatalf("(d) warmup must not record a regime label, got %q", ssD.Positions["BTC"].Regime)
 	}
-	// SIGHUP certifies the cell mid-warmup, then the primary window fills.
 	setDirectionalCertStore(certifiedMW())
 	filled := RegimePayload{MultiMode: true, Windows: map[string]RegimeSnapshot{"medium": {Regime: "trending_down_clean"}}}
 	stampPositionRegimeIfOpened(ssD, "BTC", filled, sc, rcMW)
@@ -506,9 +522,9 @@ func TestDirectionCertifiedAtOpenIsWriteOnce(t *testing.T) {
 func TestDirectionalCertSignMismatches(t *testing.T) {
 	sc := StrategyConfig{}
 	pol := &RegimeDirectionalPolicy{TrendRegime: map[string]RegimeDirectionalEntry{
-		"trending_up":   {Direction: DirectionShort}, // contradicts certified long
-		"trending_down": {Direction: DirectionShort}, // matches
-		"ranging":       {Direction: DirectionBoth},  // never contradicts
+		"trending_up":   {Direction: DirectionShort},
+		"trending_down": {Direction: DirectionShort},
+		"ranging":       {Direction: DirectionBoth},
 	}}
 	sc.RegimeDirectionalPolicy = pol
 	certStates := map[string]string{

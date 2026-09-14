@@ -191,14 +191,13 @@ func TestFormatStrategyInspectionShowsResolvedTPSource(t *testing.T) {
 			t.Errorf("output missing %q.\nfull:\n%s", want, out)
 		}
 	}
-	// Verify default markers do NOT appear for explicit fields.
 	if strings.Contains(out, "platform:            hyperliquid (default)") {
 		t.Errorf("platform was explicit but rendered as default")
 	}
 }
 
 func TestFormatStrategyInspectionMarksDefaultedFields(t *testing.T) {
-	mult := 1.0 // applied by LoadConfig default
+	mult := 1.0
 	sc := StrategyConfig{
 		ID:              "hl-tema-eth-live",
 		Type:            "perps",
@@ -206,13 +205,12 @@ func TestFormatStrategyInspectionMarksDefaultedFields(t *testing.T) {
 		Script:          "shared_scripts/check_hyperliquid.py",
 		Args:            []string{"triple_ema", "ETH", "1h"},
 		OpenStrategy:    StrategyRef{Name: "triple_ema"},
-		Leverage:        1, // LoadConfig default
-		SizingLeverage:  1, // inherited from leverage
+		Leverage:        1,
+		SizingLeverage:  1,
 		MarginMode:      "isolated",
 		MaxDrawdownPct:  50,
 		StopLossATRMult: &mult,
 	}
-	// Operator only set id/type/platform/script/args/open_strategy.
 	explicit := map[string]bool{"id": true, "type": true, "platform": true, "script": true, "args": true, "open_strategy": true}
 	out := formatStrategyInspection(sc, explicit, &Config{IntervalSeconds: 600}, nil)
 
@@ -240,7 +238,7 @@ func TestFormatStrategySummaryLineCompressesEverything(t *testing.T) {
 		CloseStrategy:   &StrategyRef{Name: "tiered_tp_atr"},
 		StopLossATRMult: &mult,
 	}
-	line := formatStrategySummaryLine(sc, map[string]bool{"stop_loss_atr_mult": true})
+	line := formatStrategySummaryLine(sc, map[string]bool{"stop_loss_atr_mult": true}, nil)
 	for _, want := range []string{
 		"[config] hl-rmc-eth-live:",
 		"type=perps",
@@ -262,7 +260,7 @@ func TestFormatStrategySummaryLineSpotOmitsHLFields(t *testing.T) {
 		Platform:     "binanceus",
 		OpenStrategy: StrategyRef{Name: "momentum"},
 	}
-	line := formatStrategySummaryLine(sc, nil)
+	line := formatStrategySummaryLine(sc, nil, nil)
 	if strings.Contains(line, "sl=") || strings.Contains(line, "tp=") {
 		t.Errorf("spot summary should not include sl/tp fields: %s", line)
 	}
@@ -320,7 +318,7 @@ func TestResolveStopLossRegimeFixedInspectDetail(t *testing.T) {
 	sc := StrategyConfig{
 		Type:     "perps",
 		Platform: "hyperliquid",
-		StopLossATRRegime: &RegimeATRBlock{
+		StopLossATRMultRegime: &RegimeATRBlock{
 			UseDefaults: true,
 			TrendRegime: map[string]RegimeATREntry{
 				"trending_up":   {ATR: 2.0},
@@ -329,8 +327,8 @@ func TestResolveStopLossRegimeFixedInspectDetail(t *testing.T) {
 			},
 		},
 	}
-	res := resolveStopLoss(sc, map[string]bool{"stop_loss_atr_regime": true})
-	if res.Source != "stop_loss_atr_regime" {
+	res := resolveStopLoss(sc, map[string]bool{"stop_loss_atr_mult_regime": true})
+	if res.Source != "stop_loss_atr_mult_regime" {
 		t.Fatalf("source=%q", res.Source)
 	}
 	if len(res.Detail) != 1 || !strings.Contains(res.Detail[0], "use_defaults baseline") {
@@ -378,9 +376,7 @@ func TestFormatStrategySummaryLineRegimeTPTierCount(t *testing.T) {
 		CloseStrategy:   &StrategyRef{Name: "tiered_tp_atr_regime", Params: map[string]interface{}{"use_defaults": true}},
 		StopLossATRMult: &mult,
 	}
-	line := formatStrategySummaryLine(sc, nil)
-	// #870: fleet default is ragged per group (2/3/4 tiers); the summary reports
-	// the fleet maximum (clean group = 4 tiers).
+	line := formatStrategySummaryLine(sc, nil, nil)
 	if !strings.Contains(line, "tp=tiered_tp_atr_regime[4-tier]") {
 		t.Errorf("expected 4-tier regime TP summary, got: %s", line)
 	}
@@ -435,16 +431,13 @@ func TestFormatStrategyInspectionPositionOrderDeterministic(t *testing.T) {
 	}
 }
 
-// #1048: a strategy with the circuit breaker explicitly disabled surfaces
-// "cb=off" in the startup summary so it isn't silently unprotected; an enabled
-// (default) strategy and a manual strategy (CB no-op) show nothing.
 func TestFormatStrategySummaryLineShowsCircuitBreakerOff(t *testing.T) {
 	off := false
 	disabled := StrategyConfig{
 		ID: "hl-eth", Type: "perps", Platform: "hyperliquid",
 		OpenStrategy: StrategyRef{Name: "momentum"}, CircuitBreaker: &off,
 	}
-	if line := formatStrategySummaryLine(disabled, nil); !strings.Contains(line, "cb=off") {
+	if line := formatStrategySummaryLine(disabled, nil, nil); !strings.Contains(line, "cb=off") {
 		t.Errorf("disabled CB should show cb=off: %s", line)
 	}
 
@@ -452,16 +445,70 @@ func TestFormatStrategySummaryLineShowsCircuitBreakerOff(t *testing.T) {
 		ID: "hl-eth", Type: "perps", Platform: "hyperliquid",
 		OpenStrategy: StrategyRef{Name: "momentum"},
 	}
-	if line := formatStrategySummaryLine(enabled, nil); strings.Contains(line, "cb=") {
+	if line := formatStrategySummaryLine(enabled, nil, nil); strings.Contains(line, "cb=") {
 		t.Errorf("default CB should not mention cb=: %s", line)
 	}
 
-	// Manual is exempt from CheckRisk — the flag is a no-op, so don't surface it.
 	manual := StrategyConfig{
 		ID: "manual-eth", Type: "manual", Platform: "hyperliquid",
 		OpenStrategy: StrategyRef{Name: "hold"}, CircuitBreaker: &off,
 	}
-	if line := formatStrategySummaryLine(manual, nil); strings.Contains(line, "cb=") {
+	if line := formatStrategySummaryLine(manual, nil, nil); strings.Contains(line, "cb=") {
 		t.Errorf("manual strategy should not mention cb=: %s", line)
+	}
+}
+
+func TestStrategySurfacesShowCBOverrides(t *testing.T) {
+	dd, th, lc := 720, 3, 30
+	tuned := StrategyConfig{
+		ID: "spot-btc", Type: "spot", Platform: "binanceus",
+		OpenStrategy:                StrategyRef{Name: "momentum"},
+		MaxDrawdownPct:              20,
+		CBDrawdownCooldownMinutes:   &dd,
+		CBLossStreakThreshold:       &th,
+		CBLossStreakCooldownMinutes: &lc,
+	}
+
+	line := formatStrategySummaryLine(tuned, nil, nil)
+	if !strings.Contains(line, "cb[losses>=3, loss_cooldown=30m, dd_cooldown=12h0m]") {
+		t.Errorf("summary line should carry the tuned CB parameters: %s", line)
+	}
+
+	text := formatStrategyInspection(tuned, nil, nil, nil)
+	if !strings.Contains(text, "circuit_breaker:     on — losses>=3, loss_cooldown=30m, dd_cooldown=12h0m") {
+		t.Errorf("inspect text should carry the tuned CB parameters:\n%s", text)
+	}
+
+	out := buildStrategyInspectionJSON(tuned, map[string]bool{
+		"cb_drawdown_cooldown_minutes": true, "cb_loss_streak_threshold": true, "cb_loss_streak_cooldown_minutes": true,
+	}, nil, nil)
+	if out["cb_drawdown_cooldown_minutes"] != 720 || out["cb_loss_streak_threshold"] != 3 || out["cb_loss_streak_cooldown_minutes"] != 30 {
+		t.Errorf("inspect JSON should carry the effective tuned values, got %v %v %v",
+			out["cb_drawdown_cooldown_minutes"], out["cb_loss_streak_threshold"], out["cb_loss_streak_cooldown_minutes"])
+	}
+	if out["cb_loss_streak_threshold_explicit"] != true {
+		t.Errorf("explicit provenance flag lost: %v", out["cb_loss_streak_threshold_explicit"])
+	}
+
+	plain := StrategyConfig{
+		ID: "spot-btc", Type: "spot", Platform: "binanceus",
+		OpenStrategy: StrategyRef{Name: "momentum"}, MaxDrawdownPct: 20,
+	}
+	if line := formatStrategySummaryLine(plain, nil, nil); strings.Contains(line, "cb[") {
+		t.Errorf("default CB parameters should not surface in summary: %s", line)
+	}
+	if text := formatStrategyInspection(plain, nil, nil, nil); strings.Contains(text, "circuit_breaker:") {
+		t.Errorf("default CB parameters should not surface in inspect text:\n%s", text)
+	}
+	out = buildStrategyInspectionJSON(plain, nil, nil, nil)
+	if out["cb_drawdown_cooldown_minutes"] != 1440 || out["cb_loss_streak_threshold"] != 5 || out["cb_loss_streak_cooldown_minutes"] != 60 {
+		t.Errorf("inspect JSON should report the built-in defaults, got %v %v %v",
+			out["cb_drawdown_cooldown_minutes"], out["cb_loss_streak_threshold"], out["cb_loss_streak_cooldown_minutes"])
+	}
+
+	manual := StrategyConfig{ID: "manual-eth", Type: "manual", Platform: "hyperliquid"}
+	out = buildStrategyInspectionJSON(manual, nil, nil, nil)
+	if _, ok := out["cb_loss_streak_threshold"]; ok {
+		t.Error("manual strategy should not emit cb_* keys in inspect JSON")
 	}
 }

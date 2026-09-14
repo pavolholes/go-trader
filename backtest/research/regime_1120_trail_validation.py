@@ -1,10 +1,4 @@
 #!/usr/bin/env python3
-"""#1120: compare incumbent vs proposed regime opening-trail defaults.
-
-Runs trailing_tp_ratchet_regime + use_defaults ratchet tiers with explicit
-trailing_stop_atr_regime trend_regime blocks (current system table vs MC-
-derived proposal) on the audit BTC 1h OOS window. Emits JSON for PR rationale.
-"""
 from __future__ import annotations
 
 import json
@@ -65,7 +59,7 @@ def _run_arm(df, label: str, trail: dict) -> dict:
         close_strategies=CLOSE_STACK,
         regime_enabled=True,
         regime_windows_spec=COMPOSITE_SPEC,
-        trailing_stop_atr_regime={"trend_regime": trail},
+        trailing_stop_atr_mult_regime={"trend_regime": trail},
     )
     r = bt.run(
         df,

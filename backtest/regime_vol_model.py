@@ -1,5 +1,3 @@
-"""Unsupervised volatility-state regime model (#1080): HMM/GMM/k-means candidates
-behind one model-dict schema decoded by regime_hmm.forward_filter_labels. Offline only."""
 from __future__ import annotations
 import os, sys
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -9,13 +7,16 @@ for _p in (_THIS_DIR, os.path.abspath(os.path.join(_THIS_DIR, "..")),
         sys.path.insert(0, _p)
 
 from dataclasses import dataclass
+import math
 
 import numpy as np
 from regime_hmm import stationary_distribution
 
 FEATURES = ["return_eff", "range_eff", "efficiency", "adx"]
 MODEL_TYPE = "unsupervised_vol_regime"
-MODEL_VERSION = 1
+MODEL_VERSION = 2
+NAMING_RULE = "distinct_nearest_cell"
+_RELABEL_PENALTY = 1e6
 
 
 def standardize(features):
@@ -29,8 +30,6 @@ def standardize(features):
 
 
 def empirical_transition(assignments_valid, valid_mask, k, *, laplace=1.0):
-    """Count i->j only between bars adjacent in the ORIGINAL series AND both feature-valid,
-    mirroring regime_hmm's NaN discipline. Laplace-smoothed, row-normalized."""
     valid_mask = np.asarray(valid_mask, dtype=bool)
     full = np.full(len(valid_mask), -1, dtype=int)
     full[valid_mask] = np.asarray(assignments_valid, dtype=int)
@@ -62,7 +61,7 @@ def fit_kmeans(z, k, *, seed=0, iters=100, var_floor=1e-3):
     n = len(z)
     rng = np.random.default_rng(seed)
     centers = z[rng.choice(n, size=k, replace=False)].copy()
-    assign = None  # None != any real assignment -> first iteration never early-breaks (k=1 safe)
+    assign = None
     for _ in range(iters):
         d = ((z[:, None, :] - centers[None, :, :]) ** 2).sum(-1)
         new = d.argmin(1)
@@ -72,23 +71,17 @@ def fit_kmeans(z, k, *, seed=0, iters=100, var_floor=1e-3):
         for j in range(k):
             if (assign == j).any():
                 centers[j] = z[assign == j].mean(0)
-    em_mean = centers.copy()  # decouple from `centers` so callers can't mutate the alias
-    # Re-seed empty clusters before summarizing: an emptied cluster keeps its stale init centroid
-    # and the default unit variance, and forward_filter_labels does NOT skip n=0 states -> that
-    # ghost Gaussian can still win the decoder argmax and emit a label no training bar supports.
-    # Hand each empty cluster the data point farthest from its assigned center (classic
-    # empty-cluster repair), stealing only from clusters that can spare a member, so every stored
-    # state summarizes >=1 real observation. No-op when every cluster is occupied -> byte-identical.
+    em_mean = centers.copy()
     empty = [j for j in range(k) if not (assign == j).any()]
     if empty:
         d = ((z[:, None, :] - centers[None, :, :]) ** 2).sum(-1)
         nearest = d[np.arange(n), assign]
         for j in empty:
-            sizes = np.bincount(assign, minlength=k)            # recomputed: prior steals shrink donors
+            sizes = np.bincount(assign, minlength=k)
             spare = np.where(sizes[assign] >= 2, nearest, -np.inf)
             far = int(spare.argmax())
             if not np.isfinite(spare[far]):
-                break  # no donor can spare a point (fewer than k distinct-enough rows) -> degenerate
+                break
             assign[far] = j
             em_mean[j] = z[far]
     em_var = np.ones((k, z.shape[1]))
@@ -103,37 +96,16 @@ def fit_kmeans(z, k, *, seed=0, iters=100, var_floor=1e-3):
 
 
 def _diag_logprob(z, mu, var):
-    # log N(z; mu, diag(var)) per row -> [n]
     diff = z - mu
     return -0.5 * (np.log(2 * np.pi * var) + diff ** 2 / var).sum(1)
 
 
 def _neutralize_dead_components(mu, var, soft_mass, *, min_soft_mass=1.0):
-    """Park truly-dead mixture/state components so they can never win the decoder argmax.
-
-    forward_filter_labels (regime_hmm.py) decodes purely on emission geometry + transitions and
-    NEVER reads the hard `n` count, so a component the fit collapsed toward the standardized origin
-    at `var_floor` forms a sharp Gaussian that can hijack near-mean (z~=0) bars at decode time.
-
-    Classify by SOFT mass (GMM responsibilities / HMM gammas), NOT the hard argmax/Viterbi count:
-      * benign  — real soft mass that merely never won a hard assignment. Its emission is legitimately
-                  soft-fitted from real data and MUST decode unchanged, so it is left untouched.
-      * truly-dead — soft mass below one effective observation (`min_soft_mass`): a numerical ghost
-                  collapsed to origin at `var_floor`. Re-anchor it at the standardized origin with
-                  unit variance — the SAME uninformative emission fit_label_anchored_hmm assigns its
-                  degenerate states (regime_hmm.py) — so any real component always out-scores it.
-
-    We PARK rather than exclude-from-decode because the decoder is shared with the label-anchored
-    HMM (whose n=0/n=1 anchored states must keep decoding); a decoder-side `n`-skip would break it,
-    whereas parking is a pure fit-time emission edit that leaves the decoder byte-identical.
-
-    Mutates mu/var in place; returns the boolean dead mask. No-op (byte-identical fit) when every
-    component clears the threshold."""
     soft_mass = np.asarray(soft_mass, dtype=float)
     dead = soft_mass < float(min_soft_mass)
     if dead.any():
-        mu[dead] = 0.0    # standardized origin
-        var[dead] = 1.0   # unit variance -> maximally flat, mirrors fit_label_anchored_hmm anchor
+        mu[dead] = 0.0
+        var[dead] = 1.0
     return dead
 
 
@@ -152,8 +124,8 @@ def fit_gmm(z, k, *, seed=0, iters=100, var_floor=1e-3, tol=1e-4, min_soft_mass=
         lse = _logsumexp_rows(log_resp)
         ll = float(lse.sum())
         resp = np.exp(log_resp - lse[:, None])
-        Nk = resp.sum(0)                       # exact responsibility mass; sum(Nk) == n
-        safe_Nk = np.maximum(Nk, 1e-10)        # guard division only — never inflates the mass
+        Nk = resp.sum(0)
+        safe_Nk = np.maximum(Nk, 1e-10)
         weights = Nk / n
         mu = (resp.T @ z) / safe_Nk[:, None]
         for j in range(k):
@@ -168,8 +140,6 @@ def fit_gmm(z, k, *, seed=0, iters=100, var_floor=1e-3, tol=1e-4, min_soft_mass=
         log_resp[:, j] = np.log(weights[j] + 1e-300) + _diag_logprob(z, mu[j], var[j])
     assign = log_resp.argmax(1)
     counts = np.array([int((assign == j).sum()) for j in range(k)], dtype=int)
-    # Soft responsibility mass under the FINAL params (the mass that shaped mu/var); a truly-dead
-    # component reads ~0 here even when its hard `n` (counts) is 0 for a benign reason.
     soft_mass = np.exp(log_resp - _logsumexp_rows(log_resp)[:, None]).sum(0)
     _neutralize_dead_components(mu, var, soft_mass, min_soft_mass=min_soft_mass)
     return assign, mu, var, counts
@@ -182,7 +152,7 @@ def _viterbi(z, mu, var, A, pi):
     delta = np.log(pi + 1e-300) + logB[0]
     back = np.zeros((n, k), dtype=int)
     for t in range(1, n):
-        m = delta[:, None] + logA            # [k_prev, k_next]
+        m = delta[:, None] + logA
         back[t] = m.argmax(0)
         delta = m.max(0) + logB[t]
     path = np.zeros(n, dtype=int)
@@ -205,8 +175,6 @@ def fit_hmm(z, k, *, seed=0, iters=50, var_floor=1e-3, tol=1e-4, min_soft_mass=1
         logA = np.log(A + 1e-300)
         log_alpha = np.empty((n, k)); log_alpha[0] = np.log(pi + 1e-300) + logB[0]
         for t in range(1, n):
-            # alpha[t,j] = logsumexp_i(alpha[t-1,i] + logA[i,j]) + logB[t,j]; reduce over the
-            # SOURCE state i (axis 0). Transpose [i,j]->[j,i] so the per-row reducer sums over i.
             log_alpha[t] = _logsumexp_rows((log_alpha[t - 1][:, None] + logA).T) + logB[t]
         ll = _logsumexp(log_alpha[-1])
         log_beta = np.zeros((n, k))
@@ -234,8 +202,6 @@ def fit_hmm(z, k, *, seed=0, iters=50, var_floor=1e-3, tol=1e-4, min_soft_mass=1
         prev_ll = ll
     assign = _viterbi(z, mu, var, A, pi)
     counts = np.array([int((assign == j).sum()) for j in range(k)], dtype=int)
-    # gamma (last E-step) IS the responsibility mass that produced the final mu/var (line above);
-    # a truly-dead state reads ~0 expected occupancy here. Same post-loop-local pattern as A/pi.
     _neutralize_dead_components(mu, var, gamma.sum(0), min_soft_mass=min_soft_mass)
     return assign, mu, var, counts
 
@@ -243,54 +209,167 @@ def fit_hmm(z, k, *, seed=0, iters=50, var_floor=1e-3, tol=1e-4, min_soft_mass=1
 FITTERS = {"kmeans": fit_kmeans, "gmm": fit_gmm, "hmm": fit_hmm}
 
 
+def handrule_cells(thresholds):
+    from regime import normalize_composite_thresholds, _DEFAULT_COMPOSITE_THRESHOLDS
+    th = normalize_composite_thresholds(thresholds)
+    rt = float(th["return_eff"])
+    gt = float(th["range_eff"])
+    at = float(th.get("adx", _DEFAULT_COMPOSITE_THRESHOLDS["adx"]))
+    et = float(th.get("efficiency", _DEFAULT_COMPOSITE_THRESHOLDS["efficiency"]))
+    R, G, E, A = "return_eff", "range_eff", "efficiency", "adx"
+    return {
+        "trending_up_clean": [[(R, ">=", rt), (E, ">=", et), (A, ">=", at)]],
+        "trending_up_choppy": [[(R, ">=", rt), (E, "<", et)], [(R, ">=", rt), (A, "<", at)]],
+        "trending_down_clean": [[(R, "<=", -rt), (E, ">=", et), (A, ">=", at)]],
+        "trending_down_choppy": [[(R, "<=", -rt), (E, "<", et)], [(R, "<=", -rt), (A, "<", at)]],
+        "ranging_directional_up": [[(R, ">", 0.0), (R, "<", rt), (A, ">=", at)]],
+        "ranging_directional_down": [[(R, "<", 0.0), (R, ">", -rt), (A, ">=", at)]],
+        "ranging_directional": [[(R, ">=", 0.0), (R, "<=", 0.0), (A, ">=", at)]],
+        "ranging_volatile": [[(R, "<", rt), (R, ">", -rt), (A, "<", at), (G, ">=", gt)]],
+        "ranging_quiet": [[(R, "<", rt), (R, ">", -rt), (A, "<", at), (G, "<", gt)]],
+    }
+
+
+def cell_distance_z(point, scale, cell):
+    best = math.inf
+    for conjunction in cell:
+        acc = 0.0
+        for feat, op, th in conjunction:
+            x = float(point[feat])
+            if op in (">=", ">"):
+                violation = max(0.0, th - x)
+            else:
+                violation = max(0.0, x - th)
+            acc += (violation / float(scale[feat])) ** 2
+        best = min(best, math.sqrt(acc))
+    return best
+
+
+def _min_cost_assignment(cost):
+    cost = np.asarray(cost, dtype=float)
+    n, m = cost.shape
+    if n > m:
+        raise ValueError(f"cannot assign {n} rows to {m} columns distinctly")
+    inf = math.inf
+    u = [0.0] * (n + 1)
+    v = [0.0] * (m + 1)
+    p = [0] * (m + 1)
+    way = [0] * (m + 1)
+    for i in range(1, n + 1):
+        p[0] = i
+        j0 = 0
+        minv = [inf] * (m + 1)
+        used = [False] * (m + 1)
+        while True:
+            used[j0] = True
+            i0 = p[j0]
+            delta = inf
+            j1 = 0
+            for j in range(1, m + 1):
+                if used[j]:
+                    continue
+                cur = cost[i0 - 1, j - 1] - u[i0] - v[j]
+                if cur < minv[j]:
+                    minv[j] = cur
+                    way[j] = j0
+                if minv[j] < delta:
+                    delta = minv[j]
+                    j1 = j
+            for j in range(m + 1):
+                if used[j]:
+                    u[p[j]] += delta
+                    v[j] -= delta
+                else:
+                    minv[j] -= delta
+            j0 = j1
+            if p[j0] == 0:
+                break
+        while True:
+            j1 = way[j0]
+            p[j0] = p[j1]
+            j0 = j1
+            if j0 == 0:
+                break
+    assign = [-1] * n
+    for j in range(1, m + 1):
+        if p[j]:
+            assign[p[j] - 1] = j - 1
+    return assign
+
+
+def assign_distinct_names(raw, feature_stds, handrule_names, thresholds, *,
+                          canonical_indices=(0, 1, 2, 3)):
+    raw = np.asarray(raw, dtype=float)
+    std = np.asarray(feature_stds, dtype=float)
+    k = len(raw)
+    cells = handrule_cells(thresholds)
+    labels = sorted(cells)
+    if k > len(labels):
+        return list(handrule_names), [0.0] * k
+    ri, gi, ei, ai = (int(x) for x in canonical_indices)
+    idx = {"return_eff": ri, "range_eff": gi, "efficiency": ei, "adx": ai}
+    dist = np.zeros((k, len(labels)))
+    cost = np.zeros((k, len(labels)))
+    for i in range(k):
+        point = {f: raw[i, j] for f, j in idx.items()}
+        scale = {f: std[j] for f, j in idx.items()}
+        for li, lab in enumerate(labels):
+            if lab == handrule_names[i]:
+                d, penalty = 0.0, 0.0
+            else:
+                d, penalty = cell_distance_z(point, scale, cells[lab]), _RELABEL_PENALTY
+            dist[i, li] = d
+            cost[i, li] = d + penalty + 1e-9 * li
+    assign = _min_cost_assignment(cost)
+    names = [labels[j] for j in assign]
+    displacement = [float(dist[i, assign[i]]) for i in range(k)]
+    return names, displacement
+
+
 def map_latent_to_names(em_mean_z, feature_means, feature_stds, thresholds,
                         *, canonical_indices=(0, 1, 2, 3)):
-    """Name each latent state by un-standardizing its centroid to raw feature space and running
-    the canonical map_composite_label on it. Uses only training-window centroids (no per-bar
-    hand-rule labels). volatility_rank orders states by centroid range_eff (ascending).
-
-    DECOUPLES fit-features from naming-features (#1095): a model may be fit on an ENRICHED matrix
-    (canonical four + extra signals), but states are still named from only the four canonical
-    columns. `canonical_indices` = the positions of (return_eff, range_eff, efficiency, adx) within
-    the fit matrix; the extra dims shape cluster geometry, never the 7-label vocabulary. Defaults
-    to (0,1,2,3) so the legacy 4-column path is unchanged. `centroid_raw` carries ALL fit dims."""
     from regime import map_composite_label
     em_mean_z = np.asarray(em_mean_z, dtype=float)
     mean = np.asarray(feature_means, dtype=float)
     std = np.asarray(feature_stds, dtype=float)
     d = em_mean_z.shape[1]
-    if mean.shape != (d,) or std.shape != (d,):     # a mis-shaped scalar/wrong-length std would
-        raise ValueError(f"feature_means/stds must be shape ({d},); "  # silently broadcast garbage
+    if mean.shape != (d,) or std.shape != (d,):
+        raise ValueError(f"feature_means/stds must be shape ({d},); "
                          f"got {mean.shape} and {std.shape}")
-    ri, gi, ei, ai = (int(x) for x in canonical_indices)  # return_eff, range_eff, efficiency, adx
+    ri, gi, ei, ai = (int(x) for x in canonical_indices)
     if not all(0 <= x < d for x in (ri, gi, ei, ai)):
         raise ValueError(f"canonical_indices {tuple(canonical_indices)} out of range for {d} dims")
-    raw = em_mean_z * std + mean                       # un-standardize centroids -> raw features
-    order = sorted(range(len(raw)), key=lambda i: (raw[i, gi], i))  # by range_eff, stable on ties
+    raw = em_mean_z * std + mean
+    order = sorted(range(len(raw)), key=lambda i: (raw[i, gi], i))
     rank = {i: r for r, i in enumerate(order)}
-    names, mapping = [], {}
+    handrule = [map_composite_label(raw[i, ri], raw[i, ai], raw[i, gi], raw[i, ei], thresholds)
+                for i in range(len(raw))]
+    names, displacement = assign_distinct_names(raw, std, handrule, thresholds,
+                                                canonical_indices=(ri, gi, ei, ai))
+    mapping = {}
     for i in range(len(raw)):
-        # map_composite_label(return_eff, adx_val, range_eff, efficiency, thresholds)
-        name = map_composite_label(raw[i, ri], raw[i, ai], raw[i, gi], raw[i, ei], thresholds)
-        names.append(name)
-        mapping[str(i)] = {"name": name, "centroid_raw": raw[i].tolist(),
+        mapping[str(i)] = {"name": names[i], "handrule_name": handrule[i],
+                           "relabeled": bool(names[i] != handrule[i]),
+                           "displacement_z": float(displacement[i]),
+                           "centroid_raw": raw[i].tolist(),
                            "volatility_rank": int(rank[i])}
     return names, mapping
+
+
+def naming_summary(names, mapping):
+    names = list(names)
+    relabeled = {i: {"from": m["handrule_name"], "to": m["name"],
+                     "displacement_z": m["displacement_z"]}
+                 for i, m in sorted(mapping.items(), key=lambda kv: int(kv[0]))
+                 if m.get("relabeled")}
+    duplicates = sorted({nm for nm in names if names.count(nm) > 1})
+    return {"rule": NAMING_RULE, "distinct": not duplicates,
+            "relabeled": relabeled, "duplicate_names": duplicates}
 
 
 def fit_unsupervised(features, *, family, k, filter_window, period=48,
                      thresholds=None, seed=0, fitted_on=None,
                      feature_names=None, canonical_indices=(0, 1, 2, 3)):
-    """Fit one unsupervised family and assemble the forward_filter_labels-decodable model dict.
-    Emissions come from the family fit; the transition table + init are always estimated
-    empirically from the training-window state sequence; states are named post-fit from centroids.
-
-    #1095: `features` may be an ENRICHED matrix (canonical four + extra signals). The fit, the
-    standardization, and `feature_means/feature_stds/emissions` all span EVERY column; naming
-    reads only the canonical columns via `canonical_indices`. `feature_names` (defaults to the
-    canonical FEATURES) and `canonical_indices` are recorded in the schema so decode can enforce
-    the column-order contract — forward_filter_labels is positional and must see the SAME columns
-    in the SAME order used here."""
     if family not in FITTERS:
         raise ValueError(f"unknown family {family!r}; known: {sorted(FITTERS)}")
     if thresholds is None:
@@ -318,6 +397,7 @@ def fit_unsupervised(features, *, family, k, filter_window, period=48,
         "transition": transition.tolist(), "init": init.tolist(),
         "filter_window": int(filter_window), "period": int(period),
         "fitted_on": dict(fitted_on or {}), "mapping": mapping,
+        "naming": naming_summary(names, mapping),
     }
 
 
@@ -353,8 +433,6 @@ def non_degeneracy(labels, thresholds):
 
 def derive_thresholds(handrule_streams, *, active_margin=1, occupancy_margin=0.05,
                       rate_margin=0.5):
-    """Lock non-degeneracy cutoffs from the incumbent's WORST window, loosened by a fixed
-    margin (anti-gaming). Must be called before scoring any candidate."""
     if not handrule_streams:
         raise ValueError("derive_thresholds needs at least one hand-rule stream")
     stats = [_stream_stats(np.asarray(s, dtype=object)) for s in handrule_streams]

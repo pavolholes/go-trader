@@ -15,15 +15,18 @@ const (
 )
 
 type PortfolioWarningMessageInputs struct {
-	Reason      string
-	Config      *PortfolioRiskConfig
-	State       *AppState
-	Prices      map[string]float64
-	TotalValue  float64
-	PerpsLoss   float64
-	PerpsMargin float64
-	Recent      []Trade
-	Now         time.Time
+	Reason           string
+	Config           *PortfolioRiskConfig
+	State            *AppState
+	Scope            PortfolioScope
+	CfgStrategies    []StrategyConfig
+	Prices           map[string]float64
+	TotalValue       float64
+	PerpsLoss        float64
+	PerpsMargin      float64
+	Recent           []Trade
+	Now              time.Time
+	EquityGuardArmed bool
 }
 
 type portfolioWarningContributor struct {
@@ -35,21 +38,30 @@ type portfolioWarningContributor struct {
 	NegativeWeight float64
 }
 
-// BuildPortfolioWarningMessage expands the single-line portfolio risk reason
-// into the operator triage block used by Discord warnings.
 func BuildPortfolioWarningMessage(in PortfolioWarningMessageInputs) string {
 	now := in.Now.UTC()
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
+	scope := in.Scope
+	if scope == scopeUnassigned {
+		scope = ScopeLive
+	}
 	var prs PortfolioRiskState
 	if in.State != nil {
-		prs = in.State.PortfolioRisk
+		if p := in.State.scopeRiskIfPresent(scope); p != nil {
+			prs = *p
+		}
 	}
-	contribs := portfolioWarningContributors(in.State, in.Prices)
+	contribs := portfolioWarningContributors(in.State, in.CfgStrategies, scope, in.Prices)
 
 	var b strings.Builder
-	b.WriteString("**PORTFOLIO WARNING**")
+	b.WriteString("**PORTFOLIO WARNING")
+	if in.Scope != scopeUnassigned {
+		b.WriteString(" ")
+		b.WriteString(strings.ToUpper(scopeLabel(in.Scope)))
+	}
+	b.WriteString("**")
 	if lead := portfolioWarningLead(contribs); lead != "" {
 		b.WriteString(" - ")
 		b.WriteString(lead)
@@ -69,18 +81,42 @@ func BuildPortfolioWarningMessage(in PortfolioWarningMessageInputs) string {
 	b.WriteString(fmt.Sprintf("Kill switch: %.1f%% drawdown | Warn threshold: %.1f%% | In band since: %s (%s)\n",
 		maxDD, warnDD, entered.Format("2006-01-02 15:04 UTC"), formatWarningDuration(now.Sub(entered))))
 
-	b.WriteString(fmt.Sprintf("Current: equity=%.1f%% ($%.0f / peak $%.0f)", prs.CurrentDrawdownPct, in.TotalValue, prs.PeakValue))
+	if in.EquityGuardArmed {
+		note := ""
+		if prs.DrawdownReadingSubstituted {
+			note = "* (carried forward; balance substituted this cycle, does not reconcile with the figures below)"
+		}
+		b.WriteString(fmt.Sprintf("Current: equity=%.1f%%%s ($%.0f / peak $%.0f)", prs.CurrentDrawdownPct, note, in.TotalValue, prs.PeakValue))
+	} else {
+		b.WriteString("Current: equity=n/a (guard not armed: no trustworthy portfolio total this cycle)")
+	}
 	if in.PerpsMargin > 0 {
 		b.WriteString(fmt.Sprintf(" | perps margin=%.1f%% ($%.0f loss on $%.0f margin)", prs.CurrentMarginDrawdownPct, in.PerpsLoss, in.PerpsMargin))
 	}
 	b.WriteByte('\n')
 
-	b.WriteString(fmt.Sprintf("Distance to kill switch: %.1f%% equity", positiveDistance(maxDD, prs.CurrentDrawdownPct)))
-	if in.PerpsMargin > 0 {
-		b.WriteString(fmt.Sprintf(" / %.1f%% margin", positiveDistance(maxDD, prs.CurrentMarginDrawdownPct)))
+	switch {
+	case in.EquityGuardArmed && !prs.UntrustedOverLimitSince.IsZero():
+		b.WriteString(fmt.Sprintf("Distance to kill switch: equity %.1f%% is already OVER the %.1f%% limit, but the total is untrusted — full-book latch DEFERRED, escalates %s unless a trusted measurement lands first",
+			prs.CurrentDrawdownPct, maxDD,
+			prs.UntrustedOverLimitSince.Add(untrustedEquityLatchDeferral).Format("2006-01-02 15:04 UTC")))
+		if in.PerpsMargin > 0 {
+			b.WriteString(fmt.Sprintf(" | perps margin %.1f%% from limit", positiveDistance(maxDD, prs.CurrentMarginDrawdownPct)))
+		}
+		b.WriteString("\nPer-strategy circuit breakers (#292) remain the active protection while the latch is deferred.")
+	case in.EquityGuardArmed:
+		b.WriteString(fmt.Sprintf("Distance to kill switch: %.1f%% equity", positiveDistance(maxDD, prs.CurrentDrawdownPct)))
+		if in.PerpsMargin > 0 {
+			b.WriteString(fmt.Sprintf(" | perps margin %.1f%% from limit", positiveDistance(maxDD, prs.CurrentMarginDrawdownPct)))
+		}
+	case in.PerpsMargin > 0:
+		b.WriteString(fmt.Sprintf("Distance to kill switch: %.1f%% perps margin (equity guard not armed, so margin owns the latch)",
+			positiveDistance(maxDD, prs.CurrentMarginDrawdownPct)))
+	default:
+		b.WriteString("Distance to kill switch: n/a (equity guard not armed and no perps margin deployed)")
 	}
 	b.WriteByte('\n')
-	b.WriteString(formatPortfolioWarningTrend(prs, in.PerpsMargin > 0))
+	b.WriteString(formatPortfolioWarningTrend(prs, in.EquityGuardArmed, in.PerpsMargin > 0))
 	b.WriteByte('\n')
 
 	if len(contribs) > 0 {
@@ -113,26 +149,34 @@ func BuildPortfolioWarningMessage(in PortfolioWarningMessageInputs) string {
 	return truncateWarningField(msg, portfolioWarningMaxChars)
 }
 
-func portfolioWarningContributors(state *AppState, prices map[string]float64) []portfolioWarningContributor {
+func portfolioWarningContributors(state *AppState, cfgStrategies []StrategyConfig, scope PortfolioScope, prices map[string]float64) []portfolioWarningContributor {
 	if state == nil {
 		return nil
 	}
+	scoped := state.Strategies
+	if len(cfgStrategies) > 0 {
+		scoped = filterStatesByScope(state.Strategies, cfgStrategies, scope)
+	}
 	totalNegative := 0.0
-	out := make([]portfolioWarningContributor, 0, len(state.Strategies))
-	ids := make([]string, 0, len(state.Strategies))
-	for id := range state.Strategies {
+	out := make([]portfolioWarningContributor, 0, len(scoped))
+	ids := make([]string, 0, len(scoped))
+	for id := range scoped {
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)
 	for _, id := range ids {
-		ss := state.Strategies[id]
+		ss := scoped[id]
 		if ss == nil {
 			continue
 		}
 		pv := PortfolioValue(ss, prices)
 		initCap := ss.InitialCapital
 		pnlLabel := "P&L"
-		if initCap <= 0 {
+		if ss.SharedWalletPoolBudget || ss.SharedWalletPerformanceOnly {
+			pv = displayStrategyValue(ss, prices)
+			initCap = 0
+			pnlLabel = "net P&L"
+		} else if initCap <= 0 {
 			initCap = pv - ss.RiskState.DailyPnL
 			pnlLabel = "daily P&L"
 		}
@@ -174,12 +218,15 @@ func portfolioWarningLead(contribs []portfolioWarningContributor) string {
 	return fmt.Sprintf("%s (dd=%.1f%%) is leading portfolio drawdown", contribs[0].ID, contribs[0].DrawdownPct)
 }
 
-func formatPortfolioWarningTrend(prs PortfolioRiskState, includeMargin bool) string {
+func formatPortfolioWarningTrend(prs PortfolioRiskState, includeEquity, includeMargin bool) string {
 	eq := prs.WarningEquityDeltaPct
 	margin := prs.WarningMarginDeltaPct
 	trend := "STABLE"
-	primary := eq
-	if includeMargin && math.Abs(margin) >= math.Abs(eq) {
+	primary := 0.0
+	if includeEquity {
+		primary = eq
+	}
+	if includeMargin && math.Abs(margin) >= math.Abs(primary) {
 		primary = margin
 	}
 	if primary > 0.05 {
@@ -187,7 +234,12 @@ func formatPortfolioWarningTrend(prs PortfolioRiskState, includeMargin bool) str
 	} else if primary < -0.05 {
 		trend = "RECOVERING"
 	}
-	parts := []string{fmt.Sprintf("equity dd %s since last cycle", formatSignedPct(eq))}
+	var parts []string
+	if includeEquity {
+		parts = append(parts, fmt.Sprintf("equity dd %s since last cycle", formatSignedPct(eq)))
+	} else {
+		parts = append(parts, "equity dd n/a (guard not armed)")
+	}
 	if includeMargin {
 		parts = append(parts, fmt.Sprintf("margin dd %s", formatSignedPct(margin)))
 	}

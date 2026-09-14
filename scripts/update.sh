@@ -1,40 +1,9 @@
 #!/usr/bin/env bash
-# Atomic update with pre-flight probe, staging build, atomic binary swap,
-# post-restart verification, and rollback (#682). #764: extra go(1) lookup
-# paths + ExecStart vs swap-target warning before systemd restart. #766:
-# RESTART_MODE=signal (explicit) for bare-process + pidfile deployments.
-# #785: systemd mode falls back to signal restart when unit missing (exit 5).
-# #790: --rsync-from safe tree sync; warn on missing systemd EnvironmentFile.
-#   --rsync-from preserves deployment .git/ (not copied from source) so rollback
-#   git reset --hard still targets the deployment repo's pre-sync SHA.
-# #1055: --all batch = UNION of ACTIVE go-trader systemd units' WorkingDirectory
-#   (layout-independent) and the <root>/go-trader-*/ glob, so neither a scattered
-#   systemd deployment nor a signal-mode/unloaded one under the glob root silently
-#   leaves the batch. Auto-discovery is active-only (never starts a stopped unit).
-#   An explicit --update-all-root / GO_TRADER_UPDATE_ALL_ROOT pins the glob root.
-#
-# Phases:
-#   preflight  — git/uv/go sanity checks
-#   rsync      — optional --rsync-from (replaces pull)
-#   pull       — git pull --ff-only
-#   sync       — uv sync
-#   build      — go build to go-trader.new (live binary untouched)
-#   probe      — go-trader.new probe against the just-synced Python
-#   swap       — atomic mv: live binary -> .prev, staged -> live
-#   restart    — systemd unit, or signal/kill + wrapper (explicit or #785 fallback)
-#   verify     — wait active (systemd) or /health + PID freshness
-#   rollback   — restore .prev on verify failure
-#
-# Use --restart (or RESTART=1) to restart after a successful build
-# AND verify the running process matches the just-built version. Without
-# --restart the script stops after swap; the caller (scheduler/updater.go's
-# applyUpgrade) handles its own restart via restartSelf.
 
 set -euo pipefail
 
 THIS_SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 THIS_SCRIPT="${THIS_SCRIPT_DIR}/$(basename "${BASH_SOURCE[0]}")"
-# shellcheck source=update_helpers.sh
 source "${THIS_SCRIPT_DIR}/update_helpers.sh"
 orig_argv=("$@")
 
@@ -58,6 +27,9 @@ go_trader_pidfile="$(trim_space "${GO_TRADER_PIDFILE:-./go-trader.pid}")"
 go_trader_run_sh="$(trim_space "${GO_TRADER_RUN_SH:-./run.sh}")"
 rsync_from=""
 tree_mutated=0
+unit_sync_source_path=""
+unit_sync_installed_path=""
+unit_sync_backup_path=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -86,7 +58,6 @@ while [[ $# -gt 0 ]]; do
                 echo "$1 requires a directory path" >&2
                 exit 2
             fi
-            # Value is applied when processing --all from orig_argv (must parse here so argv is not rejected).
             shift 2
             ;;
         --update-all-root=*)
@@ -138,7 +109,15 @@ while [[ $# -gt 0 ]]; do
             echo "                      <root>/go-trader-*/ glob. Auto-discovery is active-only, so it never"
             echo "                      starts a stopped/failed deployment; the glob still restarts anything"
             echo "                      under <root>. --update-all-root pins the glob root (skips systemd)."
-            echo "  With --all + systemd: each child inherits GO_TRADER_SERVICE — set per-worktree env if units differ."
+            echo "  With --all + systemd: each child resolves GO_TRADER_SERVICE from the active unit that owns"
+            echo "                      that deployment's WorkingDirectory (per-dir systemd lookup). Parent"
+            echo "                      --unit / --service / GO_TRADER_SERVICE is overridden when a per-dir"
+            echo "                      unit exists; if no active unit owns a dir, the parent's service_unit"
+            echo "                      is used and a warning is logged."
+            echo "  With --restart in systemd mode the shipped unit file for the resolved unit is installed"
+            echo "                      over the loaded one when they differ (previous kept as <unit>.prev) and"
+            echo "                      systemd is reloaded before the restart. Drop-ins under <unit>.d/ are never"
+            echo "                      touched; a unit loaded from outside /etc/systemd/system stops the update."
             echo "  RESTART=1 env var also enables restart."
             echo "  RESTART_MODE=signal requires Linux, GO_TRADER_RUN_SH, GO_TRADER_PIDFILE (see #766)."
             echo "  systemd mode falls back to signal when the unit is not found (systemctl exit 5)."
@@ -257,9 +236,7 @@ signal_launch_wrapper() {
     if [[ ! -x "$run_sh" ]]; then
         fail "GO_TRADER_RUN_SH ($run_sh) is not executable"
     fi
-    # Detach like a normal nohup deployment; wrapper must write GO_TRADER_PIDFILE with the trader PID.
     setsid nohup bash "$run_sh" >>"$signal_log_out" 2>&1 &
-    # Brief yield only; pidfile freshness is enforced by verify / rollback polls (not this sleep).
     sleep 1
 }
 
@@ -332,8 +309,6 @@ signal_kill_pidfile_process_then_respawn() {
     else
         echo "[update] signal: no live pid in $pidfile (cur=${cur:-empty}) — starting wrapper anyway" >&2
     fi
-    # The pidfile may not name the failed new process (it can survive on a
-    # fallback port); sweep this instance's strays before respawning (#850).
     signal_sweep_stray_instance_procs
     signal_launch_wrapper "$run_sh"
 }
@@ -372,27 +347,6 @@ update_canonicalize_path() {
     printf '%s' "$p"
 }
 
-update_resolve_db_exclude() {
-    local db_path="scheduler/state.db"
-    if [[ -f scheduler/config.json && -x .venv/bin/python3 ]]; then
-        local custom
-        custom=$(.venv/bin/python3 -c '
-import json
-try:
-    cfg = json.load(open("scheduler/config.json"))
-    p = cfg.get("db_file") or ""
-    if isinstance(p, str) and p.strip():
-        print(p.strip())
-except Exception:
-    pass
-' 2>/dev/null || true)
-        if [[ -n "$custom" ]]; then
-            db_path="$custom"
-        fi
-    fi
-    printf '%s' "$db_path"
-}
-
 run_rsync_from() {
     local src="$1"
     local dest="$2"
@@ -401,18 +355,18 @@ run_rsync_from() {
     if ! command -v rsync >/dev/null 2>&1; then
         fail "rsync not on PATH — install rsync or omit --rsync-from"
     fi
-    db_excl=$(update_resolve_db_exclude)
     signal_log_excl="${GO_TRADER_SIGNAL_LOG:-./go-trader-signal.log}"
     rsync_excludes=(
         --exclude='.git/'
         --exclude='.env'
         --exclude='scheduler/config.json'
-        --exclude="${db_excl}*"
         --exclude='trading_bot.db*'
     )
-    # Extension-based DB protection (#1012): any *.db (+ SQLite sidecar/lock) at
-    # any path survives --delete, even if it isn't the config-resolved db_file.
-    # db_excl above stays as belt-and-suspenders for non-.db-suffixed DB paths.
+    while IFS= read -r db_excl; do
+        if [[ -n "$db_excl" ]]; then
+            rsync_excludes+=(--exclude="${db_excl}*")
+        fi
+    done < <(update_resolve_db_exclude)
     local db_glob
     while IFS= read -r db_glob; do
         [[ -n "$db_glob" ]] && rsync_excludes+=(--exclude="$db_glob")
@@ -453,11 +407,6 @@ warn_execstart_vs_swap() {
     fi
 }
 
-# Return 0 when a systemd unit is active AND its ExecStart binary resolves to
-# this deployment's ./go-trader. Used to redirect an explicit signal-mode restart
-# through systemctl so we never spawn an out-of-cgroup duplicate (#850). The
-# ExecStart match avoids false-positives across sibling worktrees that each run
-# their own active unit. Conservative: any unreadable input falls through to 1.
 systemd_unit_manages_this_instance() {
     local unit="$1"
     command -v systemctl >/dev/null 2>&1 || return 1
@@ -474,11 +423,6 @@ systemd_unit_manages_this_instance() {
     [[ "$(update_signal_redirect_decision "$active_state" "$bin_abs" "$swap_res")" == "redirect" ]]
 }
 
-# Rollback hygiene (#850): SIGTERM (escalating to SIGKILL via signal_wait_pid_exit)
-# any go-trader process whose cwd is this deployment dir, i.e. one sharing this
-# instance's state DB — e.g. a failed new process still alive on a bindWithFallback
-# port. Runs before the wrapper respawn so a rollback cycle ends with exactly one
-# live process. cwd-matching spares other worktrees' traders. Linux/signal-only.
 signal_sweep_stray_instance_procs() {
     [[ -d /proc ]] || return 0
     local repo_abs
@@ -501,6 +445,19 @@ signal_sweep_stray_instance_procs() {
 do_rollback() {
     local reason="$1"
     echo "[update] rollback: $reason" >&2
+
+    if [[ -n "$unit_sync_backup_path" ]]; then
+        if update_unit_restore_backup "$unit_sync_installed_path" "$unit_sync_backup_path"; then
+            unit_sync_backup_path=""
+            echo "[update] rollback: restored previous unit file $unit_sync_installed_path" >&2
+            if ! sudo systemctl daemon-reload; then
+                echo "[update] rollback: systemctl daemon-reload failed after restoring $unit_sync_installed_path — the old unit is on disk but systemd still holds the new one" >&2
+            fi
+        else
+            echo "[update] rollback: could not restore $unit_sync_installed_path from $unit_sync_backup_path — the service stays on the newly installed unit" >&2
+        fi
+    fi
+
     if [[ ! -x ./go-trader.prev ]]; then
         echo "[update] rollback: no go-trader.prev to restore — service stays on broken binary" >&2
         return
@@ -575,22 +532,13 @@ verify_cur_restart_pid() {
     fi
 }
 
-# --- begin single-repo update body (also invoked per dir for --all) ---
 
 begin_phase preflight
 
 repo_root=$(git rev-parse --show-toplevel)
 cd "$repo_root"
 
-# The --all coordinator only fans out to per-deployment child update.sh runs (each
-# does its own uv/go preflight + build), so it must reach discovery/dispatch WITHOUT
-# the build toolchain on the coordinator host (#1055 review): the CI go-job has no
-# uv, and a thin coordinator may carry only git + systemd. Dispatch BEFORE the uv/go
-# checks below, which gate the single-repo build path only.
 if [[ "$update_all" == "1" ]]; then
-    # scan_root drives the legacy go-trader-*/ glob fallback. An explicit override
-    # (env or --update-all-root) means the operator is pinning the batch root, so we
-    # honor the glob and skip systemd auto-discovery (keeps that flow unchanged, #1055).
     scan_root="$(trim_space "${GO_TRADER_UPDATE_ALL_ROOT:-}")"
     scan_root_explicit=0
     if [[ -n "$scan_root" ]]; then
@@ -622,15 +570,6 @@ if [[ "$update_all" == "1" ]]; then
         fi
         child_args+=("$a")
     done
-    # Build the deployment batch by UNIONing two sources, so no deployment the
-    # operator expects --all to cover silently leaves the batch (#1055 review):
-    #   - systemd: ACTIVE go-trader units' WorkingDirectory (canonical, layout-
-    #     independent, even across different parent dirs).
-    #   - glob: $scan_root/go-trader-*/ (the pre-#1055 behavior), which still catches
-    #     a signal-mode or not-currently-loaded deployment living under the glob root
-    #     that active-unit discovery alone would miss.
-    # An explicit --update-all-root / GO_TRADER_UPDATE_ALL_ROOT pins the glob root and
-    # SUPPRESSES systemd discovery, keeping that documented flow unchanged.
     declare -a discovered=()
     declare -a discovery_sources=()
     if [[ "$scan_root_explicit" != "1" ]]; then
@@ -654,11 +593,6 @@ if [[ "$update_all" == "1" ]]; then
     if [[ ${#discovered[@]} -eq 0 ]]; then
         fail "no deployments found: no ACTIVE go-trader systemd units (systemctl absent or none active) and no directories match $scan_root/go-trader-*/ (batch root: $scan_root). Set --update-all-root <dir> / GO_TRADER_UPDATE_ALL_ROOT, or start the deployments' systemd units."
     fi
-    # Canonicalize each dir to its physical path BEFORE de-duping, so a systemd
-    # WorkingDirectory and a glob hit that resolve to the same directory (via a
-    # symlink, /./ or //) collapse to one entry — otherwise that one live deployment
-    # would be updated and restarted twice (#1055 review). De-dupe + sort for stable
-    # operator output; genuinely distinct physical dirs are preserved.
     declare -a canon=()
     for d in "${discovered[@]}"; do
         canon+=("$(canonicalize_deployment_dir "$d")")
@@ -669,13 +603,28 @@ if [[ "$update_all" == "1" ]]; then
     done < <(printf '%s\n' "${canon[@]}" | sort -u)
     discovery_source=$(IFS='+'; printf '%s' "${discovery_sources[*]}")
     echo "[update] --all: ${#all_dirs[@]} deployment dir(s) via ${discovery_source} discovery"
+    declare -A unit_for_dir=()
+    declare -a unit_map_warnings=()
+    while IFS= read -r row; do
+        [[ -n "$row" ]] || continue
+        row_canon="${row%%|*}"
+        row_unit="${row#*|}"
+        [[ -n "$row_canon" && -n "$row_unit" ]] || continue
+        if [[ -n "${unit_for_dir[$row_canon]:-}" && "${unit_for_dir[$row_canon]}" != "$row_unit" ]]; then
+            unit_map_warnings+=("$row_canon ${unit_for_dir[$row_canon]} $row_unit")
+            continue
+        fi
+        unit_for_dir["$row_canon"]="$row_unit"
+    done < <(discover_deployment_unit_map)
+    if [[ ${#unit_map_warnings[@]} -gt 0 ]]; then
+        for warn_row in "${unit_map_warnings[@]}"; do
+            read -r warn_dir warn_first warn_extra <<<"$warn_row"
+            echo "[update] --all: WARNING: multiple active systemd units own $warn_dir ($warn_first, $warn_extra); using $warn_first" >&2
+        done
+    fi
     fail_count=0
     skip_count=0
     update_count=0
-    # Every counted dir that is skipped is reported with a reason, so the announced
-    # count above reconciles with what actually updates (#1055 review). Systemd
-    # discovery can surface dirs with no deployment (e.g. the primary unit's source
-    # repo, which has no scheduler/config.json); they must not vanish silently.
     for d in "${all_dirs[@]}"; do
         if [[ ! -d "$d" ]]; then
             echo "[update] --all: skipping $d (no longer a directory)" >&2
@@ -687,9 +636,26 @@ if [[ "$update_all" == "1" ]]; then
             skip_count=$((skip_count + 1))
             continue
         fi
-        echo "[update] --all: $(cd "$d" && pwd)"
         update_count=$((update_count + 1))
-        if (cd "$d" && bash "$THIS_SCRIPT" "${child_args[@]}"); then
+        mapped_unit="${unit_for_dir[$d]:-}"
+        # resolve_child_unit_override is the tested helper that decides the
+        # child's effective unit + argv. Production runs must share that
+        # single decision so tests cover the real branch.
+        declare -a _rco_lines=()
+        while IFS= read -r _line || [[ -n "$_line" ]]; do
+            _rco_lines+=("$_line")
+        done < <(resolve_child_unit_override "$service_unit" "$mapped_unit" "${child_args[@]}")
+        resolved_unit="${_rco_lines[0]:-$service_unit}"
+        declare -a resolved_child_args=()
+        for ((_i = 1; _i < ${#_rco_lines[@]}; _i++)); do
+            [[ -n "${_rco_lines[$_i]}" ]] && resolved_child_args+=("${_rco_lines[$_i]}")
+        done
+        if [[ -n "$mapped_unit" ]]; then
+            echo "[update] --all: $(cd "$d" && pwd) -> unit $resolved_unit (auto-resolved from systemd)"
+        else
+            echo "[update] --all: $(cd "$d" && pwd) -> unit $resolved_unit (no active systemd unit; falling back)"
+        fi
+        if (cd "$d" && GO_TRADER_SERVICE="$resolved_unit" bash "$THIS_SCRIPT" "${resolved_child_args[@]}"); then
             :
         else
             echo "[update] --all: FAILED in $d" >&2
@@ -706,8 +672,6 @@ if [[ "$update_all" == "1" ]]; then
     exit 0
 fi
 
-# Build-toolchain preflight: gates the single-repo update path only (the --all
-# coordinator dispatched above without it; each child re-runs this in its own dir).
 if ! command -v uv >/dev/null 2>&1; then
     fail "uv not on PATH — install uv first (see CLAUDE.md → Setup)"
 fi
@@ -767,6 +731,16 @@ if [[ "$restart" == "1" && "$restart_mode" == "signal" ]]; then
     fi
 fi
 
+if [[ "$restart" == "1" && "$restart_mode" == "systemd" ]]; then
+    unit_sync_source_path=$(update_unit_source_path "$repo_root" "$service_unit")
+    unit_sync_installed_path=$(trim_space "$(systemctl show -p FragmentPath --value "$service_unit" 2>/dev/null || true)")
+    if [[ -n "$unit_sync_source_path" && -n "$unit_sync_installed_path" ]]; then
+        if [[ "$(update_unit_fragment_scope "$unit_sync_installed_path")" != "etc" ]]; then
+            fail "systemd unit $service_unit loads from $unit_sync_installed_path, outside /etc/systemd/system — update.sh will not overwrite a vendor or generator unit. Install the shipped unit with 'sudo bash scripts/install-service.sh', or set GO_TRADER_SERVICE / --unit to the unit this deployment owns."
+        fi
+    fi
+fi
+
 if [[ -z "$rsync_from" ]]; then
     build_paths=(
         scheduler
@@ -817,12 +791,10 @@ if [[ "$restart" == "1" && "$restart_mode" == "signal" ]]; then
         echo "[update] signal: warning: process cwd ($proc_cwd) != repo root ($repo_abs)" >&2
     fi
 else
-    # systemd MainPID (or best-effort when --restart off — same capture for restart=0 vs systemd restart=1)
     prev_main_pid=$(systemctl show -p MainPID --value "$service_unit" 2>/dev/null || echo "")
     if [[ "$prev_main_pid" == "0" ]]; then
         prev_main_pid=""
     fi
-    # Bare-process deploys may have no unit; keep pidfile pid for #785 signal fallback + verify.
     if [[ -z "$prev_main_pid" && "$restart" == "1" ]]; then
         prev_main_pid=$(signal_read_pidfile "$go_trader_pidfile" || true)
     fi
@@ -837,10 +809,6 @@ if [[ -n "$rsync_from" ]]; then
     end_phase
 else
     begin_phase pull
-    # DB protection on the pull path (#1012): a fast-forward only advances tracked
-    # files. Every *.db is gitignored (untracked), and git never overwrites or
-    # deletes untracked/ignored files on a fast-forward, so state DBs at any path
-    # survive `pull --ff-only` unchanged — the guarantee is explicit, not incidental.
     git pull --ff-only
     post_pull_sha=$(git rev-parse HEAD 2>/dev/null || echo "")
     if [[ -n "$pre_pull_sha" && -n "$post_pull_sha" && "$pre_pull_sha" != "$post_pull_sha" ]]; then
@@ -885,10 +853,6 @@ fi
 mv -f ./go-trader.new ./go-trader
 end_phase
 
-# #1051: refresh the auto-generated agent capability doc from the freshly
-# swapped binary. Best-effort — a doc-generation failure must never fail or
-# roll back a deploy. Writes AGENTS.generated.md (NOT AGENTS.md, a symlink to
-# the hand-maintained CLAUDE.md).
 begin_phase agent-info
 agent_info_cfg=()
 [[ -f scheduler/config.json ]] && agent_info_cfg=(--config scheduler/config.json)
@@ -920,6 +884,44 @@ fi
 status_port="${status_port:-8099}"
 
 if [[ "$restart_mode" == "systemd" ]]; then
+    begin_phase unit
+    if [[ -z "$unit_sync_source_path" ]]; then
+        echo "[update] unit: no shipped unit file matches '$service_unit' — leaving the installed unit alone (install it by hand with scripts/install-service.sh)"
+    elif [[ -z "$unit_sync_installed_path" ]]; then
+        echo "[update] unit: systemd reports no fragment path for '$service_unit' — skipping the unit install"
+    else
+        unit_needs_reload=$(trim_space "$(systemctl show -p NeedDaemonReload --value "$service_unit" 2>/dev/null || true)")
+        unit_decision=$(update_unit_sync_decision "$unit_sync_installed_path" "$unit_sync_source_path" "$unit_needs_reload")
+        case "$unit_decision" in
+            install)
+                unit_sync_backup_path=$(update_unit_install_with_backup "$unit_sync_installed_path" "$unit_sync_source_path") \
+                    || fail "could not install $unit_sync_source_path over $unit_sync_installed_path"
+                echo "[update] unit: installed $unit_sync_installed_path from $unit_sync_source_path"
+                if [[ -n "$unit_sync_backup_path" ]]; then
+                    echo "[update] unit: previous unit retained as $unit_sync_backup_path"
+                fi
+                if ! sudo systemctl daemon-reload; then
+                    if [[ -n "$unit_sync_backup_path" ]] && update_unit_restore_backup "$unit_sync_installed_path" "$unit_sync_backup_path"; then
+                        unit_sync_backup_path=""
+                        echo "[update] unit: restored $unit_sync_installed_path after the failed daemon-reload" >&2
+                    fi
+                    fail "systemctl daemon-reload failed after installing $unit_sync_installed_path"
+                fi
+                ;;
+            skip)
+                echo "[update] unit: $unit_sync_installed_path is a symlink whose target differs from $unit_sync_source_path — leaving the operator's link alone; re-point it or run 'sudo bash scripts/install-service.sh'" >&2
+                ;;
+            reload)
+                echo "[update] unit: $unit_sync_installed_path already matches $unit_sync_source_path but systemd needs a reload"
+                sudo systemctl daemon-reload || fail "systemctl daemon-reload failed for $service_unit"
+                ;;
+            *)
+                echo "[update] unit: $unit_sync_installed_path already matches $unit_sync_source_path"
+                ;;
+        esac
+    fi
+    end_phase
+
     warn_execstart_vs_swap "$service_unit"
     warn_missing_systemd_environment_files "$service_unit"
 

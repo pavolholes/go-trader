@@ -190,7 +190,7 @@ func TestEffectiveTrailingStopPct_ManualNonRatchetReturnsZero(t *testing.T) {
 	}
 }
 
-func TestValidateConfigManualRatchetAllowsTrailingATRMult(t *testing.T) {
+func TestConfigValidationManualRatchetAllowsTrailingATRMult(t *testing.T) {
 	trail := 3.0
 	cfg := &Config{
 		Strategies: []StrategyConfig{
@@ -211,7 +211,7 @@ func TestValidateConfigManualRatchetAllowsTrailingATRMult(t *testing.T) {
 			},
 		},
 	}
-	if err := ValidateConfig(cfg); err != nil {
+	if err := validateConfig(cfg, false); err != nil {
 		t.Fatalf("manual trailing_tp_ratchet config should validate, got: %v", err)
 	}
 }
@@ -338,11 +338,11 @@ func TestValidateTrailingTPRatchetClose_RejectsFixedStopLossOwners(t *testing.T)
 			want: "cannot combine with stop_loss_atr_mult",
 		},
 		{
-			name: "stop_loss_atr_regime",
+			name: "stop_loss_atr_mult_regime",
 			edit: func(sc *StrategyConfig) {
-				sc.StopLossATRRegime = &RegimeATRBlock{UseDefaults: true}
+				sc.StopLossATRMultRegime = &RegimeATRBlock{UseDefaults: true}
 			},
-			want: "cannot combine with stop_loss_atr_regime",
+			want: "cannot combine with stop_loss_atr_mult_regime",
 		},
 	}
 	for _, tc := range cases {
@@ -366,8 +366,6 @@ func TestValidateTrailingTPRatchetClose_RejectsFirstRungLooserThanInitial(t *tes
 			Name: "trailing_tp_ratchet",
 			Params: map[string]interface{}{
 				"tp_tiers": []interface{}{
-					// First rung trail (2.0×) is LOOSER than the initial 1.0× trail —
-					// it would silently no-op at runtime, so reject at load.
 					map[string]interface{}{
 						"atr_multiple": 1.0, "close_fraction": 0.0, "trailing_mult_after": 2.0,
 					},
@@ -381,9 +379,6 @@ func TestValidateTrailingTPRatchetClose_RejectsFirstRungLooserThanInitial(t *tes
 	}
 }
 
-// TestValidateTrailingTPRatchetClose_CompositeVocabulary proves the regime form
-// validates cleanly against the 7-state composite classifier when the strategy's
-// regime_atr_window opts into it (and rejects an ADX-only label under composite).
 func TestValidateTrailingTPRatchetClose_CompositeVocabulary(t *testing.T) {
 	tierList := []interface{}{
 		map[string]interface{}{
@@ -402,12 +397,10 @@ func TestValidateTrailingTPRatchetClose_CompositeVocabulary(t *testing.T) {
 		t.Fatalf("expected 9 composite labels, got %d", len(composite))
 	}
 
-	// #870: the regime variant's opening trail / SL owner is the per-regime
-	// trailing_stop_atr_regime block (scalar trailing_stop_atr_mult rejected).
 	scOK := StrategyConfig{
 		ID: "hl-comp", Type: "perps", Platform: "hyperliquid",
-		RegimeATRWindow:       "daily",
-		TrailingStopATRRegime: &RegimeATRBlock{raw: composite7StateATR(3.0)},
+		RegimeATRWindow:           "daily",
+		TrailingStopATRMultRegime: &RegimeATRBlock{raw: composite7StateATR(3.0)},
 		CloseStrategy: &StrategyRef{
 			Name:   "trailing_tp_ratchet_regime",
 			Params: map[string]interface{}{"tp_tiers": compositeTable(composite)},
@@ -417,13 +410,12 @@ func TestValidateTrailingTPRatchetClose_CompositeVocabulary(t *testing.T) {
 		t.Fatalf("composite trailing_tp_ratchet_regime must validate, got: %v", errs)
 	}
 
-	// A 3-state ADX label under a composite window must be rejected.
 	bad := compositeTable(composite)
-	bad["ranging"] = tierList // not a composite label
+	bad["ranging"] = tierList
 	scBad := StrategyConfig{
 		ID: "hl-comp-bad", Type: "perps", Platform: "hyperliquid",
-		RegimeATRWindow:       "daily",
-		TrailingStopATRRegime: &RegimeATRBlock{raw: composite7StateATR(3.0)},
+		RegimeATRWindow:           "daily",
+		TrailingStopATRMultRegime: &RegimeATRBlock{raw: composite7StateATR(3.0)},
 		CloseStrategy: &StrategyRef{
 			Name:   "trailing_tp_ratchet_regime",
 			Params: map[string]interface{}{"tp_tiers": bad},
@@ -434,9 +426,6 @@ func TestValidateTrailingTPRatchetClose_CompositeVocabulary(t *testing.T) {
 	}
 }
 
-// applyTrailingStopUpdateResult is the shared handler routed through by both the
-// perps and manual trailing dispatches. These cover the three slUpdate outcomes
-// the manual path previously dropped (immediate fill + cancel-without-rest).
 func ratchetTestState(pos *Position) *StrategyState {
 	return &StrategyState{
 		ID: "s1", Type: "perps", Platform: "hyperliquid",
@@ -447,7 +436,7 @@ func ratchetTestState(pos *Position) *StrategyState {
 func TestApplyTrailingStopUpdateResult_RestingReplacement(t *testing.T) {
 	s := ratchetTestState(&Position{Symbol: "ETH", Side: "long", Quantity: 1, AvgCost: 100, EntryATR: 5, StopLossOID: 7, RatchetFallbackNormalizePending: true})
 	upd := &HyperliquidStopLossUpdateResult{StopLossOID: 42, StopLossTriggerPx: 95}
-	fill, px := applyTrailingStopUpdateResult(s, "ETH", "long", 7, 0, false, upd, nil)
+	fill, px := applyTrailingStopUpdateResult(s, "ETH", "long", 7, 0, false, upd, "trailing_stop_loss_immediate", nil, 0)
 	if fill || px != 0 {
 		t.Fatalf("resting replacement: fill=%v px=%v want false,0", fill, px)
 	}
@@ -463,7 +452,7 @@ func TestApplyTrailingStopUpdateResult_RestingReplacement(t *testing.T) {
 func TestApplyTrailingStopUpdateResult_ImmediateFillBooksClose(t *testing.T) {
 	s := ratchetTestState(&Position{Symbol: "ETH", Side: "long", Quantity: 1, AvgCost: 100, EntryATR: 5, StopLossOID: 7})
 	upd := &HyperliquidStopLossUpdateResult{StopLossFilledImmediately: true, StopLossTriggerPx: 95}
-	fill, px := applyTrailingStopUpdateResult(s, "ETH", "long", 7, 0, false, upd, nil)
+	fill, px := applyTrailingStopUpdateResult(s, "ETH", "long", 7, 0, false, upd, "trailing_stop_loss_immediate", nil, 0)
 	if !fill || px != 95 {
 		t.Fatalf("immediate fill: fill=%v px=%v want true,95", fill, px)
 	}
@@ -475,7 +464,7 @@ func TestApplyTrailingStopUpdateResult_ImmediateFillBooksClose(t *testing.T) {
 func TestApplyTrailingStopUpdateResult_CancelWithoutRestClearsStaleOID(t *testing.T) {
 	s := ratchetTestState(&Position{Symbol: "ETH", Side: "long", Quantity: 1, AvgCost: 100, EntryATR: 5, StopLossOID: 7, StopLossTriggerPx: 96, RatchetFallbackNormalizePending: true})
 	upd := &HyperliquidStopLossUpdateResult{CancelStopLossSucceeded: true}
-	fill, _ := applyTrailingStopUpdateResult(s, "ETH", "long", 7, 0, false, upd, nil)
+	fill, _ := applyTrailingStopUpdateResult(s, "ETH", "long", 7, 0, false, upd, "trailing_stop_loss_immediate", nil, 0)
 	if fill {
 		t.Fatal("cancel-without-rest: want fill=false")
 	}
@@ -491,7 +480,7 @@ func TestApplyTrailingStopUpdateResult_CancelWithoutRestClearsStaleOID(t *testin
 func TestApplyTrailingStopUpdateResult_SideGuardSkipsMutation(t *testing.T) {
 	s := ratchetTestState(&Position{Symbol: "ETH", Side: "short", Quantity: 1, AvgCost: 100, EntryATR: 5, StopLossOID: 7})
 	upd := &HyperliquidStopLossUpdateResult{StopLossOID: 42, StopLossTriggerPx: 95}
-	fill, _ := applyTrailingStopUpdateResult(s, "ETH", "long", 7, 0, false, upd, nil)
+	fill, _ := applyTrailingStopUpdateResult(s, "ETH", "long", 7, 0, false, upd, "trailing_stop_loss_immediate", nil, 0)
 	if fill {
 		t.Fatal("side mismatch: want fill=false")
 	}
@@ -500,11 +489,6 @@ func TestApplyTrailingStopUpdateResult_SideGuardSkipsMutation(t *testing.T) {
 	}
 }
 
-// --- #866: system default fallback when tp_tiers is omitted / use_defaults ---
-
-// TestDefaultTrailingRatchetTiers_InternallyValid proves the conservative system
-// default ladder satisfies the ratchet invariants (ascending triggers, monotonic
-// tighten) so it never fails its own validation when broadcast.
 func TestDefaultTrailingRatchetTiers_InternallyValid(t *testing.T) {
 	def := defaultTrailingRatchetTiers()
 	if len(def) != 3 {
@@ -516,7 +500,6 @@ func TestDefaultTrailingRatchetTiers_InternallyValid(t *testing.T) {
 	if errs := validateTrailingRatchetTierMonotonicity(def, "default"); len(errs) > 0 {
 		t.Fatalf("default ladder must be monotonic, got: %v", errs)
 	}
-	// Initial trail >= first rung (2.0 >= 1.5) must validate clean.
 	if errs := validateTrailingRatchetInitialTrail(def, 2.0, "default"); len(errs) > 0 {
 		t.Fatalf("default vs initial 2.0 must validate, got: %v", errs)
 	}
@@ -533,8 +516,8 @@ func TestRatchetTierGroupDefaults_InternallyValid(t *testing.T) {
 func TestValidateTrailingTPRatchetClose_OmittedTiersUsesDefault(t *testing.T) {
 	trail := 2.0
 	for _, params := range []map[string]interface{}{
-		nil,                    // bare ratchet, no params
-		{"use_defaults": true}, // explicit opt-in
+		nil,
+		{"use_defaults": true},
 	} {
 		sc := StrategyConfig{
 			ID: "s1", Type: "perps", Platform: "hyperliquid",
@@ -548,9 +531,6 @@ func TestValidateTrailingTPRatchetClose_OmittedTiersUsesDefault(t *testing.T) {
 }
 
 func TestValidateTrailingTPRatchetClose_DefaultRespectsInitialTrail(t *testing.T) {
-	// Default first rung tightens to 1.5×; an initial trail looser-than... no,
-	// TIGHTER than 1.5 (here 1.0) means the default's first rung (1.5) is LOOSER
-	// than the initial 1.0 and would silently no-op, so it must be rejected.
 	trail := 1.0
 	sc := StrategyConfig{
 		ID: "s1", Type: "perps", Platform: "hyperliquid",
@@ -563,23 +543,18 @@ func TestValidateTrailingTPRatchetClose_DefaultRespectsInitialTrail(t *testing.T
 }
 
 func TestValidateTrailingTPRatchetClose_RegimeOmittedTiersUsesDefault(t *testing.T) {
-	// #870: the regime variant's opening trail / SL owner is the per-regime
-	// block; each ADX label's open must clear its group's first ratchet rung
-	// (trending_* → choppy first rung 1.5; ranging → ranging first rung 1.0).
 	sc := StrategyConfig{
 		ID: "s1", Type: "perps", Platform: "hyperliquid",
-		TrailingStopATRRegime: &RegimeATRBlock{TrendRegime: map[string]RegimeATREntry{
+		TrailingStopATRMultRegime: &RegimeATRBlock{TrendRegime: map[string]RegimeATREntry{
 			"trending_up":   {ATR: 2.0},
 			"trending_down": {ATR: 2.0},
 			"ranging":       {ATR: 1.5},
 		}},
 		CloseStrategy: &StrategyRef{Name: "trailing_tp_ratchet_regime", Params: map[string]interface{}{"use_defaults": true}},
 	}
-	// regime.enabled=true: the per-group default satisfies exhaustiveness for all labels.
 	if errs := validateTrailingTPRatchetClose(sc, canonicalTrendRegimeLabels, true); len(errs) > 0 {
 		t.Fatalf("regime ratchet use_defaults should validate via per-group default, got: %v", errs)
 	}
-	// regime.enabled=false still rejected (independent of tier source).
 	if errs := validateTrailingTPRatchetClose(sc, canonicalTrendRegimeLabels, false); !errListContains(errs, "requires top-level regime.enabled=true") {
 		t.Fatalf("regime ratchet must still require regime.enabled even with defaults, got: %v", errs)
 	}
@@ -592,7 +567,6 @@ func TestTrailingRatchetTiersForRegime_OmittedReturnsDefault(t *testing.T) {
 		want                    []trailingRatchetTier
 	}{
 		{"scalar", "trailing_tp_ratchet", "", defaultTrailingRatchetTiers()},
-		// #870: the regime variant resolves the per-quality-group ladder.
 		{"regime-clean", "trailing_tp_ratchet_regime", "trending_up_clean", []trailingRatchetTier{
 			{ATRMultiple: 3.0, TrailingMultAfter: 1.5}, {ATRMultiple: 4.5, TrailingMultAfter: 1.0}, {ATRMultiple: 6.0, TrailingMultAfter: 0.8},
 		}},
@@ -602,14 +576,12 @@ func TestTrailingRatchetTiersForRegime_OmittedReturnsDefault(t *testing.T) {
 		{"regime-ranging", "trailing_tp_ratchet_regime", "ranging_quiet", []trailingRatchetTier{
 			{ATRMultiple: 0.75, CloseFraction: 0.4, TrailingMultAfter: 1.0}, {ATRMultiple: 1.5, CloseFraction: 0.8, TrailingMultAfter: 0.75}, {ATRMultiple: 2.0, CloseFraction: 1.0, TrailingMultAfter: 0.75},
 		}},
-		// #1059: ranging substates resolve to distinct ladders.
 		{"regime-ranging-volatile", "trailing_tp_ratchet_regime", "ranging_volatile", []trailingRatchetTier{
 			{ATRMultiple: 1.0, CloseFraction: 0.4, TrailingMultAfter: 1.0}, {ATRMultiple: 2.0, CloseFraction: 0.8, TrailingMultAfter: 0.75}, {ATRMultiple: 3.0, CloseFraction: 1.0, TrailingMultAfter: 0.75},
 		}},
 		{"regime-ranging-directional", "trailing_tp_ratchet_regime", "ranging_directional", []trailingRatchetTier{
 			{ATRMultiple: 1.0, CloseFraction: 0.25, TrailingMultAfter: 1.0}, {ATRMultiple: 2.0, CloseFraction: 0.50, TrailingMultAfter: 1.0}, {ATRMultiple: 3.0, CloseFraction: 0.75, TrailingMultAfter: 0.8}, {ATRMultiple: 4.5, CloseFraction: 0.75, TrailingMultAfter: 0.6},
 		}},
-		// Bare ADX "ranging" still resolves to the quiet ladder (#1059).
 		{"regime-ranging-adx", "trailing_tp_ratchet_regime", "ranging", []trailingRatchetTier{
 			{ATRMultiple: 0.75, CloseFraction: 0.4, TrailingMultAfter: 1.0}, {ATRMultiple: 1.5, CloseFraction: 0.8, TrailingMultAfter: 0.75}, {ATRMultiple: 2.0, CloseFraction: 1.0, TrailingMultAfter: 0.75},
 		}},
@@ -643,8 +615,8 @@ func TestRegimeCloseDefaultGroup(t *testing.T) {
 		{"trending_down_clean", "clean", true},
 		{"trending_up_choppy", "choppy", true},
 		{"trending_down_choppy", "choppy", true},
-		{"trending_up", "choppy", true},   // ADX trend → choppy (no clean/choppy signal)
-		{"trending_down", "choppy", true}, // ADX trend → choppy
+		{"trending_up", "choppy", true},
+		{"trending_down", "choppy", true},
 		{"ranging", "ranging", true},
 		{"ranging_quiet", "ranging", true},
 		{"ranging_volatile", "ranging", true},
@@ -660,15 +632,12 @@ func TestRegimeCloseDefaultGroup(t *testing.T) {
 	}
 }
 
-// TestValidateTrailingTPRatchetClose_RegimeRejectsScalarMult covers #870: the
-// regime variant's trail is owned by trailing_stop_atr_regime, so a scalar
-// trailing_stop_atr_mult is rejected.
 func TestValidateTrailingTPRatchetClose_RegimeRejectsScalarMult(t *testing.T) {
 	trail := 2.0
 	sc := StrategyConfig{
 		ID: "s1", Type: "perps", Platform: "hyperliquid",
 		TrailingStopATRMult: &trail,
-		TrailingStopATRRegime: &RegimeATRBlock{TrendRegime: map[string]RegimeATREntry{
+		TrailingStopATRMultRegime: &RegimeATRBlock{TrendRegime: map[string]RegimeATREntry{
 			"trending_up": {ATR: 2.0}, "trending_down": {ATR: 2.0}, "ranging": {ATR: 1.5},
 		}},
 		CloseStrategy: &StrategyRef{Name: "trailing_tp_ratchet_regime", Params: map[string]interface{}{"use_defaults": true}},
@@ -679,9 +648,6 @@ func TestValidateTrailingTPRatchetClose_RegimeRejectsScalarMult(t *testing.T) {
 	}
 }
 
-// TestValidateTrailingTPRatchetClose_RegimePerKeyInitialTrail covers #870: the
-// initial-trail coupling is checked against each regime key's own opening trail,
-// so a too-loose first rung is rejected scoped to that key only.
 func TestValidateTrailingTPRatchetClose_RegimePerKeyInitialTrail(t *testing.T) {
 	tier := func(mult, trailAfter float64) map[string]interface{} {
 		return map[string]interface{}{"atr_multiple": mult, "close_fraction": 0.0, "trailing_mult_after": trailAfter}
@@ -689,11 +655,11 @@ func TestValidateTrailingTPRatchetClose_RegimePerKeyInitialTrail(t *testing.T) {
 	table := map[string]interface{}{
 		"trending_up":   []interface{}{tier(3.0, 1.5), tier(4.0, 1.0)},
 		"trending_down": []interface{}{tier(3.0, 1.5), tier(4.0, 1.0)},
-		"ranging":       []interface{}{tier(3.0, 2.0), tier(4.0, 1.0)}, // first trail 2.0 > ranging open 1.0
+		"ranging":       []interface{}{tier(3.0, 2.0), tier(4.0, 1.0)},
 	}
 	sc := StrategyConfig{
 		ID: "s1", Type: "perps", Platform: "hyperliquid",
-		TrailingStopATRRegime: &RegimeATRBlock{TrendRegime: map[string]RegimeATREntry{
+		TrailingStopATRMultRegime: &RegimeATRBlock{TrendRegime: map[string]RegimeATREntry{
 			"trending_up": {ATR: 3.0}, "trending_down": {ATR: 3.0}, "ranging": {ATR: 1.0},
 		}},
 		CloseStrategy: &StrategyRef{Name: "trailing_tp_ratchet_regime", Params: map[string]interface{}{"tp_tiers": table}},
@@ -707,12 +673,10 @@ func TestValidateTrailingTPRatchetClose_RegimePerKeyInitialTrail(t *testing.T) {
 	}
 }
 
-// TestValidateTrailingTPRatchetClose_ManualRegimeRatchet covers #870: HL manual
-// may own a regime ratchet via trailing_stop_atr_regime (gate widened).
 func TestValidateTrailingTPRatchetClose_ManualRegimeRatchet(t *testing.T) {
 	sc := StrategyConfig{
 		ID: "hl-man", Type: "manual", Platform: "hyperliquid",
-		TrailingStopATRRegime: &RegimeATRBlock{TrendRegime: map[string]RegimeATREntry{
+		TrailingStopATRMultRegime: &RegimeATRBlock{TrendRegime: map[string]RegimeATREntry{
 			"trending_up": {ATR: 2.0}, "trending_down": {ATR: 2.0}, "ranging": {ATR: 1.5},
 		}},
 		CloseStrategy: &StrategyRef{Name: "trailing_tp_ratchet_regime", Params: map[string]interface{}{"use_defaults": true}},
@@ -722,15 +686,11 @@ func TestValidateTrailingTPRatchetClose_ManualRegimeRatchet(t *testing.T) {
 	}
 }
 
-// TestDefaultTrailingRatchetTiersForRegime covers #870 per-group ratchet ladders
-// and the #1059 ranging-substate split.
 func TestDefaultTrailingRatchetTiersForRegime(t *testing.T) {
 	clean := defaultTrailingRatchetTiersForRegime("trending_up_clean")
 	if len(clean) != 3 || clean[0].ATRMultiple != 3.0 || clean[0].TrailingMultAfter != 1.5 || clean[2].ATRMultiple != 6.0 {
 		t.Fatalf("clean group mismatch: %+v", clean)
 	}
-	// #1059: ranging_quiet keeps the pre-split geometry; bare ADX "ranging" maps
-	// to it too, so ADX behavior is unchanged.
 	quiet := defaultTrailingRatchetTiersForRegime("ranging_quiet")
 	if len(quiet) != 3 || quiet[0].ATRMultiple != 0.75 || quiet[0].CloseFraction != 0.4 || quiet[2].CloseFraction != 1.0 {
 		t.Fatalf("ranging_quiet mismatch: %+v", quiet)
@@ -739,15 +699,12 @@ func TestDefaultTrailingRatchetTiersForRegime(t *testing.T) {
 	if len(adx) != 3 || adx[0].ATRMultiple != 0.75 || adx[2].CloseFraction != 1.0 {
 		t.Fatalf("bare ADX ranging must map to the quiet ladder: %+v", adx)
 	}
-	// #1059: ranging_volatile widens triggers, close fractions unchanged.
 	volatile := defaultTrailingRatchetTiersForRegime("ranging_volatile")
 	if len(volatile) != 3 ||
 		volatile[0].ATRMultiple != 1.0 || volatile[2].ATRMultiple != 3.0 ||
 		volatile[0].CloseFraction != 0.4 || volatile[2].CloseFraction != 1.0 {
 		t.Fatalf("ranging_volatile mismatch: %+v", volatile)
 	}
-	// #1059: ranging_directional rides further — 4 tiers, 25/50/75/75 with a
-	// let-ride final rung (no extra close, tighter trail).
 	dir := defaultTrailingRatchetTiersForRegime("ranging_directional")
 	if len(dir) != 4 {
 		t.Fatalf("ranging_directional want 4 tiers, got %+v", dir)
@@ -762,10 +719,6 @@ func TestDefaultTrailingRatchetTiersForRegime(t *testing.T) {
 	if defaultTrailingRatchetTiersForRegime("") != nil {
 		t.Error("empty regime must resolve to nil")
 	}
-	// #1124: the directional-drift substates must resolve to the SAME 4-tier
-	// ranging_directional ladder — never nil. A nil here would mean the ratchet
-	// (auto-protective exit) silently never arms for a ranging_directional_up/
-	// _down position.
 	for _, label := range []string{"ranging_directional_up", "ranging_directional_down"} {
 		got := defaultTrailingRatchetTiersForRegime(label)
 		if len(got) != len(dir) {
@@ -779,10 +732,6 @@ func TestDefaultTrailingRatchetTiersForRegime(t *testing.T) {
 	}
 }
 
-// TestRatchetCloseDefaultGroup covers #1059: the ratchet-only resolver
-// differentiates the composite ranging substates, while regimeCloseDefaultGroup
-// (the shared B2 ATR-TP fn) keeps collapsing them — verified in
-// TestRegimeCloseDefaultGroup.
 func TestRatchetCloseDefaultGroup(t *testing.T) {
 	cases := []struct {
 		label, group string
@@ -791,10 +740,9 @@ func TestRatchetCloseDefaultGroup(t *testing.T) {
 		{"ranging_quiet", "ranging_quiet", true},
 		{"ranging_volatile", "ranging_volatile", true},
 		{"ranging_directional", "ranging_directional", true},
-		// #1124: directional-drift substates share the ranging_directional ladder.
 		{"ranging_directional_up", "ranging_directional", true},
 		{"ranging_directional_down", "ranging_directional", true},
-		{"ranging", "ranging_quiet", true}, // bare ADX → quiet ladder
+		{"ranging", "ranging_quiet", true},
 		{"trending_up_clean", "clean", true},
 		{"trending_up_choppy", "choppy", true},
 		{"trending_up", "choppy", true},
@@ -809,18 +757,11 @@ func TestRatchetCloseDefaultGroup(t *testing.T) {
 	}
 }
 
-// TestValidateRegimeRatchet_AllDefaultsCompositeValidates is the #870
-// integration case: trailing_stop_atr_regime + trailing_tp_ratchet_regime both
-// on use_defaults under a composite classifier. The full validateRegimeATRConfig
-// path expands the per-group opening trails (#1120: clean 2.5 / choppy 2.25 /
-// ranging_quiet 1.0 / ranging_volatile 1.25 / ranging_directional* 1.5) and
-// per-group ratchet ladders, and the per-key initial-trail coupling
-// must hold for every label (each group's first rung ≤ its open).
 func TestValidateRegimeRatchet_AllDefaultsCompositeValidates(t *testing.T) {
 	sc := StrategyConfig{
 		ID: "hl-allc", Type: "perps", Platform: "hyperliquid",
-		RegimeATRWindow:       "daily",
-		TrailingStopATRRegime: &RegimeATRBlock{raw: map[string]interface{}{"use_defaults": true}},
+		RegimeATRWindow:           "daily",
+		TrailingStopATRMultRegime: &RegimeATRBlock{raw: map[string]interface{}{"use_defaults": true}},
 		CloseStrategy: &StrategyRef{
 			Name:   "trailing_tp_ratchet_regime",
 			Params: map[string]interface{}{"use_defaults": true},

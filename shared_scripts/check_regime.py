@@ -1,37 +1,4 @@
 #!/usr/bin/env python3
-"""Dedicated regime-bundle subprocess for the Go scheduler (#879).
-
-Computes the market regime once per distinct (platform, symbol, timeframe,
-windows-spec) signature per scheduler cycle. The Go scheduler stores the
-emitted bundle in its per-cycle global regime store and injects it into each
-check script via --regime-payload-json, so peer strategies sharing a signature
-never recompute regime math inline.
-
-Usage:
-    check_regime.py --platform hyperliquid --symbol BTC --timeframe 1h \
-        --regime-windows-spec-json '{"default":{"classifier":"adx","period":14,"adx_threshold":20}}' \
-        --ohlcv-limit 200
-
-Output (stdout, JSON):
-    {
-      "platform": "...", "symbol": "...", "timeframe": "...",
-      "bar_time": "<ISO timestamp of the last bar in the fetched frame>",
-      "regime": {"<window>": {"regime","score","classifier","metrics"}, ...},
-      "views":  {"<window>": {"adx3": "...", "composite7": "..."}, ...},
-      "timestamp": "<now>"
-    }
-
-The "regime" map is byte-compatible with the multi-window payload check
-scripts emit from prepare_check_regime, so RegimePayload on the Go side and
-regime_from_injected_payload on the Python side both consume it unchanged.
-The "views" map adds both classifier vocabularies per window for the
-portfolio/dashboard regime surface: "adx3" always runs the real ADX
-classifier at the window's FULL period (exact parity with a standalone ADX
-window even when period > COMPOSITE_ADX_PERIOD_CAP), never a prefix-collapse
-of the composite label.
-
-Errors follow the subprocess contract: JSON with "error" on stdout, exit 1.
-"""
 
 from __future__ import annotations
 
@@ -45,7 +12,8 @@ from datetime import datetime, timezone
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(_REPO_ROOT, "shared_tools"))
 
-from regime import (  # noqa: E402
+from market_payload import market_frame_rows
+from regime import (
     CLASSIFIER_ADX,
     CLASSIFIER_COMPOSITE,
     _DEFAULT_COMPOSITE_THRESHOLDS,
@@ -69,11 +37,6 @@ def _emit_error(args, message: str) -> None:
 
 
 def _load_adapter(platform: str):
-    """Load ExchangeAdapter from platforms/<platform>/adapter.py (one per file).
-
-    Mirrors check_options.py: insert the platform dir into sys.path before
-    exec (the HL adapter needs its dir first to win the SDK name clash).
-    """
     adapter_path = os.path.join(_REPO_ROOT, "platforms", platform, "adapter.py")
     if not os.path.exists(adapter_path):
         raise ImportError(f"No adapter found for platform '{platform}' at {adapter_path}")
@@ -90,7 +53,6 @@ def _load_adapter(platform: str):
 
 
 def _make_dataframe(candles):
-    """Raw OHLCV rows -> DataFrame; mirrors the per-platform check scripts."""
     import pandas as pd
 
     df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume"])
@@ -101,16 +63,6 @@ def _make_dataframe(candles):
 
 
 def _fetch_dataframe(args):
-    """Fetch OHLCV from the same source the strategy's check script uses.
-
-    binanceus -> shared_tools data_fetcher (default-spot check_strategy.py
-    path); every other platform -> its ExchangeAdapter.get_ohlcv. When
-    --allow-spot-fallback is set (options strategies), an adapter without
-    get_ohlcv or a failed adapter fetch falls back to BinanceUS ccxt with
-    "<symbol>/USDT", mirroring check_options._fetch_ohlcv_df. Without the
-    flag there is NO cross-venue fallback: wrong-feed data is worse than an
-    empty bundle (the consumers fail open on empty).
-    """
     platform = args.platform.strip().lower()
     if platform == "binanceus":
         from data_fetcher import fetch_ohlcv
@@ -127,7 +79,7 @@ def _fetch_dataframe(args):
             rows = ohlcv_fn(args.symbol, interval=args.timeframe, limit=args.ohlcv_limit)
         elif not args.allow_spot_fallback:
             raise AttributeError(f"adapter for '{platform}' has no get_ohlcv")
-    except Exception as e:  # noqa: BLE001 - converted to bundle error or fallback
+    except Exception as e:
         if not args.allow_spot_fallback:
             raise
         adapter_err = e
@@ -146,8 +98,16 @@ def _fetch_dataframe(args):
     return _make_dataframe(rows)
 
 
+def _market_dataframe(args):
+    payload = json.loads(sys.stdin.read())
+    if not isinstance(payload, dict):
+        raise ValueError("market stdin payload must be a JSON object")
+    market = payload.get("market")
+    rows = market_frame_rows(market, args.symbol, args.timeframe, limit=args.ohlcv_limit)
+    return _make_dataframe(rows)
+
+
 def _window_adx_threshold(spec: dict) -> float:
-    """ADX threshold for the 3-state view of one window spec."""
     if spec.get("classifier") == CLASSIFIER_COMPOSITE:
         th = spec.get("thresholds") or {}
         return float(th.get("adx") or _DEFAULT_COMPOSITE_THRESHOLDS["adx"])
@@ -155,16 +115,6 @@ def _window_adx_threshold(spec: dict) -> float:
 
 
 def compute_regime_bundle(df, windows_spec: dict) -> dict:
-    """Compute the per-window snapshots + both-classifier views for one frame.
-
-    Pure (no I/O) so tests can assert parity against prepare_check_regime.
-    Snapshots come from the SAME compute_multi_regime call the check scripts
-    used pre-#879, so a consumer's label is unchanged by the migration. Views
-    run the alternate classifier per window: adx3 at the window's full period
-    (exact ADX parity past COMPOSITE_ADX_PERIOD_CAP), composite7 at the
-    window's period with its composite thresholds (defaults when the window
-    is ADX-classified).
-    """
     snapshots = compute_multi_regime(df, windows_spec)
     views: dict[str, dict[str, str]] = {}
     for name in sorted(windows_spec.keys()):
@@ -184,10 +134,6 @@ def compute_regime_bundle(df, windows_spec: dict) -> dict:
 
 
 def main() -> None:
-    # #645-style startup compatibility probe — exit 0 before any work.
-    if "--probe-only" in sys.argv:
-        sys.exit(0)
-
     parser = argparse.ArgumentParser(description="Compute one regime bundle (#879)")
     parser.add_argument("--platform", required=True,
                         help="data source: binanceus | hyperliquid | okx | topstep | robinhood | <options platform>")
@@ -200,15 +146,22 @@ def main() -> None:
                         help="insufficient-data floor; mirrors the check scripts' candle guard")
     parser.add_argument("--allow-spot-fallback", action="store_true", default=False,
                         help="options platforms: fall back to BinanceUS <symbol>/USDT when the adapter has no OHLCV")
+    parser.add_argument("--market-stdin", action="store_true", default=False,
+                        help="#1524: read a sealed market payload from stdin instead of fetching candles")
     parser.add_argument("--probe-only", action="store_true", default=False)
     args = parser.parse_args()
+    if args.probe_only:
+        sys.exit(0)
 
     try:
         windows_spec = parse_regime_windows_spec_json(args.regime_windows_spec_json)
         if not windows_spec:
             _emit_error(args, "empty --regime-windows-spec-json")
 
-        df = _fetch_dataframe(args)
+        if args.market_stdin:
+            df = _market_dataframe(args)
+        else:
+            df = _fetch_dataframe(args)
         if df is None or len(df) < args.min_bars:
             got = 0 if df is None else len(df)
             _emit_error(args, f"Insufficient data: {got} candles (need {args.min_bars})")
@@ -219,7 +172,7 @@ def main() -> None:
         try:
             idx_last = df.index[-1]
             bar_time = idx_last.isoformat() if hasattr(idx_last, "isoformat") else str(idx_last)
-        except Exception:  # noqa: BLE001 - bar_time is informational only
+        except Exception:
             bar_time = ""
 
         print(json.dumps({
@@ -233,7 +186,7 @@ def main() -> None:
         }))
     except SystemExit:
         raise
-    except Exception as e:  # noqa: BLE001 - subprocess contract: JSON + exit 1
+    except Exception as e:
         import traceback
 
         traceback.print_exc(file=sys.stderr)

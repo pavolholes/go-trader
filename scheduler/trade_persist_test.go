@@ -8,8 +8,6 @@ import (
 	"time"
 )
 
-// TestInsertTrade_WritesRow verifies StateDB.InsertTrade persists a single row
-// immediately, independent of SaveState. This is the foundation of #289.
 func TestInsertTrade_WritesRow(t *testing.T) {
 	db := openTestDB(t)
 	now := time.Now().UTC()
@@ -43,8 +41,6 @@ func TestInsertTrade_WritesRow(t *testing.T) {
 	}
 }
 
-// TestRecordTrade_AppendsAndPersists verifies RecordTrade both appends to
-// TradeHistory and invokes the tradeRecorder hook (#289 — crash resilience).
 func TestRecordTrade_AppendsAndPersists(t *testing.T) {
 	db := openTestDB(t)
 
@@ -75,8 +71,6 @@ func TestRecordTrade_AppendsAndPersists(t *testing.T) {
 	}
 }
 
-// TestRecordTrade_NoRecorder verifies RecordTrade still appends in-memory when
-// tradeRecorder is nil (tests, pre-DB boot, or persistence hook unset).
 func TestRecordTrade_NoRecorder(t *testing.T) {
 	prev := tradeRecorder
 	tradeRecorder = nil
@@ -90,10 +84,6 @@ func TestRecordTrade_NoRecorder(t *testing.T) {
 	}
 }
 
-// TestRecordTrade_SaveStateNoDoubleInsert verifies that a trade already written
-// via RecordTrade is NOT duplicated when cycle-end SaveState runs. The timestamp
-// guard inside SaveState skips any trade whose ts is not strictly greater than
-// the max already in DB.
 func TestRecordTrade_SaveStateNoDoubleInsert(t *testing.T) {
 	db := openTestDB(t)
 
@@ -134,9 +124,6 @@ func TestRecordTrade_SaveStateNoDoubleInsert(t *testing.T) {
 	}
 }
 
-// TestRecordTrade_SurvivesCrashBeforeSave simulates a mid-cycle crash: trades
-// written via RecordTrade must still be visible when state is reloaded,
-// even though SaveState was never called. This is the core #289 guarantee.
 func TestRecordTrade_SurvivesCrashBeforeSave(t *testing.T) {
 	db := openTestDB(t)
 
@@ -144,7 +131,6 @@ func TestRecordTrade_SurvivesCrashBeforeSave(t *testing.T) {
 	tradeRecorder = db.InsertTrade
 	t.Cleanup(func() { tradeRecorder = prev })
 
-	// Seed a strategy row so LoadState can attach trades to it.
 	state := &AppState{
 		CycleCount: 1,
 		Strategies: map[string]*StrategyState{
@@ -163,12 +149,10 @@ func TestRecordTrade_SurvivesCrashBeforeSave(t *testing.T) {
 		t.Fatalf("seed SaveState: %v", err)
 	}
 
-	// Execute trades — simulate mid-cycle — then DO NOT call SaveState.
 	now := time.Now().UTC()
 	RecordTrade(state.Strategies["s4"], Trade{Timestamp: now, Symbol: "BTC", Side: "buy", Quantity: 1, Price: 50000, Value: 50000})
 	RecordTrade(state.Strategies["s4"], Trade{Timestamp: now.Add(time.Millisecond), Symbol: "ETH", Side: "buy", Quantity: 5, Price: 2000, Value: 10000})
 
-	// Simulated crash/restart: reload from DB.
 	loaded, err := db.LoadState()
 	if err != nil {
 		t.Fatalf("LoadState: %v", err)
@@ -181,19 +165,12 @@ func TestRecordTrade_SurvivesCrashBeforeSave(t *testing.T) {
 	}
 }
 
-// TestExecutePerpsSignal_PersistsExchangeMetadata is the #289 regression guard
-// for the fix that threads fillOID/fillFee into ExecutePerpsSignal so every
-// Trade is constructed complete before RecordTrade persists it. Prior to the
-// fix the OID/fee were stamped onto s.TradeHistory AFTER RecordTrade had
-// already written an empty-metadata row; SaveState's timestamp-dedup then
-// skipped re-insertion and the DB stayed stale. Reload + assert fills.
-func TestExecutePerpsSignal_PersistsExchangeMetadata(t *testing.T) {
+func TestExecutePerpsWithLeverage_PersistsExchangeMetadata(t *testing.T) {
 	db := openTestDB(t)
 	prev := tradeRecorder
 	tradeRecorder = db.InsertTrade
 	t.Cleanup(func() { tradeRecorder = prev })
 
-	// Seed the strategy row so LoadState has something to hang trades on.
 	state := &AppState{
 		CycleCount: 1,
 		Strategies: map[string]*StrategyState{
@@ -216,18 +193,14 @@ func TestExecutePerpsSignal_PersistsExchangeMetadata(t *testing.T) {
 	logger := newTestLogger(t)
 	s := state.Strategies["hl-live"]
 
-	// Live open-long @ $2000, qty=0.5, OID=12345, fee=$0.42.
-	trades, err := ExecutePerpsSignal(s, 1, "ETH", 2000, 1, 0.5, "12345", 0.42, false, logger)
+	trades, err := ExecutePerpsSignalWithLeverage(s, 1, "ETH", 2000, PerpsSizing{SizingLeverage: 1, ExchangeLeverage: 1}, 0.5, "12345", 0.42, DirectionLong, 0, logger)
 	if err != nil {
-		t.Fatalf("ExecutePerpsSignal: %v", err)
+		t.Fatalf("ExecutePerpsSignalWithLeverage: %v", err)
 	}
 	if trades != 1 {
 		t.Fatalf("trades = %d, want 1", trades)
 	}
 
-	// Reload from SQLite — simulates mid-cycle crash before SaveState runs.
-	// The persisted row must carry the exchange metadata, not the zero values
-	// that eager-INSERT-then-stamp would have left behind.
 	loaded, err := db.LoadState()
 	if err != nil {
 		t.Fatalf("LoadState: %v", err)
@@ -263,7 +236,7 @@ func TestDeferredOpenRecordsProtectionOIDSnapshotOnce(t *testing.T) {
 	}
 	logger := newTestLogger(t)
 
-	exec, err := ExecutePerpsSignalWithLeverageDeferredOpen(s, 1, "ETH", 2000, 1, 1, 0, 0.5, "12345", 0.42, DirectionLong, 0, "", logger)
+	exec, err := ExecutePerpsSignalWithLeverageDeferredOpen(s, 1, "ETH", 2000, PerpsSizing{SizingLeverage: 1, ExchangeLeverage: 1}, 0.5, "12345", 0.42, DirectionLong, 0, logger)
 	if err != nil {
 		t.Fatalf("ExecutePerpsSignalWithLeverageDeferredOpen: %v", err)
 	}
@@ -298,6 +271,35 @@ func TestDeferredOpenRecordsProtectionOIDSnapshotOnce(t *testing.T) {
 	}
 	if len(s.TradeHistory) != 1 || s.TradeHistory[0].StopLossOID != 111 || len(s.TradeHistory[0].TPOIDs) != 2 || s.TradeHistory[0].TPOIDs[0] != 222 || s.TradeHistory[0].TPOIDs[1] != 333 {
 		t.Fatalf("in-memory trade snapshot = %+v, want SL/TPOID snapshot", s.TradeHistory)
+	}
+}
+
+func TestDeferredPerpsLiveFillBooksWithZeroVirtualCash(t *testing.T) {
+	s := &StrategyState{
+		ID:              "hl-pool",
+		Platform:        "hyperliquid",
+		Type:            "perps",
+		Cash:            0,
+		InitialCapital:  0,
+		Positions:       map[string]*Position{},
+		OptionPositions: map[string]*OptionPosition{},
+		TradeHistory:    []Trade{},
+	}
+	logger := newTestLogger(t)
+
+	exec, err := ExecutePerpsSignalWithLeverageDeferredOpen(
+		s, 1, "ETH", 2000,
+		PerpsSizing{SizingLeverage: 1, ExchangeLeverage: 5, MarginPerTradeUSD: 100},
+		0.25, "pool-oid", 0.25, DirectionLong, 0, logger,
+	)
+	if err != nil {
+		t.Fatalf("ExecutePerpsSignalWithLeverageDeferredOpen: %v", err)
+	}
+	if exec.TradesExecuted != 1 || exec.OpenTrade == nil {
+		t.Fatalf("live fill was not booked: exec=%+v", exec)
+	}
+	if pos := s.Positions["ETH"]; pos == nil || pos.Quantity != 0.25 {
+		t.Fatalf("position=%+v, want booked live qty 0.25", pos)
 	}
 }
 
@@ -373,7 +375,7 @@ func TestRecordPositionOpenFallsBackWhenPositionMissing(t *testing.T) {
 		TradeHistory:    []Trade{},
 	}
 	logger := newTestLogger(t)
-	exec, err := ExecutePerpsSignalWithLeverageDeferredOpen(s, 1, "ETH", 2000, 1, 1, 0, 0.5, "12345", 0.42, DirectionLong, 0, "", logger)
+	exec, err := ExecutePerpsSignalWithLeverageDeferredOpen(s, 1, "ETH", 2000, PerpsSizing{SizingLeverage: 1, ExchangeLeverage: 1}, 0.5, "12345", 0.42, DirectionLong, 0, logger)
 	if err != nil {
 		t.Fatalf("ExecutePerpsSignalWithLeverageDeferredOpen: %v", err)
 	}
@@ -399,17 +401,9 @@ func assertTradeCount(t *testing.T, db *StateDB, strategyID string, want int) {
 	}
 }
 
-// TestRecordTrade_OutOfOrderFailureRecoveredBySaveState verifies the dedup
-// fix for the #289 carry-over: when an earlier-timestamped RecordTrade fails
-// eager-insert but a later-timestamped one succeeds, the pre-fix MAX(timestamp)
-// dedup in SaveState would skip the earlier row because its ts < latestTS and
-// drop it permanently. With the persisted-flag approach, the earlier row is
-// still marked persisted=false and SaveState's next flush picks it up.
 func TestRecordTrade_OutOfOrderFailureRecoveredBySaveState(t *testing.T) {
 	db := openTestDB(t)
 
-	// Inject a recorder that fails the FIRST call, then delegates to the DB.
-	// Simulates a transient write hiccup on trade T1 while T2 lands cleanly.
 	calls := 0
 	prev := tradeRecorder
 	tradeRecorder = func(id string, tr Trade) error {
@@ -437,7 +431,6 @@ func TestRecordTrade_OutOfOrderFailureRecoveredBySaveState(t *testing.T) {
 	RecordTrade(s, Trade{Timestamp: t1, Symbol: "BTC", Side: "buy", Quantity: 1, Price: 50000, Value: 50000})
 	RecordTrade(s, Trade{Timestamp: t1.Add(time.Millisecond), Symbol: "ETH", Side: "buy", Quantity: 5, Price: 2000, Value: 10000})
 
-	// After eager inserts: T1 failed (persisted=false), T2 succeeded (persisted=true).
 	if s.TradeHistory[0].persisted {
 		t.Fatal("T1 should not be persisted — recorder failed")
 	}
@@ -445,7 +438,6 @@ func TestRecordTrade_OutOfOrderFailureRecoveredBySaveState(t *testing.T) {
 		t.Fatal("T2 should be persisted — recorder succeeded")
 	}
 
-	// Cycle-end SaveState must backfill T1, even though its ts < MAX(ts) in DB.
 	if err := db.SaveState(state); err != nil {
 		t.Fatalf("SaveState: %v", err)
 	}
@@ -458,15 +450,11 @@ func TestRecordTrade_OutOfOrderFailureRecoveredBySaveState(t *testing.T) {
 	if ss == nil || len(ss.TradeHistory) != 2 {
 		t.Fatalf("loaded trades = %d, want 2 (T1 was dropped by old ts-dedup?)", len(ss.TradeHistory))
 	}
-	// Symbols must match: BTC then ETH in ts order.
 	if ss.TradeHistory[0].Symbol != "BTC" || ss.TradeHistory[1].Symbol != "ETH" {
 		t.Errorf("loaded symbols = %q,%q, want BTC,ETH", ss.TradeHistory[0].Symbol, ss.TradeHistory[1].Symbol)
 	}
 }
 
-// TestRecordTrade_PersistFailureTriggersWarnHook verifies the operator-visible
-// notification path (#289 observability follow-up): when InsertTrade fails,
-// tradePersistWarn is invoked so the failure surfaces beyond stderr.
 func TestRecordTrade_PersistFailureTriggersWarnHook(t *testing.T) {
 	prevRec := tradeRecorder
 	prevWarn := tradePersistWarn
@@ -487,7 +475,6 @@ func TestRecordTrade_PersistFailureTriggersWarnHook(t *testing.T) {
 	if !strings.Contains(warnings[0], "warn-test") || !strings.Contains(warnings[0], "boom") {
 		t.Errorf("warning = %q, want strategy ID + underlying error", warnings[0])
 	}
-	// In-memory append must still happen despite recorder failure.
 	if len(s.TradeHistory) != 1 {
 		t.Errorf("TradeHistory len = %d, want 1 (append must survive recorder failure)", len(s.TradeHistory))
 	}
@@ -496,16 +483,7 @@ func TestRecordTrade_PersistFailureTriggersWarnHook(t *testing.T) {
 	}
 }
 
-// TestExecutePerpsSignal_FlipDoesNotDoubleCountFee pins the policy that when
-// a buy signal encounters an existing short — producing a close-short +
-// open-long pair in memory — the single real exchange fee is apportioned
-// across both synthetic legs by quantity share (#954). One live fill, one
-// fee: summed ExchangeFee across the two persisted rows must equal it
-// exactly (pre-#954 the close leg took the full real fee AND the open leg
-// deducted an unstamped modeled fee — overcharging the cash book and
-// drifting the trade ledger from the wallet). Both legs stamp the shared
-// flip OID so `backfill trade-ledger` can re-apportion from userFills.
-func TestExecutePerpsSignal_FlipDoesNotDoubleCountFee(t *testing.T) {
+func TestExecutePerpsWithLeverage_FlipDoesNotDoubleCountFee(t *testing.T) {
 	db := openTestDB(t)
 	prev := tradeRecorder
 	tradeRecorder = db.InsertTrade
@@ -521,9 +499,6 @@ func TestExecutePerpsSignal_FlipDoesNotDoubleCountFee(t *testing.T) {
 				Cash:           1000,
 				InitialCapital: 1000,
 				Positions: map[string]*Position{
-					// Pre-existing short — the only way to trigger the flip
-					// branch in current live mode (state migration, paper→live
-					// handoff, or a future adapter that opens shorts).
 					"ETH": {Symbol: "ETH", Quantity: 0.5, AvgCost: 2000, Side: "short", Multiplier: 1, Leverage: 1},
 				},
 				OptionPositions: map[string]*OptionPosition{},
@@ -538,11 +513,9 @@ func TestExecutePerpsSignal_FlipDoesNotDoubleCountFee(t *testing.T) {
 	logger := newTestLogger(t)
 	s := state.Strategies["hl-flip"]
 
-	// Live flip buy @ $2000 qty=0.8 → closes the full 0.5 short + opens new
-	// 0.3 long = 2 in-memory trades, 1 real exchange fill worth $0.42.
-	trades, err := ExecutePerpsSignal(s, 1, "ETH", 2000, 1, 0.8, "99999", 0.42, true, logger)
+	trades, err := ExecutePerpsSignalWithLeverage(s, 1, "ETH", 2000, PerpsSizing{SizingLeverage: 1, ExchangeLeverage: 1}, 0.8, "99999", 0.42, DirectionBoth, 0, logger)
 	if err != nil {
-		t.Fatalf("ExecutePerpsSignal: %v", err)
+		t.Fatalf("ExecutePerpsSignalWithLeverage: %v", err)
 	}
 	if trades != 2 {
 		t.Fatalf("trades = %d, want 2 (close-short + open-long)", trades)
@@ -581,7 +554,6 @@ func TestExecutePerpsSignal_FlipDoesNotDoubleCountFee(t *testing.T) {
 	if oidHits != 2 {
 		t.Errorf("rows with OID=99999 = %d, want 2 (both flip legs share the order)", oidHits)
 	}
-	// Apportioned by qty share of the 0.8 net fill: close 0.5 → 0.2625, open 0.3 → 0.1575.
 	if math.Abs(closeFee-0.2625) > 1e-9 {
 		t.Errorf("close ExchangeFee = %v, want 0.2625 (0.5/0.8 share)", closeFee)
 	}
@@ -590,10 +562,7 @@ func TestExecutePerpsSignal_FlipDoesNotDoubleCountFee(t *testing.T) {
 	}
 }
 
-// TestExecuteSpotSignal_PersistsImmediately verifies that the production
-// execution path (ExecuteSpotSignal) writes trades through the tradeRecorder
-// hook, not just the end-of-cycle SaveState batch.
-func TestExecuteSpotSignal_PersistsImmediately(t *testing.T) {
+func TestExecuteSpotWithFillFee_PersistsImmediately(t *testing.T) {
 	db := openTestDB(t)
 	prev := tradeRecorder
 	tradeRecorder = db.InsertTrade
@@ -607,8 +576,8 @@ func TestExecuteSpotSignal_PersistsImmediately(t *testing.T) {
 	}
 	logger := newTestLogger(t)
 
-	if _, err := ExecuteSpotSignal(s, 1, "BTC", 50000, 0, logger); err != nil {
-		t.Fatalf("ExecuteSpotSignal: %v", err)
+	if _, err := ExecuteSpotSignalWithFillFee(s, 1, "BTC", 50000, 0, 0, "", 0, logger); err != nil {
+		t.Fatalf("ExecuteSpotSignalWithFillFee: %v", err)
 	}
 
 	var count int
@@ -616,6 +585,127 @@ func TestExecuteSpotSignal_PersistsImmediately(t *testing.T) {
 		t.Fatalf("count: %v", err)
 	}
 	if count != 1 {
-		t.Errorf("trade rows after ExecuteSpotSignal = %d, want 1 (hook never fired)", count)
+		t.Errorf("trade rows after ExecuteSpotSignalWithFillFee = %d, want 1 (hook never fired)", count)
+	}
+}
+
+func TestOpenTradeCarriesTrailingArmStopAfterEarlyRecord(t *testing.T) {
+	trailingMult := 2.0
+	sc := StrategyConfig{
+		ID:                  "hl-trail",
+		Platform:            "hyperliquid",
+		Type:                "perps",
+		Args:                []string{"--mode", "live"},
+		TrailingStopATRMult: &trailingMult,
+	}
+
+	pos := &Position{Symbol: "ETH", Side: "long", Quantity: 1, AvgCost: 2000, EntryATR: 25}
+	if _, syncOK := buildHyperliquidProtectionPlan(sc, pos, 0); syncOK {
+		t.Fatalf("pure trailing owner unexpectedly produced a protection plan — the backfill premise changed")
+	}
+
+	db := openTestDB(t)
+	prev := tradeRecorder
+	tradeRecorder = db.InsertTrade
+	t.Cleanup(func() { tradeRecorder = prev })
+
+	s := &StrategyState{
+		ID:              "hl-trail",
+		Platform:        "hyperliquid",
+		Type:            "perps",
+		Cash:            10000,
+		InitialCapital:  10000,
+		Positions:       map[string]*Position{},
+		OptionPositions: map[string]*OptionPosition{},
+		TradeHistory:    []Trade{},
+	}
+	logger := newTestLogger(t)
+
+	exec, err := ExecutePerpsSignalWithLeverageDeferredOpen(s, 1, "ETH", 2000, PerpsSizing{SizingLeverage: 1, ExchangeLeverage: 1}, 1, "9001", 0.2, DirectionLong, 0, logger)
+	if err != nil {
+		t.Fatalf("ExecutePerpsSignalWithLeverageDeferredOpen: %v", err)
+	}
+	opened := s.Positions["ETH"]
+	opened.EntryATR = 25
+
+	recordPositionOpen(s, sc, exec.OpenTrade, opened)
+	if s.TradeHistory[0].StopLossOID != 0 || s.TradeHistory[0].StopLossTriggerPx != 0 {
+		t.Fatalf("open row = OID %d trigger %.2f, want the pre-arm blanks this test exists to backfill", s.TradeHistory[0].StopLossOID, s.TradeHistory[0].StopLossTriggerPx)
+	}
+
+	opened.StopLossOID = 4242
+	opened.StopLossTriggerPx = 1950
+
+	stampOpenTradeWithProtectionSnapshot(s, db, sc, "ETH", opened)
+	if s.TradeHistory[0].StopLossOID != 4242 || s.TradeHistory[0].StopLossTriggerPx != 1950 {
+		t.Fatalf("in-memory open row = OID %d trigger %.2f, want 4242 / 1950", s.TradeHistory[0].StopLossOID, s.TradeHistory[0].StopLossTriggerPx)
+	}
+	var slOID int64
+	var triggerPx float64
+	if err := db.db.QueryRow(`SELECT stop_loss_oid, stop_loss_trigger_px FROM trades WHERE strategy_id = 'hl-trail'`).Scan(&slOID, &triggerPx); err != nil {
+		t.Fatalf("query persisted open row: %v", err)
+	}
+	if slOID != 4242 || triggerPx != 1950 {
+		t.Errorf("persisted open row = OID %d trigger %.2f, want 4242 / 1950", slOID, triggerPx)
+	}
+
+	opened.StopLossOID = 0
+	opened.StopLossTriggerPx = 0
+	stampOpenTradeWithProtectionSnapshot(s, db, sc, "ETH", opened)
+	if s.TradeHistory[0].StopLossOID != 4242 || s.TradeHistory[0].StopLossTriggerPx != 1950 {
+		t.Errorf("re-stamp overwrote the armed snapshot: OID %d trigger %.2f, want 4242 / 1950", s.TradeHistory[0].StopLossOID, s.TradeHistory[0].StopLossTriggerPx)
+	}
+}
+
+func TestPaperHLPerpsOpenRecordsExactlyOneTradeRow(t *testing.T) {
+	db := openTestDB(t)
+	prev := tradeRecorder
+	tradeRecorder = db.InsertTrade
+	t.Cleanup(func() { tradeRecorder = prev })
+
+	sc := StrategyConfig{ID: "hl-paper", Platform: "hyperliquid", Type: "perps", Args: []string{"--mode", "paper"}}
+	s := &StrategyState{
+		ID:              "hl-paper",
+		Platform:        "hyperliquid",
+		Type:            "perps",
+		Cash:            10000,
+		InitialCapital:  10000,
+		Positions:       map[string]*Position{},
+		OptionPositions: map[string]*OptionPosition{},
+		TradeHistory:    []Trade{},
+	}
+	logger := newTestLogger(t)
+
+	exec, err := ExecutePerpsSignalWithLeverageDeferredOpen(s, 1, "ETH", 2000, PerpsSizing{SizingLeverage: 1, ExchangeLeverage: 1}, 0, "", 0, DirectionLong, 0, logger)
+	if err != nil {
+		t.Fatalf("ExecutePerpsSignalWithLeverageDeferredOpen: %v", err)
+	}
+	if exec.TradesExecuted != 1 || exec.OpenTrade == nil {
+		t.Fatalf("paper exec = %+v, want one deferred open trade", exec)
+	}
+	recordPositionOpen(s, sc, exec.OpenTrade, s.Positions["ETH"])
+
+	countRows := func(where string) int {
+		var n int
+		if err := db.db.QueryRow(`SELECT COUNT(*) FROM trades WHERE strategy_id = 'hl-paper' AND ` + where).Scan(&n); err != nil {
+			t.Fatalf("count %s: %v", where, err)
+		}
+		return n
+	}
+	if got := countRows("is_close = 0"); got != 1 {
+		t.Fatalf("paper open rows = %d, want exactly 1", got)
+	}
+	if got := countRows("is_close = 1"); got != 0 {
+		t.Fatalf("close rows after an open = %d, want 0", got)
+	}
+
+	if _, err := ExecutePerpsSignalWithLeverageDeferredOpen(s, -1, "ETH", 2100, PerpsSizing{SizingLeverage: 1, ExchangeLeverage: 1}, 0, "", 0, DirectionLong, 0, logger); err != nil {
+		t.Fatalf("paper close: %v", err)
+	}
+	if got := countRows("is_close = 1"); got != 1 {
+		t.Errorf("paper close rows = %d, want exactly 1", got)
+	}
+	if got := countRows("is_close = 0"); got != 1 {
+		t.Errorf("open rows after the close = %d, want still exactly 1", got)
 	}
 }
