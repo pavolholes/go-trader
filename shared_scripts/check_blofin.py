@@ -70,6 +70,7 @@ def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=
                      position_side="", position_ctx=None,
                      regime_enabled=False, regime_windows_spec=None, ohlcv_limit=200, regime_atr_window="",
                      regime_payload_json=None,
+                     atr_method="simple",
                      close_params_by_name=None):
     """Run strategy signal check using BloFin OHLCV data."""
     try:
@@ -152,7 +153,7 @@ def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=
         decision = None
         if open_close_enabled:
             market_ctx = {"mark_price": float(df["close"].iloc[-1])}
-            atr_now = latest_atr(df)
+            atr_now = latest_atr(df, method=atr_method)
             if atr_now > 0:
                 market_ctx["atr"] = atr_now
             if live_regime:
@@ -177,7 +178,7 @@ def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=
             result_df = apply_strategy(strategy_name, df, strategy_params or None)
             signal = normalize_signal(result_df.iloc[-1].get("signal", 0))
 
-        ensure_atr_indicator(result_df)
+        ensure_atr_indicator(result_df, method=atr_method)
         last = result_df.iloc[-1]
         price = float(last["close"])
 
@@ -342,6 +343,7 @@ def main():
         parser.add_argument("--regime-atr-window", default="")
         parser.add_argument("--regime-payload-json", default=None)
         parser.add_argument("--regime-directional-window", default="")
+        parser.add_argument("--atr-method", default="simple", choices=["simple", "wilder"])
         parser.add_argument("--inst-type", default="swap", choices=["swap"])
         parser.add_argument("--params", default=None)
         parser.add_argument("--open-strategy", default=None)
@@ -376,6 +378,7 @@ def main():
             ohlcv_limit=args.ohlcv_limit,
             regime_atr_window=args.regime_atr_window,
             regime_payload_json=args.regime_payload_json,
+            atr_method=args.atr_method,
             close_params_by_name=close_params_by_name,
         )
 

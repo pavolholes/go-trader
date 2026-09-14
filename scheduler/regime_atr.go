@@ -705,9 +705,9 @@ func validateRegimeATRConfig(cfg *Config) []string {
 			}
 			for k := range ref.Params {
 				switch k {
-				case "use_defaults", "tp_tiers", "tiers", "atr_source", "sl_after":
+				case "use_defaults", "tp_tiers", "tiers", "atr_source", "sl_after", "sl_atr_mult":
 				default:
-					errs = append(errs, fmt.Sprintf("%s: unknown param %q (allowed: use_defaults, tp_tiers, atr_source, sl_after)", subPrefix, k))
+					errs = append(errs, fmt.Sprintf("%s: unknown param %q (allowed: use_defaults, tp_tiers, atr_source, sl_after, sl_atr_mult)", subPrefix, k))
 				}
 			}
 			if useDefaults {
