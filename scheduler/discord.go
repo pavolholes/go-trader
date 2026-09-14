@@ -161,6 +161,9 @@ func resolveChannel(channels map[string]string, platform, stratType string) stri
 	if ch, ok := channels[stratType]; ok && ch != "" {
 		return ch
 	}
+	if ch, ok := channels["default"]; ok && ch != "" {
+		return ch
+	}
 	return ""
 }
 
@@ -182,14 +185,33 @@ func resolveTradeChannel(channels map[string]string, platform, stratType string,
 // "<platform>-paper" (paper) / "<platform>-live" (live) → platform → stratType → Channels fallback.
 // Note: a stratType key (e.g. "perps") reroutes that type across all platforms — use a platform
 // key for per-platform control.
+
+// withoutDefault returns a copy of m without the env-provided "default"
+// summary channel. Trade alerts must never be rerouted there, so an empty
+// or commented-out TRADES var means alerts are off instead of falling back
+// to the daily-summary channel.
+func withoutDefault(m map[string]string) map[string]string {
+	if _, ok := m["default"]; !ok {
+		return m
+	}
+	c := make(map[string]string, len(m))
+	for k, v := range m {
+		if k != "default" {
+			c[k] = v
+		}
+	}
+	return c
+}
+
 func resolveTradeAlertChannel(override, channels map[string]string, platform, stratType string, isLive bool) string {
 	if len(override) > 0 {
 		if !isLive {
-			if ch, ok := override[platform+"-paper"]; ok && ch != "" {
+			// Explicit empty value disables paper alerts for this platform.
+			if ch, ok := override[platform+"-paper"]; ok {
 				return ch
 			}
 		} else {
-			if ch, ok := override[platform+"-live"]; ok && ch != "" {
+			if ch, ok := override[platform+"-live"]; ok {
 				return ch
 			}
 		}
@@ -199,8 +221,11 @@ func resolveTradeAlertChannel(override, channels map[string]string, platform, st
 		if ch, ok := override[stratType]; ok && ch != "" {
 			return ch
 		}
+		if ch, ok := override["default"]; ok && ch != "" {
+			return ch
+		}
 	}
-	return resolveTradeChannel(channels, platform, stratType, isLive)
+	return resolveTradeChannel(withoutDefault(channels), platform, stratType, isLive)
 }
 
 // channelKeyFromID returns the map key for a given channel ID (reverse lookup for display labels).

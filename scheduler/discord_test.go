@@ -2981,3 +2981,48 @@ func TestFormatCategorySummary_NegativeAdjustedTotalFallsBackToNaiveSum(t *testi
 		t.Errorf("TOTAL row should show drained $0 (PnL%% -100.0%%), not the naive $5,000; got: %q", drainedLine)
 	}
 }
+
+func TestResolveChannelDefaultFallback(t *testing.T) {
+	channels := map[string]string{"default": "ch-def"}
+	if got := resolveChannel(channels, "blofin", "perps"); got != "ch-def" {
+		t.Errorf("expected ch-def fallback, got %s", got)
+	}
+	channels["blofin"] = "ch-bl"
+	if got := resolveChannel(channels, "blofin", "perps"); got != "ch-bl" {
+		t.Errorf("expected ch-bl, got %s", got)
+	}
+	override := map[string]string{"default": "ch-trades"}
+	if got := resolveTradeAlertChannel(override, channels, "blofin", "perps", true); got != "ch-trades" {
+		t.Errorf("expected ch-trades, got %s", got)
+	}
+	override["blofin-live"] = "ch-live"
+	if got := resolveTradeAlertChannel(override, channels, "blofin", "perps", true); got != "ch-live" {
+		t.Errorf("expected ch-live, got %s", got)
+	}
+}
+
+func TestResolveTradeAlertEmptyDisables(t *testing.T) {
+	channels := map[string]string{"default": "ch-def"}
+	override := map[string]string{"blofin-paper": ""}
+	if got := resolveTradeAlertChannel(override, channels, "blofin", "perps", false); got != "" {
+		t.Errorf("paper explicit empty: expected disabled, got %s", got)
+	}
+	override["blofin-live"] = "ch-live"
+	if got := resolveTradeAlertChannel(override, channels, "blofin", "perps", true); got != "ch-live" {
+		t.Errorf("live unaffected: expected ch-live, got %s", got)
+	}
+}
+
+func TestResolveTradeAlertNoFallbackToDefault(t *testing.T) {
+	channels := map[string]string{"default": "ch-daily"}
+	override := map[string]string{}
+	if got := resolveTradeAlertChannel(override, channels, "blofin", "perps", false); got != "" {
+		t.Errorf("paper: empty TRADES must disable alerts, got %s", got)
+	}
+	if got := resolveTradeAlertChannel(override, channels, "blofin", "perps", true); got != "" {
+		t.Errorf("live: empty TRADES must disable alerts, got %s", got)
+	}
+	if got := resolveChannel(channels, "blofin", "perps"); got != "ch-daily" {
+		t.Errorf("summary still uses default, got %s", got)
+	}
+}

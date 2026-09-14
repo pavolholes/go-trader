@@ -8,6 +8,7 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -121,6 +122,50 @@ func (ss *StatusServer) requireAPIAuth(w http.ResponseWriter, r *http.Request) b
 	return false
 }
 
+// dashboardAccentCSS returns CSS variable overrides remapping the
+// green-tinted surfaces to blue-gray for the given accent name.
+// Empty string means default (green) - no override. Semantic colors
+// (profit green, loss red, warning amber) are intentionally untouched.
+func dashboardAccentCSS(accent string) string {
+	switch strings.ToLower(strings.TrimSpace(accent)) {
+	case "blue":
+		return ":root{--bg:#f2f4f8;--line:#d5dbe5;--line-strong:#b4bdcb;--text:#1d232e;--muted:#66707f;--sidebar-bg:#fafbfe;--topbar-bg:rgba(248,250,255,.8);--strategy-hover:#edf1f8;--strategy-active-border:#9db0d6;--strategy-active-bg:#e8edf7;--empty-bg:#ffffff;--position-line:#e9edf3;--focus-ring:rgba(37,99,235,.16);--focus-border:#2f5fc0;}" +
+			"html.dark{--bg:#11151c;--panel:#1a2029;--line:#2a3340;--line-strong:#3a4657;--text:#e6ebf2;--muted:#8b96a5;--sidebar-bg:#161b24;--topbar-bg:rgba(22,27,38,.92);--input-bg:#1f2630;--strategy-hover:#232a35;--strategy-active-border:#4a5f8a;--strategy-active-bg:#28303f;--empty-bg:#1a2029;--position-line:#2a3340;--focus-ring:rgba(91,156,246,.25);--focus-border:#5b9cf6;}"
+	default:
+		return ""
+	}
+}
+
+// dashboardIndexWithAccent serves index.html with the accent override
+// injected when DASHBOARD_ACCENT selects a non-default scheme.
+func dashboardIndexWithAccent(sub fs.FS) ([]byte, bool) {
+	css := dashboardAccentCSS(os.Getenv("DASHBOARD_ACCENT"))
+	if css == "" {
+		return nil, false
+	}
+	data, err := fs.ReadFile(sub, "index.html")
+	if err != nil {
+		return nil, false
+	}
+	return injectHeadStyle(data, css), true
+}
+
+// injectHeadStyle inserts a <style> block before </head>; returns input
+// unchanged when there is no head close tag.
+func injectHeadStyle(html []byte, css string) []byte {
+	idx := strings.Index(string(html), "</head>")
+	if idx < 0 {
+		return html
+	}
+	var sb strings.Builder
+	sb.Write(html[:idx])
+	sb.WriteString("<style id=dashboard-accent>")
+	sb.WriteString(css)
+	sb.WriteString("</style>")
+	sb.Write(html[idx:])
+	return []byte(sb.String())
+}
+
 func (ss *StatusServer) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	if ss.rejectIfDraining(w) {
 		return
@@ -135,6 +180,13 @@ func (ss *StatusServer) handleDashboard(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if r.URL.Path == "/dashboard" || r.URL.Path == "/dashboard/" {
+		if r.Method == http.MethodGet {
+			if html, ok := dashboardIndexWithAccent(sub); ok {
+				w.Header().Set("Content-Type", "text/html; charset=utf-8")
+				w.Write(html)
+				return
+			}
+		}
 		http.ServeFileFS(w, r, sub, "index.html")
 		return
 	}

@@ -2796,3 +2796,36 @@ func TestStrategyNotifyRatchetTriggersEnabled_TwoLayerResolve(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadConfigDiscordChannelEnvDefaults(t *testing.T) {
+	t.Setenv("DISCORD_DAILY_SUMMARY_CHANNEL_ID", "ch-daily")
+	t.Setenv("DISCORD_TRADES_CHANNEL_ID", "ch-trades")
+	t.Setenv("DISCORD_CHANNEL_ID", "ch-legacy")
+	q := string(rune(34))
+	cfgJSON := "{" + q + "strategies" + q + ": [{"
+	cfgJSON += q + "id" + q + ": " + q + "x" + q + ", "
+	cfgJSON += q + "type" + q + ": " + q + "spot" + q + ", "
+	cfgJSON += q + "script" + q + ": " + q + "s.py" + q + ", "
+	cfgJSON += q + "args" + q + ": [" + q + "a" + q + "], "
+	cfgJSON += q + "capital" + q + ": 1}]}"
+	dir := t.TempDir()
+	path := writeTestConfig(t, dir, cfgJSON)
+	loaded, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+	if loaded.Discord.Channels["default"] != "ch-daily" {
+		t.Errorf("Channels[default] = %q, want ch-daily", loaded.Discord.Channels["default"])
+	}
+	if loaded.Discord.TradeAlertChannels["default"] != "ch-trades" {
+		t.Errorf("TradeAlertChannels[default] = %q, want ch-trades", loaded.Discord.TradeAlertChannels["default"])
+	}
+	t.Setenv("DISCORD_TRADES_CHANNEL_ID", "")
+	loaded2, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
+	if loaded2.Discord.TradeAlertChannels["default"] != "ch-legacy" {
+		t.Errorf("legacy alias: got %q, want ch-legacy", loaded2.Discord.TradeAlertChannels["default"])
+	}
+}

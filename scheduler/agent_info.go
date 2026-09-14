@@ -85,8 +85,12 @@ type agentEnvVar struct {
 // agentInfoEnvVars is the curated env-var registry. TestAgentInfoEnvVarsCoverSource
 // cross-checks it against every os.Getenv("...") literal in scheduler/*.go.
 var agentInfoEnvVars = []agentEnvVar{
+	{Name: "DASHBOARD_ACCENT", Purpose: "Dashboard color accent: blue remaps green-tinted surfaces to blue-gray (default green).", Secret: false},
 	{Name: "DISCORD_BOT_TOKEN", Purpose: "Discord bot token for notifications.", Secret: true},
+	{Name: "DISCORD_CHANNEL_ID", Purpose: "Legacy alias: default Discord channel for trade alerts (prefer DISCORD_TRADES_CHANNEL_ID).", Secret: false},
+	{Name: "DISCORD_DAILY_SUMMARY_CHANNEL_ID", Purpose: "Default Discord channel for daily summaries (channels default fallback).", Secret: false},
 	{Name: "DISCORD_OWNER_ID", Purpose: "Discord user ID that receives owner-only DMs and mutating commands.", Secret: false},
+	{Name: "DISCORD_TRADES_CHANNEL_ID", Purpose: "Default Discord channel for trade alerts (trade_alert_channels default fallback).", Secret: false},
 	{Name: "GITHUB_TOKEN", Purpose: "GitHub token for the self-updater (fallback to GO_TRADER_GITHUB_TOKEN).", Secret: true},
 	{Name: "GO_TRADER_ALLOW_MISSING_STATE", Purpose: "Set to 1 to allow startup with no existing state DB (CheckStatePresence bypass).", Secret: false},
 	{Name: "GO_TRADER_CASHFLOW_JOURNAL_ALARM", Purpose: "Set to 0/off/false/no to force the legacy trade-ledger drift basis for HL shared wallets instead of the #1100 exchange-sourced cash-flow journal (default on).", Secret: false},

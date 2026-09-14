@@ -188,6 +188,13 @@ func bindWithFallback(port, maxAttempts int) (net.Listener, int, error) {
 
 func (ss *StatusServer) Start(port int) {
 	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		http.Redirect(w, r, "/dashboard", http.StatusFound)
+	})
 	mux.HandleFunc("/status", ss.handleStatus)
 	mux.HandleFunc("/health", ss.handleHealth)
 	mux.HandleFunc("/history", ss.handleHistory)
