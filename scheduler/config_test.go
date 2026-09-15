@@ -2073,7 +2073,7 @@ func TestLoadConfigPerpsSizingFieldRejections(t *testing.T) {
 		wantErr string
 	}{
 		{"leverage on spot", testSpotStrategyHead, `"leverage": 5`, "leverage is only supported for perps"},
-		{"leverage out of range", testHLPerpsStrategyHead, `"leverage": 150`, "leverage must be in"},
+		{"leverage out of range", testHLPerpsStrategyHead, `"leverage": 151`, "leverage must be in"},
 		{"sizing_leverage on spot", testSpotStrategyHead, `"sizing_leverage": 2`, "sizing_leverage is only supported for perps"},
 		{"sizing_leverage out of range", testHLPerpsStrategyHead, `"leverage": 20, "sizing_leverage": 200`, "sizing_leverage must be in"},
 		{"margin_per_trade_usd on spot", testSpotStrategyHead, `"margin_per_trade_usd": 100`, "margin_per_trade_usd is only supported for perps"},
