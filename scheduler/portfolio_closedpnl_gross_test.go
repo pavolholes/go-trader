@@ -120,3 +120,52 @@ func TestHLFillLookup_ClosedPnLGrossNotUsedForBooking(t *testing.T) {
 		t.Errorf("cash delta = %.6f, want %.6f (fee-net)", s.Cash-1000, wantNet)
 	}
 }
+
+func TestBookPerpsPartialClose_ClosedPositionSumsLegs(t *testing.T) {
+	const (
+		entryQty  = 0.428
+		entryPx   = 2331.5
+		tp1Qty    = 0.214
+		tp1Px     = 2354.8
+		tp1Fee    = 0.072565
+		tp1NetPnL = 4.913635
+		tp2Qty    = 0.214
+		tp2Px     = 2366.5
+		tp2Fee    = 0.072926
+		tp2NetPnL = 7.417074
+	)
+
+	s := &StrategyState{
+		ID: "hl-manual-eth", Platform: "hyperliquid", Type: "manual",
+		Cash: 1000,
+		Positions: map[string]*Position{
+			"ETH": {
+				Symbol:          "ETH",
+				Quantity:        entryQty,
+				InitialQuantity: entryQty,
+				AvgCost:         entryPx,
+				Side:            "long",
+			},
+		},
+	}
+
+	if !bookPerpsPartialCloseWithFillFee(s, "ETH", tp1Qty, tp1Px, tp1Fee, true, "tp1-oid", "tp_partial_test", "TP1", "TP1", nil) {
+		t.Fatal("TP1 booking returned false")
+	}
+	if _, ok := s.Positions["ETH"]; !ok {
+		t.Fatal("position should still be open after partial TP1")
+	}
+	if len(s.ClosedPositions) != 0 {
+		t.Fatalf("ClosedPositions = %d, want 0 after partial", len(s.ClosedPositions))
+	}
+	if !bookPerpsPartialCloseWithFillFee(s, "ETH", tp2Qty, tp2Px, tp2Fee, true, "tp2-oid", "tp_partial_test", "TP2", "TP2", nil) {
+		t.Fatal("TP2 booking returned false")
+	}
+	if len(s.ClosedPositions) != 1 {
+		t.Fatalf("ClosedPositions = %d, want 1", len(s.ClosedPositions))
+	}
+	want := tp1NetPnL + tp2NetPnL
+	if got := s.ClosedPositions[0].RealizedPnL; math.Abs(got-want) > 1e-6 {
+		t.Errorf("closed position RealizedPnL = %.6f, want sum of legs %.6f", got, want)
+	}
+}

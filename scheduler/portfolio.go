@@ -19,6 +19,7 @@ type Position struct {
 	EntryATR                        float64           `json:"entry_atr,omitempty"`
 	Side                            string            `json:"side"`
 	Multiplier                      float64           `json:"multiplier,omitempty"`
+	RealizedPnLAccum                float64           `json:"realized_pnl_accum,omitempty"`
 	Leverage                        float64           `json:"leverage,omitempty"`
 	OwnerStrategyID                 string            `json:"owner_strategy_id,omitempty"`
 	OpenedAt                        time.Time         `json:"opened_at,omitempty"`
@@ -239,7 +240,7 @@ func bookPerpsCloseWithFillFee(s *StrategyState, symbol string, closePx, fillFee
 	trade.TPTiersJSON = pos.TPTiersJSON
 	RecordTrade(s, trade)
 	recordPositionTradeResult(s, pos, pnl)
-	recordClosedPosition(s, pos, closePx, pnl, reason, now)
+	recordClosedPosition(s, pos, closePx, pos.RealizedPnLAccum+pnl, reason, now)
 	delete(s.Positions, symbol)
 	clearHLPerpsPositionAlertThrottles(s, symbol)
 	if logger != nil {
@@ -318,10 +319,11 @@ func bookPerpsPartialCloseWithFillFee(s *StrategyState, symbol string, closeQty,
 
 	remaining := pos.Quantity - qty
 	if remaining <= 1e-9 {
-		recordClosedPosition(s, pos, closePx, pnl, reason, now)
+		recordClosedPosition(s, pos, closePx, pos.RealizedPnLAccum+pnl, reason, now)
 		delete(s.Positions, symbol)
 		clearHLPerpsPositionAlertThrottles(s, symbol)
 	} else {
+		pos.RealizedPnLAccum += pnl
 		pos.Quantity = remaining
 		if !pos.isHedgeLeg() {
 			recordReplayDecision(s, ReplayDecisionPartialClose, symbol, side, qty, closePx, reason, now, 0, "")
@@ -983,13 +985,14 @@ func executePerpsSignalWithLeverage(s *StrategyState, signal int, symbol string,
 			RecordTrade(s, trade)
 			RecordTradeResult(&s.RiskState, pnl)
 			if partialClose {
+				pos.RealizedPnLAccum += pnl
 				pos.Quantity -= closeQty
 				if !pos.isHedgeLeg() {
 					recordReplayDecision(s, ReplayDecisionPartialClose, symbol, pos.Side, closeQty, execPrice, "", now, 0, "")
 				}
 				logger.Info("Partial-close short %s: %.6f (remaining %.6f) @ $%.2f (fee $%.2f) | PnL: $%.2f", symbol, closeQty, pos.Quantity, execPrice, fee, pnl)
 			} else {
-				recordClosedPosition(s, pos, execPrice, pnl, "signal", now)
+				recordClosedPosition(s, pos, execPrice, pos.RealizedPnLAccum+pnl, "signal", now)
 				delete(s.Positions, symbol)
 				clearHLPerpsPositionAlertThrottles(s, symbol)
 				logger.Info("Closed short %s @ $%.2f (fee $%.2f) | PnL: $%.2f", symbol, execPrice, fee, pnl)
@@ -1156,13 +1159,14 @@ func executePerpsSignalWithLeverage(s *StrategyState, signal int, symbol string,
 			RecordTrade(s, trade)
 			RecordTradeResult(&s.RiskState, pnl)
 			if partialClose {
+				pos.RealizedPnLAccum += pnl
 				pos.Quantity -= closeQty
 				if !pos.isHedgeLeg() {
 					recordReplayDecision(s, ReplayDecisionPartialClose, symbol, pos.Side, closeQty, execPrice, "", now, 0, "")
 				}
 				logger.Info("Partial-close long %s: %.6f (remaining %.6f) @ $%.2f (fee $%.2f) | PnL: $%.2f", symbol, closeQty, pos.Quantity, execPrice, fee, pnl)
 			} else {
-				recordClosedPosition(s, pos, execPrice, pnl, "signal", now)
+				recordClosedPosition(s, pos, execPrice, pos.RealizedPnLAccum+pnl, "signal", now)
 				delete(s.Positions, symbol)
 				clearHLPerpsPositionAlertThrottles(s, symbol)
 				logger.Info("SELL %s: %.6f @ $%.2f (fee $%.2f) | PnL: $%.2f", symbol, closeQty, execPrice, fee, pnl)
@@ -1381,10 +1385,11 @@ func executeSpotSignalWithFillFee(s *StrategyState, signal int, symbol string, p
 			RecordTrade(s, trade)
 			RecordTradeResult(&s.RiskState, pnl)
 			if partialClose {
+				pos.RealizedPnLAccum += pnl
 				pos.Quantity -= closeQty
 				logger.Info("Partial-close short %s: %.6f (remaining %.6f) @ $%.2f (fee $%.2f) | PnL: $%.2f", symbol, closeQty, pos.Quantity, execPrice, fee, pnl)
 			} else {
-				recordClosedPosition(s, pos, execPrice, pnl, "signal", now)
+				recordClosedPosition(s, pos, execPrice, pos.RealizedPnLAccum+pnl, "signal", now)
 				delete(s.Positions, symbol)
 				logger.Info("Closed short %s @ $%.2f (fee $%.2f) | PnL: $%.2f", symbol, execPrice, fee, pnl)
 			}
@@ -1528,10 +1533,11 @@ func executeSpotSignalWithFillFee(s *StrategyState, signal int, symbol string, p
 			RecordTrade(s, trade)
 			RecordTradeResult(&s.RiskState, pnl)
 			if partialClose {
+				pos.RealizedPnLAccum += pnl
 				pos.Quantity -= closeQty
 				logger.Info("Partial-close long %s: %.6f (remaining %.6f) @ $%.2f (fee $%.2f) | PnL: $%.2f", symbol, closeQty, pos.Quantity, execPrice, fee, pnl)
 			} else {
-				recordClosedPosition(s, pos, execPrice, pnl, "signal", now)
+				recordClosedPosition(s, pos, execPrice, pos.RealizedPnLAccum+pnl, "signal", now)
 				delete(s.Positions, symbol)
 				logger.Info("SELL %s: %.6f @ $%.2f (fee $%.2f) | PnL: $%.2f", symbol, closeQty, execPrice, fee, pnl)
 			}
@@ -1645,7 +1651,7 @@ func executeFuturesSignalWithFillFee(s *StrategyState, signal int, symbol string
 				pos.Quantity -= float64(contracts)
 				logger.Info("Partial-close short %s %d contracts (remaining %d) @ $%.2f (fee $%.2f) | PnL: $%.2f", symbol, contracts, int(pos.Quantity), execPrice, fee, pnl)
 			} else {
-				recordClosedPosition(s, pos, execPrice, pnl, "signal", now)
+				recordClosedPosition(s, pos, execPrice, pos.RealizedPnLAccum+pnl, "signal", now)
 				delete(s.Positions, symbol)
 				logger.Info("Closed short %s %d contracts @ $%.2f (fee $%.2f) | PnL: $%.2f", symbol, contracts, execPrice, fee, pnl)
 			}
@@ -1790,7 +1796,7 @@ func executeFuturesSignalWithFillFee(s *StrategyState, signal int, symbol string
 				pos.Quantity -= float64(contracts)
 				logger.Info("Partial-close long %s %d contracts (remaining %d) @ $%.2f (fee $%.2f) | PnL: $%.2f", symbol, contracts, int(pos.Quantity), execPrice, fee, pnl)
 			} else {
-				recordClosedPosition(s, pos, execPrice, pnl, "signal", now)
+				recordClosedPosition(s, pos, execPrice, pos.RealizedPnLAccum+pnl, "signal", now)
 				delete(s.Positions, symbol)
 				logger.Info("SELL %s: %d contracts @ $%.2f (fee $%.2f) | PnL: $%.2f", symbol, contracts, execPrice, fee, pnl)
 			}

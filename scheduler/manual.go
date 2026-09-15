@@ -577,12 +577,13 @@ func applyManualActionWithCriticals(state *AppState, cfg *Config, scByID map[str
 		ss.Cash += a.RealizedPnL
 
 		if closedFull {
-			recordClosedPosition(ss, pos, a.FillPrice, a.RealizedPnL, operatorCloseReason(sc), now)
+			recordClosedPosition(ss, pos, a.FillPrice, pos.RealizedPnLAccum+a.RealizedPnL, operatorCloseReason(sc), now)
 			delete(ss.Positions, a.Symbol)
 			clearHLPerpsPositionAlertThrottles(ss, a.Symbol)
 		} else {
 			preReduceQty := pos.Quantity
 			preReduceBasis := pos.HedgePrimaryQtyBasis
+			pos.RealizedPnLAccum += a.RealizedPnL
 			pos.Quantity -= a.Quantity
 			if sc.Type != "manual" {
 				clearForceCloseCanceledProtectionOIDs(pos, a.StopLossOID, a.TPOIDs)

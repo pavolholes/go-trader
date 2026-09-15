@@ -569,7 +569,7 @@ func reconcileHyperliquidPositionsWithResolver(stratState *StrategyState, sym st
 			logger.Info("hl-sync: %s external close has no price source — booking at avg cost $%.4f (zero PnL)", sym, closePx)
 		}
 		if !recordPerpsExternalCloseWithFillFee(stratState, sym, closePx, lookupExt.Fee, useFillFeeExt, "", "hl_sync_external", logger) {
-			recordClosedPosition(stratState, statePos, 0, 0, "hl_sync_external", time.Now().UTC())
+			recordClosedPosition(stratState, statePos, 0, statePos.RealizedPnLAccum, "hl_sync_external", time.Now().UTC())
 			delete(stratState.Positions, sym)
 			clearHLPerpsPositionAlertThrottles(stratState, sym)
 		}
@@ -1569,7 +1569,7 @@ func hlAttemptCloseFromTPFills(s *StrategyState, sym string, pos *Position, reso
 		if logger != nil {
 			logger.Warn("hl-sync: %s residual %.6f after TP fill attribution; finalizing at zero PnL", sym, residual.Quantity)
 		}
-		recordClosedPosition(s, residual, 0, 0, "hl_sync_external", time.Now().UTC())
+		recordClosedPosition(s, residual, 0, residual.RealizedPnLAccum, "hl_sync_external", time.Now().UTC())
 		delete(s.Positions, sym)
 	}
 	clearHLPerpsPositionAlertThrottles(s, sym)
@@ -2291,10 +2291,11 @@ func applyHyperliquidCircuitCloseFill(s *StrategyState, symbol string, fillSz, f
 
 	remaining := pos.Quantity - qtyClosed
 	if remaining <= 1e-9 {
-		recordClosedPosition(s, pos, fillPx, pnl, closeReason, now)
+		recordClosedPosition(s, pos, fillPx, pos.RealizedPnLAccum+pnl, closeReason, now)
 		delete(s.Positions, symbol)
 		clearHLPerpsPositionAlertThrottles(s, symbol)
 	} else {
+		pos.RealizedPnLAccum += pnl
 		pos.Quantity = remaining
 	}
 }

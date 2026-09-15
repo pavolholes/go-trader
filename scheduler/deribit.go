@@ -463,9 +463,10 @@ func applyAssignment(s *StrategyState, r markResult, logger *StrategyLogger) {
 			posStopLossTriggerPx = existing.StopLossTriggerPx
 			newQty := existing.Quantity - r.AssignQuantity
 			if newQty <= 0 {
-				recordClosedPosition(s, existing, r.AssignStrike, pnl, "assignment", now)
+				recordClosedPosition(s, existing, r.AssignStrike, existing.RealizedPnLAccum+pnl, "assignment", now)
 				delete(s.Positions, symbol)
 			} else {
+				existing.RealizedPnLAccum += pnl
 				existing.Quantity = newQty
 			}
 			RecordTradeResult(&s.RiskState, pnl)
