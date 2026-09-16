@@ -283,15 +283,24 @@ def run_execute(symbol, side, size, mode):
         result = adapter.market_open(symbol, is_buy, size, inst_type="swap")
 
         fill = {}
+        copy_filled = False
         try:
             data = result.get("data", [{}])[0] if result.get("data") else result
-            fill = {
-                "avg_px": float(data.get("fillPx", 0) or 0) or float(data.get("avgPx", 0) or 0),
-                "total_sz": float(data.get("fillSz", 0) or 0) or float(data.get("accFillSz", 0) or 0) or size,
-            }
-            oid = data.get("ordId") or result.get("ordId", "")
-            if oid:
-                fill["oid"] = str(oid)
+            if adapter.trade_account == "copy":
+                oid = data.get("orderId") or ""
+                if oid:
+                    got = adapter.get_copy_order_fill(str(oid))
+                    if got:
+                        fill = got
+                        copy_filled = True
+            if not copy_filled:
+                fill = {
+                    "avg_px": float(data.get("fillPx", 0) or 0) or float(data.get("avgPx", 0) or 0),
+                    "total_sz": float(data.get("fillSz", 0) or 0) or float(data.get("accFillSz", 0) or 0) or size,
+                }
+                oid = data.get("ordId") or result.get("ordId", "")
+                if oid:
+                    fill["oid"] = str(oid)
         except Exception:
             pass
 

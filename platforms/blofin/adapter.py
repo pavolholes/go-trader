@@ -11,6 +11,7 @@ Environment variables:
     BLOFIN_BASE_URL      — API base URL (demo or live)
 """
 
+import base64
 import hashlib
 import hmac
 import json
@@ -41,6 +42,7 @@ class BloFinExchangeAdapter:
         self.base_url = os.environ.get("BLOFIN_BASE_URL", "https://demo-trading-openapi.blofin.com")
 
         self._is_live = bool(self.api_key and self.api_secret and self.passphrase)
+        self.trade_account = os.environ.get("BLOFIN_TRADE_ACCOUNT", "standard").strip().lower()
 
     @property
     def is_live(self) -> bool:
@@ -59,14 +61,15 @@ class BloFinExchangeAdapter:
     # ─────────────────────────────────────────────
 
     def _generate_signature(self, method: str, request_path: str, body: str = "") -> tuple[str, str, str]:
-        timestamp = str(int(time.time()))
+        timestamp = str(int(time.time() * 1000))
         nonce = str(int(time.time() * 1000)) + str(int(time.monotonic_ns() % 100000))
-        msg = timestamp + method.upper() + request_path + nonce + body
+        msg = request_path + method.upper() + timestamp + nonce + body
         signature = hmac.new(
             self.api_secret.encode("utf-8"),
             msg.encode("utf-8"),
             hashlib.sha256,
         ).hexdigest()
+        signature = base64.b64encode(signature.encode()).decode()
         return timestamp, nonce, signature
 
     def _headers(self, method: str, request_path: str, body: str = "") -> dict:
@@ -224,14 +227,20 @@ class BloFinExchangeAdapter:
     def get_account_balance(self) -> float:
         data = self._private_get("/api/v1/account/balance", {"productType": "USDT-FUTURES"})
         balances = data.get("data", [])
+        if isinstance(balances, dict):
+            balances = [balances]
         for b in balances:
+            if not isinstance(b, dict):
+                continue
             details = b.get("details", [])
             for d in details:
                 if d.get("currency") == "USDT":
-                    return float(d.get("eq", 0) or 0)
+                    return float(d.get("equity", d.get("eq", 0)) or 0)
         return 0.0
 
     def get_positions(self, inst_id: str = "") -> list:
+        if self.trade_account == "copy":
+            return self.get_copy_positions_normalized(inst_id)
         params = {}
         if inst_id:
             params["instId"] = inst_id
@@ -247,10 +256,65 @@ class BloFinExchangeAdapter:
         return infos[0] if infos else {}
 
     def set_leverage(self, inst_id: str, leverage: str, margin_mode: str = "cross", pos_side: str = "") -> dict:
+        if self.trade_account == "copy":
+            return self._private_post("/api/v1/copytrading/account/set-leverage", {
+                "instId": inst_id, "leverage": str(leverage),
+                "marginMode": margin_mode, "positionSide": pos_side or "net",
+            })
         body = {"instId": inst_id, "lever": leverage, "mgnMode": margin_mode}
         if pos_side:
             body["posSide"] = pos_side
         return self._private_post("/api/v1/account/set-leverage", body)
+
+    def get_copy_positions(self, inst_id: str = "") -> list:
+        params = {}
+        if inst_id:
+            params["instId"] = inst_id
+        data = self._private_get("/api/v1/copytrading/account/positions-by-contract", params)
+        out = data.get("data", [])
+        return out if isinstance(out, list) else []
+
+    def get_copy_positions_normalized(self, inst_id: str = "") -> list:
+        """Copy positions mapped to the standard shape (instId/posSide/pos/avgPx/upl).""" 
+        out = []
+        for q in self.get_copy_positions(inst_id):
+            try:
+                qty = float(q.get("positions", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if qty <= 0:
+                continue
+            out.append({
+                "instId": q.get("instId", ""),
+                "posSide": str(q.get("positionSide", "net") or "net").lower(),
+                "pos": qty,
+                "avgPx": q.get("averagePrice", 0),
+                "upl": q.get("unrealizedPnl", 0),
+                "markPrice": q.get("markPrice", 0),
+                "leverage": q.get("leverage", 0),
+            })
+        return out
+
+    def get_copy_order_fill(self, order_id: str, tries: int = 3) -> dict:
+        """Poll copy orders-history for a market fill (avg price / size / fee).""" 
+        for _ in range(max(1, tries)):
+            try:
+                data = self._private_get("/api/v1/copytrading/trade/orders-history", {"orderId": order_id, "limit": "1"})
+                items = data.get("data", [])
+                if items:
+                    o = items[0]
+                    filled = float(o.get("filledSize", 0) or 0)
+                    if filled > 0:
+                        return {
+                            "avg_px": float(o.get("averagePrice", 0) or 0),
+                            "total_sz": filled,
+                            "fee": float(o.get("fee", 0) or 0),
+                            "oid": str(o.get("orderId", order_id)),
+                        }
+            except Exception:
+                pass
+            time.sleep(1)
+        return {}
 
     # ─────────────────────────────────────────────
     # Order execution (live mode only)
@@ -261,6 +325,16 @@ class BloFinExchangeAdapter:
                     reduce_only: bool = False, client_oid: str = "",
                     tp_trigger_px: str = "", tp_order_px: str = "",
                     sl_trigger_px: str = "", sl_order_px: str = "") -> dict:
+        if self.trade_account == "copy":
+            if pos_side not in ("long", "short"):
+                raise RuntimeError("copy account is hedge mode: pos_side must be long/short, got %r" % (pos_side,))
+            body = {"instId": inst_id, "marginMode": margin_mode, "positionSide": pos_side,
+                    "side": side, "orderType": order_type, "size": str(size)}
+            if price:
+                body["price"] = price
+            if client_oid:
+                body["brokerId"] = client_oid[:16]
+            return self._private_post("/api/v1/copytrading/trade/place-order", body)
         body = {
             "instId": inst_id,
             "tdMode": margin_mode,
@@ -300,12 +374,24 @@ class BloFinExchangeAdapter:
                 "market_open requires live mode (set BLOFIN_API_KEY, BLOFIN_API_SECRET, BLOFIN_PASSPHRASE)"
             )
         side = "buy" if is_buy else "sell"
+        pos_side = "net"
+        if self.trade_account == "copy":
+            cur = ""
+            try:
+                for q in self.get_copy_positions(f"{symbol}-USDT"):
+                    if float(q.get("positions", 0) or 0) > 0:
+                        cur = str(q.get("positionSide", "") or "").lower()
+                        break
+            except Exception:
+                cur = ""
+            pos_side = cur if cur in ("long", "short") else ("long" if is_buy else "short")
         result = self.place_order(
             inst_id=f"{symbol}-USDT",
             margin_mode="cross",
             side=side,
             order_type="market",
             size=str(size),
+            pos_side=pos_side,
         )
         return result
 
@@ -332,6 +418,13 @@ class BloFinExchangeAdapter:
             close_qty = min(sz, pos_qty)
             if close_qty <= 0:
                 return {}
+        if self.trade_account == "copy":
+            if pos_side not in ("long", "short"):
+                raise RuntimeError("copy account is hedge mode: cannot close unknown side %r" % (pos_side,))
+            return self._private_post("/api/v1/copytrading/trade/close-position-by-contract", {
+                "instId": inst_id, "size": str(close_qty), "marginMode": "cross",
+                "positionSide": pos_side, "closeType": "pnl",
+            })
         close_side = "sell" if pos_side in ("long", "net") else "buy"
         result = self.place_order(
             inst_id=inst_id,
