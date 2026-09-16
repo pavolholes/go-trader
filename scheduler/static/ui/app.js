@@ -134,6 +134,7 @@
     sortKey: "id",
     modeFilter: "all",
     sortDir: "asc",
+    summaryLoaded: false,
     chart: null,
     series: null,
     timer: 0,
@@ -187,6 +188,10 @@
     overviewPanel: document.getElementById("overview-panel"),
     overviewBody: document.getElementById("overview-body"),
     detailPanel: document.getElementById("detail-panel"),
+    summaryPanel: document.getElementById("summary-panel"),
+    summaryContent: document.getElementById("summary-content"),
+    summaryLoading: document.getElementById("summary-loading"),
+    summaryDailyPnlChart: document.getElementById("summary-today-pnl-chart"),
     tunerPanel: document.getElementById("tuner-panel"),
     tunerForm: document.getElementById("tuner-form"),
     tunerStatus: document.getElementById("tuner-status"),
@@ -1024,7 +1029,8 @@
 
   function loadViewMode() {
     const saved = window.localStorage.getItem(VIEW_MODE_KEY);
-    return saved === "table" ? "table" : "detail";
+    if (saved === "table" || saved === "summary") return saved;
+    return "summary";
   }
 
   function saveViewMode(mode) {
@@ -1033,15 +1039,29 @@
 
   function applyViewMode() {
     const tableMode = state.viewMode === "table";
+    const summaryMode = state.viewMode === "summary";
     els.overviewPanel.hidden = !tableMode;
-    els.detailPanel.hidden = tableMode;
-    els.viewMode.textContent = tableMode ? "Detail" : "Table";
+    if (els.summaryPanel) els.summaryPanel.hidden = !summaryMode;
+    els.detailPanel.hidden = tableMode || summaryMode;
     els.viewMode.setAttribute("aria-pressed", tableMode ? "true" : "false");
+    if (summaryMode) {
+      els.viewMode.textContent = "Table";
+      els.title.textContent = "Summary";
+      els.subtitle.textContent = "Aggregated Metrics";
+    } else if (tableMode) {
+      els.viewMode.textContent = "Summary";
+    } else {
+      els.viewMode.textContent = "Table";
+    }
     document.querySelector(".content").classList.toggle("content-table", tableMode);
+    document.querySelector(".content").classList.toggle("content-summary", summaryMode);
+    if (summaryMode) refreshSummary().catch(handleRefreshError);
   }
 
   function toggleViewMode() {
-    state.viewMode = state.viewMode === "table" ? "detail" : "table";
+    if (state.viewMode === "detail") state.viewMode = "table";
+    else if (state.viewMode === "table") state.viewMode = "summary";
+    else state.viewMode = "table";
     saveViewMode(state.viewMode);
     applyViewMode();
     refreshAll().catch(handleRefreshError);
@@ -1062,7 +1082,10 @@
     });
     new ResizeObserver(function () {
       const rect = els.chart.getBoundingClientRect();
-      state.chart.resize(Math.max(320, rect.width), Math.max(320, rect.height));
+      const compact = window.matchMedia("(max-width: 620px)").matches;
+      const minWidth = compact ? 240 : 320;
+      const minHeight = compact ? 200 : 320;
+      state.chart.resize(Math.max(minWidth, rect.width), Math.max(minHeight, rect.height));
     }).observe(els.chart);
   }
 
@@ -2027,10 +2050,36 @@
     return value === undefined || value === null ? "" : String(value).toLowerCase();
   }
 
-  function sortedOverviewRows() {
-    const rows = state.overviewRows.filter(function (row) {
-      return state.modeFilter === "all" || row.mode === state.modeFilter;
+  function filterValue(row, key) {
+    if (key === "trade_count") return row.trade_count !== undefined ? String(row.trade_count) : "-";
+    if (key === "mode") return row.mode || "-";
+    if (key === "pnl_pct") return fmtPct(row.pnl_pct);
+    if (key === "pnl") return row.pnl !== undefined ? fmtSignedMoney(row.pnl) : "-";
+    if (key === "win_rate") return row.win_rate ? fmtPct(row.win_rate) : "-";
+    if (key === "sharpe") return row.sharpe ? fmtNumber(row.sharpe) : "-";
+    return row[key] === undefined || row[key] === null ? "-" : String(row[key]);
+  }
+
+  function filterOverviewRows(rows) {
+    const filters = {};
+    document.querySelectorAll(".overview-filter-input").forEach(function (input) {
+      const key = input.dataset.key;
+      const value = input.value.trim().toLowerCase();
+      if (value) filters[key] = value;
     });
+    if (Object.keys(filters).length === 0) return rows;
+    return rows.filter(function (row) {
+      return Object.keys(filters).every(function (key) {
+        const filterValueStr = filterValue(row, key).toLowerCase();
+        return filterValueStr.indexOf(filters[key]) !== -1;
+      });
+    });
+  }
+
+  function sortedOverviewRows() {
+    const rows = filterOverviewRows(state.overviewRows.filter(function (row) {
+      return state.modeFilter === "all" || row.mode === state.modeFilter;
+    }));
     const dir = state.sortDir === "desc" ? -1 : 1;
     rows.sort(function (a, b) {
       const av = sortValue(a, state.sortKey);
@@ -2429,6 +2478,10 @@
 
   async function refreshAll() {
     try {
+      if (state.viewMode === "summary") {
+        await refreshSummary();
+        return;
+      }
       if (state.viewMode === "table") {
         await Promise.all([refreshOverview(), refreshOpsPanels()]);
         return;
@@ -2478,6 +2531,12 @@
     if (value === undefined || value === null || Number.isNaN(Number(value))) return "-";
     return Number(value).toLocaleString(undefined, { maximumFractionDigits: 4 });
   }
+  function fmtCapitalPct(pnl, strategyCount) {
+    const capital = Number(strategyCount || 0) * 1000;
+    if (!capital || Number.isNaN(Number(pnl))) return "-";
+    return fmtPct((Number(pnl) / capital) * 100);
+  }
+
 
   function pnlClass(value, invert) {
     const n = Number(value);
@@ -2635,6 +2694,11 @@
       renderOverviewTable();
     });
   });
+  document.querySelectorAll(".overview-filter-input").forEach(function (input) {
+    input.addEventListener("input", function () {
+      renderOverviewTable();
+    });
+  });
   els.authPanel.addEventListener("submit", function (event) {
     event.preventDefault();
     const token = els.authToken.value.trim();
@@ -2662,4 +2726,234 @@
     els.statusGrid.innerHTML = "<dt>API</dt><dd>Unauthorized</dd>";
     els.authToken.focus();
   }
+
+  // Restored pre-v0.103 summary view.
+  async function refreshSummary() {
+    let resp;
+    const firstLoad = !state.summaryLoaded;
+    if (firstLoad && els.summaryLoading) {
+      els.summaryLoading.textContent = "Loading summary...";
+      els.summaryLoading.hidden = false;
+    }
+    if (firstLoad && els.summaryContent) {
+      els.summaryContent.hidden = true;
+    }
+    try {
+      resp = await getJSON("/api/summary");
+    } catch (e) {
+      console.error("[DEBUG] refreshSummary: getJSON FAILED:", e.message ? e.message : String(e));
+      if (els.summaryLoading && !state.summaryLoaded) {
+        els.summaryLoading.textContent = "Summary failed to load.";
+        els.summaryLoading.hidden = false;
+      }
+      return;
+    }
+
+    // Cards
+    document.getElementById("summary-total-strategies").textContent = String(resp.total_strategies);
+    document.getElementById("summary-with-trades").textContent = String(resp.with_trades);
+    document.getElementById("summary-open-positions").textContent = String(resp.open_positions);
+    document.getElementById("summary-total-pnl").textContent = fmtSignedMoney(resp.total_pnl);
+    document.getElementById("summary-total-pnl").className = pnlClass(resp.total_pnl) ? "summary-card-value " + pnlClass(resp.total_pnl) : "summary-card-value";
+    document.getElementById("summary-today-pnl").textContent = fmtSignedMoney(resp.today_pnl);
+    document.getElementById("summary-today-pnl").className = pnlClass(resp.today_pnl) ? "summary-card-value " + pnlClass(resp.today_pnl) : "summary-card-value";
+    document.getElementById("summary-today-trades").textContent = String(resp.today_trades);
+    document.getElementById("summary-today-wl").textContent = resp.today_wins + "/" + resp.today_losses;
+    document.getElementById("summary-long-pnl").textContent = fmtSignedMoney(resp.long_pnl);
+    document.getElementById("summary-short-pnl").textContent = fmtSignedMoney(resp.short_pnl);
+
+    // Top by PnL
+    renderSummaryTable("summary-top-pnl", resp.top_by_pnl, ["pnl_pct", "win_rate", "sharpe", "total_trades"]);
+    renderSummaryTable("summary-bottom-pnl", resp.bottom_by_pnl, ["pnl_pct", "win_rate", "sharpe", "total_trades"]);
+    renderSummaryTable("summary-top-wr", resp.top_by_winrate, ["pnl_pct", "win_rate", "sharpe", "total_trades"]);
+    renderSummaryTable("summary-top-trades", resp.top_by_trades, ["pnl_pct", "win_rate", "sharpe", "total_trades"]);
+    renderSummaryTypeTable("summary-by-type", resp.by_type);
+    renderSummarySymbolTable("summary-by-symbol", resp.by_symbol);
+    renderDailyPnlChart(resp.today_pnl_history);
+    renderSummaryPairTable("summary-by-strategy-symbol", resp.by_strategy_symbol);
+    renderSummaryPairTable("summary-by-strategy-timeframe", resp.by_strategy_timeframe);
+
+    els.statusDot.className = "status-dot ok";
+    els.statusLabel.textContent = "Summary live";
+    els.statusGrid.innerHTML = "<dt>Generated</dt><dd>" + escapeHTML(new Date(resp.generated_at * 1000).toLocaleString()) + "</dd>" +
+      "<dt>Strategies</dt><dd>" + escapeHTML(String(resp.total_strategies)) + "</dd>" +
+      "<dt>With trades</dt><dd>" + escapeHTML(String(resp.with_trades)) + "</dd>" +
+      "<dt>Total PnL</dt><dd>" + escapeHTML(fmtSignedMoney(resp.total_pnl)) + "</dd>" +
+      "<dt>Today PnL</dt><dd>" + escapeHTML(fmtSignedMoney(resp.today_pnl)) + "</dd>";
+    els.positions.innerHTML = '<div class="position-row"><span>Summary view</span><span>Select a strategy for detail</span></div>';
+    state.summaryLoaded = true;
+    if (els.summaryLoading) {
+      els.summaryLoading.hidden = true;
+    }
+    if (els.summaryContent) {
+      els.summaryContent.hidden = false;
+    }
+
+  }
+
+
+  function renderDailyPnlChart(rows) {
+    const el = els.summaryDailyPnlChart;
+    if (!el) return;
+    const data = (rows || []).slice(-14);
+    if (!data.length) {
+      el.innerHTML = '<div class="summary-chart-empty">No data</div>';
+      return;
+    }
+    const values = data.map(function (r) { return Number(r.pnl || 0); });
+    const maxAbs = Math.max(1, values.reduce(function (m, v) { return Math.max(m, Math.abs(v)); }, 0));
+    const bars = data.map(function (r) {
+      const pnl = Number(r.pnl || 0);
+      const pct = Math.max(2, Math.min(48, Math.abs(pnl) / maxAbs * 48));
+      const isPos = pnl >= 0;
+      const day = String(r.date || "").slice(5);
+      const valueLabel = fmtSignedMoney(pnl);
+      return '<div class="summary-chart-bar">' +
+        '<div class="summary-chart-bar-fill' + (isPos ? '' : ' negative') + '" style="' + (isPos ? 'bottom: 50%;' : 'top: 50%;') + 'height: ' + pct + '%;"></div>' +
+        '<div class="summary-chart-bar-value ' + (isPos ? 'positive' : 'negative') + '">' + escapeHTML(valueLabel) + '</div>' +
+        '<div class="summary-chart-bar-label">' + escapeHTML(day) + '</div>' +
+        '</div>';
+    }).join('');
+    el.innerHTML = '<div class="summary-chart-grid"></div><div class="summary-chart-bars">' + bars + '</div>';
+  }
+
+  function renderSummaryTable(tableId, rows, extraFields) {
+    const tbody = document.getElementById(tableId);
+    if (!rows || !rows.length) {
+      tbody.innerHTML = '<tr><td colspan="9">No data</td></tr>';
+      return;
+    }
+    tbody.innerHTML = rows.map(function (r) {
+      const pnlCls = r.pnl > 0 ? "pnl-pos" : r.pnl < 0 ? "pnl-neg" : "";
+      const wrCls = r.win_rate > 50 ? "pnl-pos" : r.win_rate > 0 ? "" : "";
+      return '<tr class="summary-row" data-id="' + escapeHTML(r.id) + '">' +
+        "<td>" + escapeHTML(r.strategy) + "</td>" +
+        "<td>" + escapeHTML(r.symbol) + "</td>" +
+        "<td>" + escapeHTML(r.timeframe) + "</td>" +
+        "<td>" + escapeHTML(r.direction) + "</td>" +
+        '<td class="' + pnlCls + '">' + escapeHTML(fmtSignedMoney(r.pnl)) + "</td>" +
+        "<td>" + escapeHTML(fmtPct(r.pnl_pct)) + "</td>" +
+        '<td class="' + wrCls + '">' + escapeHTML(fmtPct(r.win_rate)) + "</td>" +
+        "<td>" + escapeHTML(String(r.total_trades)) + "</td>" +
+        "<td>" + escapeHTML(r.sharpe ? fmtNumber(r.sharpe) : "-") + "</td>" +
+        "</tr>";
+    }).join("");
+  }
+
+  function renderSummaryPairTable(tableId, rows) {
+    const tbody = document.getElementById(tableId);
+    const limited = rows ? rows.slice(0, 30) : [];
+    if (!limited.length) {
+      tbody.innerHTML = '<tr><td colspan="8">No data</td></tr>';
+      return;
+    }
+    tbody.innerHTML = limited.map(function (r) {
+      const pnlCls = r.total_pnl > 0 ? "pnl-pos" : r.total_pnl < 0 ? "pnl-neg" : "";
+      return '<tr class="summary-row">' +
+        "<td>" + escapeHTML(r.strategy) + "</td>" +
+        "<td>" + escapeHTML(r.secondary) + "</td>" +
+        "<td>" + escapeHTML(String(r.total)) + "</td>" +
+        "<td>" + escapeHTML(String(r.with_trades)) + "</td>" +
+        '<td class="' + pnlCls + '">' + escapeHTML(fmtSignedMoney(r.total_pnl)) + "</td>" +
+        "<td>" + escapeHTML(fmtPct(r.pnl_pct)) + "</td>" +
+        "<td>" + escapeHTML(String(r.total_trades)) + "</td>" +
+        "<td>" + escapeHTML(fmtPct(r.win_rate)) + "</td>" +
+        "</tr>";
+    }).join("");
+  }
+
+  function renderSummaryWrTable(tableId, rows) {
+    const tbody = document.getElementById(tableId);
+    if (!rows || !rows.length) {
+      tbody.innerHTML = '<tr><td colspan="8">No data</td></tr>';
+      return;
+    }
+    tbody.innerHTML = rows.map(function (r) {
+      const pnlCls = r.pnl > 0 ? "pnl-pos" : r.pnl < 0 ? "pnl-neg" : "";
+      const wrCls = r.win_rate > 50 ? "pnl-pos" : "";
+      return '<tr class="summary-row" data-id="' + escapeHTML(r.id) + '">' +
+        "<td>" + escapeHTML(r.strategy) + "</td>" +
+        "<td>" + escapeHTML(r.symbol) + "</td>" +
+        "<td>" + escapeHTML(r.timeframe) + "</td>" +
+        '<td class="' + wrCls + '">' + escapeHTML(fmtPct(r.win_rate)) + "</td>" +
+        "<td>" + escapeHTML(String(r.total_trades)) + "</td>" +
+        '<td class="' + pnlCls + '">' + escapeHTML(fmtSignedMoney(r.pnl)) + "</td>" +
+        "<td>" + escapeHTML(fmtPct(r.pnl_pct)) + "</td>" +
+        "<td>" + escapeHTML(r.sharpe ? fmtNumber(r.sharpe) : "-") + "</td>" +
+        "</tr>";
+    }).join("");
+  }
+
+  function renderSummaryActiveTable(tableId, rows) {
+    const tbody = document.getElementById(tableId);
+    if (!rows || !rows.length) {
+      tbody.innerHTML = '<tr><td colspan="7">No data</td></tr>';
+      return;
+    }
+    tbody.innerHTML = rows.map(function (r) {
+      const pnlCls = r.pnl > 0 ? "pnl-pos" : r.pnl < 0 ? "pnl-neg" : "";
+      return '<tr class="summary-row" data-id="' + escapeHTML(r.id) + '">' +
+        "<td>" + escapeHTML(r.strategy) + "</td>" +
+        "<td>" + escapeHTML(r.symbol) + "</td>" +
+        "<td>" + escapeHTML(r.timeframe) + "</td>" +
+        "<td>" + escapeHTML(String(r.total_trades)) + "</td>" +
+        '<td class="' + pnlCls + '">' + escapeHTML(fmtSignedMoney(r.pnl)) + "</td>" +
+        "<td>" + escapeHTML(fmtPct(r.pnl_pct)) + "</td>" +
+        "<td>" + escapeHTML(fmtPct(r.win_rate)) + "</td>" +
+        "</tr>";
+    }).join("");
+  }
+
+  function renderSummaryTypeTable(tableId, rows) {
+    const tbody = document.getElementById(tableId);
+    if (!rows || !rows.length) {
+      tbody.innerHTML = '<tr><td colspan="11">No data</td></tr>';
+      return;
+    }
+    tbody.innerHTML = rows.map(function (r) {
+      const pnlCls = r.total_pnl > 0 ? "pnl-pos" : r.total_pnl < 0 ? "pnl-neg" : "";
+      const lCls = r.long_pnl > 0 ? "pnl-pos" : r.long_pnl < 0 ? "pnl-neg" : "";
+      const sCls = r.short_pnl > 0 ? "pnl-pos" : r.short_pnl < 0 ? "pnl-neg" : "";
+      return "<tr>" +
+        "<td>" + escapeHTML(r.type) + "</td>" +
+        "<td>" + escapeHTML(String(r.total)) + "</td>" +
+        "<td>" + escapeHTML(String(r.with_trades)) + "</td>" +
+        '<td class="' + pnlCls + '">' + escapeHTML(fmtSignedMoney(r.total_pnl)) + "</td>" +
+        "<td>" + escapeHTML(fmtCapitalPct(r.total_pnl, r.total)) + "</td>" +
+        "<td>" + escapeHTML(String(r.total_trades)) + "</td>" +
+        '<td class="' + lCls + '">' + escapeHTML(fmtSignedMoney(r.long_pnl)) + "</td>" +
+        "<td>" + escapeHTML(fmtCapitalPct(r.long_pnl, r.total)) + "</td>" +
+        '<td class="' + sCls + '">' + escapeHTML(fmtSignedMoney(r.short_pnl)) + "</td>" +
+        "<td>" + escapeHTML(fmtCapitalPct(r.short_pnl, r.total)) + "</td>" +
+        "<td>" + (r.avg_capture_ratio != null && r.avg_capture_ratio !== 0 ? escapeHTML((r.avg_capture_ratio * 100).toFixed(1) + '%') : '-') + "</td>" +
+        "</tr>";
+    }).join("");
+  }
+
+  function renderSummarySymbolTable(tableId, rows) {
+    const tbody = document.getElementById(tableId);
+    if (!rows || !rows.length) {
+      tbody.innerHTML = '<tr><td colspan="11">No data</td></tr>';
+      return;
+    }
+    tbody.innerHTML = rows.map(function (r) {
+      const pnlCls = r.total_pnl > 0 ? "pnl-pos" : r.total_pnl < 0 ? "pnl-neg" : "";
+      const lCls = r.long_pnl > 0 ? "pnl-pos" : r.long_pnl < 0 ? "pnl-neg" : "";
+      const sCls = r.short_pnl > 0 ? "pnl-pos" : r.short_pnl < 0 ? "pnl-neg" : "";
+      return "<tr>" +
+        "<td>" + escapeHTML(r.symbol) + "</td>" +
+        "<td>" + escapeHTML(String(r.total)) + "</td>" +
+        "<td>" + escapeHTML(String(r.with_trades)) + "</td>" +
+        '<td class="' + pnlCls + '">' + escapeHTML(fmtSignedMoney(r.total_pnl)) + "</td>" +
+        "<td>" + escapeHTML(fmtCapitalPct(r.total_pnl, r.total)) + "</td>" +
+        "<td>" + escapeHTML(String(r.total_trades)) + "</td>" +
+        '<td class="' + lCls + '">' + escapeHTML(fmtSignedMoney(r.long_pnl)) + "</td>" +
+        "<td>" + escapeHTML(fmtCapitalPct(r.long_pnl, r.total)) + "</td>" +
+        '<td class="' + sCls + '">' + escapeHTML(fmtSignedMoney(r.short_pnl)) + "</td>" +
+        "<td>" + escapeHTML(fmtCapitalPct(r.short_pnl, r.total)) + "</td>" +
+        "<td>" + (r.avg_capture_ratio != null && r.avg_capture_ratio !== 0 ? escapeHTML((r.avg_capture_ratio * 100).toFixed(1) + '%') : '-') + "</td>" +
+        "</tr>";
+    }).join("");
+  }
+
 })();

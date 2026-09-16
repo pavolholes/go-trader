@@ -30,10 +30,6 @@
           <input id="strategy-search" type="search" autocomplete="off" placeholder="Strategy or symbol">
         </label>
         <nav id="strategy-list" class="strategy-list" aria-label="Strategies"></nav>
-        <nav class="sidebar-links" aria-label="Tools">
-          <a href="/tuning">Tuning</a>
-          <a href="/reports">Reports</a>
-        </nav>
       </aside>
 
       <main class="workspace">
@@ -62,6 +58,8 @@
           </div>
           <div class="toolbar">
             <button id="view-mode-button" class="view-mode-button" type="button" aria-pressed="false">Detail</button>
+            <a class="toolbar-link" href="/tuning">Tuning</a>
+            <a class="toolbar-link" href="/reports">Reports</a>
             <button id="dark-mode-toggle" class="icon-button" type="button" title="Dark mode" aria-label="Toggle dark mode" aria-pressed="false">
               <span id="dark-mode-icon" aria-hidden="true">☾</span>
             </button>
@@ -99,6 +97,20 @@
                   <th scope="col"><button type="button" class="sort-button" data-key="regime">Regime</button></th>
                   <th scope="col"><button type="button" class="sort-button" data-key="direction">Direction</button></th>
                   <th scope="col"><button type="button" class="sort-button" data-key="close_strategy">Close</button></th>
+                </tr>
+                <tr class="overview-filter-row">
+                  <td><input type="text" class="overview-filter-input" data-key="id" placeholder="Filter..."></td>
+                  <td><input type="text" class="overview-filter-input" data-key="platform" placeholder="Filter..."></td>
+                  <td><input type="text" class="overview-filter-input" data-key="symbol" placeholder="Filter..."></td>
+                  <td><input type="text" class="overview-filter-input" data-key="mode" placeholder="Filter..."></td>
+                  <td><input type="text" class="overview-filter-input" data-key="trade_count" placeholder="Filter..."></td>
+                  <td><input type="text" class="overview-filter-input" data-key="pnl" placeholder="Filter..."></td>
+                  <td><input type="text" class="overview-filter-input" data-key="pnl_pct" placeholder="Filter..."></td>
+                  <td><input type="text" class="overview-filter-input" data-key="win_rate" placeholder="Filter..."></td>
+                  <td><input type="text" class="overview-filter-input" data-key="sharpe" placeholder="Filter..."></td>
+                  <td><input type="text" class="overview-filter-input" data-key="regime" placeholder="Filter..."></td>
+                  <td><input type="text" class="overview-filter-input" data-key="direction" placeholder="Filter..."></td>
+                  <td><input type="text" class="overview-filter-input" data-key="close_strategy" placeholder="Filter..."></td>
                 </tr>
               </thead>
               <tbody id="overview-body"></tbody>
@@ -173,6 +185,123 @@
               </div>
             </div>
           </div>
+          <div id="summary-panel" class="summary-panel" hidden>
+            <div id="summary-loading" class="summary-loading" hidden>Loading summary...</div>
+            <div id="summary-content" class="summary-content" hidden>
+              <div class="summary-card-row summary-card-row--total">
+                <div class="summary-card">
+                  <span class="summary-card-label">Strategies</span>
+                  <span class="summary-card-value" id="summary-total-strategies">-</span>
+                </div>
+                <div class="summary-card">
+                  <span class="summary-card-label">With Trades</span>
+                  <span class="summary-card-value" id="summary-with-trades">-</span>
+                </div>
+                <div class="summary-card">
+                  <span class="summary-card-label">Open Positions Now</span>
+                  <span class="summary-card-value" id="summary-open-positions">-</span>
+                </div>
+                <div class="summary-card">
+                  <span class="summary-card-label">Total PnL</span>
+                  <span class="summary-card-value" id="summary-total-pnl">-</span>
+                </div>
+                <div class="summary-card">
+                  <span class="summary-card-label">Long PnL</span>
+                  <span class="summary-card-value" id="summary-long-pnl">-</span>
+                </div>
+                <div class="summary-card">
+                  <span class="summary-card-label">Short PnL</span>
+                  <span class="summary-card-value" id="summary-short-pnl">-</span>
+                </div>
+              </div>
+              <div class="summary-card-row summary-card-row--today">
+                <div class="summary-card">
+                  <span class="summary-card-label">Today PnL</span>
+                  <span class="summary-card-value" id="summary-today-pnl">-</span>
+                </div>
+                <div class="summary-card">
+                  <span class="summary-card-label">Today Trades</span>
+                  <span class="summary-card-value" id="summary-today-trades">-</span>
+                </div>
+                <div class="summary-card">
+                  <span class="summary-card-label">Today W/L</span>
+                  <span class="summary-card-value" id="summary-today-wl">-</span>
+                </div>
+              </div>
+              <div class="summary-chart-wrap">
+                <h3>Today PnL - Last 14 Days</h3>
+                <div id="summary-today-pnl-chart" class="summary-chart" aria-label="Today PnL last 14 days chart"></div>
+              </div>
+            <div class="summary-tables">
+              <div class="summary-table-wrap">
+                <h3>Top 10 by PnL</h3>
+                <table class="summary-table">
+                  <thead><tr><th>Strategy</th><th>Symbol</th><th>TF</th><th>Dir</th><th>PnL</th><th>PnL %</th><th>Win Rate</th><th>Trades</th><th>Sharpe</th></tr></thead>
+                  <tbody id="summary-top-pnl"></tbody>
+                </table>
+              </div>
+              <div class="summary-table-wrap">
+                <h3>Bottom 10 by PnL</h3>
+                <table class="summary-table">
+                  <thead><tr><th>Strategy</th><th>Symbol</th><th>TF</th><th>Dir</th><th>PnL</th><th>PnL %</th><th>Win Rate</th><th>Trades</th><th>Sharpe</th></tr></thead>
+                  <tbody id="summary-bottom-pnl"></tbody>
+                </table>
+              </div>
+              <div class="summary-table-wrap">
+                <h3>Top by Win Rate (10+ trades)</h3>
+                <table class="summary-table">
+                  <thead><tr><th>Strategy</th><th>Symbol</th><th>TF</th><th>Dir</th><th>PnL</th><th>PnL %</th><th>Win Rate</th><th>Trades</th><th>Sharpe</th></tr></thead>
+                  <tbody id="summary-top-wr"></tbody>
+                </table>
+              </div>
+              <div class="summary-table-wrap">
+                <h3>Most Active</h3>
+                <table class="summary-table">
+                  <thead><tr><th>Strategy</th><th>Symbol</th><th>TF</th><th>Dir</th><th>PnL</th><th>PnL %</th><th>Win Rate</th><th>Trades</th><th>Sharpe</th></tr></thead>
+                  <tbody id="summary-top-trades"></tbody>
+                </table>
+              </div>
+            </div>
+            <div class="summary-tables">
+              <div class="summary-table-wrap">
+                <h3>By Strategy Type</h3>
+                <div class="summary-note">Aggregated across all 33 symbols and 3 timeframes for each strategy type. "Configs" means all variants; "With trades" means variants that traded at least once.</div>
+                <table class="summary-table summary-table--compact">
+                  <thead><tr><th>Type</th><th>Configs</th><th>With trades</th><th>PnL</th><th>PnL %</th><th>Trades</th><th>Long PnL</th><th>Long PnL %</th><th>Short PnL</th><th>Short PnL %</th><th>Capture</th></tr></thead>
+                  <tbody id="summary-by-type"></tbody>
+                </table>
+              </div>
+              <div class="summary-table-wrap">
+                <h3>By Symbol</h3>
+                <div class="summary-note">Aggregated across all strategy types and timeframes for each symbol.</div>
+                <table class="summary-table summary-table--compact">
+                  <thead><tr><th>Symbol</th><th>Configs</th><th>With trades</th><th>PnL</th><th>PnL %</th><th>Trades</th><th>Long PnL</th><th>Long PnL %</th><th>Short PnL</th><th>Short PnL %</th><th>Capture</th></tr></thead>
+                  <tbody id="summary-by-symbol"></tbody>
+                </table>
+              </div>
+            </div>
+            <div class="summary-tables">
+              <div class="summary-table-wrap">
+                <h3>Strategy x Symbol</h3>
+                <div class="summary-note">Aggregated across the 3 timeframes for each strategy type and symbol pair.</div>
+                <table class="summary-table summary-table--compact">
+                  <thead><tr><th>Strategy</th><th>Symbol</th><th>Configs</th><th>With trades</th><th>PnL</th><th>PnL %</th><th>Trades</th><th>Win Rate</th></tr></thead>
+                  <tbody id="summary-by-strategy-symbol"></tbody>
+                </table>
+              </div>
+              <div class="summary-table-wrap">
+                <h3>Strategy x Timeframe</h3>
+                <div class="summary-note">Aggregated across all symbols for each strategy type and timeframe pair.</div>
+                <table class="summary-table summary-table--compact">
+                  <thead><tr><th>Strategy</th><th>TF</th><th>Configs</th><th>With trades</th><th>PnL</th><th>PnL %</th><th>Trades</th><th>Win Rate</th></tr></thead>
+                  <tbody id="summary-by-strategy-timeframe"></tbody>
+                </table>
+              </div>
+            </div>
+            </div>
+          </div>
+          <div id="detail-panel" class="detail-panel">
+
           <div id="detail-panel" class="detail-panel">
             <div class="chart-panel">
               <div class="chart-wrap">

@@ -147,34 +147,24 @@ func dashboardAccentCSS(accent string) string {
 	}
 }
 
-// dashboardIndexWithAccent serves index.html with the accent override
-// injected when DASHBOARD_ACCENT selects a non-default scheme.
-func dashboardIndexWithAccent(sub fs.FS) ([]byte, bool) {
-	css := dashboardAccentCSS(os.Getenv("DASHBOARD_ACCENT"))
-	if css == "" {
-		return nil, false
+// accentStylesheet appends the DASHBOARD_ACCENT override to the dashboard
+// stylesheet so every page using it (dashboard, tuning, reports) follows
+// the configured accent. Empty accent means default (green).
+func accentStylesheet(css []byte) []byte {
+	override := dashboardAccentCSS(os.Getenv("DASHBOARD_ACCENT"))
+	if override == "" {
+		return css
 	}
-	data, err := fs.ReadFile(sub, "index.html")
-	if err != nil {
-		return nil, false
+	out := make([]byte, 0, len(css)+len(override)+64)
+	out = append(out, css...)
+	if len(out) == 0 || out[len(out)-1] != 10 {
+		out = append(out, 10)
 	}
-	return injectHeadStyle(data, css), true
-}
-
-// injectHeadStyle inserts a <style> block before </head>; returns input
-// unchanged when there is no head close tag.
-func injectHeadStyle(html []byte, css string) []byte {
-	idx := strings.Index(string(html), "</head>")
-	if idx < 0 {
-		return html
-	}
-	var sb strings.Builder
-	sb.Write(html[:idx])
-	sb.WriteString("<style id=dashboard-accent>")
-	sb.WriteString(css)
-	sb.WriteString("</style>")
-	sb.Write(html[idx:])
-	return []byte(sb.String())
+	out = append(out, "/* DASHBOARD_ACCENT override */"...)
+	out = append(out, 10)
+	out = append(out, override...)
+	out = append(out, 10)
+	return out
 }
 
 func (ss *StatusServer) handleDashboard(w http.ResponseWriter, r *http.Request) {
@@ -190,14 +180,14 @@ func (ss *StatusServer) handleDashboard(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "ui assets unavailable", http.StatusInternalServerError)
 		return
 	}
-	if r.URL.Path == "/dashboard" || r.URL.Path == "/dashboard/" {
-		if r.Method == http.MethodGet {
-			if html, ok := dashboardIndexWithAccent(sub); ok {
-				w.Header().Set("Content-Type", "text/html; charset=utf-8")
-				w.Write(html)
-				return
-			}
+	if r.URL.Path == "/dashboard/styles.css" && r.Method == http.MethodGet {
+		if data, err := fs.ReadFile(sub, "styles.css"); err == nil {
+			w.Header().Set("Content-Type", "text/css; charset=utf-8")
+			w.Write(accentStylesheet(data))
+			return
 		}
+	}
+	if r.URL.Path == "/dashboard" || r.URL.Path == "/dashboard/" {
 		http.ServeFileFS(w, r, sub, "index.html")
 		return
 	}

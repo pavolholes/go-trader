@@ -27,18 +27,15 @@ func TestDashboardAccentCSS(t *testing.T) {
 	}
 }
 
-func TestInjectHeadStyle(t *testing.T) {
-	html := []byte("<html><head><title>x</title></head><body></body></html>")
-	out := injectHeadStyle(html, ":root{--bg:#111;}")
-	s := string(out)
-	if !strings.Contains(s, "<style id=dashboard-accent>:root{--bg:#111;}</style>") {
-		t.Errorf("expected injected style block, got %s", s)
+func TestAccentStylesheet(t *testing.T) {
+	css := []byte(":root{--bg:#fff;}")
+	t.Setenv("DASHBOARD_ACCENT", "blue")
+	out := accentStylesheet(css)
+	if !strings.Contains(string(out), "--bg:#11151c") {
+		t.Errorf("expected blue override appended")
 	}
-	if strings.Index(s, "</style>") > strings.Index(s, "</head>") {
-		t.Errorf("style must precede </head>")
-	}
-	plain := []byte("<html>no head here</html>")
-	if got := string(injectHeadStyle(plain, "x")); got != string(plain) {
-		t.Errorf("expected unchanged input, got %s", got)
+	t.Setenv("DASHBOARD_ACCENT", "")
+	if got := accentStylesheet(css); string(got) != string(css) {
+		t.Errorf("empty accent must leave css unchanged")
 	}
 }
