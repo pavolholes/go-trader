@@ -118,7 +118,11 @@ def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=
                 print(f"Warning: failed to fetch funding rate: {e}", file=sys.stderr)
 
         print(f"Fetching {symbol} {timeframe} from BloFin ({mode})...", file=sys.stderr)
-        if inst_type == "swap":
+        if inst_type == "spot":
+            from spot_adapter import BloFinSpotExchangeAdapter
+            spot_adapter = BloFinSpotExchangeAdapter()
+            candles = spot_adapter.get_spot_ohlcv(symbol, interval=timeframe, limit=ohlcv_limit)
+        elif inst_type == "swap":
             candles = adapter.get_perp_ohlcv(symbol, interval=timeframe, limit=ohlcv_limit)
         else:
             candles = adapter.get_ohlcv(symbol, interval=timeframe, limit=ohlcv_limit)
@@ -205,7 +209,10 @@ def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=
             signal = decision["signal"]
 
         try:
-            if inst_type == "swap":
+            if inst_type == "spot":
+                from spot_adapter import BloFinSpotExchangeAdapter
+                mid = BloFinSpotExchangeAdapter().get_spot_price(symbol)
+            elif inst_type == "swap":
                 mid = adapter.get_perp_price(symbol)
             else:
                 mid = adapter.get_spot_price(symbol)
@@ -335,7 +342,7 @@ def main():
         parser.add_argument("--side", required=True, choices=["buy", "sell"])
         parser.add_argument("--size", type=float, required=True)
         parser.add_argument("--mode", default="live")
-        parser.add_argument("--inst-type", default="swap", choices=["swap"])
+        parser.add_argument("--inst-type", default="swap", choices=["swap", "spot"])
         args = parser.parse_args()
         run_execute(args.symbol, args.side, args.size, args.mode)
     else:
@@ -353,7 +360,7 @@ def main():
         parser.add_argument("--regime-payload-json", default=None)
         parser.add_argument("--regime-directional-window", default="")
         parser.add_argument("--atr-method", default="simple", choices=["simple", "wilder"])
-        parser.add_argument("--inst-type", default="swap", choices=["swap"])
+        parser.add_argument("--inst-type", default="swap", choices=["swap", "spot"])
         parser.add_argument("--params", default=None)
         parser.add_argument("--open-strategy", default=None)
         parser.add_argument("--close-strategies", default=None)

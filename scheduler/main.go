@@ -1761,7 +1761,7 @@ func main() {
 				var blofinPosSide string
 				var blofinAvgCost float64
 				var blofinPosCtx PositionCtx
-				if sc.Platform == "blofin" {
+				if sc.Platform == "blofin" || sc.Platform == "blofin_spot" {
 					if blofinLiveStrategy {
 						blofinCash = stratState.Cash
 					}
@@ -2181,7 +2181,7 @@ func main() {
 								}
 							}
 						}
-					} else if sc.Platform == "blofin" {
+					} else if sc.Platform == "blofin" || sc.Platform == "blofin_spot" {
 						if result, signalStr, price, ok := runBloFinCheck(sc, prices, blofinPosCtx, cfg.Regime, notifier, logger); ok {
 							prices[result.Symbol] = price
 							storeRegime := globalRegimeStore.PayloadForStrategy(sc, cfg.Regime)

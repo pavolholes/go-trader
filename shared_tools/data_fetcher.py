@@ -27,6 +27,11 @@ def fetch_ohlcv(
     exchange_id: str = "binanceus",
     store: bool = True,
 ) -> pd.DataFrame:
+    _ex = (exchange_id or "").strip().lower()
+    if _ex == "blofin_spot":
+        return fetch_ohlcv_blofin_spot(symbol=symbol, timeframe=timeframe, limit=limit, store=store)
+    if _ex == "blofin":
+        return fetch_ohlcv_blofin(symbol=symbol, timeframe=timeframe, limit=limit, store=store)
     exchange = get_exchange(exchange_id)
 
     since_ts = None
@@ -46,6 +51,49 @@ def fetch_ohlcv(
     df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms")
     df.set_index("datetime", inplace=True)
 
+    return df
+
+
+def fetch_ohlcv_blofin(
+    symbol: str = "BTC/USDT",
+    timeframe: str = "1d",
+    limit: int = 200,
+    store: bool = True,
+) -> pd.DataFrame:
+    """OHLCV from BloFin public REST (spot and perps share /market/candles)."""
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "platforms", "blofin"))
+    from adapter import BloFinExchangeAdapter
+    base = (symbol or "").split("/")[0].split("-")[0].strip().upper()
+    raw = BloFinExchangeAdapter().get_ohlcv(base, timeframe, limit)
+    if not raw:
+        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    if store:
+        store_ohlcv(df, "blofin", symbol, timeframe)
+    df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms")
+    df.set_index("datetime", inplace=True)
+    return df
+
+
+def fetch_ohlcv_blofin_spot(
+    symbol: str = "BTC/USDT",
+    timeframe: str = "1d",
+    limit: int = 200,
+    store: bool = True,
+) -> pd.DataFrame:
+    """OHLCV from BloFin spot REST (/api/v1/spot/market/candles)."""
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "platforms", "blofin"))
+    from spot_adapter import BloFinSpotExchangeAdapter
+    raw = BloFinSpotExchangeAdapter().get_spot_ohlcv(symbol, timeframe, limit)
+    if not raw:
+        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    if store:
+        store_ohlcv(df, "blofin_spot", symbol, timeframe)
+    df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms")
+    df.set_index("datetime", inplace=True)
     return df
 
 

@@ -63,6 +63,7 @@ def main():
     regime_enabled = "--regime-enabled" in sys.argv
     regime_windows_spec = parse_regime_windows_spec_json(_arg_value("--regime-windows-spec-json"))
     ohlcv_limit = int(_arg_value("--ohlcv-limit") or 200)
+    exchange_id = (_arg_value("--exchange") or "binanceus").strip().lower()
     regime_atr_window = (_arg_value("--regime-atr-window") or "").strip()
     regime_payload_json = _arg_value("--regime-payload-json")
     atr_method = (_arg_value("--atr-method") or "simple").strip().lower()
@@ -103,7 +104,7 @@ def main():
             "--position-side", "--position-avg-cost", "--position-qty",
             "--position-initial-qty", "--position-entry-atr",
             "--position-regime",
-            "--regime-windows-spec-json", "--ohlcv-limit",
+            "--regime-windows-spec-json", "--ohlcv-limit", "--exchange",
             "--regime-atr-window", "--regime-directional-window",
             "--regime-payload-json", "--atr-method",
         ):
@@ -162,11 +163,11 @@ def main():
             )
 
         print(f"Fetching {symbol} {timeframe}...", file=sys.stderr)
-        df = fetch_ohlcv(symbol=symbol, timeframe=timeframe, limit=ohlcv_limit, store=False)
+        df = fetch_ohlcv(symbol=symbol, timeframe=timeframe, limit=ohlcv_limit, store=False, exchange_id=exchange_id)
 
         if needs_pair and symbol_b:
             print(f"Fetching secondary {symbol_b} {timeframe}...", file=sys.stderr)
-            df_b = fetch_ohlcv(symbol=symbol_b, timeframe=timeframe, limit=ohlcv_limit, store=False)
+            df_b = fetch_ohlcv(symbol=symbol_b, timeframe=timeframe, limit=ohlcv_limit, store=False, exchange_id=exchange_id)
             if df_b.empty:
                 print(json.dumps({
                     "strategy": strategy_name,
@@ -244,7 +245,7 @@ def main():
             from htf_filter import htf_trend_filter, apply_htf_filter
 
             def _fetch_htf(sym, tf, limit):
-                return fetch_ohlcv(symbol=sym, timeframe=tf, limit=limit, store=False)
+                return fetch_ohlcv(symbol=sym, timeframe=tf, limit=limit, store=False, exchange_id=exchange_id)
 
             htf_info = htf_trend_filter(symbol, timeframe, _fetch_htf)
             original_signal = signal

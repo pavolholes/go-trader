@@ -1068,6 +1068,8 @@ func loadConfig(path string, skipLiveCredentialChecks bool, readOnly bool) (*Con
 				cfg.Strategies[i].Platform = "luno"
 			case strings.HasPrefix(cfg.Strategies[i].ID, "okx-"):
 				cfg.Strategies[i].Platform = "okx"
+			case strings.HasPrefix(cfg.Strategies[i].ID, "bls-"):
+				cfg.Strategies[i].Platform = "blofin_spot"
 			case strings.HasPrefix(cfg.Strategies[i].ID, "bl-"):
 				cfg.Strategies[i].Platform = "blofin"
 			case cfg.Strategies[i].Type == "options":
