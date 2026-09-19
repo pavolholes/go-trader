@@ -251,9 +251,10 @@ func (ss *StatusServer) handleAPIStrategiesOverview(w http.ResponseWriter, r *ht
 	}
 
 	configs := ss.uiStrategies()
+	prices := ss.fetchLiveMarkPrices()
 	out := make([]UIStrategyOverview, 0, len(configs))
 	for _, item := range configs {
-		overview, _, ok := ss.uiStrategyOverview(item.ID)
+		overview, _, ok := ss.uiStrategyOverviewWithPrices(item.ID, prices)
 		if !ok {
 			continue
 		}
@@ -500,6 +501,10 @@ func (ss *StatusServer) handleAPIStrategyTrades(w http.ResponseWriter, r *http.R
 }
 
 func (ss *StatusServer) uiStrategyOverview(id string) (UIStrategyOverview, LifetimeTradeStats, bool) {
+	return ss.uiStrategyOverviewWithPrices(id, ss.fetchLiveMarkPrices())
+}
+
+func (ss *StatusServer) uiStrategyOverviewWithPrices(id string, prices map[string]float64) (UIStrategyOverview, LifetimeTradeStats, bool) {
 	sc, ok := ss.strategyConfig(id)
 	if !ok {
 		return UIStrategyOverview{}, LifetimeTradeStats{}, false
@@ -516,7 +521,6 @@ func (ss *StatusServer) uiStrategyOverview(id string) (UIStrategyOverview, Lifet
 		return UIStrategyOverview{}, LifetimeTradeStats{}, false
 	}
 
-	prices := ss.fetchLiveMarkPrices()
 	pv := displayStrategyValue(&snapshot, prices)
 	initCap := EffectiveInitialCapital(sc, &snapshot)
 	pnl := pv - initCap

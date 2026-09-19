@@ -77,10 +77,10 @@
 
         <section class="content">
           <div id="overview-panel" class="overview-panel" hidden>
-            <div class="overview-filter" role="group" aria-label="Mode filter">
+            <div class="overview-filter" role="group" aria-label="Type filter">
               <button type="button" class="mode-filter-button active" data-mode="all" aria-pressed="true">All</button>
-              <button type="button" class="mode-filter-button" data-mode="paper" aria-pressed="false">Paper</button>
-              <button type="button" class="mode-filter-button" data-mode="live" aria-pressed="false">Live</button>
+              <button type="button" class="mode-filter-button" data-mode="perps" aria-pressed="false">Futures</button>
+              <button type="button" class="mode-filter-button" data-mode="spot" aria-pressed="false">Spot</button>
             </div>
             <table class="overview-table">
               <thead>
@@ -116,30 +116,6 @@
               <tbody id="overview-body"></tbody>
             </table>
             <div class="ops-panels">
-              <div class="ops-panel ops-panel--wide">
-                <h3>Leaderboard</h3>
-                <div class="ops-table-scroll">
-                  <table class="ops-table">
-                    <thead>
-                      <tr><th>#</th><th>ID</th><th>PnL %</th><th>PnL $</th><th>#T</th><th>W/L</th><th>Value</th></tr>
-                    </thead>
-                    <tbody id="leaderboard-body"></tbody>
-                  </table>
-                </div>
-                <p id="leaderboard-empty" class="panel-muted" hidden>No strategies to rank</p>
-              </div>
-              <div class="ops-panel ops-panel--wide">
-                <h3>Trade diagnostics</h3>
-                <div class="ops-table-scroll">
-                  <table class="ops-table">
-                    <thead>
-                      <tr><th>Closed</th><th>Strategy</th><th>Symbol</th><th>Side</th><th>Net PnL</th><th>MFE %</th><th>MAE %</th><th>Capture</th><th>Status</th></tr>
-                    </thead>
-                    <tbody id="diagnostics-body"></tbody>
-                  </table>
-                </div>
-                <p id="diagnostics-empty" class="panel-muted" hidden>No diagnostics rows yet</p>
-              </div>
               <div class="ops-panel">
                 <h3>Cashflow journal</h3>
                 <div id="cashflow-content" class="panel-list"></div>
@@ -296,6 +272,32 @@
                   <thead><tr><th>Strategy</th><th>TF</th><th>Configs</th><th>With trades</th><th>PnL</th><th>PnL %</th><th>Trades</th><th>Win Rate</th></tr></thead>
                   <tbody id="summary-by-strategy-timeframe"></tbody>
                 </table>
+              </div>
+            </div>
+            <div class="ops-panels">
+              <div class="ops-panel ops-panel--wide">
+                <h3>Leaderboard</h3>
+                <div class="ops-table-scroll">
+                  <table class="ops-table">
+                    <thead>
+                      <tr><th>#</th><th>ID</th><th>PnL %</th><th>PnL $</th><th>#T</th><th>W/L</th><th>Value</th></tr>
+                    </thead>
+                    <tbody id="leaderboard-body"></tbody>
+                  </table>
+                </div>
+                <p id="leaderboard-empty" class="panel-muted" hidden>No strategies to rank</p>
+              </div>
+              <div class="ops-panel ops-panel--wide">
+                <h3>Trade diagnostics</h3>
+                <div class="ops-table-scroll">
+                  <table class="ops-table">
+                    <thead>
+                      <tr><th>Closed</th><th>Strategy</th><th>Symbol</th><th>Side</th><th>Net PnL</th><th>MFE %</th><th>MAE %</th><th>Capture</th><th>Status</th></tr>
+                    </thead>
+                    <tbody id="diagnostics-body"></tbody>
+                  </table>
+                </div>
+                <p id="diagnostics-empty" class="panel-muted" hidden>No diagnostics rows yet</p>
               </div>
             </div>
             </div>

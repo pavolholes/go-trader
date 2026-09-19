@@ -2078,7 +2078,7 @@
 
   function sortedOverviewRows() {
     const rows = filterOverviewRows(state.overviewRows.filter(function (row) {
-      return state.modeFilter === "all" || row.mode === state.modeFilter;
+      return state.modeFilter === "all" || row.type === state.modeFilter;
     }));
     const dir = state.sortDir === "desc" ? -1 : 1;
     rows.sort(function (a, b) {
@@ -2479,7 +2479,7 @@
   async function refreshAll() {
     try {
       if (state.viewMode === "summary") {
-        await refreshSummary();
+        await Promise.all([refreshSummary(), refreshLeaderboardPanel(), refreshDiagnosticsPanel()]);
         return;
       }
       if (state.viewMode === "table") {
