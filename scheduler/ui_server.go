@@ -31,6 +31,7 @@ type UIStrategy struct {
 
 type UIStrategyOverview struct {
 	ID                    string                 `json:"id"`
+	Type                  string                 `json:"type"`
 	Platform              string                 `json:"platform"`
 	Symbol                string                 `json:"symbol"`
 	PnLPct                float64                `json:"pnl_pct"`
@@ -250,6 +251,14 @@ func (ss *StatusServer) handleAPIStrategiesOverview(w http.ResponseWriter, r *ht
 		return
 	}
 
+	ss.overviewCacheMu.RLock()
+	cached := ss.overviewCache
+	cachedAt := ss.overviewCacheAt
+	ss.overviewCacheMu.RUnlock()
+	if cached != nil && time.Since(cachedAt) < 5*time.Minute {
+		writeJSON(w, map[string][]UIStrategyOverview{"strategies": cached})
+		return
+	}
 	configs := ss.uiStrategies()
 	prices := ss.fetchLiveMarkPrices()
 	out := make([]UIStrategyOverview, 0, len(configs))
@@ -260,6 +269,10 @@ func (ss *StatusServer) handleAPIStrategiesOverview(w http.ResponseWriter, r *ht
 		}
 		out = append(out, overview)
 	}
+	ss.overviewCacheMu.Lock()
+	ss.overviewCache = out
+	ss.overviewCacheAt = time.Now()
+	ss.overviewCacheMu.Unlock()
 	writeJSON(w, map[string][]UIStrategyOverview{"strategies": out})
 }
 
@@ -551,6 +564,7 @@ func (ss *StatusServer) uiStrategyOverviewWithPrices(id string, prices map[strin
 
 	return UIStrategyOverview{
 		ID:                    id,
+		Type:                  sc.Type,
 		Platform:              sc.Platform,
 		Symbol:                strategyDisplaySymbol(sc),
 		PnLPct:                pnlPct,

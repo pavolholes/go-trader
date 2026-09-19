@@ -2479,7 +2479,7 @@
   async function refreshAll() {
     try {
       if (state.viewMode === "summary") {
-        await Promise.all([refreshSummary(), refreshLeaderboardPanel(), refreshDiagnosticsPanel()]);
+        await Promise.all([refreshSummary(), refreshDeadStrategiesPanel()]);
         return;
       }
       if (state.viewMode === "table") {
@@ -2493,9 +2493,7 @@
         refreshRegimeStorePanel(),
         refreshTransitionsPanel(),
         loadTunerConfig(),
-        loadSparklines(filteredStrategies().map(function (s) {
-          return s.id;
-        })),
+        loadSparklines(state.activeID ? [state.activeID] : []),
       ]);
     } catch (err) {
       handleRefreshError(err);

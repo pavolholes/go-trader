@@ -27,6 +27,9 @@ type StatusServer struct {
 
 	strategiesMu  sync.RWMutex
 	strategies    []StrategyConfig
+	overviewCacheMu sync.RWMutex
+	overviewCache   []UIStrategyOverview
+	overviewCacheAt time.Time
 	configPath    string
 	regime        *RegimeConfig
 	configWriteMu sync.Mutex
