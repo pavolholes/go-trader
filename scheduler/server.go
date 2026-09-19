@@ -25,14 +25,14 @@ type StatusServer struct {
 	candleCache    *UICandleCache
 	tuning         *tuningRunManager
 
-	strategiesMu  sync.RWMutex
-	strategies    []StrategyConfig
+	strategiesMu    sync.RWMutex
+	strategies      []StrategyConfig
 	overviewCacheMu sync.RWMutex
 	overviewCache   []UIStrategyOverview
 	overviewCacheAt time.Time
-	configPath    string
-	regime        *RegimeConfig
-	configWriteMu sync.Mutex
+	configPath      string
+	regime          *RegimeConfig
+	configWriteMu   sync.Mutex
 
 	intervalSeconds   int
 	userCloseDefaults CloseDefaultsMap
