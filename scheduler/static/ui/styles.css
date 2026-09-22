@@ -1012,6 +1012,7 @@ h3 {
 .sharpe-bad { color: var(--red); }
 .dd-bad { color: var(--red); font-weight: 600; }
 .dd-mid { color: #f59e0b; }
+.dd-good { color: #86efac; }
 .wr-great { color: #22c55e; font-weight: 600; }
 .wr-good { color: #86efac; }
 .wr-mid { color: var(--muted); }

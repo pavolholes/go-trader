@@ -2232,7 +2232,7 @@
     const rows = sortedOverviewRows();
     els.overviewBody.innerHTML = rows.map(function (row) {
       const pnlClassName = row.pnl_pct > 0 ? "pnl-pos" : row.pnl_pct < 0 ? "pnl-neg" : "";
-      const ddClassName = row.drawdown_pct > 10 ? "dd-bad" : row.drawdown_pct > 5 ? "dd-mid" : "";
+      const ddClassName = !row.drawdown_pct ? "" : row.drawdown_pct > 10 ? "dd-bad" : row.drawdown_pct > 5 ? "dd-mid" : "dd-good";
       return '<tr class="overview-row' + (row.id === state.activeID ? " active" : "") + '" data-id="' + escapeHTML(row.id) + '">' +
         "<td>" + (row.paused ? '<span title="Paused">⏸</span> ' : "") + escapeHTML(row.id) + "</td>" +
         "<td>" + escapeHTML(row.platform || "-") + "</td>" +
