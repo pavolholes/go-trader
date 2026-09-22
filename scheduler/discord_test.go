@@ -36,23 +36,23 @@ func TestResolveTradeChannel(t *testing.T) {
 		"spot":              "ch-spot",
 	}
 
-	if got := resolveTradeChannel(channels, "hyperliquid", "perps", false); got != "ch-hl-paper" {
+	if got := resolveTradeChannel(channels, "hyperliquid", "perps", false, ""); got != "ch-hl-paper" {
 		t.Errorf("paper with -paper key: expected ch-hl-paper, got %s", got)
 	}
 
-	if got := resolveTradeChannel(channels, "hyperliquid", "perps", true); got != "ch-hl" {
+	if got := resolveTradeChannel(channels, "hyperliquid", "perps", true, ""); got != "ch-hl" {
 		t.Errorf("live trade: expected ch-hl, got %s", got)
 	}
 
-	if got := resolveTradeChannel(channels, "binanceus", "spot", false); got != "ch-spot" {
+	if got := resolveTradeChannel(channels, "binanceus", "spot", false, ""); got != "ch-spot" {
 		t.Errorf("paper fallback to stratType: expected ch-spot, got %s", got)
 	}
 
-	if got := resolveTradeChannel(channels, "unknown", "unknown", false); got != "" {
+	if got := resolveTradeChannel(channels, "unknown", "unknown", false, ""); got != "" {
 		t.Errorf("paper no channel: expected empty, got %s", got)
 	}
 
-	if got := resolveTradeChannel(channels, "binanceus", "spot", true); got != "ch-spot" {
+	if got := resolveTradeChannel(channels, "binanceus", "spot", true, ""); got != "ch-spot" {
 		t.Errorf("live fallback to stratType: expected ch-spot, got %s", got)
 	}
 }
@@ -824,11 +824,11 @@ func TestResolveChannelDefaultFallback(t *testing.T) {
 		t.Errorf("expected ch-bl, got %s", got)
 	}
 	override := map[string]string{"default": "ch-trades"}
-	if got := resolveTradeAlertChannel(override, channels, "blofin", "perps", true); got != "ch-trades" {
+	if got := resolveTradeAlertChannel(override, channels, "blofin", "perps", true, ""); got != "ch-trades" {
 		t.Errorf("expected ch-trades, got %s", got)
 	}
 	override["blofin-live"] = "ch-live"
-	if got := resolveTradeAlertChannel(override, channels, "blofin", "perps", true); got != "ch-live" {
+	if got := resolveTradeAlertChannel(override, channels, "blofin", "perps", true, ""); got != "ch-live" {
 		t.Errorf("expected ch-live, got %s", got)
 	}
 }
@@ -836,11 +836,11 @@ func TestResolveChannelDefaultFallback(t *testing.T) {
 func TestResolveTradeAlertEmptyDisables(t *testing.T) {
 	channels := map[string]string{"default": "ch-def"}
 	override := map[string]string{"blofin-paper": ""}
-	if got := resolveTradeAlertChannel(override, channels, "blofin", "perps", false); got != "" {
+	if got := resolveTradeAlertChannel(override, channels, "blofin", "perps", false, ""); got != "" {
 		t.Errorf("paper explicit empty: expected disabled, got %s", got)
 	}
 	override["blofin-live"] = "ch-live"
-	if got := resolveTradeAlertChannel(override, channels, "blofin", "perps", true); got != "ch-live" {
+	if got := resolveTradeAlertChannel(override, channels, "blofin", "perps", true, ""); got != "ch-live" {
 		t.Errorf("live unaffected: expected ch-live, got %s", got)
 	}
 }
@@ -848,10 +848,10 @@ func TestResolveTradeAlertEmptyDisables(t *testing.T) {
 func TestResolveTradeAlertNoFallbackToDefault(t *testing.T) {
 	channels := map[string]string{"default": "ch-daily"}
 	override := map[string]string{}
-	if got := resolveTradeAlertChannel(override, channels, "blofin", "perps", false); got != "" {
+	if got := resolveTradeAlertChannel(override, channels, "blofin", "perps", false, ""); got != "" {
 		t.Errorf("paper: empty TRADES must disable alerts, got %s", got)
 	}
-	if got := resolveTradeAlertChannel(override, channels, "blofin", "perps", true); got != "" {
+	if got := resolveTradeAlertChannel(override, channels, "blofin", "perps", true, ""); got != "" {
 		t.Errorf("live: empty TRADES must disable alerts, got %s", got)
 	}
 	if got := resolveChannel(channels, "blofin", "perps"); got != "ch-daily" {

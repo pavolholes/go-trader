@@ -154,10 +154,27 @@ func resolveChannel(channels map[string]string, platform, stratType string) stri
 	return ""
 }
 
-func resolveTradeChannel(channels map[string]string, platform, stratType string, isLive bool) string {
+// paperChannelSuffix marks every paper routing key; a named source appends the
+// partition separator and its id after it.
+const paperChannelSuffix = "-paper"
+
+// paperChannelKeys lists the paper routing keys for one strategy, most specific
+// first: the named source, then the default paper key. A folded source reaches
+// its own channel when one is configured and otherwise keeps the route the
+// merged deployment already had.
+func paperChannelKeys(platform, source string) []string {
+	if source == "" {
+		return []string{platform + paperChannelSuffix}
+	}
+	return []string{platform + paperChannelSuffix + paperSourceSeparator + source, platform + paperChannelSuffix}
+}
+
+func resolveTradeChannel(channels map[string]string, platform, stratType string, isLive bool, source string) string {
 	if !isLive {
-		if ch, ok := channels[platform+"-paper"]; ok && ch != "" {
-			return ch
+		for _, key := range paperChannelKeys(platform, source) {
+			if ch, ok := channels[key]; ok && ch != "" {
+				return ch
+			}
 		}
 	}
 	return resolveChannel(channels, platform, stratType)
@@ -166,7 +183,7 @@ func resolveTradeChannel(channels map[string]string, platform, stratType string,
 // withoutDefault returns a copy of m without the env-provided "default"
 // summary channel. Trade alerts must never be rerouted there, so an empty
 // or commented-out TRADES var means alerts are off instead of falling back
-// to the daily-summary channel.
+// to the daily-summary channel. (Pavol override, kept across merges.)
 func withoutDefault(m map[string]string) map[string]string {
 	if _, ok := m["default"]; !ok {
 		return m
@@ -180,12 +197,15 @@ func withoutDefault(m map[string]string) map[string]string {
 	return c
 }
 
-func resolveTradeAlertChannel(override, channels map[string]string, platform, stratType string, isLive bool) string {
+func resolveTradeAlertChannel(override, channels map[string]string, platform, stratType string, isLive bool, source string) string {
 	if len(override) > 0 {
 		if !isLive {
 			// Explicit empty value disables paper alerts for this platform.
-			if ch, ok := override[platform+"-paper"]; ok {
-				return ch
+			// (Pavol override: empty means off, not fallback.)
+			for _, key := range paperChannelKeys(platform, source) {
+				if ch, ok := override[key]; ok {
+					return ch
+				}
 			}
 		} else {
 			if ch, ok := override[platform+"-live"]; ok {
@@ -202,7 +222,7 @@ func resolveTradeAlertChannel(override, channels map[string]string, platform, st
 			return ch
 		}
 	}
-	return resolveTradeChannel(withoutDefault(channels), platform, stratType, isLive)
+	return resolveTradeChannel(withoutDefault(channels), platform, stratType, isLive, source)
 }
 
 func channelKeyFromID(channels map[string]string, chID string) string {

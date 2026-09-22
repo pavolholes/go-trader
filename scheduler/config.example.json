@@ -38,6 +38,8 @@
   "portfolio_risk": {
     "max_drawdown_pct": 25,
     "max_notional_usd": 0,
+    "_doc_include_paused_in_warning": "Default false; flat paused strategies are excluded from the portfolio warning's Top contributors block. Paused strategies with open regular or option positions remain visible because their market risk continues. Set true to include flat paused strategies.",
+    "include_paused_in_warning": false,
     "paper": {
       "max_drawdown_pct": 50
     }

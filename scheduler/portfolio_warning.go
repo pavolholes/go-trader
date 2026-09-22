@@ -18,7 +18,7 @@ type PortfolioWarningMessageInputs struct {
 	Reason           string
 	Config           *PortfolioRiskConfig
 	State            *AppState
-	Scope            PortfolioScope
+	Partition        RiskPartition
 	CfgStrategies    []StrategyConfig
 	Prices           map[string]float64
 	TotalValue       float64
@@ -43,23 +43,24 @@ func BuildPortfolioWarningMessage(in PortfolioWarningMessageInputs) string {
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
-	scope := in.Scope
-	if scope == scopeUnassigned {
-		scope = ScopeLive
+	part := in.Partition
+	if part.Scope == scopeUnassigned {
+		part = livePartition
 	}
 	var prs PortfolioRiskState
 	if in.State != nil {
-		if p := in.State.scopeRiskIfPresent(scope); p != nil {
+		if p := in.State.partitionRiskIfPresent(part); p != nil {
 			prs = *p
 		}
 	}
-	contribs := portfolioWarningContributors(in.State, in.CfgStrategies, scope, in.Prices)
+	includePaused := in.Config != nil && in.Config.IncludePausedInWarning
+	contribs, excluded := portfolioWarningContributors(in.State, in.CfgStrategies, part, in.Prices, includePaused)
 
 	var b strings.Builder
 	b.WriteString("**PORTFOLIO WARNING")
-	if in.Scope != scopeUnassigned {
+	if in.Partition.Scope != scopeUnassigned {
 		b.WriteString(" ")
-		b.WriteString(strings.ToUpper(scopeLabel(in.Scope)))
+		b.WriteString(strings.ToUpper(partitionLabel(in.Partition)))
 	}
 	b.WriteString("**")
 	if lead := portfolioWarningLead(contribs); lead != "" {
@@ -128,6 +129,10 @@ func BuildPortfolioWarningMessage(in PortfolioWarningMessageInputs) string {
 		}
 		b.WriteString("```\n")
 	}
+	if excluded > 0 && !includePaused {
+		b.WriteString(fmt.Sprintf("\n(%d flat paused strateg%s excluded from contributors; set portfolio_risk.include_paused_in_warning=true to include)\n",
+			excluded, pluralize(excluded, "y", "ies")))
+	}
 
 	if len(in.Recent) > 0 {
 		b.WriteString("\nRecent activity (last 15m):\n")
@@ -149,13 +154,21 @@ func BuildPortfolioWarningMessage(in PortfolioWarningMessageInputs) string {
 	return truncateWarningField(msg, portfolioWarningMaxChars)
 }
 
-func portfolioWarningContributors(state *AppState, cfgStrategies []StrategyConfig, scope PortfolioScope, prices map[string]float64) []portfolioWarningContributor {
+func portfolioWarningContributors(state *AppState, cfgStrategies []StrategyConfig, part RiskPartition, prices map[string]float64, includePaused bool) ([]portfolioWarningContributor, int) {
 	if state == nil {
-		return nil
+		return nil, 0
 	}
 	scoped := state.Strategies
 	if len(cfgStrategies) > 0 {
-		scoped = filterStatesByScope(state.Strategies, cfgStrategies, scope)
+		scoped = filterStatesByPartition(state.Strategies, cfgStrategies, part)
+	}
+	pausedByID := make(map[string]bool, len(cfgStrategies))
+	if !includePaused {
+		for _, sc := range cfgStrategies {
+			if sc.Paused {
+				pausedByID[sc.ID] = true
+			}
+		}
 	}
 	totalNegative := 0.0
 	out := make([]portfolioWarningContributor, 0, len(scoped))
@@ -164,9 +177,14 @@ func portfolioWarningContributors(state *AppState, cfgStrategies []StrategyConfi
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)
+	excludedFlatPaused := 0
 	for _, id := range ids {
 		ss := scoped[id]
 		if ss == nil {
+			continue
+		}
+		if pausedByID[id] && !strategyHasOpenPositions(ss) {
+			excludedFlatPaused++
 			continue
 		}
 		pv := PortfolioValue(ss, prices)
@@ -208,7 +226,7 @@ func portfolioWarningContributors(state *AppState, cfgStrategies []StrategyConfi
 	if len(out) > portfolioWarningMaxRows {
 		out = out[:portfolioWarningMaxRows]
 	}
-	return out
+	return out, excludedFlatPaused
 }
 
 func portfolioWarningLead(contribs []portfolioWarningContributor) string {
@@ -348,6 +366,13 @@ func formatSignedDollar(v float64) string {
 		return fmt.Sprintf("-$%.0f", math.Abs(v))
 	}
 	return fmt.Sprintf("$%.0f", v)
+}
+
+func pluralize(n int, singular, plural string) string {
+	if n == 1 {
+		return singular
+	}
+	return plural
 }
 
 func formatSignedPct(v float64) string {
