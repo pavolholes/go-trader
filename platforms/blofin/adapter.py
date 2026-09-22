@@ -329,11 +329,12 @@ class BloFinExchangeAdapter:
             if pos_side not in ("long", "short"):
                 raise RuntimeError("copy account is hedge mode: pos_side must be long/short, got %r" % (pos_side,))
             body = {"instId": inst_id, "marginMode": margin_mode, "positionSide": pos_side,
-                    "side": side, "orderType": order_type, "size": str(size)}
+                    "side": side, "orderType": order_type, "size": str(size),
+                    "brokerId": (os.environ.get("BLOFIN_BROKER_ID", "") or "")[:16]}
             if price:
                 body["price"] = price
             if client_oid:
-                body["brokerId"] = client_oid[:16]
+                body["clientOrderId"] = client_oid
             return self._private_post("/api/v1/copytrading/trade/place-order", body)
         body = {
             "instId": inst_id,
