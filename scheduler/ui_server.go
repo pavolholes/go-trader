@@ -571,7 +571,17 @@ func (ss *StatusServer) uiStrategyOverviewWithPrices(id string, prices map[strin
 		PnLPct:                pnlPct,
 		WinRate:               winRate,
 		Sharpe:                sharpe,
-		DrawdownPct:           snapshot.RiskState.CurrentDrawdownPct,
+		DrawdownPct:           func() float64 {
+			peak := snapshot.RiskState.PeakValue
+			if peak > 0 {
+				dd := (peak - pv) / peak * 100
+				if dd < 0 {
+					dd = 0
+				}
+				return dd
+			}
+			return 0
+		}(),
 		Regime:                strategyDisplayRegimeLabel(&snapshot, sc, ss.regime),
 		Direction:             strategyDisplayDirection(sc),
 		Mode:                  strategyDisplayMode(sc),
