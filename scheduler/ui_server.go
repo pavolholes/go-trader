@@ -37,6 +37,7 @@ type UIStrategyOverview struct {
 	PnLPct                float64                `json:"pnl_pct"`
 	WinRate               float64                `json:"win_rate,omitempty"`
 	Sharpe                float64                `json:"sharpe,omitempty"`
+	DrawdownPct           float64                `json:"drawdown_pct,omitempty"`
 	Regime                string                 `json:"regime,omitempty"`
 	Direction             string                 `json:"direction,omitempty"`
 	Mode                  string                 `json:"mode"`
@@ -570,6 +571,7 @@ func (ss *StatusServer) uiStrategyOverviewWithPrices(id string, prices map[strin
 		PnLPct:                pnlPct,
 		WinRate:               winRate,
 		Sharpe:                sharpe,
+		DrawdownPct:           snapshot.RiskState.CurrentDrawdownPct,
 		Regime:                strategyDisplayRegimeLabel(&snapshot, sc, ss.regime),
 		Direction:             strategyDisplayDirection(sc),
 		Mode:                  strategyDisplayMode(sc),

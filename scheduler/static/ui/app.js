@@ -2105,10 +2105,18 @@
     });
   }
 
+  function sharpeClass(v) {
+    if (v === null || v === undefined || v === 0) return "";
+    if (v >= 2) return "sharpe-great";
+    if (v >= 1) return "sharpe-good";
+    if (v < 0) return "sharpe-bad";
+    return "sharpe-mid";
+  }
   function renderOverviewTable() {
     const rows = sortedOverviewRows();
     els.overviewBody.innerHTML = rows.map(function (row) {
       const pnlClassName = row.pnl_pct > 0 ? "pnl-pos" : row.pnl_pct < 0 ? "pnl-neg" : "";
+      const ddClassName = row.drawdown_pct > 10 ? "dd-bad" : row.drawdown_pct > 5 ? "dd-mid" : "";
       return '<tr class="overview-row' + (row.id === state.activeID ? " active" : "") + '" data-id="' + escapeHTML(row.id) + '">' +
         "<td>" + (row.paused ? '<span title="Paused">⏸</span> ' : "") + escapeHTML(row.id) + "</td>" +
         "<td>" + escapeHTML(row.platform || "-") + "</td>" +
@@ -2118,7 +2126,8 @@
         '<td class="' + pnlClassName + '">' + escapeHTML(row.pool_budget ? "—" : fmtNumber(row.pnl)) + "</td>" +
         '<td class="' + pnlClassName + '">' + escapeHTML(row.pool_budget ? "—" : fmtPct(row.pnl_pct)) + "</td>" +
         "<td>" + escapeHTML(row.win_rate ? fmtPct(row.win_rate) : "-") + "</td>" +
-        "<td>" + escapeHTML(row.sharpe ? fmtNumber(row.sharpe) : "-") + "</td>" +
+        '<td class="' + sharpeClass(row.sharpe) + '">' + escapeHTML(row.sharpe ? fmtNumber(row.sharpe) : "-") + "</td>" +
+        '<td class="' + ddClassName + '">' + escapeHTML(row.drawdown_pct ? fmtPct(row.drawdown_pct) : "-") + "</td>" +
         "<td>" + escapeHTML(row.regime || "-") + "</td>" +
         "<td>" + escapeHTML(row.direction || "-") + "</td>" +
         "<td>" + escapeHTML(row.close_strategy || "-") + "</td>" +

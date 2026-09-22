@@ -1006,6 +1006,12 @@ h3 {
 .pnl-neg {
   color: var(--red);
 }
+.sharpe-great { color: #22c55e; font-weight: 600; }
+.sharpe-good { color: #86efac; }
+.sharpe-mid { color: var(--muted); }
+.sharpe-bad { color: var(--red); }
+.dd-bad { color: var(--red); font-weight: 600; }
+.dd-mid { color: #f59e0b; }
 
 .tuner-panel {
   margin-top: 18px;
