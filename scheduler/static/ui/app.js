@@ -2042,7 +2042,7 @@
 
 
   function sortValue(row, key) {
-    if (key === "pnl_pct" || key === "win_rate" || key === "sharpe" || key === "trade_count" || key === "pnl") {
+    if (key === "pnl_pct" || key === "win_rate" || key === "sharpe" || key === "trade_count" || key === "pnl" || key === "drawdown_pct") {
       const n = Number(row[key]);
       return Number.isFinite(n) ? n : -Infinity;
     }
