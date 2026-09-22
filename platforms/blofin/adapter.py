@@ -320,6 +320,28 @@ class BloFinExchangeAdapter:
     # Order execution (live mode only)
     # ─────────────────────────────────────────────
 
+    _lot_size_cache: dict = {}
+
+    def quantize_size(self, inst_id: str, size: float) -> str:
+        """Floor size to the instrument lotSize (copy API rejects bad precision)."""
+        try:
+            lot = self._lot_size_cache.get(inst_id)
+            if lot is None:
+                data = self._public_get("/api/v1/market/instruments", {"instId": inst_id})
+                items = data.get("data", [])
+                lot = float(items[0].get("lotSize", "1") or "1") if items else 1.0
+                if lot <= 0:
+                    lot = 1.0
+                self._lot_size_cache[inst_id] = lot
+            steps = int(size / lot + 1e-9)
+            if steps <= 0:
+                return ""
+            q = steps * lot
+            s = ("%.8f" % q).rstrip("0").rstrip(".")
+            return s if s else ""
+        except Exception:
+            return str(size)
+
     def place_order(self, inst_id: str, margin_mode: str, side: str, order_type: str,
                     size: str, price: str = "", pos_side: str = "net",
                     reduce_only: bool = False, client_oid: str = "",
@@ -386,12 +408,16 @@ class BloFinExchangeAdapter:
             except Exception:
                 cur = ""
             pos_side = cur if cur in ("long", "short") else ("long" if is_buy else "short")
+        inst_id = f"{symbol}-USDT"
+        qsize = self.quantize_size(inst_id, float(size))
+        if not qsize:
+            raise RuntimeError(f"size {size} below lotSize for {inst_id}")
         result = self.place_order(
-            inst_id=f"{symbol}-USDT",
+            inst_id=inst_id,
             margin_mode="cross",
             side=side,
             order_type="market",
-            size=str(size),
+            size=qsize,
             pos_side=pos_side,
         )
         return result
