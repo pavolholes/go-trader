@@ -1012,6 +1012,10 @@ h3 {
 .sharpe-bad { color: var(--red); }
 .dd-bad { color: var(--red); font-weight: 600; }
 .dd-mid { color: #f59e0b; }
+.wr-great { color: #22c55e; font-weight: 600; }
+.wr-good { color: #86efac; }
+.wr-mid { color: var(--muted); }
+.wr-bad { color: var(--red); }
 
 .tuner-panel {
   margin-top: 18px;

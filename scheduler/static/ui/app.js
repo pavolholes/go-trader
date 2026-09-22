@@ -2112,6 +2112,13 @@
     if (v < 0) return "sharpe-bad";
     return "sharpe-mid";
   }
+  function winRateClass(v) {
+    if (v === null || v === undefined || v === 0) return "";
+    if (v >= 60) return "wr-great";
+    if (v >= 50) return "wr-good";
+    if (v < 35) return "wr-bad";
+    return "wr-mid";
+  }
   function renderOverviewTable() {
     const rows = sortedOverviewRows();
     els.overviewBody.innerHTML = rows.map(function (row) {
@@ -2125,7 +2132,7 @@
         "<td>" + escapeHTML(String(row.trade_count || 0)) + "</td>" +
         '<td class="' + pnlClassName + '">' + escapeHTML(row.pool_budget ? "—" : fmtNumber(row.pnl)) + "</td>" +
         '<td class="' + pnlClassName + '">' + escapeHTML(row.pool_budget ? "—" : fmtPct(row.pnl_pct)) + "</td>" +
-        "<td>" + escapeHTML(row.win_rate ? fmtPct(row.win_rate) : "-") + "</td>" +
+        '<td class="' + winRateClass(row.win_rate) + '">' + escapeHTML(row.win_rate ? fmtPct(row.win_rate) : "-") + "</td>" +
         '<td class="' + sharpeClass(row.sharpe) + '">' + escapeHTML(row.sharpe ? fmtNumber(row.sharpe) : "-") + "</td>" +
         '<td class="' + ddClassName + '">' + escapeHTML(row.drawdown_pct ? fmtPct(row.drawdown_pct) : "-") + "</td>" +
         "<td>" + escapeHTML(row.regime || "-") + "</td>" +
