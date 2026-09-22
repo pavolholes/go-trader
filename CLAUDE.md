@@ -1,6 +1,6 @@
 # go-trader
 
-Guardrails only. Mechanism/flows: SKILL.md, docs/POST_UPDATE_HISTORY.md; <15k bytes, never split (root `CLAUDE.md` only; `AGENTS.md` symlink). Shorten wording, drop no guardrail.
+Guardrails only. Mechanism/flows: SKILL.md, docs/POST_UPDATE_HISTORY.md; <15k bytes, never split (root `CLAUDE.md` only; `AGENTS.md` symlink). Shorten wording, drop no guardrail. Overrides: docs/GO-TRADER_OVERRIDES_PAVOL.md — Pavol overrides (BloFin spot bls-, UI, fees), must be preserved across upstream merges.
 
 ## Env
 - Go 1.26.2 (`/opt/homebrew/bin/go`). Python: `uv run --no-sync python`; scheduler `.venv/bin/python3`; `uv sync` per worktree.
