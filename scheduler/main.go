@@ -936,6 +936,7 @@ func main() {
 				}
 			}
 		}
+		maybeSendDailySummary(store, state, cfg, notifier, cycleStart, prices)
 		if len(prices) > 0 {
 			fmt.Printf("Prices: ")
 			for sym, price := range prices {
