@@ -2715,7 +2715,21 @@
     });
   }
 
+  async function loadInstanceLabel() {
+    try {
+      const resp = await getJSON("/api/instance");
+      const label = (resp && resp.label || "").trim();
+      if (!label) return;
+      document.title = label + " \u2014 go-trader";
+      const badge = document.getElementById("instance-badge");
+      if (badge) {
+        badge.textContent = label;
+        badge.hidden = false;
+      }
+    } catch (_err) {}
+  }
   async function boot() {
+    loadInstanceLabel().catch(function () {});
     state.viewMode = loadViewMode();
     applyViewMode();
     updateDarkModeToggle();

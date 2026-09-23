@@ -2,6 +2,7 @@ package main
 
 import (
 	"math"
+	"os"
 	"net/http"
 	"sort"
 	"strings"
@@ -85,6 +86,15 @@ type UISummary struct {
 	BySymbol            []UISummarySymbolRow   `json:"by_symbol"`
 	ByStrategySymbol    []UISummaryPairRow     `json:"by_strategy_symbol"`
 	ByStrategyTimeframe []UISummaryPairRow     `json:"by_strategy_timeframe"`
+}
+
+func (ss *StatusServer) handleAPIInstance(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	label := os.Getenv("INSTANCE_LABEL")
+	writeJSON(w, map[string]string{"label": label})
 }
 
 func (ss *StatusServer) handleAPISummary(w http.ResponseWriter, r *http.Request) {

@@ -209,6 +209,7 @@ func (ss *StatusServer) Start(port int) {
 	mux.HandleFunc("/tuning/", ss.handleTuning)
 	mux.HandleFunc("/reports", ss.handleReports)
 	mux.HandleFunc("/api/summary", ss.handleAPISummary)
+	mux.HandleFunc("/api/instance", ss.handleAPIInstance)
 	mux.HandleFunc("/reports/", ss.handleReports)
 	mux.HandleFunc("/api/strategies", ss.handleAPIStrategies)
 	mux.HandleFunc("/api/strategies/overview", ss.handleAPIStrategiesOverview)
