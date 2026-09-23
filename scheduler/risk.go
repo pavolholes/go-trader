@@ -19,7 +19,9 @@ func markSchedulerStarted() {
 func collectPriceSymbols(strategies []StrategyConfig) []string {
 	set := make(map[string]bool)
 	for _, sc := range strategies {
-		if sc.Type != "spot" {
+		isSpot := sc.Type == "spot"
+		isBloFin := sc.Platform == "blofin" || sc.Platform == "blofin_spot"
+		if !isSpot && !isBloFin {
 			continue
 		}
 		if len(sc.Args) < 2 {

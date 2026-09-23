@@ -19,7 +19,7 @@ def main():
         for symbol in symbols:
             try:
                 ticker = exchange.fetch_ticker(symbol)
-                prices[symbol] = round(ticker["last"], 2)
+                prices[symbol] = float(ticker["last"]) if isinstance(ticker, dict) else ticker["last"]
             except Exception as e:
                 print(f"Failed to fetch {symbol}: {e}", file=sys.stderr)
 
@@ -38,7 +38,7 @@ def main():
                     except (ValueError, TypeError):
                         last = 0
                     if last > 0:
-                        prices[symbol] = round(last, 2)
+                        prices[symbol] = last
             except Exception as e2:
                 print(f"BloFin spot fallback failed: {e2}", file=sys.stderr)
 
