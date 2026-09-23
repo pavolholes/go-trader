@@ -323,17 +323,22 @@ class BloFinExchangeAdapter:
     _lot_size_cache: dict = {}
 
     def quantize_size(self, inst_id: str, size: float) -> str:
-        """Floor size to the instrument lotSize (copy API rejects bad precision)."""
+        """Floor size (in base coins) to contracts: size/contractValue,
+        floored to lotSize. Copy API counts size in contracts."""
         try:
-            lot = self._lot_size_cache.get(inst_id)
+            lot, cv = self._lot_size_cache.get(inst_id, (None, None))
             if lot is None:
                 data = self._public_get("/api/v1/market/instruments", {"instId": inst_id})
                 items = data.get("data", [])
                 lot = float(items[0].get("lotSize", "1") or "1") if items else 1.0
+                cv = float(items[0].get("contractValue", "1") or "1") if items else 1.0
                 if lot <= 0:
                     lot = 1.0
-                self._lot_size_cache[inst_id] = lot
-            steps = int(size / lot + 1e-9)
+                if cv <= 0:
+                    cv = 1.0
+                self._lot_size_cache[inst_id] = (lot, cv)
+            contracts = size / cv
+            steps = int(contracts / lot + 1e-9)
             if steps <= 0:
                 return ""
             q = steps * lot
