@@ -95,6 +95,15 @@ func runBloFinExecuteOrder(sc StrategyConfig, result *BloFinResult, price, cash,
 		return nil, false
 	}
 	size := ComputePerpsSize(sc, notional, price)
+	// Close signaly: burza musi dostat rovnaku velkost ako DB (posQty x closeFraction),
+	// inak sa partial close vykona ako full close a stav sa rozide.
+	if result.CloseFraction > 0 && posQty > 0 {
+		if result.CloseFraction < 1 {
+			size = posQty * result.CloseFraction
+		} else {
+			size = posQty
+		}
+	}
 	if size <= 0 {
 		logger.Info("BloFin: computed size <= 0, skipping order")
 		return nil, false
