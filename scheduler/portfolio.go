@@ -869,6 +869,15 @@ func ExecutePerpsSignalWithLeverage(s *StrategyState, signal int, symbol string,
 	})
 }
 
+// posMult vrati contract multiplier pozicie (BloFin kontrakty -> mince).
+// Pre platformy bez multiplieru (HL=1) sa nic nemeni; 0 znamena nenastavene -> 1.
+func posMult(pos *Position) float64 {
+	if pos == nil || pos.Multiplier <= 0 {
+		return 1
+	}
+	return pos.Multiplier
+}
+
 func ExecutePerpsSignalWithLeverageDeferredOpen(s *StrategyState, signal int, symbol string, price float64, sizing PerpsSizing, fillQty float64, fillOID string, fillFee float64, direction string, closeFraction float64, logger *StrategyLogger) (SignalExecutionResult, error) {
 	var result SignalExecutionResult
 	trades, err := executePerpsSignalWithLeverage(s, signal, symbol, price, sizing, fillQty, fillOID, fillFee, direction, closeFraction, logger, func(trade Trade) {
@@ -938,7 +947,7 @@ func executePerpsSignalWithLeverage(s *StrategyState, signal int, symbol string,
 			} else {
 				execPrice = ApplySlippage(price)
 			}
-			pnl := closeQty * (pos.AvgCost - execPrice)
+			pnl := closeQty * posMult(pos) * (pos.AvgCost - execPrice)
 			terminalClose := closeOnlyAction || !allowsLong
 			useFillFee := flipCloseQty > 0 || terminalClose
 			legFillFee := fillFee
@@ -1112,7 +1121,7 @@ func executePerpsSignalWithLeverage(s *StrategyState, signal int, symbol string,
 			} else {
 				execPrice = ApplySlippage(price)
 			}
-			pnl := closeQty * (execPrice - pos.AvgCost)
+			pnl := closeQty * posMult(pos) * (execPrice - pos.AvgCost)
 			terminalClose := closeOnlyAction || !allowsShort
 			useFillFee := flipCloseQty > 0 || terminalClose
 			legFillFee := fillFee
