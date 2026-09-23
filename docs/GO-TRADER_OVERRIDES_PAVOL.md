@@ -76,3 +76,8 @@ upstream merges. Base: v0.103.0 (`623566b`). This file is referenced from
 5. `gofmt -l`, `go build ./...`, `go vet`, `go test`, `py_compile` on Python touchpoints.
 6. Push → CI green → rebuild demo image → verify `/api/strategies/overview` + dashboard.
 7. Live (`go-trader-live`) rebuild only after demo proves stable.
+
+
+## 8. Learnings
+
+Prevádzkové poznatky: LEARNINGS_PAVOL.md (rovnaký adresár).
