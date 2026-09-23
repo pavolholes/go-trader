@@ -989,6 +989,24 @@ func writeCatTableChunks(bots []botInfo, totalValue, totalPnl, totalPnlPct float
 	return chunks
 }
 
+// fmtPrice formats a price adaptively: whole dollars for >= $1000,
+// 2 decimals for >= $1, up to 5 significant decimals below $1
+// (DOGE/XLM-style coins would otherwise render as $0).
+func fmtPrice(v float64) string {
+	if v >= 1000 {
+		return fmtComma(v)
+	}
+	if v >= 1 {
+		return fmtComma2(v)
+	}
+	s := fmt.Sprintf("%.5f", v)
+	s = strings.TrimRight(strings.TrimRight(s, "0"), ".")
+	if s == "" || s == "-" {
+		return "0"
+	}
+	return s
+}
+
 func fmtWinLossRatio(wins, losses int) string {
 	if wins == 0 && losses == 0 {
 		return "—"
@@ -1187,7 +1205,7 @@ func FormatTradeDM(sc StrategyConfig, trade Trade, mode string, rc *RegimeConfig
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("%s **%s - %s**\n", icon, header, strings.ToUpper(mode)))
 	sb.WriteString(fmt.Sprintf("Strategy: %s (%s %s)\n", sc.ID, platformLabel, typeLabel))
-	sb.WriteString(fmt.Sprintf("%s — %s %.3f @ $%s | Value: $%s", trade.Symbol, tradeDirectionLabel(trade), trade.Quantity, fmtComma(trade.Price), fmtComma(trade.Value)))
+	sb.WriteString(fmt.Sprintf("%s — %s %.3f @ $%s | Value: $%s", trade.Symbol, tradeDirectionLabel(trade), trade.Quantity, fmtPrice(trade.Price), fmtPrice(trade.Value)))
 	if oid := strings.TrimSpace(trade.ExchangeOrderID); oid != "" {
 		sb.WriteString(fmt.Sprintf(" | OID: %s", oid))
 	}
@@ -1227,18 +1245,18 @@ func tradeAlertExtras(sc StrategyConfig, trade Trade, isClose bool, rc *RegimeCo
 		tps = tieredTPATRPricesFromTiers(tiers, direction, trade.Price, trade.EntryATR)
 	}
 	if !isClose && trade.EntryATR > 0 {
-		extras = append(extras, fmt.Sprintf("ATR: $%s", fmtComma2(trade.EntryATR)))
+		extras = append(extras, fmt.Sprintf("ATR: $%s", fmtPrice(trade.EntryATR)))
 	}
 	if trade.StopLossTriggerPx > 0 {
 		slPct := percentFromEntry(direction, trade.Price, trade.StopLossTriggerPx)
 		if trade.StopLossATRMult != nil {
-			extras = append(extras, fmt.Sprintf("SL: $%s (%s) (%gx)", fmtComma2(trade.StopLossTriggerPx), fmtPnlPct(slPct), *trade.StopLossATRMult))
+			extras = append(extras, fmt.Sprintf("SL: $%s (%s) (%gx)", fmtPrice(trade.StopLossTriggerPx), fmtPnlPct(slPct), *trade.StopLossATRMult))
 		} else {
-			extras = append(extras, fmt.Sprintf("SL: $%s (%s)", fmtComma2(trade.StopLossTriggerPx), fmtPnlPct(slPct)))
+			extras = append(extras, fmt.Sprintf("SL: $%s (%s)", fmtPrice(trade.StopLossTriggerPx), fmtPnlPct(slPct)))
 		}
 	}
 	for i, tp := range tps {
-		extras = append(extras, fmt.Sprintf("TP%d: $%s (%gx)", i+1, fmtComma2(tp), tiers[i].Multiple))
+		extras = append(extras, fmt.Sprintf("TP%d: $%s (%gx)", i+1, fmtPrice(tp), tiers[i].Multiple))
 	}
 	if !isClose && len(tps) == 0 && trade.EntryATR > 0 && trade.Price > 0 &&
 		trade.TradeType != scaleInTradeType && !strategyUsesNonDefaultATRWindow(sc) {
@@ -1251,7 +1269,7 @@ func tradeAlertExtras(sc StrategyConfig, trade Trade, isClose bool, rc *RegimeCo
 			for i, tier := range ratchetTiers {
 				target := ratchetTargetPrice(direction, trade.Price, trade.EntryATR, tier.ATRMultiple)
 				pct := percentFromEntry(direction, trade.Price, target)
-				extras = append(extras, fmt.Sprintf("RT%d: $%s (%s) (%gx -> %gx trail)", i+1, fmtComma2(target), fmtPnlPct(pct), tier.ATRMultiple, tier.TrailingMultAfter))
+				extras = append(extras, fmt.Sprintf("RT%d: $%s (%s) (%gx -> %gx trail)", i+1, fmtPrice(target), fmtPnlPct(pct), tier.ATRMultiple, tier.TrailingMultAfter))
 			}
 		}
 	}
