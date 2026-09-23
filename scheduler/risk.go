@@ -1235,7 +1235,7 @@ func perpsMarginDrawdownInputs(s *StrategyState, configLeverage float64, prices 
 		if price <= 0 {
 			continue
 		}
-		notional := pos.Quantity * price
+		notional := pos.Quantity * posMult(pos) * price
 		if notional <= 0 {
 			continue
 		}
