@@ -48,6 +48,8 @@ func CalculatePlatformSpotFee(platform string, value float64) float64 {
 		return CalculateHyperliquidFee(value)
 	case "blofin":
 		return CalculateBloFinFee(value)
+	case "blofin_spot":
+		return CalculateBloFinFee(value)
 	case "luno":
 		return value * LunoTakerFeePct
 	case "robinhood":
