@@ -151,6 +151,9 @@ func executeBloFinResult(sc StrategyConfig, s *StrategyState, db *StateDB, resul
 	stampEntryATRIfOpened(s, result.Symbol, result.Indicators)
 	stampPositionRegimeIfOpened(s, result.Symbol, regimePayloadValue(result.Regime), sc, regime)
 	if pos, ok := s.Positions[sym]; ok {
+		if sc.Platform == "blofin" && execResult != nil && execResult.Execution != nil && execResult.Execution.Fill != nil && execResult.Execution.Fill.ContractValue > 0 {
+			pos.Multiplier = execResult.Execution.Fill.ContractValue
+		}
 		recordPositionOpen(s, sc, exec.OpenTrade, pos)
 	}
 

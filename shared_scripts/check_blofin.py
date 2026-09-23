@@ -300,11 +300,21 @@ def run_execute(symbol, side, size, mode):
                     if got:
                         fill = got
                         copy_filled = True
+            try:
+                fill_cv = float(result.get("contract_value", 0) or 0)
+            except Exception:
+                fill_cv = 0
             if not copy_filled:
                 fill = {
                     "avg_px": float(data.get("fillPx", 0) or 0) or float(data.get("avgPx", 0) or 0),
                     "total_sz": float(data.get("fillSz", 0) or 0) or float(data.get("accFillSz", 0) or 0) or size,
+                    "contract_value": fill_cv,
                 }
+            elif fill_cv > 0:
+                try:
+                    fill["contract_value"] = fill_cv
+                except Exception:
+                    pass
                 oid = data.get("ordId") or result.get("ordId", "")
                 if oid:
                     fill["oid"] = str(oid)

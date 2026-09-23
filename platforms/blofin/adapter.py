@@ -415,6 +415,7 @@ class BloFinExchangeAdapter:
             pos_side = cur if cur in ("long", "short") else ("long" if is_buy else "short")
         inst_id = f"{symbol}-USDT"
         qsize = self.quantize_size(inst_id, float(size))
+        cv = (self._lot_size_cache.get(inst_id, (None, None))[1] if isinstance(self._lot_size_cache.get(inst_id), tuple) else None) or 1.0
         if not qsize:
             raise RuntimeError(f"size {size} below lotSize for {inst_id}")
         result = self.place_order(
@@ -425,6 +426,11 @@ class BloFinExchangeAdapter:
             size=qsize,
             pos_side=pos_side,
         )
+        try:
+            if isinstance(result, dict):
+                result["contract_value"] = cv
+        except Exception:
+            pass
         return result
 
     def market_close(self, symbol: str, sz: Optional[float] = None) -> dict:

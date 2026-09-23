@@ -1355,10 +1355,11 @@ type BloFinResult struct {
 
 // BloFinFill holds fill details from a live BloFin order.
 type BloFinFill struct {
-	AvgPx   float64 `json:"avg_px"`
-	TotalSz float64 `json:"total_sz"`
-	OID     string  `json:"oid,omitempty"`
-	Fee     float64 `json:"fee,omitempty"`
+	AvgPx         float64 `json:"avg_px"`
+	TotalSz       float64 `json:"total_sz"`
+	OID           string  `json:"oid,omitempty"`
+	Fee           float64 `json:"fee,omitempty"`
+	ContractValue float64 `json:"contract_value,omitempty"`
 }
 
 // BloFinExecution is the execution block from check_blofin.py --execute output.
