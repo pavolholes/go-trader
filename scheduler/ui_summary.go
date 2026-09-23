@@ -2,8 +2,8 @@ package main
 
 import (
 	"math"
-	"os"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 	"time"
