@@ -73,6 +73,7 @@ var agentInfoEnvVars = []agentEnvVar{
 	{Name: "BLOFIN_API_KEY", Purpose: "BloFin API key for live BloFin perps.", Secret: true},
 	{Name: "BLOFIN_API_SECRET", Purpose: "BloFin API secret for live BloFin perps.", Secret: true},
 	{Name: "BLOFIN_PASSPHRASE", Purpose: "BloFin API passphrase for live BloFin perps.", Secret: true},
+	{Name: "INSTANCE_LABEL", Purpose: "Instance label shown in tab title and header badge (Demo/Live).", Secret: false},
 	{Name: "ROBINHOOD_PASSWORD", Purpose: "Robinhood password for live options.", Secret: true},
 	{Name: "ROBINHOOD_TOTP_SECRET", Purpose: "Robinhood TOTP secret for live options 2FA.", Secret: true},
 	{Name: "ROBINHOOD_USERNAME", Purpose: "Robinhood username for live options.", Secret: false},
