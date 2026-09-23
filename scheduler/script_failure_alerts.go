@@ -77,7 +77,7 @@ var scriptFailureTracker = &ScriptFailureTracker{}
 var scriptFailureTransientTracker = &ScriptFailureTracker{}
 
 func formatScriptFailureAlert(sc StrategyConfig, mode scriptFailureMode, errMsg string, count int) string {
-	return fmt.Sprintf("**SIGNAL SCRIPT FAILING** [%s] %s %s (pid=%d, %s, %d consecutive failures): %s",
+	return fmt.Sprintf("\u26a0\ufe0f **SIGNAL SCRIPT FAILING** [%s] %s %s (pid=%d, %s, %d consecutive failures): %s",
 		sc.ID, sc.Platform, sc.Script, os.Getpid(), scriptFailureModeLabel(mode), count, errMsg)
 }
 
@@ -87,7 +87,7 @@ func formatScriptRecoveredAlert(sc StrategyConfig, priorCount int) string {
 }
 
 func formatScriptFailureTransientAlert(sc StrategyConfig, mode scriptFailureMode, errMsg string, count int) string {
-	return fmt.Sprintf("**SIGNAL SCRIPT FAILING (sustained upstream error)** [%s] %s %s (pid=%d, %s, %d consecutive transient failures): %s",
+	return fmt.Sprintf("\u26a0\ufe0f **SIGNAL SCRIPT FAILING (sustained upstream error)** [%s] %s %s (pid=%d, %s, %d consecutive transient failures): %s",
 		sc.ID, sc.Platform, sc.Script, os.Getpid(), scriptFailureModeLabel(mode), count, errMsg)
 }
 
