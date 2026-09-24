@@ -2725,6 +2725,23 @@
         badge.textContent = label;
         badge.hidden = false;
       }
+      try {
+        var color = /live/i.test(label) ? "#c23b3b" : "#2563eb";
+        var letter = label.trim().charAt(0).toUpperCase() || "G";
+        var svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">'
+          + '<rect width="32" height="32" rx="6" fill="#1a1a2e"/>'
+          + '<rect x="4" y="4" width="24" height="24" rx="4" fill="' + color + '"/>'
+          + '<text x="16" y="22" font-family="sans-serif" font-size="16" font-weight="bold"'
+          + ' text-anchor="middle" fill="#fff">' + letter + "</text></svg>";
+        var link = document.querySelector('link[rel="icon"]');
+        if (!link) {
+          link = document.createElement("link");
+          link.rel = "icon";
+          document.head.appendChild(link);
+        }
+        link.type = "image/svg+xml";
+        link.href = "data:image/svg+xml," + encodeURIComponent(svg);
+      } catch (_e2) {}
     } catch (_err) {}
   }
   async function boot() {
