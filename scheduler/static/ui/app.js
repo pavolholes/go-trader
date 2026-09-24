@@ -1208,53 +1208,11 @@
   }
 
   function filteredStrategies() {
-    const query = els.search.value.trim().toLowerCase();
-    return state.strategies.filter(function (s) {
-      const haystack = [s.id, s.platform, s.symbol, s.timeframe, s.strategy].join(" ").toLowerCase();
-      return haystack.includes(query);
-    });
+    return state.strategies;
   }
 
   function renderStrategies() {
-    const filtered = filteredStrategies();
-    els.count.textContent = filtered.length + " strategies";
-    els.list.innerHTML = "";
-    const groups = groupStrategies(filtered);
-    Object.keys(groups).sort().forEach(function (platform) {
-      const heading = document.createElement("div");
-      heading.className = "platform-heading";
-      heading.textContent = platform;
-      els.list.appendChild(heading);
-      groups[platform].forEach(function (strategy) {
-        const button = document.createElement("button");
-        button.className = "strategy-button" + (strategy.id === state.activeID ? " active" : "");
-        button.type = "button";
-        button.dataset.id = strategy.id;
-        button.innerHTML =
-          '<span class="strategy-id"></span>' +
-          '<canvas class="strategy-sparkline" width="48" height="28" aria-hidden="true"></canvas>' +
-          '<span class="strategy-symbol"></span>' +
-          '<span class="strategy-meta"></span>';
-        button.querySelector(".strategy-id").textContent = (strategy.paused ? "⏸ " : "") + strategy.id;
-        if (strategy.paused) {
-          button.title = "Paused — position-increasing signals held";
-        }
-        button.querySelector(".strategy-symbol").textContent = strategy.symbol || "-";
-        button.querySelector(".strategy-meta").textContent =
-          [strategy.type, strategy.timeframe, strategy.direction].filter(Boolean).join(" / ");
-        button.addEventListener("click", function () {
-          selectStrategy(strategy.id).catch(handleRefreshError);
-        });
-        els.list.appendChild(button);
-        const cached = state.sparklines[strategy.id];
-        if (cached) {
-          drawSparkline(button.querySelector(".strategy-sparkline"), cached);
-        }
-      });
-    });
-    loadSparklines(filtered.map(function (s) {
-      return s.id;
-    }));
+    return;
   }
 
   function drawSparkline(canvas, points) {
@@ -1296,6 +1254,7 @@
   }
 
   async function loadSparklines(ids) {
+    return; // sidebar removed, nic sa nekresli ani nefetchuje
     const unique = Array.from(new Set(ids));
     await Promise.all(unique.map(async function (id) {
       try {
@@ -2879,7 +2838,6 @@
       }
     });
   }
-  els.search.addEventListener("input", renderStrategies);
   els.darkToggle.addEventListener("click", function () {
     setDarkMode(!isDarkMode());
   });

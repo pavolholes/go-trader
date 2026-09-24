@@ -81,3 +81,8 @@ upstream merges. Base: v0.103.0 (`623566b`). This file is referenced from
 ## 8. Learnings
 
 Prevádzkové poznatky: LEARNINGS_PAVOL.md (rovnaký adresár).
+
+
+## 9. Sidebar odstraneny
+
+Lavy stlpec (zoznam strategii + search + sparklines) je odstraneny z Table aj Summary view: index.html (aside, toggle, backdrop), app.js (renderStrategies/loadSparklines no-op, ziadny search listener), styles.css (.shell na 1 stlpec). Dovod: nepouzivane + 1300+ sparkline requestov brzdilo nacitanie. Pri upstream mergi neobnovovat.
