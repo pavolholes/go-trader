@@ -185,6 +185,10 @@ func (ss *StatusServer) handleDashboard(w http.ResponseWriter, r *http.Request) 
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
+	// Domaci lab za CloudFlare: ziadne cachovanie UI assetov, inak po deployi
+	// chodia stare app.js/index.html z edge cache.
+	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+	w.Header().Set("Pragma", "no-cache")
 	sub, err := fs.Sub(uiAssets, "static/ui")
 	if err != nil {
 		http.Error(w, "ui assets unavailable", http.StatusInternalServerError)
