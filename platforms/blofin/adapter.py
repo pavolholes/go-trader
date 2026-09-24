@@ -322,8 +322,8 @@ class BloFinExchangeAdapter:
 
     _lot_size_cache: dict = {}
 
-    def quantize_size(self, inst_id: str, size: float) -> str:
-        """Floor size (in base coins) to contracts: size/contractValue,
+    def quantize_size(self, inst_id: str, size: float, size_in_contracts: bool = False) -> str:
+        """Floor size to contracts: size/contractValue unless already contracts,
         floored to lotSize. Copy API counts size in contracts."""
         try:
             lot, cv = self._lot_size_cache.get(inst_id, (None, None))
@@ -414,7 +414,7 @@ class BloFinExchangeAdapter:
                 cur = ""
             pos_side = cur if cur in ("long", "short") else ("long" if is_buy else "short")
         inst_id = f"{symbol}-USDT"
-        qsize = self.quantize_size(inst_id, float(size))
+        qsize = self.quantize_size(inst_id, float(size), size_in_contracts)
         cv = (self._lot_size_cache.get(inst_id, (None, None))[1] if isinstance(self._lot_size_cache.get(inst_id), tuple) else None) or 1.0
         if not qsize:
             raise RuntimeError(f"size {size} below lotSize for {inst_id}")
