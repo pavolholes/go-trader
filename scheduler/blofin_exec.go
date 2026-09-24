@@ -75,8 +75,9 @@ func runBloFinCheck(sc StrategyConfig, prices map[string]float64, posCtx Positio
 // runBloFinExecuteOrder places a live BloFin order (Phase 3, no lock).
 func runBloFinExecuteOrder(sc StrategyConfig, result *BloFinResult, price, cash, posQty float64, posSide string, avgCost float64, notifier *MultiNotifier, logger *StrategyLogger) (*BloFinExecuteResult, bool) {
 	signal := result.Signal
+	isClose := result.CloseFraction > 0 && posQty > 0
 	side := "buy"
-	if result.CloseFraction > 0 && posQty > 0 {
+	if isClose {
 		// Close: opposite of position side
 		if posSide == "long" {
 			side = "sell"
@@ -89,7 +90,7 @@ func runBloFinExecuteOrder(sc StrategyConfig, result *BloFinResult, price, cash,
 		side = "sell"
 	}
 	effectiveDir := EffectiveDirection(sc)
-	if effectiveDir == DirectionLong && signal < 0 {
+	if effectiveDir == DirectionLong && signal < 0 && !isClose {
 		logger.Info("BloFin: direction=long, skipping sell signal")
 		return nil, true
 	}
