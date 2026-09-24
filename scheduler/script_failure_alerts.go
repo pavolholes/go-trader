@@ -160,6 +160,17 @@ func notifyScriptFailure(notifier *MultiNotifier, sc StrategyConfig, mode script
 	notifier.SendOwnerDM(msg)
 }
 
+// notifyLiveExecuteFailure posiela alert OKAMZITE (bez prahu 3 opakovani).
+// Len pre live exekucie — kazde zlyhanie realneho obchodu musi byt vidiet hned.
+func notifyLiveExecuteFailure(notifier *MultiNotifier, sc StrategyConfig, errMsg string) {
+	if notifier == nil || !notifier.HasBackends() {
+		return
+	}
+	msg := formatScriptFailureAlert(sc, scriptFailureError, errMsg, 1)
+	notifier.SendToAllChannels(msg)
+	notifier.SendOwnerDM(msg)
+}
+
 func formatBatchSharedStateFailureAlert(sc StrategyConfig, errMsg string, memberIDs []string, count int) string {
 	members := "none"
 	if len(memberIDs) > 0 {

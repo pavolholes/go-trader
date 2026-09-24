@@ -128,12 +128,12 @@ func runBloFinExecuteOrder(sc StrategyConfig, result *BloFinResult, price, cash,
 	}
 	if err != nil {
 		logger.Error("BloFin execute failed: %v", err)
-		notifyScriptFailure(notifier, sc, scriptFailureError, fmt.Sprintf("live execute failed for %s: %v", sym, err))
+		notifyLiveExecuteFailure(notifier, sc, fmt.Sprintf("live execute failed for %s: %v", sym, err))
 		return nil, false
 	}
 	if execResult.Error != "" {
 		logger.Error("BloFin execute error: %s", execResult.Error)
-		notifyScriptFailure(notifier, sc, scriptFailureError, fmt.Sprintf("live execute error for %s: %s", sym, execResult.Error))
+		notifyLiveExecuteFailure(notifier, sc, fmt.Sprintf("live execute error for %s: %s", sym, execResult.Error))
 		return nil, false
 	}
 	return execResult, true
