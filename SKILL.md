@@ -122,6 +122,14 @@ Set in systemd overrides or exported environment variables before installation:
 | `TOPSTEP_API_KEY`, `TOPSTEP_API_SECRET`, `TOPSTEP_ACCOUNT_ID` | TopStep live |
 | `ROBINHOOD_USERNAME`, `ROBINHOOD_PASSWORD`, `ROBINHOOD_TOTP_SECRET` | Robinhood live |
 | `OKX_API_KEY`, `OKX_API_SECRET`, `OKX_PASSPHRASE`, `OKX_SANDBOX` | OKX live/demo |
+| `BLOFIN_API_KEY`, `BLOFIN_API_SECRET`, `BLOFIN_PASSPHRASE` | BloFin live (API Transaction key, IP-whitelisted) |
+| `BLOFIN_BASE_URL` | `https://openapi.blofin.com` live, `https://demo-trading-openapi.blofin.com` demo |
+| `BLOFIN_TRADE_ACCOUNT` | `copy` (copy-trading) or `standard` (normal perps) |
+| `BLOFIN_BROKER_ID` | Optional, usually empty (copy place-order sends `""`) |
+| `INSTANCE_LABEL` | `Demo` / `Live` — tab title + header badge + favicon letter |
+| `DISCORD_TRADES_CHANNEL_ID` | Trade alerts channel (default fallback) |
+| `DISCORD_DAILY_SUMMARY_CHANNEL_ID` | Nightly daily summary channel |
+| `DISCORD_CHANNEL_ID` | Legacy alias for trades channel |
 | `LUNO_API_KEY_ID`, `LUNO_API_KEY_SECRET` | Luno live |
 | `GO_TRADER_ALLOW_MISSING_STATE` | `1` only for a genuine first-run live deployment |
 | `GO_TRADER_CASHFLOW_JOURNAL_ALARM` | `0`/`off`/`false`/`no` forces the legacy trade-ledger drift basis for HL shared wallets (default on) |

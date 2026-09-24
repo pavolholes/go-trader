@@ -1,4 +1,38 @@
-# go-trader — Crypto Trading Bot
+# go-trader — Crypto Trading Bot (Pavol fork)
+
+> **Custom fork** of [richkuo/go-trader](https://github.com/richkuo/go-trader)
+> (many thanks upstream!). We try to stay in sync with upstream releases,
+> but this fork carries its own customizations listed below. See
+> [docs/GO-TRADER_OVERRIDES_PAVOL.md](docs/GO-TRADER_OVERRIDES_PAVOL.md)
+> for the full inventory that must be preserved across merges.
+
+## Pavol customizations
+
+- **BloFin perps** (`bl-`): live/paper trading via REST + copy-trading routing
+  (`BLOFIN_TRADE_ACCOUNT=copy`), incl. brokerId, lotSize/contractValue sizing.
+- **BloFin spot** (`bls-`): paper signal fleet on `/api/v1/spot/market/*`
+  with USDT-volume ranking (`shared_scripts/export_spot_top.py`).
+- **Dashboard**: Futures/Spot filter, Real./Unr. PnL split, DD % (equity),
+  colored Sharpe/WinRate, 5-min overview cache, no-store headers,
+  Demo/Live instance badge (`INSTANCE_LABEL`), removed sidebar.
+- **Discord**: env-driven channels (`DISCORD_TRADES_CHANNEL_ID`,
+  `DISCORD_DAILY_SUMMARY_CHANNEL_ID`), immediate live-execute alerts,
+  nightly daily summary, adaptive `fmtPrice` for sub-dollar coins.
+- **Risk/PnL**: contract multiplier in PnL + margin math, close sizing by
+  `posQty x closeFraction`, full-precision prices.
+
+## Pavol env (.env) extras
+
+```bash
+BLOFIN_API_KEY / BLOFIN_API_SECRET / BLOFIN_PASSPHRASE  # BloFin API Transaction key
+BLOFIN_BASE_URL=https://openapi.blofin.com              # live (demo-trading-... for demo)
+BLOFIN_TRADE_ACCOUNT=copy                               # copy | standard
+BLOFIN_BROKER_ID=                                       # optional, usually empty
+INSTANCE_LABEL=Demo                                     # Demo | Live (tab title + header badge)
+DISCORD_TRADES_CHANNEL_ID=                              # trade alerts
+DISCORD_DAILY_SUMMARY_CHANNEL_ID=                       # nightly summary
+```
+
 
 [![GitHub release](https://img.shields.io/github/v/release/richkuo/go-trader)](https://github.com/richkuo/go-trader/releases/latest)
 [![Discord](https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&logoColor=white)](https://discord.com/invite/44BykmWZsP)
