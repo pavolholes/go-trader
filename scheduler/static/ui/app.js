@@ -2253,6 +2253,8 @@
     updatePortfolioTotal(rows);
   }
 
+  var accountBalanceCache = null;
+  var accountBalanceAt = 0;
   function updatePortfolioTotal(rows) {
     var el = document.getElementById("portfolio-total");
     if (!el) return;
@@ -2265,7 +2267,29 @@
     var cls = total >= 0 ? "pnl-pos" : "pnl-neg";
     el.innerHTML = 'Total: <span class="' + cls + '">' + escapeHTML(fmtMoney(total)) + "</span>" +
       ' <span class="portfolio-sub">(R ' + escapeHTML(fmtSignedMoney(real)) +
-      " / U " + escapeHTML(fmtSignedMoney(unr)) + ")</span>";
+      " / U " + escapeHTML(fmtSignedMoney(unr)) + ")</span>" +
+      ' <span id="account-balance" class="portfolio-sub"></span>';
+    var now = Date.now();
+    if (accountBalanceCache !== null && now - accountBalanceAt < 60000) {
+      renderAccountBalance();
+      return;
+    }
+    getJSON("/api/account/balance").then(function (resp) {
+      if (resp && resp.total_equity) {
+        accountBalanceCache = resp;
+        accountBalanceAt = Date.now();
+      }
+      renderAccountBalance();
+    }).catch(function () {});
+  }
+  function renderAccountBalance() {
+    var el = document.getElementById("account-balance");
+    if (!el) return;
+    if (accountBalanceCache && accountBalanceCache.total_equity) {
+      el.textContent = " | \u00da\u010det: " + fmtMoney(accountBalanceCache.total_equity);
+    } else {
+      el.textContent = "";
+    }
   }
 
   async function refreshOverview() {

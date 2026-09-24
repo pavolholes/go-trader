@@ -6,6 +6,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -86,6 +87,37 @@ type UISummary struct {
 	BySymbol            []UISummarySymbolRow   `json:"by_symbol"`
 	ByStrategySymbol    []UISummaryPairRow     `json:"by_strategy_symbol"`
 	ByStrategyTimeframe []UISummaryPairRow     `json:"by_strategy_timeframe"`
+}
+
+var accountBalanceCacheMu sync.RWMutex
+var accountBalanceCache []byte
+var accountBalanceCacheAt time.Time
+
+func (ss *StatusServer) handleAPIAccountBalance(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	accountBalanceCacheMu.RLock()
+	cached := accountBalanceCache
+	cachedAt := accountBalanceCacheAt
+	accountBalanceCacheMu.RUnlock()
+	if cached != nil && time.Since(cachedAt) < 60*time.Second {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(cached)
+		return
+	}
+	stdout, _, err := RunPythonScript("shared_scripts/fetch_blofin_copy_balance.py", nil)
+	if err != nil {
+		writeJSON(w, map[string]string{"error": err.Error()})
+		return
+	}
+	accountBalanceCacheMu.Lock()
+	accountBalanceCache = stdout
+	accountBalanceCacheAt = time.Now()
+	accountBalanceCacheMu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(stdout)
 }
 
 func (ss *StatusServer) handleAPIInstance(w http.ResponseWriter, r *http.Request) {
