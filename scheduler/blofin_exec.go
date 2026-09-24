@@ -76,7 +76,16 @@ func runBloFinCheck(sc StrategyConfig, prices map[string]float64, posCtx Positio
 func runBloFinExecuteOrder(sc StrategyConfig, result *BloFinResult, price, cash, posQty float64, posSide string, avgCost float64, notifier *MultiNotifier, logger *StrategyLogger) (*BloFinExecuteResult, bool) {
 	signal := result.Signal
 	side := "buy"
-	if signal < 0 {
+	if result.CloseFraction > 0 && posQty > 0 {
+		// Close: opposite of position side
+		if posSide == "long" {
+			side = "sell"
+		} else if posSide == "short" {
+			side = "buy"
+		} else if signal < 0 {
+			side = "sell"
+		}
+	} else if signal < 0 {
 		side = "sell"
 	}
 	effectiveDir := EffectiveDirection(sc)

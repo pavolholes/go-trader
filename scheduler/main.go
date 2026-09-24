@@ -2254,7 +2254,7 @@ func main() {
 							}
 							var execResult *BloFinExecuteResult
 							liveExecFailed := false
-							if blofinIsLive(sc.Args) && result.Signal != 0 {
+							if blofinIsLive(sc.Args) && (result.Signal != 0 || result.CloseFraction > 0) {
 								if er, ok2 := runBloFinExecuteOrder(sc, result, price, blofinCash, blofinPosQty, blofinPosSide, blofinAvgCost, notifier, logger); ok2 {
 									execResult = er
 								} else {
