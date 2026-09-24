@@ -277,7 +277,7 @@ def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=
         sys.exit(1)
 
 
-def run_execute(symbol, side, size, mode):
+def run_execute(symbol, side, size, mode, size_in_contracts=False):
     """Place a live market order on BloFin."""
     if mode != "live":
         print(json.dumps({"error": "--execute requires --mode=live"}))
@@ -287,7 +287,7 @@ def run_execute(symbol, side, size, mode):
         from adapter import BloFinExchangeAdapter
         adapter = BloFinExchangeAdapter()
         is_buy = side.lower() == "buy"
-        result = adapter.market_open(symbol, is_buy, size, inst_type="swap", size_in_contracts=args.size_in_contracts)
+        result = adapter.market_open(symbol, is_buy, size, inst_type="swap", size_in_contracts=size_in_contracts)
 
         fill = {}
         copy_filled = False
@@ -355,7 +355,7 @@ def main():
         parser.add_argument("--size-in-contracts", action="store_true", default=False)
         parser.add_argument("--inst-type", default="swap", choices=["swap", "spot"])
         args = parser.parse_args()
-        run_execute(args.symbol, args.side, args.size, args.mode)
+        run_execute(args.symbol, args.side, args.size, args.mode, args.size_in_contracts)
     else:
         import argparse
         parser = argparse.ArgumentParser()
