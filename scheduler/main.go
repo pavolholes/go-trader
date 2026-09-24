@@ -3498,7 +3498,11 @@ func sendTradeAlertRows(sc StrategyConfig, newTrades []Trade, notifier tradeAler
 		mode = "live"
 	}
 
-	for _, route := range notifier.tradeAlertRoutes(sc.Platform, sc.Type, isLive, sc.PaperSource) {
+	routes := notifier.tradeAlertRoutes(sc.Platform, sc.Type, isLive, sc.PaperSource)
+	if len(newTrades) > 0 && len(routes) == 0 {
+		fmt.Printf("[WARN] trade alert dropped: no routes for %s %s live=%v (%d trades)\n", sc.Platform, sc.Type, isLive, len(newTrades))
+	}
+	for _, route := range routes {
 		for _, t := range newTrades {
 			var msg string
 			if route.plainText {
