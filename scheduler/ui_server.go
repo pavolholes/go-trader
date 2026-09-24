@@ -47,6 +47,8 @@ type UIStrategyOverview struct {
 	TradeCount            int                    `json:"trade_count"`
 	CloseStrategy         string                 `json:"close_strategy,omitempty"`
 	PnL                   float64                `json:"pnl"`
+	RealizedPnL           float64                `json:"realized_pnl,omitempty"`
+	UnrealizedPnL         float64                `json:"unrealized_pnl,omitempty"`
 	PortfolioValue        float64                `json:"portfolio_value"`
 	InitialCapital        float64                `json:"initial_capital"`
 	PoolBudget            bool                   `json:"pool_budget,omitempty"`
@@ -569,13 +571,37 @@ func (ss *StatusServer) uiStrategyOverviewWithPrices(id string, prices map[strin
 
 	lifetime := LifetimeTradeStats{}
 	sharpe := 0.0
+	var realizedPnL float64
 	if ss.stateDB != nil {
 		if stats, err := ss.stateDB.LifetimeTradeStatsForStrategy(id); err == nil {
 			lifetime = stats
 		}
 		if closed, _, err := ss.stateDB.QueryClosedPositions(id, "", time.Time{}, time.Time{}, sharpeLookbackLimit, 0); err == nil {
 			sharpe = ComputeSharpeRatio(closed, initCap, DefaultAnnualRiskFreeRate)
+			for _, c := range closed {
+				realizedPnL += c.RealizedPnL
+			}
 		}
+	}
+	// Unrealized = total - realized, minus odhad exit fee z otvorenych pozicii.
+	unrealizedPnL := pnl - realizedPnL
+	var openNotional float64
+	for sym, pos := range snapshot.Positions {
+		if pos == nil {
+			continue
+		}
+		px, ok := prices[sym]
+		if !ok || px <= 0 {
+			px = pos.AvgCost
+		}
+		mult := pos.Multiplier
+		if mult <= 0 {
+			mult = 1
+		}
+		openNotional += pos.Quantity * mult * px
+	}
+	if openNotional > 0 {
+		unrealizedPnL -= CalculatePlatformSpotFee(sc.Platform, openNotional)
 	}
 	winRate := 0.0
 	if lifetime.Wins+lifetime.Losses > 0 {
@@ -612,6 +638,8 @@ func (ss *StatusServer) uiStrategyOverviewWithPrices(id string, prices map[strin
 		TradeCount:            lifetime.Wins + lifetime.Losses,
 		CloseStrategy:         strategyDisplayCloseStrategy(sc),
 		PnL:                   pnl,
+		RealizedPnL:           realizedPnL,
+		UnrealizedPnL:         unrealizedPnL,
 		PortfolioValue:        pv,
 		InitialCapital:        initCap,
 		PoolBudget:            usesSharedWalletPoolBudget(sc),

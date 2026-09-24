@@ -83,16 +83,17 @@
               <button type="button" class="mode-filter-button active" data-mode="all" aria-pressed="true">All</button>
               <button type="button" class="mode-filter-button" data-mode="perps" aria-pressed="false">Futures</button>
               <button type="button" class="mode-filter-button" data-mode="spot" aria-pressed="false">Spot</button>
+              <span id="portfolio-total" class="portfolio-total" title="Sucet hodnot strategii podla filtra"></span>
             </div>
             <table class="overview-table">
               <thead>
                 <tr>
                   <th scope="col"><button type="button" class="sort-button" data-key="id">ID</button></th>
-                  <th scope="col"><button type="button" class="sort-button" data-key="platform">Platform</button></th>
                   <th scope="col"><button type="button" class="sort-button" data-key="symbol">Symbol</button></th>
-                  <th scope="col"><button type="button" class="sort-button" data-key="mode">Mode</button></th>
                   <th scope="col"><button type="button" class="sort-button" data-key="trade_count">Trades</button></th>
                   <th scope="col"><button type="button" class="sort-button" data-key="pnl">PnL</button></th>
+                  <th scope="col"><button type="button" class="sort-button" data-key="realized_pnl">Real.</button></th>
+                  <th scope="col"><button type="button" class="sort-button" data-key="unrealized_pnl">Unr.</button></th>
                   <th scope="col"><button type="button" class="sort-button" data-key="pnl_pct">PnL %</button></th>
                   <th scope="col"><button type="button" class="sort-button" data-key="win_rate">Win Rate</button></th>
                   <th scope="col"><button type="button" class="sort-button" data-key="sharpe">Sharpe</button></th>
@@ -103,9 +104,7 @@
                 </tr>
                 <tr class="overview-filter-row">
                   <td><input type="text" class="overview-filter-input" data-key="id" placeholder="Filter..."></td>
-                  <td><input type="text" class="overview-filter-input" data-key="platform" placeholder="Filter..."></td>
                   <td><input type="text" class="overview-filter-input" data-key="symbol" placeholder="Filter..."></td>
-                  <td><input type="text" class="overview-filter-input" data-key="mode" placeholder="Filter..."></td>
                   <td><input type="text" class="overview-filter-input" data-key="trade_count" placeholder="Filter..."></td>
                   <td><input type="text" class="overview-filter-input" data-key="pnl" placeholder="Filter..."></td>
                   <td><input type="text" class="overview-filter-input" data-key="pnl_pct" placeholder="Filter..."></td>

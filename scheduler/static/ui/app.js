@@ -2151,7 +2151,7 @@
 
 
   function sortValue(row, key) {
-    if (key === "pnl_pct" || key === "win_rate" || key === "sharpe" || key === "trade_count" || key === "pnl" || key === "drawdown_pct") {
+    if (key === "pnl_pct" || key === "win_rate" || key === "sharpe" || key === "trade_count" || key === "pnl" || key === "drawdown_pct" || key === "realized_pnl" || key === "unrealized_pnl") {
       const n = Number(row[key]);
       return Number.isFinite(n) ? n : -Infinity;
     }
@@ -2235,11 +2235,11 @@
       const ddClassName = !row.drawdown_pct ? "" : row.drawdown_pct > 10 ? "dd-bad" : row.drawdown_pct > 5 ? "dd-mid" : "dd-good";
       return '<tr class="overview-row' + (row.id === state.activeID ? " active" : "") + '" data-id="' + escapeHTML(row.id) + '">' +
         "<td>" + (row.paused ? '<span title="Paused">⏸</span> ' : "") + escapeHTML(row.id) + "</td>" +
-        "<td>" + escapeHTML(row.platform || "-") + "</td>" +
         "<td>" + escapeHTML(row.symbol || "-") + "</td>" +
-        "<td>" + escapeHTML(row.mode || "-") + "</td>" +
         "<td>" + escapeHTML(String(row.trade_count || 0)) + "</td>" +
         '<td class="' + pnlClassName + '">' + escapeHTML(row.pool_budget ? "—" : fmtNumber(row.pnl)) + "</td>" +
+        '<td class="' + (row.realized_pnl > 0 ? "pnl-pos" : row.realized_pnl < 0 ? "pnl-neg" : "") + '">' + escapeHTML(fmtNumber(row.realized_pnl || 0)) + "</td>" +
+        '<td class="' + (row.unrealized_pnl > 0 ? "pnl-pos" : row.unrealized_pnl < 0 ? "pnl-neg" : "") + '">' + escapeHTML(fmtNumber(row.unrealized_pnl || 0)) + "</td>" +
         '<td class="' + pnlClassName + '">' + escapeHTML(row.pool_budget ? "—" : fmtPct(row.pnl_pct)) + "</td>" +
         '<td class="' + winRateClass(row.win_rate) + '">' + escapeHTML(row.win_rate ? fmtPct(row.win_rate) : "-") + "</td>" +
         '<td class="' + sharpeClass(row.sharpe) + '">' + escapeHTML(row.sharpe ? fmtNumber(row.sharpe) : "-") + "</td>" +
@@ -2250,6 +2250,22 @@
         "</tr>";
     }).join("");
     updateSortButtons();
+    updatePortfolioTotal(rows);
+  }
+
+  function updatePortfolioTotal(rows) {
+    var el = document.getElementById("portfolio-total");
+    if (!el) return;
+    var total = 0, real = 0, unr = 0;
+    rows.forEach(function (row) {
+      total += row.portfolio_value || 0;
+      real += row.realized_pnl || 0;
+      unr += row.unrealized_pnl || 0;
+    });
+    var cls = total >= 0 ? "pnl-pos" : "pnl-neg";
+    el.innerHTML = 'Total: <span class="' + cls + '">' + escapeHTML(fmtMoney(total)) + "</span>" +
+      ' <span class="portfolio-sub">(R ' + escapeHTML(fmtSignedMoney(real)) +
+      " / U " + escapeHTML(fmtSignedMoney(unr)) + ")</span>";
   }
 
   async function refreshOverview() {
