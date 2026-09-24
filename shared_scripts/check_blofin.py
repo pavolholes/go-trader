@@ -287,7 +287,7 @@ def run_execute(symbol, side, size, mode):
         from adapter import BloFinExchangeAdapter
         adapter = BloFinExchangeAdapter()
         is_buy = side.lower() == "buy"
-        result = adapter.market_open(symbol, is_buy, size, inst_type="swap")
+        result = adapter.market_open(symbol, is_buy, size, inst_type="swap", size_in_contracts=args.size_in_contracts)
 
         fill = {}
         copy_filled = False
@@ -352,6 +352,7 @@ def main():
         parser.add_argument("--side", required=True, choices=["buy", "sell"])
         parser.add_argument("--size", type=float, required=True)
         parser.add_argument("--mode", default="live")
+        parser.add_argument("--size-in-contracts", action="store_true", default=False)
         parser.add_argument("--inst-type", default="swap", choices=["swap", "spot"])
         args = parser.parse_args()
         run_execute(args.symbol, args.side, args.size, args.mode)

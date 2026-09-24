@@ -92,11 +92,11 @@ func runBloFinExecuteOrder(sc StrategyConfig, result *BloFinResult, price, cash,
 	effectiveDir := EffectiveDirection(sc)
 	if effectiveDir == DirectionLong && signal < 0 && !isClose {
 		logger.Info("BloFin: direction=long, skipping sell signal")
-		return nil, true
+		return nil, false
 	}
 	if effectiveDir == DirectionShort && signal > 0 {
 		logger.Info("BloFin: direction=short, skipping buy signal")
-		return nil, true
+		return nil, false
 	}
 	sym := result.Symbol
 	notional := ComputePerpsOpenNotional(sc, cash)
@@ -122,7 +122,7 @@ func runBloFinExecuteOrder(sc StrategyConfig, result *BloFinResult, price, cash,
 		logger.Info("BloFin: SL price=%.2f for %s", result.StopLossPrice, sym)
 	}
 	logger.Info("BloFin: placing %s order %s sz=%.6f (notional=%.2f)", side, sym, size, notional)
-	execResult, stderr, err := RunBloFinExecute(sc.Script, sym, side, size, result.StopLossPrice)
+	execResult, stderr, err := RunBloFinExecute(sc.Script, sym, side, size, result.StopLossPrice, isClose)
 	if stderr != "" {
 		logger.Warn("BloFin execute stderr: %s", stderr)
 	}

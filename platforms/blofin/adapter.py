@@ -337,7 +337,7 @@ class BloFinExchangeAdapter:
                 if cv <= 0:
                     cv = 1.0
                 self._lot_size_cache[inst_id] = (lot, cv)
-            contracts = size / cv
+            contracts = size if size_in_contracts else size / cv
             steps = int(contracts / lot + 1e-9)
             if steps <= 0:
                 return ""
@@ -396,7 +396,7 @@ class BloFinExchangeAdapter:
             body["clientOrderId"] = client_oid
         return self._private_post("/api/v1/trade/close-position", body)
 
-    def market_open(self, symbol: str, is_buy: bool, size: float, inst_type: str = "swap") -> dict:
+    def market_open(self, symbol: str, is_buy: bool, size: float, inst_type: str = "swap", size_in_contracts: bool = False) -> dict:
         if not self._is_live:
             raise RuntimeError(
                 "market_open requires live mode (set BLOFIN_API_KEY, BLOFIN_API_SECRET, BLOFIN_PASSPHRASE)"
