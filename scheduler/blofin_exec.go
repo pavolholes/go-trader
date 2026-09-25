@@ -128,7 +128,7 @@ func runBloFinExecuteOrder(sc StrategyConfig, result *BloFinResult, price, cash,
 		logger.Info("BloFin: SL price=%.2f for %s", result.StopLossPrice, sym)
 	}
 	logger.Info("BloFin: placing %s order %s sz=%.6f price=%.6f (notional=%.2f)", side, sym, size, price, notional)
-	execResult, stderr, err := RunBloFinExecute(sc.Script, sym, side, size, result.StopLossPrice, isClose)
+	execResult, stderr, err := RunBloFinExecute(sc.Script, sym, side, size, result.StopLossPrice, isClose, posSide)
 	if stderr != "" {
 		logger.Warn("BloFin execute stderr: %s", stderr)
 	}

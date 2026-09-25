@@ -396,7 +396,7 @@ class BloFinExchangeAdapter:
             body["clientOrderId"] = client_oid
         return self._private_post("/api/v1/trade/close-position", body)
 
-    def market_open(self, symbol: str, is_buy: bool, size: float, inst_type: str = "swap", size_in_contracts: bool = False) -> dict:
+    def market_open(self, symbol: str, is_buy: bool, size: float, inst_type: str = "swap", size_in_contracts: bool = False, pos_side_hint: str = "") -> dict:
         if not self._is_live:
             raise RuntimeError(
                 "market_open requires live mode (set BLOFIN_API_KEY, BLOFIN_API_SECRET, BLOFIN_PASSPHRASE)"
@@ -404,15 +404,25 @@ class BloFinExchangeAdapter:
         side = "buy" if is_buy else "sell"
         pos_side = "net"
         if self.trade_account == "copy":
-            cur = ""
-            try:
-                for q in self.get_copy_positions(f"{symbol}-USDT"):
-                    if float(q.get("positions", 0) or 0) > 0:
-                        cur = str(q.get("positionSide", "") or "").lower()
-                        break
-            except Exception:
+            hint = (pos_side_hint or "").strip().lower()
+            if hint in ("long", "short"):
+                # DB vie stranu pozicie - burza sa moze mylit (prazdny vysledok)
+                pos_side = hint
+            else:
                 cur = ""
-            pos_side = cur if cur in ("long", "short") else ("long" if is_buy else "short")
+                try:
+                    for q in self.get_copy_positions(f"{symbol}-USDT"):
+                        if float(q.get("positions", 0) or 0) > 0:
+                            cur = str(q.get("positionSide", "") or "").lower()
+                            break
+                except Exception:
+                    cur = ""
+                if cur in ("long", "short"):
+                    pos_side = cur
+                elif hint:
+                    pos_side = hint
+                else:
+                    raise RuntimeError(f"cannot determine position side for {symbol} (no hint, no exchange position) - refusing to open opposite side")
         inst_id = f"{symbol}-USDT"
         qsize = self.quantize_size(inst_id, float(size), size_in_contracts)
         cv = (self._lot_size_cache.get(inst_id, (None, None))[1] if isinstance(self._lot_size_cache.get(inst_id), tuple) else None) or 1.0
