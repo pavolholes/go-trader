@@ -354,6 +354,7 @@ def main():
         parser.add_argument("--mode", default="live")
         parser.add_argument("--size-in-contracts", action="store_true", default=False)
         parser.add_argument("--inst-type", default="swap", choices=["swap", "spot"])
+        parser.add_argument("--sl-price", type=float, default=0.0)
         args = parser.parse_args()
         run_execute(args.symbol, args.side, args.size, args.mode, args.size_in_contracts)
     else:
