@@ -287,7 +287,7 @@ def run_execute(symbol, side, size, mode, size_in_contracts=False, pos_side_hint
         from adapter import BloFinExchangeAdapter
         adapter = BloFinExchangeAdapter()
         is_buy = side.lower() == "buy"
-        result = adapter.market_open(symbol, is_buy, size, inst_type="swap", size_in_contracts=size_in_contracts, pos_side_hint=pos_side_hint, is_close=args.is_close)
+        result = adapter.market_open(symbol, is_buy, size, inst_type="swap", size_in_contracts=size_in_contracts, pos_side_hint=pos_side_hint, is_close=is_close)
 
         fill = {}
         copy_filled = False
