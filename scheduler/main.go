@@ -2263,7 +2263,7 @@ func main() {
 							}
 							if !liveExecFailed {
 								mu.Lock()
-								trades, detail = executeBloFinResult(sc, stratState, stratDB, result, execResult, signalStr, price, cfg.Regime, logger)
+								trades, detail = executeBloFinResult(sc, stratState, stratDB, result, execResult, signalStr, price, cfg.Regime, logger, notifier)
 								mu.Unlock()
 							}
 						}
