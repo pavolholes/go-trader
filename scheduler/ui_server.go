@@ -582,9 +582,9 @@ func (ss *StatusServer) uiStrategyOverviewWithPrices(id string, prices map[strin
 		}
 		if closed, _, err := ss.stateDB.QueryClosedPositions(id, "", time.Time{}, time.Time{}, sharpeLookbackLimit, 0); err == nil {
 			sharpe = ComputeSharpeRatio(closed, initCap, DefaultAnnualRiskFreeRate)
-			for _, c := range closed {
-				realizedPnL += c.RealizedPnL
-			}
+		}
+		if rpnl, err := ss.stateDB.RealizedPnLForStrategy(id); err == nil {
+			realizedPnL = rpnl
 		}
 	}
 	// Unrealized = total - realized, minus odhad exit fee z otvorenych pozicii.

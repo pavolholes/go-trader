@@ -2719,6 +2719,27 @@ func (sdb *StateDB) LifetimeTradeStatsAll() (map[string]LifetimeTradeStats, erro
 	return out, nil
 }
 
+// RealizedPnLForStrategy vrati sucet realized_pnl zo vsetkych close legov
+// (trades WHERE is_close=1) — vratane partial close. closed_positions obsahuju
+// len full closy, takze pre partial by chybali.
+func (sdb *StateDB) RealizedPnLForStrategy(strategyID string) (float64, error) {
+	if sdb == nil || sdb.db == nil {
+		return 0, fmt.Errorf("state db unavailable")
+	}
+	if strategyID == "" {
+		return 0, fmt.Errorf("strategy id required")
+	}
+	sid, err := sdb.toStorageID(strategyID)
+	if err != nil {
+		return 0, err
+	}
+	var out sql.NullFloat64
+	if err := sdb.db.QueryRow(`SELECT COALESCE(SUM(realized_pnl),0) FROM trades WHERE strategy_id = ? AND is_close = 1`, sid).Scan(&out); err != nil {
+		return 0, fmt.Errorf("query realized pnl for %s: %w", strategyID, err)
+	}
+	return out.Float64, nil
+}
+
 func (sdb *StateDB) LifetimeTradeStatsForStrategy(strategyID string) (LifetimeTradeStats, error) {
 	if sdb == nil || sdb.db == nil {
 		return LifetimeTradeStats{}, fmt.Errorf("state db unavailable")
