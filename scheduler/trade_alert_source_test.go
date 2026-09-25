@@ -67,7 +67,7 @@ func TestFormatTradeDMSourceLine(t *testing.T) {
 				Details:         "Stop loss close, PnL: $-100.05 (fee $0.05)",
 				ExchangeOrderID: "42",
 			},
-			wantContains: []string{"TRADE CLOSED - LIVE", "OID: 42", "Source: exchange SL"},
+			wantContains: []string{"TRADE STOPPED - LIVE", "OID: 42", "Source: exchange SL"},
 		},
 		{
 			name: "open trade omits source",

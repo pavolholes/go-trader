@@ -1186,14 +1186,34 @@ func isTradeCloseDetails(details string) bool {
 	return strings.Contains(strings.ToLower(details), "close")
 }
 
+func tradeCloseKind(details string) string {
+	lower := strings.ToLower(details)
+	if strings.Contains(lower, "partial-close") || strings.Contains(lower, "partial close") {
+		return "partial"
+	}
+	if strings.Contains(lower, "sl close") || strings.Contains(lower, "stop loss") || strings.Contains(lower, "stop-loss") || strings.Contains(lower, "trailing sl") {
+		return "stop"
+	}
+	return "full"
+}
+
 func FormatTradeDM(sc StrategyConfig, trade Trade, mode string, rc *RegimeConfig) string {
 	isClose := isTradeCloseDetails(trade.Details)
 
 	icon := "🟢"
 	header := "TRADE EXECUTED"
 	if isClose {
-		icon = "🔴"
-		header = "TRADE CLOSED"
+		switch tradeCloseKind(trade.Details) {
+		case "partial":
+			icon = "🟡"
+			header = "TRADE PARTIAL"
+		case "stop":
+			icon = "🟠"
+			header = "TRADE STOPPED"
+		default:
+			icon = "🔴"
+			header = "TRADE CLOSED"
+		}
 	}
 
 	platformLabel := sc.Platform
