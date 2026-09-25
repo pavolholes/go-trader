@@ -588,7 +588,13 @@ func (ss *StatusServer) uiStrategyOverviewWithPrices(id string, prices map[strin
 		}
 	}
 	// Unrealized = total - realized, minus odhad exit fee z otvorenych pozicii.
+	// Flat strategia (ziadne pozicie) nema unrealized - vsetko je realizovane
+	// (vratane fee za otvorenie a nezaoctovanych closev).
 	unrealizedPnL := pnl - realizedPnL
+	if len(snapshot.Positions) == 0 && len(snapshot.OptionPositions) == 0 {
+		realizedPnL = pnl
+		unrealizedPnL = 0
+	}
 	var openNotional float64
 	for sym, pos := range snapshot.Positions {
 		if pos == nil {
