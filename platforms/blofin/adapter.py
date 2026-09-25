@@ -396,7 +396,7 @@ class BloFinExchangeAdapter:
             body["clientOrderId"] = client_oid
         return self._private_post("/api/v1/trade/close-position", body)
 
-    def market_open(self, symbol: str, is_buy: bool, size: float, inst_type: str = "swap", size_in_contracts: bool = False, pos_side_hint: str = "") -> dict:
+    def market_open(self, symbol: str, is_buy: bool, size: float, inst_type: str = "swap", size_in_contracts: bool = False, pos_side_hint: str = "", is_close: bool = False) -> dict:
         if not self._is_live:
             raise RuntimeError(
                 "market_open requires live mode (set BLOFIN_API_KEY, BLOFIN_API_SECRET, BLOFIN_PASSPHRASE)"
@@ -414,15 +414,21 @@ class BloFinExchangeAdapter:
                         break
             except Exception:
                 exch = ""
-            if hint in ("long", "short"):
+            if is_close and hint in ("long", "short"):
                 # Close: burza musi mat rovnaku stranu, inak je DB zastarana.
                 # Otocenie strany (open opposite) je zakazane - fail-closed.
-                is_close = (hint == "long" and not is_buy) or (hint == "short" and is_buy)
-                if is_close and exch != "" and exch != hint:
+                want_close = (hint == "long" and not is_buy) or (hint == "short" and is_buy)
+                if want_close and exch != "" and exch != hint:
                     raise RuntimeError(f"DB says {hint} but exchange has {exch} for {symbol} - refusing (stale DB?)")
-                if is_close and exch == "":
+                if want_close and exch == "":
                     raise RuntimeError(f"DB says {hint} but exchange has no position for {symbol} - refusing (already closed?)")
                 pos_side = hint
+            elif is_close:
+                # Close bez hintu: pouzi burzovu stranu, inak fail.
+                if exch in ("long", "short"):
+                    pos_side = exch
+                else:
+                    raise RuntimeError(f"SKIP: cannot determine position side for {symbol} (no hint, no exchange position) - refusing to open opposite side")
             else:
                 if exch in ("long", "short"):
                     pos_side = exch
