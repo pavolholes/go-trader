@@ -913,6 +913,38 @@ func EffectiveInitialCapital(sc StrategyConfig, ss *StrategyState) float64 {
 	return sc.Capital
 }
 
+// blofinMaxLeverage je max paka z /api/v1/market/instruments (2026-09-25).
+// Pri starte sa leverage nad limit automaticky znizi (autofix) + WARN.
+var blofinMaxLeverage = map[string]float64{
+	"AAPL": 20, "AAVE": 100, "ADA": 75, "AVAX": 100, "BEAT": 10,
+	"BNB": 75, "BTC": 150, "DOGE": 75, "ETH": 150, "GOOGL": 20,
+	"HYPE": 75, "LINK": 75, "MAGIC": 50, "MSFT": 20, "NEAR": 75,
+	"NVDA": 20, "ONDO": 75, "SOL": 125, "SPCX": 75, "SPX": 75,
+	"SUI": 100, "TAO": 100, "TRX": 50, "TSLA": 20, "USELESS": 12,
+	"WLD": 75, "XAG": 100, "XAU": 100, "XLM": 75, "XRP": 125, "ZEC": 75,
+}
+
+
+// clampBloFinLeverage znizi leverage na venue max (autofix pri starte).
+func clampBloFinLeverage(sc *StrategyConfig) {
+	if sc.Type != "perps" || (sc.Platform != "blofin" && sc.Platform != "blofin_spot") {
+		return
+	}
+	if len(sc.Args) < 2 || sc.Leverage <= 0 {
+		return
+	}
+	sym := strings.ToUpper(strings.Split(strings.Split(sc.Args[1], "/")[0], "-")[0])
+	maxLev, ok := blofinMaxLeverage[sym]
+	if !ok || sc.Leverage <= maxLev {
+		return
+	}
+	fmt.Printf("[WARN] %s: leverage %.0f nad BloFin max %.0f pre %s — autofix na max\n", sc.ID, sc.Leverage, maxLev, sym)
+	sc.Leverage = maxLev
+	if sc.SizingLeverage > maxLev {
+		sc.SizingLeverage = maxLev
+	}
+}
+
 func LoadConfig(path string) (*Config, error) {
 	return loadConfig(path, false, false)
 }
@@ -1115,6 +1147,7 @@ func loadConfig(path string, skipLiveCredentialChecks bool, readOnly bool) (*Con
 		cfg.Platforms = make(map[string]*PlatformConfig)
 	}
 
+
 	for i := range cfg.Strategies {
 		normalizeDeprecatedCloseRef(cfg.Strategies[i].CloseStrategy)
 		if cfg.Strategies[i].Platform == "" {
@@ -1158,6 +1191,8 @@ func loadConfig(path string, skipLiveCredentialChecks bool, readOnly bool) (*Con
 				cfg.Strategies[i].MaxDrawdownPct = 60
 			}
 		}
+
+		clampBloFinLeverage(&cfg.Strategies[i])
 
 		if cfg.Strategies[i].Type == "perps" && cfg.Strategies[i].Leverage <= 0 {
 			cfg.Strategies[i].Leverage = 1
