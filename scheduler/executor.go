@@ -1376,6 +1376,7 @@ type BloFinExecuteResult struct {
 	Platform  string           `json:"platform"`
 	Timestamp string           `json:"timestamp"`
 	Error     string           `json:"error,omitempty"`
+	Skipped   string           `json:"skipped,omitempty"`
 }
 
 // BloFinCloseFill is the parsed fill block from close_blofin_position.py.

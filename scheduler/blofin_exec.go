@@ -142,6 +142,10 @@ func runBloFinExecuteOrder(sc StrategyConfig, result *BloFinResult, price, cash,
 		notifyLiveExecuteFailure(notifier, sc, fmt.Sprintf("live execute error for %s: %s", sym, execResult.Error))
 		return nil, false
 	}
+	if execResult.Skipped != "" {
+		logger.Info("BloFin execute skipped for %s: %s", sym, execResult.Skipped)
+		return nil, false
+	}
 	return execResult, true
 }
 

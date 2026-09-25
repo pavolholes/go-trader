@@ -333,12 +333,21 @@ def run_execute(symbol, side, size, mode, size_in_contracts=False, pos_side_hint
         }))
 
     except Exception as e:
+        errmsg = str(e)
+        if errmsg.startswith("SKIP:"):
+            print(json.dumps({
+                "execution": None,
+                "platform": "blofin",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "skipped": errmsg[5:].strip(),
+            }))
+            sys.exit(0)
         traceback.print_exc(file=sys.stderr)
         print(json.dumps({
             "execution": None,
             "platform": "blofin",
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "error": str(e),
+            "error": errmsg,
         }))
         sys.exit(1)
 

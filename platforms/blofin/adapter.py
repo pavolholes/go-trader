@@ -427,7 +427,7 @@ class BloFinExchangeAdapter:
                 if exch in ("long", "short"):
                     pos_side = exch
                 else:
-                    raise RuntimeError(f"cannot determine position side for {symbol} (no hint, no exchange position) - refusing to open opposite side")
+                    raise RuntimeError(f"SKIP: cannot determine position side for {symbol} (no hint, no exchange position) - refusing to open opposite side")
         inst_id = f"{symbol}-USDT"
         qsize = self.quantize_size(inst_id, float(size), size_in_contracts)
         cv = (self._lot_size_cache.get(inst_id, (None, None))[1] if isinstance(self._lot_size_cache.get(inst_id), tuple) else None) or 1.0
