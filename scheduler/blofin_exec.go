@@ -140,7 +140,7 @@ func runBloFinExecuteOrder(sc StrategyConfig, result *BloFinResult, price, cash,
 }
 
 // executeBloFinResult applies a BloFin result to state. Must be called under Lock.
-func executeBloFinResult(sc StrategyConfig, s *StrategyState, db *StateDB, result *BloFinResult, execResult *BloFinExecuteResult, signalStr string, price float64, regime *RegimeConfig, logger *StrategyLogger) (int, string) {
+func executeBloFinResult(sc StrategyConfig, s *StrategyState, db *StateDB, result *BloFinResult, execResult *BloFinExecuteResult, signalStr string, price float64, regime *RegimeConfig, logger *StrategyLogger, notifier *MultiNotifier) (int, string) {
 	sym := result.Symbol
 	detail := ""
 	trades := 0
@@ -161,6 +161,13 @@ func executeBloFinResult(sc StrategyConfig, s *StrategyState, db *StateDB, resul
 		logger.Info("SL hit for %s: sl_price=$%.2f atr_value=%.2f", result.Symbol, result.StopLossPrice, result.ATRValue)
 	}
 
+	// Live: bez burzoveho fillu sa nic nezapisuje do DB (ziadne fantomy).
+	// Paper fill=mark cena je OK len pre paper (execResult==nil).
+	if execResult != nil && fillQty <= 0 {
+		logger.Error("BloFin live order without fill for %s — skipping DB write", sym)
+		notifyLiveExecuteFailure(notifier, sc, fmt.Sprintf("live order without fill for %s (no exchange fill)", sym))
+		return 0, ""
+	}
 	exec, err := ExecutePerpsSignalWithLeverageDeferredOpen(s, result.Signal, result.Symbol, fillPrice, PerpsSizingFor(sc, fillPrice, result.ATRValue), fillQty, fillOID, fillFee, EffectiveDirection(sc), result.CloseFraction, logger)
 	if err != nil {
 		logger.Error("Trade execution failed: %v", err)
