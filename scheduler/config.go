@@ -924,7 +924,6 @@ var blofinMaxLeverage = map[string]float64{
 	"WLD": 75, "XAG": 100, "XAU": 100, "XLM": 75, "XRP": 125, "ZEC": 75,
 }
 
-
 // clampBloFinLeverage znizi leverage na venue max (autofix pri starte).
 func clampBloFinLeverage(sc *StrategyConfig) {
 	if sc.Type != "perps" || (sc.Platform != "blofin" && sc.Platform != "blofin_spot") {
@@ -1146,7 +1145,6 @@ func loadConfig(path string, skipLiveCredentialChecks bool, readOnly bool) (*Con
 	if cfg.Platforms == nil {
 		cfg.Platforms = make(map[string]*PlatformConfig)
 	}
-
 
 	for i := range cfg.Strategies {
 		normalizeDeprecatedCloseRef(cfg.Strategies[i].CloseStrategy)
