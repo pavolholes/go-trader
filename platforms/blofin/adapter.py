@@ -405,22 +405,27 @@ class BloFinExchangeAdapter:
         pos_side = "net"
         if self.trade_account == "copy":
             hint = (pos_side_hint or "").strip().lower()
+            # Burzova pozicia je vzdy pravda - nacitaj ju prvu.
+            exch = ""
+            try:
+                for q in self.get_copy_positions(f"{symbol}-USDT"):
+                    if float(q.get("positions", 0) or 0) > 0:
+                        exch = str(q.get("positionSide", "") or "").lower()
+                        break
+            except Exception:
+                exch = ""
             if hint in ("long", "short"):
-                # DB vie stranu pozicie - burza sa moze mylit (prazdny vysledok)
+                # Close: burza musi mat rovnaku stranu, inak je DB zastarana.
+                # Otocenie strany (open opposite) je zakazane - fail-closed.
+                is_close = (hint == "long" and not is_buy) or (hint == "short" and is_buy)
+                if is_close and exch != "" and exch != hint:
+                    raise RuntimeError(f"DB says {hint} but exchange has {exch} for {symbol} - refusing (stale DB?)")
+                if is_close and exch == "":
+                    raise RuntimeError(f"DB says {hint} but exchange has no position for {symbol} - refusing (already closed?)")
                 pos_side = hint
             else:
-                cur = ""
-                try:
-                    for q in self.get_copy_positions(f"{symbol}-USDT"):
-                        if float(q.get("positions", 0) or 0) > 0:
-                            cur = str(q.get("positionSide", "") or "").lower()
-                            break
-                except Exception:
-                    cur = ""
-                if cur in ("long", "short"):
-                    pos_side = cur
-                elif hint:
-                    pos_side = hint
+                if exch in ("long", "short"):
+                    pos_side = exch
                 else:
                     raise RuntimeError(f"cannot determine position side for {symbol} (no hint, no exchange position) - refusing to open opposite side")
         inst_id = f"{symbol}-USDT"
