@@ -1235,7 +1235,7 @@ func TestReconcileSoleOwnerSL_SendsTradeAlertAndProtectionDM(t *testing.T) {
 	if len(mock.messages) != 1 {
 		t.Fatalf("trade alert messages = %d, want 1", len(mock.messages))
 	}
-	if mock.messages[0].channelID != "trade-alerts" || !strings.Contains(mock.messages[0].content, "TRADE CLOSED") {
+	if mock.messages[0].channelID != "trade-alerts" || !strings.Contains(mock.messages[0].content, "TRADE STOPPED") {
 		t.Errorf("trade alert = %+v, want configured live close alert", mock.messages[0])
 	}
 	if len(mock.dms) != 1 || !strings.Contains(mock.dms[0].content, "SL filled") {
@@ -1300,13 +1300,23 @@ func TestReconcileSharedCoinSLAndExternal_SendsTradeAlertPerBookedTrade(t *testi
 	}
 	counts := map[string]int{}
 	for _, message := range mock.messages {
-		if message.channelID != "trade-alerts" || !strings.Contains(message.content, "TRADE CLOSED") {
-			t.Errorf("trade alert = %+v, want configured live close alert", message)
+		if message.channelID != "trade-alerts" {
+			t.Errorf("trade alert = %+v, want trade-alerts channel", message)
+			continue
 		}
-		for _, id := range []string{"hl-owner-eth", "hl-peer-eth"} {
-			if strings.Contains(message.content, "Strategy: "+id) {
-				counts[id]++
+		// owner SL close -> STOPPED, peer external close -> CLOSED
+		if strings.Contains(message.content, "Strategy: hl-owner-eth") {
+			if !strings.Contains(message.content, "TRADE STOPPED") {
+				t.Errorf("owner SL alert = %+v, want TRADE STOPPED", message)
 			}
+			counts["hl-owner-eth"]++
+		} else if strings.Contains(message.content, "Strategy: hl-peer-eth") {
+			if !strings.Contains(message.content, "TRADE CLOSED") {
+				t.Errorf("peer external alert = %+v, want TRADE CLOSED", message)
+			}
+			counts["hl-peer-eth"]++
+		} else {
+			t.Errorf("trade alert = %+v, want known strategy", message)
 		}
 	}
 	for _, id := range []string{"hl-owner-eth", "hl-peer-eth"} {
