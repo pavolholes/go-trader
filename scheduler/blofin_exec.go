@@ -76,6 +76,12 @@ func runBloFinCheck(sc StrategyConfig, prices map[string]float64, posCtx Positio
 func runBloFinExecuteOrder(sc StrategyConfig, result *BloFinResult, price, cash, posQty float64, posSide string, avgCost float64, notifier *MultiNotifier, logger *StrategyLogger) (*BloFinExecuteResult, bool) {
 	signal := result.Signal
 	isClose := result.CloseFraction > 0 && posQty > 0
+	// SELL/close signál bez otvorenej pozície nemá čo zatvárať — tichý noop.
+	// (Len pre long-only; pri both je SELL bez pozície legitímny short open.)
+	if posQty <= 0 && (signal < 0 || result.CloseFraction > 0) && EffectiveDirection(sc) == DirectionLong {
+		logger.Info("BloFin: sell/close signal with no open position (long-only), skipping")
+		return nil, true
+	}
 	side := "buy"
 	if isClose {
 		// Close: opposite of position side
@@ -121,7 +127,7 @@ func runBloFinExecuteOrder(sc StrategyConfig, result *BloFinResult, price, cash,
 	if result.StopLossPrice > 0 {
 		logger.Info("BloFin: SL price=%.2f for %s", result.StopLossPrice, sym)
 	}
-	logger.Info("BloFin: placing %s order %s sz=%.6f (notional=%.2f)", side, sym, size, notional)
+	logger.Info("BloFin: placing %s order %s sz=%.6f price=%.6f (notional=%.2f)", side, sym, size, price, notional)
 	execResult, stderr, err := RunBloFinExecute(sc.Script, sym, side, size, result.StopLossPrice, isClose)
 	if stderr != "" {
 		logger.Warn("BloFin execute stderr: %s", stderr)
