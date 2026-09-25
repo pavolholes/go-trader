@@ -295,7 +295,7 @@ class BloFinExchangeAdapter:
             })
         return out
 
-    def get_copy_order_fill(self, order_id: str, tries: int = 3) -> dict:
+    def get_copy_order_fill(self, order_id: str, tries: int = 10) -> dict:
         """Poll copy orders-history for a market fill (avg price / size / fee).""" 
         for _ in range(max(1, tries)):
             try:
@@ -313,7 +313,7 @@ class BloFinExchangeAdapter:
                         }
             except Exception:
                 pass
-            time.sleep(1)
+            time.sleep(3)
         return {}
 
     # ─────────────────────────────────────────────
