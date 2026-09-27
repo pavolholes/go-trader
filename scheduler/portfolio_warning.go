@@ -53,8 +53,12 @@ func BuildPortfolioWarningMessage(in PortfolioWarningMessageInputs) string {
 			prs = *p
 		}
 	}
-	includePaused := in.Config != nil && in.Config.IncludePausedInWarning
-	contribs, excluded := portfolioWarningContributors(in.State, in.CfgStrategies, part, in.Prices, includePaused)
+	maxDD := 0.0
+	warnDD := 0.0
+	if in.Config != nil {
+		maxDD = in.Config.MaxDrawdownPct
+		warnDD = maxDD * in.Config.WarnThresholdPct / 100
+	}
 
 	var b strings.Builder
 	b.WriteString("**PORTFOLIO WARNING")
@@ -62,92 +66,47 @@ func BuildPortfolioWarningMessage(in PortfolioWarningMessageInputs) string {
 		b.WriteString(" ")
 		b.WriteString(strings.ToUpper(partitionLabel(in.Partition)))
 	}
-	b.WriteString("**")
-	if lead := portfolioWarningLead(contribs); lead != "" {
-		b.WriteString(" - ")
-		b.WriteString(lead)
-	}
-	b.WriteByte('\n')
-
-	maxDD := 0.0
-	warnDD := 0.0
-	if in.Config != nil {
-		maxDD = in.Config.MaxDrawdownPct
-		warnDD = maxDD * in.Config.WarnThresholdPct / 100
-	}
-	entered := prs.WarnBandEnteredAt.UTC()
-	if entered.IsZero() {
-		entered = now
-	}
-	b.WriteString(fmt.Sprintf("Kill switch: %.1f%% drawdown | Warn threshold: %.1f%% | In band since: %s (%s)\n",
-		maxDD, warnDD, entered.Format("2006-01-02 15:04 UTC"), formatWarningDuration(now.Sub(entered))))
+	b.WriteString("**\n")
 
 	if in.EquityGuardArmed {
 		note := ""
 		if prs.DrawdownReadingSubstituted {
-			note = "* (carried forward; balance substituted this cycle, does not reconcile with the figures below)"
+			note = " (balance substituted this cycle)"
 		}
-		b.WriteString(fmt.Sprintf("Current: equity=%.1f%%%s ($%.0f / peak $%.0f)", prs.CurrentDrawdownPct, note, in.TotalValue, prs.PeakValue))
+		b.WriteString(fmt.Sprintf("Equity drawdown: %.1f%%%s ($%.0f / peak $%.0f).\n",
+			prs.CurrentDrawdownPct, note, in.TotalValue, prs.PeakValue))
 	} else {
-		b.WriteString("Current: equity=n/a (guard not armed: no trustworthy portfolio total this cycle)")
+		b.WriteString("Equity drawdown: n/a this cycle.\n")
 	}
 	if in.PerpsMargin > 0 {
-		b.WriteString(fmt.Sprintf(" | perps margin=%.1f%% ($%.0f loss on $%.0f margin)", prs.CurrentMarginDrawdownPct, in.PerpsLoss, in.PerpsMargin))
+		b.WriteString(fmt.Sprintf("Perps margin drawdown: %.1f%% ($%.0f loss on $%.0f margin).\n",
+			prs.CurrentMarginDrawdownPct, in.PerpsLoss, in.PerpsMargin))
 	}
-	b.WriteByte('\n')
+
+	b.WriteString(fmt.Sprintf("Warning threshold (equity or margin): %.1f%%.\n", warnDD))
 
 	switch {
-	case in.EquityGuardArmed && !prs.UntrustedOverLimitSince.IsZero():
-		b.WriteString(fmt.Sprintf("Distance to kill switch: equity %.1f%% is already OVER the %.1f%% limit, but the total is untrusted — full-book latch DEFERRED, escalates %s unless a trusted measurement lands first",
-			prs.CurrentDrawdownPct, maxDD,
-			prs.UntrustedOverLimitSince.Add(untrustedEquityLatchDeferral).Format("2006-01-02 15:04 UTC")))
-		if in.PerpsMargin > 0 {
-			b.WriteString(fmt.Sprintf(" | perps margin %.1f%% from limit", positiveDistance(maxDD, prs.CurrentMarginDrawdownPct)))
-		}
-		b.WriteString("\nPer-strategy circuit breakers (#292) remain the active protection while the latch is deferred.")
+	case !prs.UntrustedOverLimitSince.IsZero():
+		b.WriteString(fmt.Sprintf("CRITICAL: equity data is untrusted; the equity kill switch is DEFERRED. Strategy-level circuit breakers remain active. Escalation by %s UTC.",
+			prs.UntrustedOverLimitSince.Add(untrustedEquityLatchDeferral).Format("2006-01-02 15:04")))
 	case in.EquityGuardArmed:
-		b.WriteString(fmt.Sprintf("Distance to kill switch: %.1f%% equity", positiveDistance(maxDD, prs.CurrentDrawdownPct)))
+		b.WriteString(fmt.Sprintf("Equity kill switch: %.1f%%; current equity drawdown %.1f%% (%.1f pp away).",
+			maxDD, prs.CurrentDrawdownPct, positiveDistance(maxDD, prs.CurrentDrawdownPct)))
 		if in.PerpsMargin > 0 {
-			b.WriteString(fmt.Sprintf(" | perps margin %.1f%% from limit", positiveDistance(maxDD, prs.CurrentMarginDrawdownPct)))
+			if prs.CurrentMarginDrawdownPct > maxDD {
+				b.WriteString(fmt.Sprintf(" Perps margin drawdown %.1f%% exceeds %.1f%%; per-strategy circuit breakers handle margin risk.",
+					prs.CurrentMarginDrawdownPct, maxDD))
+			} else {
+				b.WriteString(fmt.Sprintf(" Perps margin drawdown: %.1f%%.", prs.CurrentMarginDrawdownPct))
+			}
 		}
+		b.WriteString(" Heads-up only; no manual position close is requested.")
 	case in.PerpsMargin > 0:
-		b.WriteString(fmt.Sprintf("Distance to kill switch: %.1f%% perps margin (equity guard not armed, so margin owns the latch)",
-			positiveDistance(maxDD, prs.CurrentMarginDrawdownPct)))
+		b.WriteString(fmt.Sprintf("Perps-margin kill switch: %.1f%%; current margin drawdown %.1f%% (%.1f pp away). No manual position close is requested.",
+			maxDD, prs.CurrentMarginDrawdownPct, positiveDistance(maxDD, prs.CurrentMarginDrawdownPct)))
+		b.WriteString(" Equity is unavailable; perps margin is the active portfolio guard.")
 	default:
-		b.WriteString("Distance to kill switch: n/a (equity guard not armed and no perps margin deployed)")
-	}
-	b.WriteByte('\n')
-	b.WriteString(formatPortfolioWarningTrend(prs, in.EquityGuardArmed, in.PerpsMargin > 0))
-	b.WriteByte('\n')
-
-	if len(contribs) > 0 {
-		b.WriteString("\nTop contributors:\n")
-		b.WriteString("```\n")
-		for _, c := range contribs {
-			b.WriteString(fmt.Sprintf("%-20s %-9s %s  dd %.1f%%  %s\n",
-				truncateWarningField(c.ID, 20), c.PnLLabel, formatSignedDollar(c.PnL), c.DrawdownPct, c.PositionLine))
-		}
-		b.WriteString("```\n")
-	}
-	if excluded > 0 && !includePaused {
-		b.WriteString(fmt.Sprintf("\n(%d flat paused strateg%s excluded from contributors; set portfolio_risk.include_paused_in_warning=true to include)\n",
-			excluded, pluralize(excluded, "y", "ies")))
-	}
-
-	if len(in.Recent) > 0 {
-		b.WriteString("\nRecent activity (last 15m):\n")
-		b.WriteString("```\n")
-		for _, tr := range in.Recent {
-			b.WriteString(formatPortfolioWarningTrade(tr))
-			b.WriteByte('\n')
-		}
-		b.WriteString("```\n")
-	}
-
-	if rec := portfolioWarningRecommendation(contribs); rec != "" {
-		b.WriteString("\nRecommended: ")
-		b.WriteString(rec)
-		b.WriteByte('\n')
+		b.WriteString("Equity is unavailable and no perps margin is deployed; no manual action is requested.")
 	}
 
 	msg := strings.TrimRight(b.String(), "\n")
@@ -229,41 +188,6 @@ func portfolioWarningContributors(state *AppState, cfgStrategies []StrategyConfi
 	return out, excludedFlatPaused
 }
 
-func portfolioWarningLead(contribs []portfolioWarningContributor) string {
-	if len(contribs) == 0 || contribs[0].PnL >= 0 {
-		return "portfolio is in the warn band"
-	}
-	return fmt.Sprintf("%s (dd=%.1f%%) is leading portfolio drawdown", contribs[0].ID, contribs[0].DrawdownPct)
-}
-
-func formatPortfolioWarningTrend(prs PortfolioRiskState, includeEquity, includeMargin bool) string {
-	eq := prs.WarningEquityDeltaPct
-	margin := prs.WarningMarginDeltaPct
-	trend := "STABLE"
-	primary := 0.0
-	if includeEquity {
-		primary = eq
-	}
-	if includeMargin && math.Abs(margin) >= math.Abs(primary) {
-		primary = margin
-	}
-	if primary > 0.05 {
-		trend = "WORSENING"
-	} else if primary < -0.05 {
-		trend = "RECOVERING"
-	}
-	var parts []string
-	if includeEquity {
-		parts = append(parts, fmt.Sprintf("equity dd %s since last cycle", formatSignedPct(eq)))
-	} else {
-		parts = append(parts, "equity dd n/a (guard not armed)")
-	}
-	if includeMargin {
-		parts = append(parts, fmt.Sprintf("margin dd %s", formatSignedPct(margin)))
-	}
-	return "Trend: " + trend + " - " + strings.Join(parts, "; ")
-}
-
 func formatPortfolioWarningPosition(ss *StrategyState, prices map[string]float64) string {
 	if ss == nil {
 		return "(flat)"
@@ -306,33 +230,6 @@ func positionUnrealizedPnL(pos *Position, price float64) float64 {
 	return pos.Quantity * mult * (price - pos.AvgCost)
 }
 
-func formatPortfolioWarningTrade(tr Trade) string {
-	kind := "fill"
-	if tr.IsClose {
-		kind = "close"
-	} else if tr.Manual {
-		kind = "manual"
-	} else if tr.TradeType != "" {
-		kind = tr.TradeType
-	}
-	details := strings.TrimSpace(tr.Details)
-	if details != "" {
-		details = " (" + truncateWarningField(details, 42) + ")"
-	}
-	return fmt.Sprintf("%s  %s  %s  %s %s @ $%s%s",
-		tr.Timestamp.UTC().Format("15:04"), kind, truncateWarningField(tr.StrategyID, 20), tr.Side, formatWarningQty(tr.Quantity), formatWarningPrice(tr.Price), details)
-}
-
-func portfolioWarningRecommendation(contribs []portfolioWarningContributor) string {
-	if len(contribs) == 0 {
-		return "review portfolio exposure and recent fills before adding risk."
-	}
-	if contribs[0].PnL < 0 && contribs[0].NegativeWeight >= 0.5 {
-		return fmt.Sprintf("review open positions above; consider manually closing %s if the signal does not recover next cycle.", contribs[0].ID)
-	}
-	return "review open positions above and avoid adding risk until the drawdown recovers."
-}
-
 func positiveDistance(limit, current float64) float64 {
 	d := limit - current
 	if d < 0 {
@@ -373,16 +270,6 @@ func pluralize(n int, singular, plural string) string {
 		return singular
 	}
 	return plural
-}
-
-func formatSignedPct(v float64) string {
-	if v > 0 {
-		return fmt.Sprintf("+%.1f%%", v)
-	}
-	if v < 0 {
-		return fmt.Sprintf("%.1f%%", v)
-	}
-	return "+0.0%"
 }
 
 func formatWarningQty(v float64) string {

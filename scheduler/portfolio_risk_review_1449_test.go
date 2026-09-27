@@ -158,25 +158,28 @@ func TestPortfolioWarningThrottle(t *testing.T) {
 		t.Error("a signal newly entering the band must notify immediately")
 	}
 
-	if n, _ := portfolioWarningShouldNotify(throttled, false, true, 0, 31, base.Add(10*time.Minute)); !n {
-		t.Error("a 1.0pp rise must notify")
+	if n, _ := portfolioWarningShouldNotify(throttled, false, true, 0, 31, base.Add(10*time.Minute)); n {
+		t.Error("a 1.0pp rise must stay throttled")
+	}
+	if n, _ := portfolioWarningShouldNotify(throttled, false, true, 0, 32, base.Add(10*time.Minute)); !n {
+		t.Error("a 2.0pp rise must notify")
 	}
 	if n, _ := portfolioWarningShouldNotify(throttled, false, true, 0, 30.3, base.Add(10*time.Minute)); n {
 		t.Error("a 0.3pp rise must stay throttled")
 	}
 
 	creep := throttled
-	for i := 1; i <= 4; i++ {
+	for i := 1; i <= 7; i++ {
 		var n bool
 		n, creep = portfolioWarningShouldNotify(creep, false, true, 0, 30+0.3*float64(i), base.Add(time.Duration(i)*10*time.Minute))
-		if n && i < 4 {
+		if n && i < 7 {
 			t.Errorf("creep notified too early at step %d", i)
 		}
-		if n && i == 4 {
+		if n && i == 7 {
 			return
 		}
 	}
-	t.Error("a slow creep past the escalation threshold must eventually notify")
+	t.Error("a slow creep past the 2pp escalation threshold must eventually notify")
 }
 
 func TestPortfolioWarnBandSignals_SharedDefinition(t *testing.T) {
@@ -374,11 +377,11 @@ func TestPortfolioWarningLabels_FollowTheArmedGuard(t *testing.T) {
 		PerpsMargin:      2000,
 		EquityGuardArmed: false,
 	})
-	if !strings.Contains(unarmed, "Distance to kill switch: 5.0% perps margin") {
-		t.Errorf("unarmed guard must label margin as the distance to the kill switch:\n%s", unarmed)
+	if !strings.Contains(unarmed, "Perps-margin kill switch: 25.0%; current margin drawdown 20.0% (5.0 pp away)") {
+		t.Errorf("unarmed guard must label margin distance to the kill switch:\n%s", unarmed)
 	}
-	if strings.Contains(unarmed, "from limit") {
-		t.Errorf("margin must not be demoted to distance-from-limit when it owns the latch:\n%s", unarmed)
+	if !strings.Contains(unarmed, "perps margin is the active portfolio guard") {
+		t.Errorf("unarmed guard must say that margin owns the portfolio guard:\n%s", unarmed)
 	}
 	if strings.Contains(unarmed, "equity=18.0%") {
 		t.Errorf("a stale equity reading must not be shown as current when the guard is unarmed:\n%s", unarmed)
@@ -391,14 +394,14 @@ func TestPortfolioWarningLabels_FollowTheArmedGuard(t *testing.T) {
 		PerpsMargin:      2000,
 		EquityGuardArmed: false,
 	})
-	if !strings.Contains(coldStart, "Distance to kill switch: 6.0% perps margin") {
+	if !strings.Contains(coldStart, "Perps-margin kill switch: 25.0%; current margin drawdown 19.0% (6.0 pp away)") {
 		t.Errorf("cold start must point the kill-switch label at margin:\n%s", coldStart)
 	}
 	if strings.Contains(coldStart, "22.0%") {
 		t.Errorf("leftover cold-start equity reading leaked into the message:\n%s", coldStart)
 	}
-	if !strings.Contains(coldStart, "equity dd n/a") {
-		t.Errorf("trend line must not report a delta for a signal never measured:\n%s", coldStart)
+	if !strings.Contains(coldStart, "Equity drawdown: n/a this cycle.") {
+		t.Errorf("cold-start message must state that equity is unavailable:\n%s", coldStart)
 	}
 
 	armed := BuildPortfolioWarningMessage(PortfolioWarningMessageInputs{
@@ -409,7 +412,7 @@ func TestPortfolioWarningLabels_FollowTheArmedGuard(t *testing.T) {
 		PerpsMargin:      2000,
 		EquityGuardArmed: true,
 	})
-	if !strings.Contains(armed, "Distance to kill switch: 7.0% equity | perps margin 5.0% from limit") {
+	if !strings.Contains(armed, "Equity kill switch: 25.0%; current equity drawdown 18.0% (7.0 pp away)") {
 		t.Errorf("armed guard must keep equity on the kill-switch label:\n%s", armed)
 	}
 

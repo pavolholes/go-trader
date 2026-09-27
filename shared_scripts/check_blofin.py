@@ -277,7 +277,21 @@ def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=
         sys.exit(1)
 
 
-def run_execute(symbol, side, size, mode, size_in_contracts=False, pos_side_hint="", is_close=False):
+def _order_response_data(result):
+    """Normalize BloFin order responses whose ``data`` may be an object or list."""
+    if not isinstance(result, dict):
+        return {}
+    data = result.get("data")
+    if isinstance(data, dict):
+        return data
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict):
+                return item
+    return result
+
+
+def run_execute(symbol, side, size, mode, size_in_contracts=False, pos_side_hint="", is_close=False, leverage=0.0):
     """Place a live market order on BloFin."""
     if mode != "live":
         print(json.dumps({"error": "--execute requires --mode=live"}))
@@ -287,39 +301,36 @@ def run_execute(symbol, side, size, mode, size_in_contracts=False, pos_side_hint
         from adapter import BloFinExchangeAdapter
         adapter = BloFinExchangeAdapter()
         is_buy = side.lower() == "buy"
-        result = adapter.market_open(symbol, is_buy, size, inst_type="swap", size_in_contracts=size_in_contracts, pos_side_hint=pos_side_hint, is_close=is_close)
+        result = adapter.market_open(symbol, is_buy, size, inst_type="swap", size_in_contracts=size_in_contracts, pos_side_hint=pos_side_hint, is_close=is_close, leverage=leverage)
 
+        data = _order_response_data(result)
+        oid = data.get("orderId") or data.get("ordId") or result.get("orderId") or result.get("ordId") or ""
         fill = {}
         copy_filled = False
-        try:
-            data = result.get("data", [{}])[0] if result.get("data") else result
-            if adapter.trade_account == "copy":
-                oid = data.get("orderId") or ""
-                if oid:
-                    got = adapter.get_copy_order_fill(str(oid))
-                    if got:
-                        fill = got
-                        copy_filled = True
-            try:
-                fill_cv = float(result.get("contract_value", 0) or 0)
-            except Exception:
-                fill_cv = 0
-            if not copy_filled:
-                fill = {
-                    "avg_px": float(data.get("fillPx", 0) or 0) or float(data.get("avgPx", 0) or 0),
-                    "total_sz": float(data.get("fillSz", 0) or 0) or float(data.get("accFillSz", 0) or 0) or size,
-                    "contract_value": fill_cv,
-                }
-            elif fill_cv > 0:
-                try:
-                    fill["contract_value"] = fill_cv
-                except Exception:
-                    pass
-                oid = data.get("ordId") or result.get("ordId", "")
-                if oid:
-                    fill["oid"] = str(oid)
-        except Exception:
-            pass
+        if adapter.trade_account == "copy" and oid:
+            got = adapter.get_copy_order_fill(str(oid), f"{symbol}-USDT")
+            if got:
+                fill = got
+                copy_filled = True
+        fill_cv = float(result.get("contract_value", 0) or 0)
+        if not copy_filled:
+            reported_size = (
+                data.get("fillSz", 0)
+                or data.get("accFillSz", 0)
+                or data.get("filledSize", 0)
+                or 0
+            )
+            fill = {
+                "avg_px": float(data.get("fillPx", 0) or 0) or float(data.get("avgPx", 0) or 0),
+                # A copy-order acknowledgement is not proof of a fill. Never
+                # substitute requested size when Copy Trading history is late.
+                "total_sz": float(reported_size or (0 if adapter.trade_account == "copy" else size)),
+                "contract_value": fill_cv,
+            }
+            if oid:
+                fill["oid"] = str(oid)
+        elif fill_cv > 0:
+            fill["contract_value"] = fill_cv
 
         print(json.dumps({
             "execution": {
@@ -366,8 +377,9 @@ def main():
         parser.add_argument("--sl-price", type=float, default=0.0)
         parser.add_argument("--pos-side-hint", default="")
         parser.add_argument("--is-close", action="store_true", default=False)
+        parser.add_argument("--leverage", type=float, default=0.0)
         args = parser.parse_args()
-        run_execute(args.symbol, args.side, args.size, args.mode, args.size_in_contracts, args.pos_side_hint)
+        run_execute(args.symbol, args.side, args.size, args.mode, args.size_in_contracts, args.pos_side_hint, args.is_close, args.leverage)
     else:
         import argparse
         parser = argparse.ArgumentParser()

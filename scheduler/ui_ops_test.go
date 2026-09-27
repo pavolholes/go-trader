@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -25,6 +26,86 @@ func opsGet(ss *StatusServer, handler func(http.ResponseWriter, *http.Request), 
 	w := httptest.NewRecorder()
 	handler(w, httptest.NewRequest("GET", path, nil))
 	return w
+}
+
+func TestFlatLiveBloFinOverviewUsesRealizedLedger(t *testing.T) {
+	strategy := StrategyConfig{
+		ID:             "live-blofin-doge-1h",
+		Type:           "perps",
+		Platform:       "blofin",
+		Args:           []string{"stoch_rsi", "DOGE", "1h", "--mode=live"},
+		Capital:        100,
+		InitialCapital: 100,
+	}
+	state := NewAppState()
+	state.Strategies[strategy.ID] = &StrategyState{
+		ID:              strategy.ID,
+		Type:            strategy.Type,
+		Platform:        strategy.Platform,
+		Cash:            155.51,
+		InitialCapital:  100,
+		Positions:       map[string]*Position{},
+		OptionPositions: map[string]*OptionPosition{},
+	}
+	ss := newOpsTestServer(t, []StrategyConfig{strategy}, state, true)
+	_, err := ss.stateDB.primary().db.Exec(`INSERT INTO trades (
+		strategy_id,timestamp,symbol,position_id,side,quantity,price,value,trade_type,
+		is_close,realized_pnl,pnl_gross,fee_source
+	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`, strategy.ID, "2026-09-25T00:00:00Z", "DOGE", "position-1", "sell", 1.0, 1.0, 1.0, "perps", 1, 12.5, 1, "userfills")
+	if err != nil {
+		t.Fatalf("insert realized ledger row: %v", err)
+	}
+
+	overview, _, ok := ss.uiStrategyOverviewWithPrices(strategy.ID, map[string]float64{})
+	if !ok {
+		t.Fatal("overview not found")
+	}
+	if overview.PnL != 12.5 || overview.RealizedPnL != 12.5 || overview.UnrealizedPnL != 0 || overview.PortfolioValue != 112.5 {
+		t.Fatalf("flat live BloFin overview = pnl %.4f realized %.4f unrealized %.4f value %.4f; want 12.5/12.5/0/112.5",
+			overview.PnL, overview.RealizedPnL, overview.UnrealizedPnL, overview.PortfolioValue)
+	}
+}
+
+func TestOpenLiveBloFinOverviewSeparatesExchangeRealizedAndMarkUnrealized(t *testing.T) {
+	strategy := StrategyConfig{
+		ID:             "live-blofin-xlm-15m",
+		Type:           "perps",
+		Platform:       "blofin",
+		Args:           []string{"consolidation_range", "XLM", "15m", "--mode=live"},
+		Capital:        100,
+		InitialCapital: 100,
+	}
+	state := NewAppState()
+	state.Strategies[strategy.ID] = &StrategyState{
+		ID:             strategy.ID,
+		Type:           strategy.Type,
+		Platform:       strategy.Platform,
+		Cash:           104.85,
+		InitialCapital: 100,
+		Positions: map[string]*Position{
+			"XLM": {Symbol: "XLM", Quantity: 34, AvgCost: 0.21759, Side: "long", Multiplier: 100},
+		},
+		OptionPositions: map[string]*OptionPosition{},
+	}
+	ss := newOpsTestServer(t, []StrategyConfig{strategy}, state, true)
+	_, err := ss.stateDB.primary().db.Exec(`INSERT INTO trades (
+		strategy_id,timestamp,symbol,position_id,side,quantity,price,value,trade_type,
+		is_close,realized_pnl,pnl_gross,fee_source
+	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`, strategy.ID, "2026-09-25T00:00:00Z", "XLM", "position-1", "sell", 1.0, 1.0, 1.0, "perps", 1, 8.0395, 1, "userfills")
+	if err != nil {
+		t.Fatalf("insert realized ledger row: %v", err)
+	}
+
+	overview, _, ok := ss.uiStrategyOverviewWithPrices(strategy.ID, map[string]float64{"XLM": 0.21765})
+	if !ok {
+		t.Fatal("overview not found")
+	}
+	wantUnrealized := 34*100*(0.21765-0.21759) - CalculatePlatformSpotFee("blofin", 34*100*0.21765)
+	wantPnL := 8.0395 + wantUnrealized
+	if overview.RealizedPnL != 8.0395 || math.Abs(overview.UnrealizedPnL-wantUnrealized) > 1e-9 || math.Abs(overview.PnL-wantPnL) > 1e-9 {
+		t.Fatalf("open live BloFin overview = pnl %.8f realized %.8f unrealized %.8f; want %.8f/8.0395/%.8f",
+			overview.PnL, overview.RealizedPnL, overview.UnrealizedPnL, wantPnL, wantUnrealized)
+	}
 }
 
 func TestOpsEndpointsRejectWhileDraining(t *testing.T) {

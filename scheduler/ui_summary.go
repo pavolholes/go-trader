@@ -89,32 +89,48 @@ type UISummary struct {
 	ByStrategyTimeframe []UISummaryPairRow     `json:"by_strategy_timeframe"`
 }
 
+type accountBalanceCacheEntry struct {
+	body []byte
+	at   time.Time
+}
+
 var accountBalanceCacheMu sync.RWMutex
-var accountBalanceCache []byte
-var accountBalanceCacheAt time.Time
+var accountBalanceCache = make(map[string]accountBalanceCacheEntry)
 
 func (ss *StatusServer) handleAPIAccountBalance(w http.ResponseWriter, r *http.Request) {
+	if ss.rejectIfDraining(w) {
+		return
+	}
+	if !ss.requireAPIAuth(w, r) {
+		return
+	}
 	if r.Method != http.MethodGet {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	accountBalanceCacheMu.RLock()
-	cached := accountBalanceCache
-	cachedAt := accountBalanceCacheAt
-	accountBalanceCacheMu.RUnlock()
-	if cached != nil && time.Since(cachedAt) < 60*time.Second {
-		w.Header().Set("Content-Type", "application/json")
-		w.Write(cached)
+	mode := r.URL.Query().Get("mode")
+	if mode == "" {
+		mode = "all"
+	}
+	if mode != "all" && mode != "perps" && mode != "spot" {
+		writeJSONError(w, http.StatusBadRequest, "mode must be all, perps, or spot")
 		return
 	}
-	stdout, _, err := RunPythonScript("shared_scripts/fetch_blofin_copy_balance.py", nil)
+	accountBalanceCacheMu.RLock()
+	cached := accountBalanceCache[mode]
+	accountBalanceCacheMu.RUnlock()
+	if cached.body != nil && time.Since(cached.at) < 60*time.Second {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(cached.body)
+		return
+	}
+	stdout, _, err := RunPythonScript("shared_scripts/fetch_blofin_copy_balance.py", []string{mode})
 	if err != nil {
-		writeJSON(w, map[string]string{"error": err.Error()})
+		writeJSONError(w, http.StatusBadGateway, err.Error())
 		return
 	}
 	accountBalanceCacheMu.Lock()
-	accountBalanceCache = stdout
-	accountBalanceCacheAt = time.Now()
+	accountBalanceCache[mode] = accountBalanceCacheEntry{body: stdout, at: time.Now()}
 	accountBalanceCacheMu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(stdout)

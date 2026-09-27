@@ -7,10 +7,8 @@ import (
 	"time"
 )
 
-// TestPortfolioWarningMessageLiveLikeSample is an end-to-end format check that
-// mirrors the live scope state when margin DD crosses the warn threshold: a
-// paused strategy with a frozen -$220 P&L must NOT be named as the lead
-// contributor and the warning must show the "(N paused strateg...)" footnote.
+// TestPortfolioWarningMessageLiveLikeSample checks that a portfolio warning is
+// concise and does not turn a risk threshold alert into a manual-close request.
 func TestPortfolioWarningMessageLiveLikeSample(t *testing.T) {
 	cfgStrategies := []StrategyConfig{
 		{ID: "hl-vwap-eth-60", Type: "perps", Args: []string{"--mode=live"}, MarginPerTradeUSD: ptrF(50)},
@@ -74,39 +72,17 @@ func TestPortfolioWarningMessageLiveLikeSample(t *testing.T) {
 	fmt.Println(msg)
 	fmt.Println("===== END WARNING DM =====")
 
-	// Hard assertions on what must NOT and MUST be in the message.
-	mustNotContain := []string{"hl-rmc-eth-live", "hl-tcross-eth-live"}
+	// Per-strategy triage and action advice belong to separate alerts.
+	mustNotContain := []string{"hl-rmc-eth-live", "hl-tcross-eth-live", "Top contributors", "Recent activity", "Recommended:", "consider manually closing"}
 	for _, s := range mustNotContain {
-		// find line(s) containing the strategy id in the contributors block.
-		// We tolerate mentions outside Top contributors (e.g., Recent activity).
-		// Filter out the recent activity block where it's allowed.
-		withinContribs := false
-		for _, line := range strings.Split(msg, "\n") {
-			// Lines inside the ``` block following "Top contributors:" are the rule.
-			if strings.HasPrefix(strings.TrimSpace(line), "Top contributors:") {
-				withinContribs = true
-				continue
-			}
-			if withinContribs && strings.HasPrefix(strings.TrimSpace(line), "```") {
-				withinContribs = false
-				continue
-			}
-			if withinContribs && strings.Contains(line, s) {
-				t.Fatalf("paused strategy %q leaked into Top contributors block: %q", s, line)
-			}
+		if strings.Contains(msg, s) {
+			t.Fatalf("warning unexpectedly contains %q: %s", s, msg)
 		}
 	}
-
-	if !strings.Contains(msg, "excluded from contributors") {
-		t.Fatalf("expected '(N paused strateg...) excluded from contributors' footnote in warning, got:\n%s", msg)
-	}
-	if !strings.Contains(msg, "include_paused_in_warning=true") {
-		t.Fatalf("expected footnote to mention the opt-in config key, got:\n%s", msg)
-	}
-
-	// Lead line must not name a paused strategy as "leading portfolio drawdown".
-	if strings.Contains(msg, "hl-rmc-eth-live (dd=") || strings.Contains(msg, "hl-tcross-eth-live (dd=") {
-		t.Fatalf("lead attribution named a paused strategy: %s", msg)
+	for _, want := range []string{"**PORTFOLIO WARNING LIVE**", "Warning threshold (equity or margin): 30.0%", "Equity kill switch: 30.0%", "no manual position close is requested", "per-strategy circuit breakers handle margin risk"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("warning missing %q: %s", want, msg)
+		}
 	}
 }
 

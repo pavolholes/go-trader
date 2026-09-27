@@ -1438,7 +1438,7 @@ func RunBloFinCheck(script string, args []string) (*BloFinResult, string, error)
 }
 
 // RunBloFinExecute runs check_blofin.py in execute mode (live orders).
-func RunBloFinExecute(script, symbol, side string, size float64, slPrice float64, sizeInContracts bool, posSideHint string, isClose bool, tpPrices ...float64) (*BloFinExecuteResult, string, error) {
+func RunBloFinExecute(script, symbol, side string, size float64, slPrice float64, sizeInContracts bool, posSideHint string, isClose bool, leverage float64, tpPrices ...float64) (*BloFinExecuteResult, string, error) {
 	args := []string{
 		"--execute",
 		fmt.Sprintf("--symbol=%s", symbol),
@@ -1454,6 +1454,9 @@ func RunBloFinExecute(script, symbol, side string, size float64, slPrice float64
 	}
 	if isClose {
 		args = append(args, "--is-close")
+	}
+	if leverage > 0 {
+		args = append(args, fmt.Sprintf("--leverage=%g", leverage))
 	}
 	if slPrice > 0 {
 		args = append(args, fmt.Sprintf("--sl-price=%g", slPrice))

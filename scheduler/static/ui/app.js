@@ -2212,43 +2212,48 @@
     updatePortfolioTotal(rows);
   }
 
-  var accountBalanceCache = null;
-  var accountBalanceAt = 0;
+  var accountBalanceCache = Object.create(null);
+  var accountBalanceAt = Object.create(null);
+  var accountBalanceRequests = Object.create(null);
+  var portfolioPnLTotals = { realized: 0, unrealized: 0 };
   function updatePortfolioTotal(rows) {
-    var el = document.getElementById("portfolio-total");
-    if (!el) return;
-    var total = 0, real = 0, unr = 0;
+    var real = 0, unr = 0;
     rows.forEach(function (row) {
-      total += row.portfolio_value || 0;
       real += row.realized_pnl || 0;
       unr += row.unrealized_pnl || 0;
     });
-    var cls = total >= 0 ? "pnl-pos" : "pnl-neg";
-    el.innerHTML = 'Total: <span class="' + cls + '">' + escapeHTML(fmtMoney(total)) + "</span>" +
-      ' <span class="portfolio-sub">(R ' + escapeHTML(fmtSignedMoney(real)) +
-      " / U " + escapeHTML(fmtSignedMoney(unr)) + ")</span>" +
-      ' <span id="account-balance" class="portfolio-sub"></span>';
+    portfolioPnLTotals = { realized: real, unrealized: unr };
+    renderPortfolioTotal();
+
+    var mode = state.modeFilter || "all";
     var now = Date.now();
-    if (accountBalanceCache !== null && now - accountBalanceAt < 60000) {
-      renderAccountBalance();
-      return;
-    }
-    getJSON("/api/account/balance").then(function (resp) {
-      if (resp && resp.total_equity) {
-        accountBalanceCache = resp;
-        accountBalanceAt = Date.now();
-      }
-      renderAccountBalance();
-    }).catch(function () {});
+    if (accountBalanceCache[mode] && now - accountBalanceAt[mode] < 60000) return;
+    if (accountBalanceRequests[mode]) return;
+    accountBalanceRequests[mode] = getJSON("/api/account/balance?mode=" + encodeURIComponent(mode))
+      .then(function (resp) {
+        var total = Number(resp && resp.total_equity);
+        if (Number.isFinite(total)) {
+          accountBalanceCache[mode] = resp;
+          accountBalanceAt[mode] = Date.now();
+        }
+      })
+      .catch(function () {})
+      .finally(function () {
+        delete accountBalanceRequests[mode];
+        renderPortfolioTotal();
+      });
   }
-  function renderAccountBalance() {
-    var el = document.getElementById("account-balance");
+  function renderPortfolioTotal() {
+    var el = document.getElementById("portfolio-total");
     if (!el) return;
-    if (accountBalanceCache && accountBalanceCache.total_equity) {
-      el.textContent = " | \u00da\u010det: " + fmtMoney(accountBalanceCache.total_equity);
-    } else {
-      el.textContent = "";
-    }
+    var mode = state.modeFilter || "all";
+    var balance = accountBalanceCache[mode];
+    var total = balance ? Number(balance.total_equity) : NaN;
+    var totalText = Number.isFinite(total) ? fmtMoney(total) : "—";
+    var totalClass = Number.isFinite(total) && total < 0 ? "pnl-neg" : "pnl-pos";
+    el.innerHTML = 'Total: <span class="' + totalClass + '">' + escapeHTML(totalText) + "</span>" +
+      ' <span class="portfolio-sub">(R ' + escapeHTML(fmtSignedMoney(portfolioPnLTotals.realized)) +
+      " / U " + escapeHTML(fmtSignedMoney(portfolioPnLTotals.unrealized)) + ")</span>";
   }
 
   async function refreshOverview() {

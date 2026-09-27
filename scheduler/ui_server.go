@@ -576,6 +576,7 @@ func (ss *StatusServer) uiStrategyOverviewWithPrices(id string, prices map[strin
 	lifetime := LifetimeTradeStats{}
 	sharpe := 0.0
 	var realizedPnL float64
+	realizedPnLFromLedger := false
 	if ss.stateDB != nil {
 		if stats, err := ss.stateDB.LifetimeTradeStatsForStrategy(id); err == nil {
 			lifetime = stats
@@ -585,33 +586,67 @@ func (ss *StatusServer) uiStrategyOverviewWithPrices(id string, prices map[strin
 		}
 		if rpnl, err := ss.stateDB.RealizedPnLForStrategy(id); err == nil {
 			realizedPnL = rpnl
+			realizedPnLFromLedger = true
 		}
 	}
-	// Unrealized = total - realized, minus odhad exit fee z otvorenych pozicii.
-	// Flat strategia (ziadne pozicie) nema unrealized - vsetko je realizovane
-	// (vratane fee za otvorenie a nezaoctovanych closev).
-	unrealizedPnL := pnl - realizedPnL
-	if len(snapshot.Positions) == 0 && len(snapshot.OptionPositions) == 0 {
-		realizedPnL = pnl
-		unrealizedPnL = 0
-	}
+	flat := len(snapshot.Positions) == 0 && len(snapshot.OptionPositions) == 0
+	liveBloFinLedger := realizedPnLFromLedger && sc.Platform == "blofin" && sc.Type == "perps" && partitionFor(sc).IsLive()
+	var unrealizedPnL float64
 	var openNotional float64
-	for sym, pos := range snapshot.Positions {
-		if pos == nil {
-			continue
+	if liveBloFinLedger {
+		// For live BloFin, realized comes from exchange fills. Calculate open PnL
+		// directly so stale virtual cash/old fees are not mislabelled as U.
+		for sym, pos := range snapshot.Positions {
+			if pos == nil {
+				continue
+			}
+			px, ok := prices[sym]
+			if !ok || px <= 0 {
+				px = pos.AvgCost
+			}
+			mult := pos.Multiplier
+			if mult <= 0 {
+				mult = 1
+			}
+			move := px - pos.AvgCost
+			if strings.EqualFold(pos.Side, "short") {
+				move = -move
+			}
+			unrealizedPnL += pos.Quantity * mult * move
+			openNotional += pos.Quantity * mult * px
 		}
-		px, ok := prices[sym]
-		if !ok || px <= 0 {
-			px = pos.AvgCost
+		if openNotional > 0 {
+			unrealizedPnL -= CalculatePlatformSpotFee(sc.Platform, openNotional)
 		}
-		mult := pos.Multiplier
-		if mult <= 0 {
-			mult = 1
+		pnl = realizedPnL + unrealizedPnL
+		pv = initCap + pnl
+		pnlPct = 0
+		if initCap > 0 {
+			pnlPct = pnl / initCap * 100
 		}
-		openNotional += pos.Quantity * mult * px
-	}
-	if openNotional > 0 {
-		unrealizedPnL -= CalculatePlatformSpotFee(sc.Platform, openNotional)
+	} else {
+		unrealizedPnL = pnl - realizedPnL
+		if flat {
+			realizedPnL = pnl
+			unrealizedPnL = 0
+		}
+		for sym, pos := range snapshot.Positions {
+			if pos == nil {
+				continue
+			}
+			px, ok := prices[sym]
+			if !ok || px <= 0 {
+				px = pos.AvgCost
+			}
+			mult := pos.Multiplier
+			if mult <= 0 {
+				mult = 1
+			}
+			openNotional += pos.Quantity * mult * px
+		}
+		if openNotional > 0 {
+			unrealizedPnL -= CalculatePlatformSpotFee(sc.Platform, openNotional)
+		}
 	}
 	winRate := 0.0
 	if lifetime.Wins+lifetime.Losses > 0 {

@@ -648,6 +648,67 @@ func TestForceCloseAllPositionsRecordsDirectionalTradeSides(t *testing.T) {
 	}
 }
 
+func TestForceCloseAllPositionsLiveBloFinPreservesExchangePosition(t *testing.T) {
+	drainModelOnlyCloseAlerts()
+	s := &StrategyState{
+		ID:              "live-blofin-xlm-15m",
+		Type:            "perps",
+		Platform:        "blofin",
+		Cash:            105,
+		Positions:       map[string]*Position{"XLM": {Symbol: "XLM", Quantity: 34, AvgCost: 0.21759, Side: "long", Multiplier: 100}},
+		OptionPositions: map[string]*OptionPosition{},
+		TradeHistory:    []Trade{},
+		ClosedPositions: []ClosedPosition{},
+	}
+	sc := &StrategyConfig{
+		ID:       s.ID,
+		Type:     "perps",
+		Platform: "blofin",
+		Args:     []string{"consolidation_range", "XLM", "15m", "--mode=live"},
+	}
+	forceCloseAllPositions(s, sc, map[string]float64{"XLM": 0.2161}, nil)
+
+	if s.Positions["XLM"] == nil || s.Positions["XLM"].Quantity != 34 {
+		t.Fatalf("live XLM position was changed by model-only force close: %+v", s.Positions["XLM"])
+	}
+	if len(s.TradeHistory) != 0 || len(s.ClosedPositions) != 0 {
+		t.Fatalf("model-only live close wrote ledger rows: trades=%d closed=%d", len(s.TradeHistory), len(s.ClosedPositions))
+	}
+	if s.Cash != 105 {
+		t.Fatalf("cash = %.4f, want unchanged 105", s.Cash)
+	}
+}
+
+func TestForceCloseAllPositionsLiveBloFinPreservesPositionWithoutExchangeFill(t *testing.T) {
+	s := &StrategyState{
+		ID:              "live-blofin-xlm-15m",
+		Type:            "perps",
+		Platform:        "blofin",
+		Cash:            105,
+		Positions:       map[string]*Position{"XLM": {Symbol: "XLM", Quantity: 34, AvgCost: 0.21759, Side: "long", Multiplier: 100}},
+		OptionPositions: map[string]*OptionPosition{},
+		TradeHistory:    []Trade{},
+		ClosedPositions: []ClosedPosition{},
+	}
+	sc := &StrategyConfig{
+		ID:       s.ID,
+		Type:     "perps",
+		Platform: "blofin",
+		Args:     []string{"consolidation_range", "XLM", "15m", "--mode=live"},
+	}
+	forceCloseAllPositions(s, sc, map[string]float64{"XLM": 0.2161}, nil)
+
+	if pos := s.Positions["XLM"]; pos == nil || pos.Quantity != 34 || pos.Side != "long" {
+		t.Fatalf("live position was changed without an exchange fill: %+v", pos)
+	}
+	if len(s.TradeHistory) != 0 || len(s.ClosedPositions) != 0 {
+		t.Fatalf("model-only close wrote trade rows: trades=%d closed=%d", len(s.TradeHistory), len(s.ClosedPositions))
+	}
+	if s.Cash != 105 {
+		t.Fatalf("cash = %.4f, want unchanged 105", s.Cash)
+	}
+}
+
 func TestForceCloseAllPositions_CorruptPositionBooksZeroPnL(t *testing.T) {
 	cases := []struct {
 		name string
@@ -2319,7 +2380,7 @@ func TestCheckPortfolioRisk_MarginWarningReasons(t *testing.T) {
 	}
 }
 
-func TestBuildPortfolioWarningMessage_IncludesTriageSections(t *testing.T) {
+func TestBuildPortfolioWarningMessage_IsConciseAndDoesNotRequestManualClose(t *testing.T) {
 	now := time.Date(2026, 6, 6, 6, 5, 0, 0, time.UTC)
 	state := &AppState{
 		PortfolioRisk: map[RiskPartition]*PortfolioRiskState{livePartition: {
@@ -2357,6 +2418,7 @@ func TestBuildPortfolioWarningMessage_IncludesTriageSections(t *testing.T) {
 	msg := BuildPortfolioWarningMessage(PortfolioWarningMessageInputs{
 		Config:      &PortfolioRiskConfig{MaxDrawdownPct: 25, WarnThresholdPct: 60},
 		State:       state,
+		Partition:   livePartition,
 		Prices:      map[string]float64{"BTC": 68080},
 		TotalValue:  8400,
 		PerpsLoss:   250,
@@ -2369,22 +2431,21 @@ func TestBuildPortfolioWarningMessage_IncludesTriageSections(t *testing.T) {
 	})
 
 	for _, want := range []string{
-		"**PORTFOLIO WARNING**",
-		"Kill switch: 25.0% drawdown | Warn threshold: 15.0%",
-		"In band since: 2026-06-06 05:47 UTC (18m)",
-		"Current: equity=16.5% ($8400 / peak $10060) | perps margin=18.2% ($250 loss on $1500 margin)",
-		"Distance to kill switch: 8.5% equity | perps margin 6.8% from limit",
-		"Trend: WORSENING - equity dd +1.2% since last cycle; margin dd +0.8%",
-		"Top contributors:",
-		"```",
-		"hl-btc-sma-30",
-		"pos: short 0.5 BTC @ $67800 (-$140 unrealized)",
-		"Recent activity (last 15m):",
-		"05:51  perps  hl-btc-sma-30",
-		"Recommended:",
+		"**PORTFOLIO WARNING LIVE**",
+		"Equity drawdown: 16.5% ($8400 / peak $10060).",
+		"Perps margin drawdown: 18.2% ($250 loss on $1500 margin).",
+		"Warning threshold (equity or margin): 15.0%.",
+		"Equity kill switch: 25.0%; current equity drawdown 16.5% (8.5 pp away).",
+		"Perps margin drawdown: 18.2%.",
+		"Heads-up only; no manual position close is requested.",
 	} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("warning message missing %q:\n%s", want, msg)
+		}
+	}
+	for _, unwanted := range []string{"Top contributors:", "Recent activity", "Recommended:", "consider manually closing", "hl-btc-sma-30"} {
+		if strings.Contains(msg, unwanted) {
+			t.Errorf("concise warning unexpectedly contains %q:\n%s", unwanted, msg)
 		}
 	}
 	if len(msg) >= 2000 {
@@ -2392,7 +2453,7 @@ func TestBuildPortfolioWarningMessage_IncludesTriageSections(t *testing.T) {
 	}
 }
 
-func TestBuildPortfolioWarningMessage_DailyPnLFallbackLabel(t *testing.T) {
+func TestBuildPortfolioWarningMessage_DoesNotListStrategyPnL(t *testing.T) {
 	now := time.Date(2026, 6, 6, 6, 5, 0, 0, time.UTC)
 	state := &AppState{
 		PortfolioRisk: map[RiskPartition]*PortfolioRiskState{livePartition: {
@@ -2419,12 +2480,12 @@ func TestBuildPortfolioWarningMessage_DailyPnLFallbackLabel(t *testing.T) {
 		Now:              now,
 		EquityGuardArmed: true,
 	})
-	if !strings.Contains(msg, "daily P&L -$75") {
-		t.Fatalf("expected daily P&L fallback label in warning message:\n%s", msg)
+	if strings.Contains(msg, "daily P&L") || strings.Contains(msg, "no-initial-cap") {
+		t.Fatalf("portfolio warning should not attribute risk to individual strategy P&L:\n%s", msg)
 	}
 }
 
-func TestBuildPortfolioWarningMessage_PoolIgnoresStaleInitialCapital(t *testing.T) {
+func TestBuildPortfolioWarningMessage_DoesNotListPoolStrategyPnL(t *testing.T) {
 	state := &AppState{Strategies: map[string]*StrategyState{
 		"hl-pool": {
 			ID: "hl-pool", Type: "perps",
@@ -2442,11 +2503,10 @@ func TestBuildPortfolioWarningMessage_PoolIgnoresStaleInitialCapital(t *testing.
 		State:            state,
 		EquityGuardArmed: true,
 	})
-	if !strings.Contains(msg, "net P&L") || !strings.Contains(msg, "-$75") {
-		t.Fatalf("expected pool net P&L without stale baseline:\n%s", msg)
-	}
-	if strings.Contains(msg, "-$1075") {
-		t.Fatalf("stale initial capital leaked into pool warning:\n%s", msg)
+	for _, unwanted := range []string{"net P&L", "-$75", "-$1075", "hl-pool"} {
+		if strings.Contains(msg, unwanted) {
+			t.Fatalf("portfolio warning should not list strategy P&L %q:\n%s", unwanted, msg)
+		}
 	}
 }
 

@@ -127,60 +127,28 @@ func TestPortfolioWarningContributors_IncludePausedOptIn(t *testing.T) {
 	}
 }
 
-func TestPortfolioWarningMessage_PausedFootnote(t *testing.T) {
-	cfgStrategies := []StrategyConfig{
-		{ID: "live-paused-btc", Type: "futures", Args: []string{"--mode=live"}, Paused: true},
-		{ID: "live-active-eth", Type: "futures", Args: []string{"--mode=live"}},
-	}
-	state := NewAppState()
-	state.Strategies["live-paused-btc"] = &StrategyState{
-		ID: "live-paused-btc", InitialCapital: 100,
-		Positions: map[string]*Position{},
-		RiskState: RiskState{CurrentDrawdownPct: 30},
-	}
-	state.Strategies["live-active-eth"] = &StrategyState{
-		ID: "live-active-eth", InitialCapital: 100,
-		Positions: map[string]*Position{},
-		RiskState: RiskState{CurrentDrawdownPct: 5},
-	}
-	state.Strategies["live-paused-btc"].Cash = 50
-	state.Strategies["live-active-eth"].Cash = 100
-	state.PortfolioRisk = map[RiskPartition]*PortfolioRiskState{
-		livePartition: {PeakValue: 200, WarningSent: true, WarnBandEnteredAt: time.Now().UTC()},
-	}
-
-	prices := map[string]float64{"ETH": 3000, "BTC": 60000}
+func TestPortfolioWarningMessage_NoManualCloseRecommendation(t *testing.T) {
+	state := &AppState{PortfolioRisk: map[RiskPartition]*PortfolioRiskState{
+		livePartition: {PeakValue: 200, CurrentDrawdownPct: 1.7, CurrentMarginDrawdownPct: 12.5},
+	}}
 	msg := BuildPortfolioWarningMessage(PortfolioWarningMessageInputs{
-		Reason:           "test",
-		Config:           &PortfolioRiskConfig{MaxDrawdownPct: 30, WarnThresholdPct: 60},
+		Config:           &PortfolioRiskConfig{MaxDrawdownPct: 20, WarnThresholdPct: 80},
 		State:            state,
 		Partition:        livePartition,
-		CfgStrategies:    cfgStrategies,
-		Prices:           prices,
-		TotalValue:       150,
-		PerpsMargin:      50,
-		PerpsLoss:        15,
-		Recent:           []Trade{{StrategyID: "live-paused-btc", Side: "buy", Quantity: 1, Price: 1, Timestamp: time.Now().UTC()}},
+		TotalValue:       196.6,
+		PerpsMargin:      55,
+		PerpsLoss:        7,
 		Now:              time.Now().UTC(),
 		EquityGuardArmed: true,
 	})
-	const contributorsPrefix = "Top contributors:\n```\n"
-	start := strings.Index(msg, contributorsPrefix)
-	if start < 0 {
-		t.Fatalf("warning missing contributors block: %s", msg)
+	for _, want := range []string{"Warning threshold (equity or margin): 16.0%", "Equity kill switch: 20.0%", "no manual position close is requested"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("warning missing %q:\n%s", want, msg)
+		}
 	}
-	blockStart := start + len(contributorsPrefix)
-	end := strings.Index(msg[blockStart:], "```\n")
-	if end < 0 {
-		t.Fatalf("warning contributors block is not closed: %s", msg)
-	}
-	if block := msg[blockStart : blockStart+end]; strings.Contains(block, "live-paused-btc") {
-		t.Fatalf("paused strategy leaked into Top contributors block: %q", block)
-	}
-	if !strings.Contains(msg, "live-paused-btc") {
-		t.Fatalf("recent activity fixture missing from warning: %s", msg)
-	}
-	if !strings.Contains(msg, "paused strateg") || !strings.Contains(msg, "excluded from contributors") {
-		t.Fatalf("expected paused footnote in message, got:\n%s", msg)
+	for _, unwanted := range []string{"Top contributors", "Recent activity", "Recommended:", "consider manually closing", "live-paused-btc"} {
+		if strings.Contains(msg, unwanted) {
+			t.Fatalf("warning unexpectedly contains %q:\n%s", unwanted, msg)
+		}
 	}
 }

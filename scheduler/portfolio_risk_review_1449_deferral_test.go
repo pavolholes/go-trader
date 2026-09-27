@@ -165,11 +165,8 @@ func TestPortfolioWarningMessage_NamesTheDeferredLatch(t *testing.T) {
 	if !strings.Contains(msg, "DEFERRED") {
 		t.Errorf("the warning message must name the deferred latch; got:\n%s", msg)
 	}
-	if strings.Contains(msg, "Distance to kill switch: 0.0% equity") {
-		t.Errorf("the deferred path must not print a bare 0.0%% distance; got:\n%s", msg)
-	}
-	if !strings.Contains(msg, "#292") {
-		t.Errorf("the message must name what is protecting the book meanwhile; got:\n%s", msg)
+	if !strings.Contains(msg, "equity data is untrusted") || !strings.Contains(msg, "circuit breakers remain active") {
+		t.Errorf("the deferred path must explain its data state and remaining protection; got:\n%s", msg)
 	}
 }
 

@@ -1085,6 +1085,17 @@ func classifyPositionTradeType(s *StrategyState, pos *Position) string {
 }
 
 func forceCloseAllPositions(s *StrategyState, sc *StrategyConfig, prices map[string]float64, logger *StrategyLogger) {
+	if s == nil {
+		return
+	}
+	if sc != nil && sc.Platform == "blofin" && sc.Type == "perps" && isLiveArgs(sc.Args) {
+		// A model mark is not an exchange fill. Keep the live copy position in
+		// state so the ledger, margin view and next close decision cannot drift.
+		if logger != nil {
+			logger.Warn("BloFin live circuit breaker: preserving exchange position state; no close fill was confirmed")
+		}
+		return
+	}
 	for symbol, pos := range s.Positions {
 		closeVirtualPositionAtMark(s, sc, symbol, pos, prices, logger)
 	}
