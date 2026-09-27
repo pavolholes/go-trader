@@ -65,6 +65,30 @@ def test_copy_order_fill_never_returns_a_different_order():
     assert fill == {}
 
 
+def test_copy_order_fill_matches_client_id_when_close_detail_id_differs():
+    client_order_id = "c0ffee1234567890abcdef1234567890"
+    adapter, _ = adapter_with_history([[
+        {
+            "orderId": "16967850",
+            "clientOrderId": client_order_id,
+            "filledSize": "201",
+            "averagePrice": "148.83",
+            "fee": "0.17948898",
+        }
+    ]])
+
+    fill = adapter.get_copy_order_fill(
+        "7363438", "SPCX-USDT", tries=1, client_order_id=client_order_id
+    )
+
+    assert fill == {
+        "avg_px": 148.83,
+        "total_sz": 201.0,
+        "fee": 0.17948898,
+        "oid": "16967850",
+    }
+
+
 def copy_adapter(current_positions=None):
     adapter = object.__new__(BloFinExchangeAdapter)
     adapter._is_live = True
@@ -106,6 +130,14 @@ def test_copy_open_applies_configured_leverage_to_selected_side():
     assert leverage_calls == [("XLM-USDT", "75", "cross", "long")]
 
 
+def test_copy_order_forwards_stable_client_order_id():
+    adapter, submitted, _ = copy_adapter()
+
+    adapter.market_open("XLM", True, 1.0, client_order_id="client-order-123")
+
+    assert submitted["client_oid"] == "client-order-123"
+
+
 def test_copy_account_refuses_unmarked_open_that_would_flip_tracked_position():
     adapter, submitted, leverage_calls = copy_adapter()
 
@@ -141,20 +173,24 @@ def test_execute_handles_object_shaped_copy_order_response(monkeypatch, capsys):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     calls = []
+    client_ids = []
 
     class FakeAdapter:
         trade_account = "copy"
 
         def market_open(self, *args, **kwargs):
-            return {"code": "0", "data": {"orderId": "16949003"}, "contract_value": 0.01}
+            client_ids.append(kwargs["client_order_id"])
+            # The place-order acknowledgement returns a close-detail ID, not
+            # the parent Copy order ID used by orders-history.
+            return {"code": "0", "data": {"orderId": "7361243"}, "contract_value": 0.01}
 
-        def get_copy_order_fill(self, order_id, inst_id):
-            calls.append((order_id, inst_id))
+        def get_copy_order_fill(self, order_id, inst_id, client_order_id=""):
+            calls.append((order_id, inst_id, client_order_id))
             return {
                 "avg_px": 2688.85,
                 "total_sz": 11.1,
                 "fee": 0.17907741,
-                "oid": order_id,
+                "oid": "16949003",
             }
 
     monkeypatch.setattr(adapter_module, "BloFinExchangeAdapter", FakeAdapter)
@@ -162,7 +198,9 @@ def test_execute_handles_object_shaped_copy_order_response(monkeypatch, capsys):
     module.run_execute("ETH", "sell", 11.16, "live", False, "long", True, 75)
 
     output = json.loads(capsys.readouterr().out)
-    assert calls == [("16949003", "ETH-USDT")]
+    assert len(client_ids) == 1 and len(client_ids[0]) == 32
+    int(client_ids[0], 16)
+    assert calls == [("7361243", "ETH-USDT", client_ids[0])]
     assert output["execution"]["fill"] == {
         "avg_px": 2688.85,
         "total_sz": 11.1,
@@ -186,7 +224,7 @@ def test_copy_order_ack_without_history_fill_does_not_assume_requested_size(monk
         def market_open(self, *args, **kwargs):
             return {"code": "0", "data": {"orderId": "unfilled"}, "contract_value": 0.01}
 
-        def get_copy_order_fill(self, order_id, inst_id):
+        def get_copy_order_fill(self, order_id, inst_id, client_order_id=""):
             return {}
 
     monkeypatch.setattr(adapter_module, "BloFinExchangeAdapter", FakeAdapter)

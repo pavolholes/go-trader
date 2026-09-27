@@ -295,9 +295,11 @@ class BloFinExchangeAdapter:
             })
         return out
 
-    def get_copy_order_fill(self, order_id: str, inst_id: str, tries: int = 10) -> dict:
-        """Poll copy orders-history and select the exact instrument/order fill."""
-        if not order_id or not inst_id:
+    def get_copy_order_fill(self, order_id: str, inst_id: str, tries: int = 10, client_order_id: str = "") -> dict:
+        """Poll copy order history by its order ID or stable client order ID."""
+        wanted_order_id = str(order_id or "")
+        wanted_client_order_id = str(client_order_id or "")
+        if not inst_id or (not wanted_order_id and not wanted_client_order_id):
             return {}
         for _ in range(max(1, tries)):
             try:
@@ -308,7 +310,11 @@ class BloFinExchangeAdapter:
                         params["before"] = cursor
                     items = self._private_get("/api/v1/copytrading/trade/orders-history", params).get("data", [])
                     for o in items:
-                        if str(o.get("orderId", "")) != str(order_id):
+                        copy_order_id = str(o.get("orderId", "") or "")
+                        history_client_order_id = str(o.get("clientOrderId") or o.get("clOrdId") or "")
+                        if copy_order_id != wanted_order_id and (
+                            not wanted_client_order_id or history_client_order_id != wanted_client_order_id
+                        ):
                             continue
                         filled = float(o.get("filledSize", 0) or 0)
                         if filled > 0:
@@ -316,7 +322,7 @@ class BloFinExchangeAdapter:
                                 "avg_px": float(o.get("averagePrice", 0) or 0),
                                 "total_sz": filled,
                                 "fee": float(o.get("fee", 0) or 0),
-                                "oid": str(o["orderId"]),
+                                "oid": copy_order_id or wanted_order_id,
                             }
                     if len(items) < 20:
                         break
@@ -410,7 +416,7 @@ class BloFinExchangeAdapter:
             body["clientOrderId"] = client_oid
         return self._private_post("/api/v1/trade/close-position", body)
 
-    def market_open(self, symbol: str, is_buy: bool, size: float, inst_type: str = "swap", size_in_contracts: bool = False, pos_side_hint: str = "", is_close: bool = False, leverage: float = 0.0) -> dict:
+    def market_open(self, symbol: str, is_buy: bool, size: float, inst_type: str = "swap", size_in_contracts: bool = False, pos_side_hint: str = "", is_close: bool = False, leverage: float = 0.0, client_order_id: str = "") -> dict:
         if not self._is_live:
             raise RuntimeError(
                 "market_open requires live mode (set BLOFIN_API_KEY, BLOFIN_API_SECRET, BLOFIN_PASSPHRASE)"
@@ -468,6 +474,7 @@ class BloFinExchangeAdapter:
             order_type="market",
             size=qsize,
             pos_side=pos_side,
+            client_oid=client_order_id,
         )
         try:
             if isinstance(result, dict):

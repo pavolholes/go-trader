@@ -330,6 +330,12 @@ func TestSendTradeAlertsRouting(t *testing.T) {
 		Platform: "hyperliquid",
 		Args:     []string{"sma", "BTC", "1h", "--mode=live"},
 	}
+	blofinLive := StrategyConfig{
+		ID:       "live-order_blocks-spcx-15m",
+		Type:     "perps",
+		Platform: "blofin",
+		Args:     []string{"order_blocks", "SPCX", "15m", "--mode=live"},
+	}
 	hlPaperNoChannelKey := StrategyConfig{
 		ID:       "hl-perps-sma",
 		Type:     "perps",
@@ -338,15 +344,17 @@ func TestSendTradeAlertsRouting(t *testing.T) {
 	}
 
 	cases := []struct {
-		name        string
-		sc          StrategyConfig
-		ownerID     string
-		channels    map[string]string
-		dmChannels  map[string]string
-		failSendDM  bool
-		wantDMs     int
-		wantDMUser  string
-		wantChanIDs []string
+		name               string
+		sc                 StrategyConfig
+		ownerID            string
+		channels           map[string]string
+		dmChannels         map[string]string
+		tradeAlertChannels map[string]string
+		trades             []Trade
+		failSendDM         bool
+		wantDMs            int
+		wantDMUser         string
+		wantChanIDs        []string
 	}{
 		{
 			name: "dm and channel", sc: spotPaper, ownerID: "owner123",
@@ -380,6 +388,12 @@ func TestSendTradeAlertsRouting(t *testing.T) {
 			channels:   map[string]string{"hyperliquid": "ch-hl", "hyperliquid-live": "ch-hl-live"},
 			dmChannels: map[string]string{"hyperliquid": "owner123"},
 			wantDMs:    1, wantChanIDs: []string{"ch-hl", "ch-hl-live"},
+		},
+		{
+			name: "BloFin live partial close uses trade-alert channel", sc: blofinLive,
+			tradeAlertChannels: map[string]string{"default": "live-trades"},
+			trades:             []Trade{{StrategyID: blofinLive.ID, Symbol: "SPCX", Side: "sell", Quantity: 201, Price: 148.83, IsClose: true, RealizedPnL: 0.1809}},
+			wantChanIDs:        []string{"live-trades"},
 		},
 		{
 			name: "live channel dedup", sc: hlLive,
@@ -427,15 +441,20 @@ func TestSendTradeAlertsRouting(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			mock := &mockNotifier{failSendDM: tc.failSendDM}
-			state := &StrategyState{TradeHistory: []Trade{testTrade()}}
+			trades := tc.trades
+			if trades == nil {
+				trades = []Trade{testTrade()}
+			}
+			state := &StrategyState{TradeHistory: trades}
 			var mu sync.RWMutex
 			notifier := &MultiNotifier{
 				backends: []notifierBackend{
 					{
-						notifier:   mock,
-						ownerID:    tc.ownerID,
-						channels:   tc.channels,
-						dmChannels: tc.dmChannels,
+						notifier:           mock,
+						ownerID:            tc.ownerID,
+						channels:           tc.channels,
+						dmChannels:         tc.dmChannels,
+						tradeAlertChannels: tc.tradeAlertChannels,
 					},
 				},
 			}

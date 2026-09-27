@@ -15,6 +15,7 @@ import os
 import json
 import math
 import traceback
+import uuid
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'platforms', 'blofin'))
@@ -301,14 +302,21 @@ def run_execute(symbol, side, size, mode, size_in_contracts=False, pos_side_hint
         from adapter import BloFinExchangeAdapter
         adapter = BloFinExchangeAdapter()
         is_buy = side.lower() == "buy"
-        result = adapter.market_open(symbol, is_buy, size, inst_type="swap", size_in_contracts=size_in_contracts, pos_side_hint=pos_side_hint, is_close=is_close, leverage=leverage)
+        client_order_id = uuid.uuid4().hex if adapter.trade_account == "copy" else ""
+        result = adapter.market_open(
+            symbol, is_buy, size, inst_type="swap", size_in_contracts=size_in_contracts,
+            pos_side_hint=pos_side_hint, is_close=is_close, leverage=leverage,
+            client_order_id=client_order_id,
+        )
 
         data = _order_response_data(result)
         oid = data.get("orderId") or data.get("ordId") or result.get("orderId") or result.get("ordId") or ""
         fill = {}
         copy_filled = False
-        if adapter.trade_account == "copy" and oid:
-            got = adapter.get_copy_order_fill(str(oid), f"{symbol}-USDT")
+        if adapter.trade_account == "copy" and (oid or client_order_id):
+            got = adapter.get_copy_order_fill(
+                str(oid or ""), f"{symbol}-USDT", client_order_id=client_order_id
+            )
             if got:
                 fill = got
                 copy_filled = True

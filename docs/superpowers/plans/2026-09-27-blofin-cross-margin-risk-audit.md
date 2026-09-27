@@ -1,6 +1,6 @@
 # BloFin Copy Trading Cross-Margin Risk — Audit and Fix Plan
 
-**Status:** Audit findings recorded; implementation of exchange-risk and kill-switch changes is pending operator policy decisions.
+**Status:** SPCX/USELESS ledger reconciled and client-order-ID correlation implemented; exchange-risk and kill-switch redesign is pending operator policy decisions.
 
 **Currently deployed:** portfolio warning threshold is configured at 80% of the 20% model limit (16%), with a simpler message and 2pp escalation. Those warning inputs are still model-derived and must not be represented as BloFin account-equity or cross-margin measurements.
 
@@ -13,11 +13,11 @@ The current portfolio warning uses internal virtual strategy-book value and esti
 - BloFin Copy Trading asset balance: **$396.447 USDT**.
 - BloFin Copy Trading perps `totalEquity`: **$396.598**, available **$346.164**.
 - At the same audit, Go `/status` reported internal `TotalPV` **$1,223.04**, peak **$1,253.32**, equity drawdown **2.28%**, and modeled perps-margin drawdown **7.09%**. These are not account equity/margin fields.
-- BloFin returned 6 open positions by order before the SPCX close sequence and **5 open positions / 0 open orders** afterward.
-- At the same audit, Go `/status` reported internal `TotalPV` **$1,223.04**, peak **$1,253.32**, equity drawdown **2.28%**, and modeled perps-margin drawdown **7.09%**. These are not account equity/margin fields.
+- BloFin returned 6 open positions before the close sequences and **4 open positions / 0 open orders** afterward.
 - SPCX parent position `16931262` had 504 original contracts. Three strategy SELL close orders filled: `16967850` 201 contracts (PnL +$0.1809, fee $0.17948898), `16968008` 201 (PnL +$0.201, fee $0.17950104), and `16968123` 102 (PnL +$0.102, fee $0.09109008). Total 504 closed; gross PnL +$0.4839 and fees $0.45008010. BloFin position history confirms the parent position is closed.
-- The strategy requested a 201.6-contract 40% partial close on three consecutive cycles because runtime/DB stayed at 504. BloFin filled the available quantity each time; the last fill closed the remaining 102. The live log reported `BloFin live order without fill ... skipping DB write` after each fill. Go runtime and `state.db` still show quantity 504 and only the opening trade; the exchange has no SPCX position.
-- The other five exchange positions remain open. No SPX order was submitted in the inspected 30-minute window; the SPX row is an existing position, not one of these SPCX close orders.
+- USELESS parent position `16924903` also closed in two fills: `16968579` sold 16 contracts (PnL +$0.8694, fee $0.02823876) and `16968847` sold 25 (PnL +$2.8725, fee $0.0450315). Gross PnL +$3.7419, fees $0.07327026.
+- Both exits were absent from the original ledger: the Bot logged “without fill” and kept stale quantities, then retried partial sells until BloFin was flat. After full Copy-history reconciliation the DB has 81 trades, 55 close fills, 22 closed positions, 4 open positions, and realized gross PnL +$144.60736 (`integrity=ok`).
+- Current exchange-open order IDs are SPX `16944011`, HYPE `16927677` (41 remaining from 81), DOGE `16923379`, and XLM `16921894`; the DB now matches these. No SPX order was submitted in the inspected 30-minute window.
 - Discord config has no `discord.owner_id`; container environment has no `DISCORD_OWNER_ID`. Therefore owner DMs are silently skipped. Channel warnings still send.
 - Warning events at 09:38:13Z and 09:38:36Z were two separate margin-band events, not a channel/DM duplicate. The warning flag resets when metrics leave the band, so crossing back over the threshold can notify immediately.
 
@@ -45,11 +45,12 @@ The 20% drawdown calculation is therefore against the virtual book. At a `$1,253
 
 ### D. Fill-to-ledger reconciliation is still incomplete
 
-Copy order-history IDs `16967850`, `16968008`, and `16968123` record the three fills; the first position-detail close ID is `7363438`, a different ID namespace. Direct polling by Copy history ID returns the fills, but live execution still reports no fill and skips DB writes. Runtime/DB therefore remain at 504 after BloFin fully closed the position. The stale quantity can corrupt risk inputs and cause repeated close attempts; the close guard prevented orders after exchange inventory reached zero.
+Copy order-history IDs `16967850`, `16968008`, and `16968123` record the SPCX fills; position-detail close ID `7363438` is a different ID namespace. USELESS had the same missed-fill pattern. A stable `clientOrderId` is now submitted and the fill poller can match it or the canonical Copy-history ID. Python regression tests cover an acknowledgement close-detail ID differing from the parent history ID. No live close has occurred after this change yet, so end-to-end exchange verification is still pending.
 
 ### E. Discord owner DM is not configured; threshold can chatter
 
 - `SendOwnerDM` is a no-op when owner ID is blank. Configure `DISCORD_OWNER_ID` or `discord.owner_id` and verify the DM route end-to-end.
+- `DISCORD_TRADES_CHANNEL_ID` is configured; the failed fill path returned zero recorded trades, so `sendTradeAlerts` had nothing to publish. One aggregated recovery summary for the five missed close fills was posted after ledger reconciliation. Owner DMs remain unconfigured.
 - The 16% threshold is currently applied to model equity or modeled margin. The 2pp escalation and six-hour reminder do not suppress immediate notifications after the risk state leaves and re-enters the band; add a re-entry cooldown/hysteresis.
 
 ## Proposed target design
@@ -66,15 +67,15 @@ Copy order-history IDs `16967850`, `16968008`, and `16968123` record the three f
 
 ## Implementation phases
 
-### P0 — Repair current SPCX state
+### P0 — Reconcile current Copy ledger (completed 2026-09-27)
 
-1. Obtain authorization to stop automation briefly, take a consistent SQLite backup, and stage reconciliation from Copy Trading position/order history.
-2. Rebuild SPCX parent `16931262` as fully closed from the three confirmed fills, booking all three fees and realized PnL and removing its stale open-position row.
-3. Install only after integrity/count validation, preserve backups, restart, and compare all five remaining order IDs/available quantities with BloFin.
+1. Paused automation, took a consistent SQLite backup, and staged the complete Copy Trading history.
+2. Rebuilt SPCX `16931262` and USELESS `16924903` as closed, booking all five confirmed close fills, fees, and realized PnL.
+3. Installed after integrity/count validation, preserved consistent/raw/WAL/SHM backups, restarted, and confirmed the four remaining exchange positions match DB.
 
 ### P1 — Make fill correlation reliable
 
-Add tests for differing placement, Copy-history, and position-detail ID namespaces; instrument the acknowledgement identifiers without logging secrets; ensure a confirmed exchange fill reaches Go before its DB write decision.
+Stable client-order-ID submission and Copy-history lookup are implemented and deployed. Regression tests cover a close-detail acknowledgement ID differing from the Copy-history parent ID, unfilled acknowledgements, and live partial-close trade-alert routing. Verify against the next real fill; do not use a test market order.
 
 ### P2 — Base risk on the actual Copy account
 
@@ -94,4 +95,4 @@ Set/verify `DISCORD_OWNER_ID`; test delivery and failures. Add re-entry hysteres
 2. Should BloFin risk be protected by exchange-native SL/TP orders, bot-managed exits that continue during breakers, or both?
 3. Provide the Discord numeric user ID or set `DISCORD_OWNER_ID` in the live environment if private DMs are desired.
 
-No exchange positions were closed and no database changes were made during this audit.
+No exchange orders were submitted by the assistant. Strategy-generated SPCX and USELESS close fills were reconciled offline; the four remaining exchange positions were left unchanged. One recovery summary was posted to the configured live-trades channel. The real-account risk source and kill-switch policy are still pending the decisions below.
