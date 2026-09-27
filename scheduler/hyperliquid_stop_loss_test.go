@@ -369,8 +369,8 @@ func TestRunHyperliquidTrailingStopUpdate_DefersOnCancelFailure(t *testing.T) {
 	if len(mock.messages) != 1 || !strings.Contains(mock.messages[0].content, "old trigger OID 111") || !strings.Contains(mock.messages[0].content, "not replaced") {
 		t.Fatalf("broadcast messages=%+v, want deferred cancel-failure alert", mock.messages)
 	}
-	if len(mock.dms) != 1 || !strings.Contains(mock.dms[0].content, "order not found") {
-		t.Fatalf("DMs=%+v, want owner alert with cancel error", mock.dms)
+	if len(mock.dms) != 0 {
+		t.Fatalf("informational stop alerts must not use DMs: %+v", mock.dms)
 	}
 }
 
@@ -1339,8 +1339,8 @@ func TestNotifyATRMultMissingEntryATROnce_ThrottlesPerStrategySymbol(t *testing.
 	if got := len(mock.messages); got != 1 {
 		t.Errorf("expected 1 broadcast for ETH, got %d (%+v)", got, mock.messages)
 	}
-	if got := len(mock.dms); got != 1 {
-		t.Errorf("expected 1 owner DM for ETH, got %d (%+v)", got, mock.dms)
+	if got := len(mock.dms); got != 0 {
+		t.Errorf("expected no owner DMs for ETH, got %d (%+v)", got, mock.dms)
 	}
 	if len(mock.messages) > 0 && !strings.Contains(mock.messages[0].content, "MISSING ENTRY ATR") {
 		t.Errorf("alert content missing MISSING ENTRY ATR phrase: %q", mock.messages[0].content)
@@ -1466,8 +1466,8 @@ func TestNotifyTieredTPATRMissingEntryATROnce_ThrottlesAndShares(t *testing.T) {
 	if got := len(mock.messages); got != 1 {
 		t.Errorf("expected 1 broadcast for ETH, got %d", got)
 	}
-	if got := len(mock.dms); got != 1 {
-		t.Errorf("expected 1 owner DM for ETH, got %d", got)
+	if got := len(mock.dms); got != 0 {
+		t.Errorf("expected no owner DMs for ETH, got %d", got)
 	}
 	if len(mock.messages) > 0 && !strings.Contains(mock.messages[0].content, "tiered_tp_atr") {
 		t.Errorf("alert content missing tiered_tp_atr: %q", mock.messages[0].content)

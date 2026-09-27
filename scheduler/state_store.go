@@ -636,11 +636,11 @@ func reportStateOwnershipFailure(err error) string {
 	return msg
 }
 
-// sendStartupRefusalDM pages the owner about a refusal that systemd keeps down
+// sendStartupRefusalDM posts a refusal that systemd keeps down
 // under RestartPreventExitStatus. Every such exit must reach the notifier, not
 // stderr alone.
 func sendStartupRefusalDM(notifier *MultiNotifier, guard, msg string) {
-	if notifier == nil || !notifier.HasOwner() {
+	if notifier == nil || !notifier.HasBackends() {
 		return
 	}
 	notifier.SendOwnerDM(fmt.Sprintf("**%s** — %s", guard, msg))

@@ -113,6 +113,5 @@ func warnNotifier(notifier *MultiNotifier, msg string) {
 	fmt.Fprintln(os.Stderr, "[WARN] "+msg)
 	if notifier != nil && notifier.HasBackends() {
 		notifier.SendToAllChannels(msg)
-		notifier.SendOwnerDM(msg)
 	}
 }

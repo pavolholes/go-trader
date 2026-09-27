@@ -148,7 +148,6 @@ func notifyScriptFailure(notifier *MultiNotifier, sc StrategyConfig, mode script
 		}
 		msg := formatScriptFailureTransientAlert(sc, mode, errMsg, count)
 		notifier.SendToAllChannels(msg)
-		notifier.SendOwnerDM(msg)
 		return
 	}
 	shouldNotify, count := scriptFailureTracker.Record(sc.ID, errMsg, now)
@@ -157,7 +156,6 @@ func notifyScriptFailure(notifier *MultiNotifier, sc StrategyConfig, mode script
 	}
 	msg := formatScriptFailureAlert(sc, mode, errMsg, count)
 	notifier.SendToAllChannels(msg)
-	notifier.SendOwnerDM(msg)
 }
 
 // notifyLiveExecuteFailure posiela alert OKAMZITE (bez prahu 3 opakovani).
@@ -168,7 +166,6 @@ func notifyLiveExecuteFailure(notifier *MultiNotifier, sc StrategyConfig, errMsg
 	}
 	msg := formatScriptFailureAlert(sc, scriptFailureError, errMsg, 1)
 	notifier.SendToAllChannels(msg)
-	notifier.SendOwnerDM(msg)
 }
 
 func formatBatchSharedStateFailureAlert(sc StrategyConfig, errMsg string, memberIDs []string, count int) string {
@@ -197,7 +194,6 @@ func notifyBatchSharedStateFailure(notifier *MultiNotifier, sc StrategyConfig, e
 		}
 		msg := formatBatchSharedStateFailureAlert(sc, errMsg, memberIDs, count)
 		notifier.SendToAllChannels(msg)
-		notifier.SendOwnerDM(msg)
 		return
 	}
 	shouldNotify, count := scriptFailureTracker.Record(sc.ID, errMsg, now)
@@ -206,7 +202,6 @@ func notifyBatchSharedStateFailure(notifier *MultiNotifier, sc StrategyConfig, e
 	}
 	msg := formatBatchSharedStateFailureAlert(sc, errMsg, memberIDs, count)
 	notifier.SendToAllChannels(msg)
-	notifier.SendOwnerDM(msg)
 }
 
 func clearBatchSharedStateFailure(notifier *MultiNotifier, sc StrategyConfig) {
@@ -224,7 +219,6 @@ func clearBatchSharedStateFailure(notifier *MultiNotifier, sc StrategyConfig) {
 	}
 	msg := formatBatchSharedStateRecoveredAlert(sc, prior)
 	notifier.SendToAllChannels(msg)
-	notifier.SendOwnerDM(msg)
 }
 
 func clearScriptFailure(notifier *MultiNotifier, sc StrategyConfig) {
@@ -242,5 +236,4 @@ func clearScriptFailure(notifier *MultiNotifier, sc StrategyConfig) {
 	}
 	msg := formatScriptRecoveredAlert(sc, prior)
 	notifier.SendToAllChannels(msg)
-	notifier.SendOwnerDM(msg)
 }

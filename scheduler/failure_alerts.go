@@ -117,7 +117,6 @@ func notifyLiveExecFailure(notifier *MultiNotifier, sc StrategyConfig, direction
 	}
 	msg := formatLiveExecFailureAlert(sc.ID, sc.Platform, direction, symbol, errMsg, count)
 	notifier.SendToAllChannels(msg)
-	notifier.SendOwnerDM(msg)
 }
 
 func clearLiveExecThrottle(sc StrategyConfig, direction, symbol string) {

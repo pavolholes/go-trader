@@ -303,8 +303,8 @@ func TestDrainOperatorRequired_DeliversToNotifier(t *testing.T) {
 
 	drainOperatorRequiredPendingCloses(state, n, &mu)
 
-	if len(n.channels) != 1 || len(n.dms) != 1 {
-		t.Fatalf("expected 1 channel send + 1 owner DM; got channels=%d dms=%d", len(n.channels), len(n.dms))
+	if len(n.channels) != 1 || len(n.dms) != 0 {
+		t.Fatalf("expected one channel alert and no DM; got channels=%d dms=%d", len(n.channels), len(n.dms))
 	}
 	if !strings.Contains(n.channels[0], "OPERATOR INTERVENTION REQUIRED") {
 		t.Errorf("channel message missing header: %s", n.channels[0])

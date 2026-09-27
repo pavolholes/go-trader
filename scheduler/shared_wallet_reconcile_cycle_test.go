@@ -691,10 +691,10 @@ func TestReportSharedWalletDrift_CompoundOrphanAndDriftReportsDrift(t *testing.T
 	}
 	reportSharedWalletDrift(notifier, compound())
 	reportSharedWalletDrift(notifier, compound())
-	if len(mock.dms) == 0 {
-		t.Fatal("compound over-tolerance drift + orphan must alarm after confirmation")
+	if len(mock.messages) == 0 {
+		t.Fatal("compound over-tolerance drift + orphan must alert its configured channel after confirmation")
 	}
-	msg := mock.dms[len(mock.dms)-1].content
+	msg := mock.messages[len(mock.messages)-1].content
 	if strings.Contains(msg, "within tolerance") {
 		t.Errorf("compound state must NOT claim the total is within tolerance: %s", msg)
 	}
@@ -723,18 +723,18 @@ func TestReportSharedWalletDrift_JournalGapConfirmsDespiteOrphanChurn(t *testing
 		}
 	}
 	reportSharedWalletDrift(notifier, gap("BTC"))
-	if len(mock.dms) != 0 {
-		t.Fatalf("cycle 1 must not confirm yet: %+v", mock.dms)
+	if len(mock.messages) != 0 {
+		t.Fatalf("cycle 1 must not confirm yet: %+v", mock.messages)
 	}
 	reportSharedWalletDrift(notifier, gap("ETH"))
 	if e := sharedWalletDriftTracker.entries[churnJKey]; e == nil || !e.alerted {
 		t.Fatalf("a persistent journal gap must confirm despite orphan churn: %+v", e)
 	}
-	if len(mock.dms) == 0 || !strings.Contains(mock.dms[len(mock.dms)-1].content, "DRIFT (exchange journal)") {
-		t.Errorf("the journal-gap alarm must fire on confirmation: %+v", mock.dms)
+	if len(mock.messages) == 0 || !strings.Contains(mock.messages[len(mock.messages)-1].content, "DRIFT (exchange journal)") {
+		t.Errorf("the journal-gap alarm must fire on confirmation: %+v", mock.messages)
 	}
 
-	mock.dms = nil
+	mock.messages = nil
 	noOrphanKey := SharedWalletKey{Platform: "hyperliquid", Account: "0xclean"}
 	noOrphanJKey := sharedWalletKeyLabel(noOrphanKey) + journalDriftStreakKeySuffix
 	clean := []sharedWalletDriftResult{{Key: noOrphanKey, Drift: 5.00, Balance: 1000, ExpectedEquity: 995, Basis: driftBasisJournal}}
@@ -787,23 +787,23 @@ func TestReportSharedWalletDrift_BasisSwitchClearsStaleTradeLedgerEntry(t *testi
 	if e := sharedWalletDriftTracker.entries[label]; e == nil || !e.alerted {
 		t.Fatalf("trade-ledger outage must alert under the bare label key: %+v", e)
 	}
-	mock.dms = nil
+	mock.messages = nil
 
 	reportSharedWalletDrift(notifier, journalClean())
 	if sharedWalletDriftTracker.entries[label] != nil {
 		t.Error("a return to the journal basis must clear the stale trade-ledger entry")
 	}
-	if len(mock.dms) == 0 || !strings.Contains(mock.dms[len(mock.dms)-1].content, "RESOLVED") {
-		t.Errorf("a stranded trade-ledger alert must fire a RESOLVED notice on recovery: %+v", mock.dms)
+	if len(mock.messages) == 0 || !strings.Contains(mock.messages[len(mock.messages)-1].content, "RESOLVED") {
+		t.Errorf("a stranded trade-ledger alert must fire a RESOLVED notice on recovery: %+v", mock.messages)
 	}
 
-	mock.dms = nil
+	mock.messages = nil
 	reportSharedWalletDrift(notifier, ledgerDrift(10.00))
 	if e := sharedWalletDriftTracker.entries[label]; e == nil || e.cycles != 1 || e.alerted {
 		t.Fatalf("second outage cycle 1 must start fresh (count 1, not alerted): %+v", e)
 	}
-	if len(mock.dms) != 0 {
-		t.Errorf("second outage must NOT alert on its first cycle (no early fire off a stale entry): %+v", mock.dms)
+	if len(mock.messages) != 0 {
+		t.Errorf("second outage must NOT alert on its first cycle (no early fire off a stale entry): %+v", mock.messages)
 	}
 	reportSharedWalletDrift(notifier, ledgerDrift(10.00))
 	if e := sharedWalletDriftTracker.entries[label]; e == nil || !e.alerted {

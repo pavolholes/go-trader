@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"strings"
-	"time"
 )
 
 const CurrentConfigVersion = 19
@@ -287,7 +286,7 @@ func cloneOrNewJSONMap(v interface{}) map[string]interface{} {
 
 func deliverConfigMigrationNotices(baseVersion int, notifier *MultiNotifier) {
 	for _, notice := range configMigrationNotices(baseVersion) {
-		if notifier != nil && notifier.HasOwner() {
+		if notifier != nil && notifier.HasBackends() {
 			notifier.SendOwnerDM(notice)
 		} else {
 			fmt.Printf("[migration] %s\n", notice)
@@ -295,7 +294,7 @@ func deliverConfigMigrationNotices(baseVersion int, notifier *MultiNotifier) {
 	}
 }
 
-func runConfigMigrationDM(cfg *Config, notifier *MultiNotifier, configPath string) {
+func runConfigMigrationNotices(cfg *Config, notifier *MultiNotifier, configPath string) {
 	baseVersion := cfg.MigrationBaseVersion()
 	fields := NewFieldsSince(baseVersion)
 
@@ -308,46 +307,23 @@ func runConfigMigrationDM(cfg *Config, notifier *MultiNotifier, configPath strin
 	}
 
 	values := make(map[string]string)
-
-	if notifier == nil || !notifier.HasOwner() {
-		fmt.Printf("[migration] %d new config field(s) — applying defaults (no DM configured)\n", len(fields))
-		for _, f := range fields {
-			if f.Default != "" {
-				values[f.JSONPath] = f.Default
-			}
-		}
-		if err := MigrateConfig(configPath, values, cfg); err != nil {
-			fmt.Printf("[migration] Failed to migrate config: %v\n", err)
-		}
-		deliverConfigMigrationNotices(baseVersion, nil)
-		return
-	}
-
-	intro := fmt.Sprintf("**go-trader upgraded!** %d new config field(s) to set.", len(fields))
-	notifier.SendOwnerDM(intro)
-
 	for _, f := range fields {
-		defaultHint := "none"
 		if f.Default != "" {
-			defaultHint = f.Default
-		}
-		prompt := fmt.Sprintf("**%s** — %s\nDefault: `%s`\nReply with a value, or `default` to use the default:", f.JSONPath, f.Description, defaultHint)
-		resp, err := notifier.AskOwnerDM(prompt, 10*time.Minute)
-		if err != nil || strings.EqualFold(strings.TrimSpace(resp), "default") || resp == "" {
-			if f.Default != "" {
-				values[f.JSONPath] = f.Default
-			}
-		} else {
-			values[f.JSONPath] = strings.TrimSpace(resp)
+			values[f.JSONPath] = f.Default
 		}
 	}
 
 	if err := MigrateConfig(configPath, values, cfg); err != nil {
-		notifier.SendOwnerDM(fmt.Sprintf("**Migration failed**: %v", err))
+		fmt.Printf("[migration] Failed to migrate config: %v\n", err)
+		if notifier != nil && notifier.HasBackends() {
+			notifier.SendToTradeAlertChannels(fmt.Sprintf("**Config migration failed**: %v", err))
+		}
 		return
 	}
 
-	notifier.SendOwnerDM("Config updated. Changes take effect next restart.")
+	if notifier != nil && notifier.HasBackends() {
+		notifier.SendToTradeAlertChannels(fmt.Sprintf("[migration] Applied defaults for %d new config field(s). Changes take effect next restart.", len(fields)))
+	}
 
 	deliverConfigMigrationNotices(baseVersion, notifier)
 }

@@ -336,6 +336,12 @@ type PortfolioRiskState struct {
 	PeakValue                  float64           `json:"peak_value"`
 	CurrentDrawdownPct         float64           `json:"current_drawdown_pct"`
 	CurrentMarginDrawdownPct   float64           `json:"current_margin_drawdown_pct,omitempty"`
+	EquitySource               string            `json:"equity_source,omitempty"`
+	EquityBaselineAt           time.Time         `json:"equity_baseline_at,omitempty"`
+	EquitySnapshotAt           time.Time         `json:"equity_snapshot_at,omitempty"`
+	EquityRearmReadings        int               `json:"equity_rearm_readings,omitempty"`
+	EquityUnavailableSince     time.Time         `json:"equity_unavailable_since,omitempty"`
+	EntryHaltOnly              bool              `json:"entry_halt_only,omitempty"`
 	DrawdownReadingSubstituted bool              `json:"drawdown_reading_substituted,omitempty"`
 	UntrustedOverLimitSince    time.Time         `json:"untrusted_over_limit_since,omitempty"`
 	KillSwitchActive           bool              `json:"kill_switch_active"`
@@ -433,6 +439,12 @@ func ClearLatchedKillSwitchSharedWallet(state *AppState, strategies []StrategyCo
 	prs.DrawdownReadingSubstituted = false
 	prs.UntrustedOverLimitSince = time.Time{}
 	prs.KillSwitchCloseApplied = false
+	prs.EquitySource = ""
+	prs.EquityBaselineAt = time.Time{}
+	prs.EquitySnapshotAt = time.Time{}
+	prs.EquityRearmReadings = 0
+	prs.EquityUnavailableSince = time.Time{}
+	prs.EntryHaltOnly = false
 	addKillSwitchEvent(prs, "auto_reset", "",
 		0, totalBalance, totalBalance,
 		fmt.Sprintf("startup auto-clear: shared wallets %v reachable, total balance=$%.2f (peak re-baselined)",
@@ -481,6 +493,7 @@ func AutoResetConfirmedFlatKillSwitch(
 	prs.DrawdownReadingSubstituted = false
 	prs.UntrustedOverLimitSince = time.Time{}
 	prs.KillSwitchCloseApplied = false
+	prs.EquityRearmReadings = 0
 	addKillSwitchEvent(prs, "auto_reset", "", 0, rebaselineValue, prs.PeakValue, details)
 	return true
 }
@@ -497,6 +510,7 @@ func ResetPortfolioKillSwitchManual(prs *PortfolioRiskState) float64 {
 	prs.DrawdownReadingSubstituted = false
 	prs.UntrustedOverLimitSince = time.Time{}
 	prs.KillSwitchCloseApplied = false
+	prs.EquityRearmReadings = 0
 	return priorDrawdownPct
 }
 
@@ -540,7 +554,7 @@ func CheckPortfolioRisk(prs *PortfolioRiskState, cfg *PortfolioRiskConfig, total
 }
 
 func checkPortfolioRiskWithEquityAvailability(prs *PortfolioRiskState, cfg *PortfolioRiskConfig, totalValue, totalNotional, perpsUnrealizedLoss, perpsMargin float64, equityAvailable, equityTrusted bool) (allowed, notionalBlocked, warning bool, reason string) {
-	if prs.KillSwitchActive {
+	if prs.KillSwitchActive && !prs.EntryHaltOnly {
 		return false, false, false, fmt.Sprintf("portfolio kill switch is latched (triggered at %s, manual reset required)",
 			prs.KillSwitchAt.Format("2006-01-02 15:04:05 UTC"))
 	}
@@ -574,6 +588,34 @@ func checkPortfolioRiskWithEquityAvailability(prs *PortfolioRiskState, cfg *Port
 	prs.CurrentMarginDrawdownPct = marginDD
 
 	equityGuardArmed := equityAvailable && prs.PeakValue > 0
+	if prs.KillSwitchActive && prs.EntryHaltOnly {
+		rearmThresholdPct := portfolioRearmThresholdPct(cfg)
+		if equityAvailable && equityTrusted && equityGuardArmed && equityDD < rearmThresholdPct {
+			prs.EquityRearmReadings++
+			if prs.EquityRearmReadings >= 3 {
+				previousLatchAt := prs.KillSwitchAt
+				prs.KillSwitchActive = false
+				prs.KillSwitchAt = time.Time{}
+				prs.EquityRearmReadings = 0
+				prs.WarningSent = false
+				prs.WarnBandEnteredAt = time.Time{}
+				prs.LastWarningEquityDDPct = 0
+				prs.LastWarningMarginDDPct = 0
+				prs.WarningEquityDeltaPct = 0
+				prs.WarningMarginDeltaPct = 0
+				addKillSwitchEvent(prs, "auto_rearm", prs.EquitySource, equityDD, totalValue, prs.PeakValue,
+					fmt.Sprintf("entry halt auto-rearmed after three consecutive trusted equity readings below %.1f%% (previous latch at %s)",
+						rearmThresholdPct, previousLatchAt.Format("2006-01-02 15:04:05 UTC")))
+			} else {
+				return false, false, false, fmt.Sprintf("portfolio entry halt remains latched: trusted equity drawdown %.1f%%; automatic re-arm requires three consecutive readings below %.1f%% (%d/3)",
+					equityDD, rearmThresholdPct, prs.EquityRearmReadings)
+			}
+		} else {
+			prs.EquityRearmReadings = 0
+			return false, false, false, fmt.Sprintf("portfolio entry halt remains latched: trusted equity drawdown must be below %.1f%% for three consecutive readings (current %.1f%%)",
+				rearmThresholdPct, equityDD)
+		}
+	}
 
 	equityLatchDeferred := false
 	if equityGuardArmed && !equityTrusted && cfg.MaxDrawdownPct > 0 && equityDD > cfg.MaxDrawdownPct {
@@ -589,9 +631,14 @@ func checkPortfolioRiskWithEquityAvailability(prs *PortfolioRiskState, cfg *Port
 		prs.UntrustedOverLimitSince = time.Time{}
 	}
 
-	if (equityGuardArmed && !equityLatchDeferred && equityDD > cfg.MaxDrawdownPct) || (!equityGuardArmed && marginDD > cfg.MaxDrawdownPct) {
+	equityOverLimit := equityDD > cfg.MaxDrawdownPct
+	if prs.EntryHaltOnly {
+		equityOverLimit = equityDD >= cfg.MaxDrawdownPct
+	}
+	if (equityGuardArmed && !equityLatchDeferred && equityOverLimit) || (!equityGuardArmed && marginDD > cfg.MaxDrawdownPct) {
 		prs.KillSwitchActive = true
 		prs.KillSwitchAt = time.Now().UTC()
+		prs.EquityRearmReadings = 0
 		prs.WarningSent = false
 		prs.WarnBandEnteredAt = time.Time{}
 		prs.LastWarningEquityDDPct = 0
@@ -612,6 +659,9 @@ func checkPortfolioRiskWithEquityAvailability(prs *PortfolioRiskState, cfg *Port
 			}
 		} else {
 			source = "equity"
+			if prs.EquitySource != "" {
+				source = prs.EquitySource
+			}
 			dd = equityDD
 			if !prs.UntrustedOverLimitSince.IsZero() {
 				r = fmt.Sprintf("portfolio drawdown %.1f%% exceeds limit %.1f%% (value=$%.2f, peak=$%.2f); measurement is UNTRUSTED (substituted or stale total) and has read over the limit continuously since %s — latch escalated after %s",
@@ -619,7 +669,12 @@ func checkPortfolioRiskWithEquityAvailability(prs *PortfolioRiskState, cfg *Port
 					prs.UntrustedOverLimitSince.Format("2006-01-02 15:04 UTC"),
 					formatWarningDuration(untrustedEquityLatchDeferral))
 			} else {
-				r = fmt.Sprintf("portfolio drawdown %.1f%% exceeds limit %.1f%% (value=$%.2f, peak=$%.2f)",
+				label := "portfolio"
+				if prs.EquitySource != "" {
+					label = prs.EquitySource
+				}
+				r = fmt.Sprintf("%s drawdown %.1f%% reaches limit %.1f%% (value=$%.2f, peak=$%.2f)",
+					label,
 					equityDD, cfg.MaxDrawdownPct, totalValue, prs.PeakValue)
 			}
 		}
@@ -700,9 +755,23 @@ func portfolioWarnBandSignals(cfg *PortfolioRiskConfig, prs *PortfolioRiskState,
 		return false, false
 	}
 	warnDrawdownPct := cfg.MaxDrawdownPct * cfg.WarnThresholdPct / 100
-	equityInBand = equityAvailable && prs.PeakValue > 0 && prs.CurrentDrawdownPct > warnDrawdownPct
+	if prs.EntryHaltOnly {
+		equityInBand = equityAvailable && prs.PeakValue > 0 && prs.CurrentDrawdownPct >= warnDrawdownPct
+	} else {
+		equityInBand = equityAvailable && prs.PeakValue > 0 && prs.CurrentDrawdownPct > warnDrawdownPct
+	}
 	marginInBand = prs.CurrentMarginDrawdownPct > warnDrawdownPct
 	return equityInBand, marginInBand
+}
+
+func portfolioRearmThresholdPct(cfg *PortfolioRiskConfig) float64 {
+	if cfg == nil || cfg.MaxDrawdownPct <= 0 {
+		return 0
+	}
+	if cfg.WarnThresholdPct > 0 {
+		return cfg.MaxDrawdownPct * cfg.WarnThresholdPct / 100
+	}
+	return cfg.MaxDrawdownPct * 0.8
 }
 
 func PortfolioNotional(strategies map[string]*StrategyState, prices map[string]float64) float64 {
@@ -1272,8 +1341,18 @@ const (
 )
 
 func circuitBreakerPermitsManagement(reason, platform, stratType string, posQty float64) bool {
-	return reason == RiskReasonCircuitBreakerActive &&
-		platform == "hyperliquid" && stratType == "perps" && posQty > 0
+	if posQty <= 0 || stratType != "perps" {
+		return false
+	}
+	if platform == "hyperliquid" {
+		return reason == RiskReasonCircuitBreakerActive
+	}
+	if platform == "blofin" {
+		return reason == RiskReasonCircuitBreakerActive ||
+			strings.HasPrefix(reason, RiskReasonMaxDrawdownExceeded) ||
+			strings.HasPrefix(reason, RiskReasonConsecutiveLosses)
+	}
+	return false
 }
 
 func CheckRisk(sc *StrategyConfig, s *StrategyState, portfolioValue float64, prices map[string]float64, logger *StrategyLogger, assist *PlatformRiskAssist) (bool, string) {

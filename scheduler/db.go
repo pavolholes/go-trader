@@ -219,7 +219,13 @@ CREATE TABLE IF NOT EXISTS portfolio_risk (
     warning_margin_delta_pct REAL NOT NULL DEFAULT 0,
     manual_mark_basis_rebaselined INTEGER NOT NULL DEFAULT 0,
     drawdown_reading_substituted INTEGER NOT NULL DEFAULT 0,
-    untrusted_over_limit_since TEXT NOT NULL DEFAULT ''
+    untrusted_over_limit_since TEXT NOT NULL DEFAULT '',
+    equity_source TEXT NOT NULL DEFAULT '',
+    equity_baseline_at TEXT NOT NULL DEFAULT '',
+    equity_snapshot_at TEXT NOT NULL DEFAULT '',
+    equity_rearm_readings INTEGER NOT NULL DEFAULT 0,
+    equity_unavailable_since TEXT NOT NULL DEFAULT '',
+    entry_halt_only INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS kill_switch_events (
@@ -596,6 +602,12 @@ func (sdb *StateDB) migrateSchema() error {
 		"ALTER TABLE portfolio_risk ADD COLUMN manual_mark_basis_rebaselined INTEGER NOT NULL DEFAULT 0",
 		"ALTER TABLE portfolio_risk ADD COLUMN drawdown_reading_substituted INTEGER NOT NULL DEFAULT 0",
 		"ALTER TABLE portfolio_risk ADD COLUMN untrusted_over_limit_since TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE portfolio_risk ADD COLUMN equity_source TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE portfolio_risk ADD COLUMN equity_baseline_at TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE portfolio_risk ADD COLUMN equity_snapshot_at TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE portfolio_risk ADD COLUMN equity_rearm_readings INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE portfolio_risk ADD COLUMN equity_unavailable_since TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE portfolio_risk ADD COLUMN entry_halt_only INTEGER NOT NULL DEFAULT 0",
 		"ALTER TABLE pending_limit_orders ADD COLUMN operator_required_since TEXT NOT NULL DEFAULT ''",
 		"CREATE INDEX IF NOT EXISTS idx_trades_strategy_timestamp ON trades(strategy_id, timestamp DESC, rowid DESC)",
 		"ALTER TABLE kill_switch_events ADD COLUMN scope TEXT NOT NULL DEFAULT ''",
@@ -866,20 +878,30 @@ const portfolioRiskScopedDDL = `CREATE TABLE portfolio_risk_v2 (
     manual_mark_basis_rebaselined INTEGER NOT NULL DEFAULT 0,
     drawdown_reading_substituted INTEGER NOT NULL DEFAULT 0,
     untrusted_over_limit_since TEXT NOT NULL DEFAULT '',
-    kill_switch_close_applied INTEGER NOT NULL DEFAULT 0
+    kill_switch_close_applied INTEGER NOT NULL DEFAULT 0,
+    equity_source TEXT NOT NULL DEFAULT '',
+    equity_baseline_at TEXT NOT NULL DEFAULT '',
+    equity_snapshot_at TEXT NOT NULL DEFAULT '',
+    equity_rearm_readings INTEGER NOT NULL DEFAULT 0,
+    equity_unavailable_since TEXT NOT NULL DEFAULT '',
+    entry_halt_only INTEGER NOT NULL DEFAULT 0
 )`
 
 const portfolioRiskScopedCopySQL = `INSERT INTO portfolio_risk_v2 (scope, peak_value, current_drawdown_pct,
     current_margin_drawdown_pct, kill_switch_active, kill_switch_at, warning_sent, warn_band_entered_at,
     last_warning_equity_dd_pct, last_warning_margin_dd_pct, warning_equity_delta_pct, warning_margin_delta_pct,
-    manual_mark_basis_rebaselined, drawdown_reading_substituted, untrusted_over_limit_since, kill_switch_close_applied)
+    manual_mark_basis_rebaselined, drawdown_reading_substituted, untrusted_over_limit_since, kill_switch_close_applied,
+    equity_source, equity_baseline_at, equity_snapshot_at, equity_rearm_readings, equity_unavailable_since, entry_halt_only)
     SELECT '', COALESCE(peak_value, 0), COALESCE(current_drawdown_pct, 0),
     COALESCE(current_margin_drawdown_pct, 0), COALESCE(kill_switch_active, 0), COALESCE(kill_switch_at, ''),
     COALESCE(warning_sent, 0), COALESCE(warn_band_entered_at, ''),
     COALESCE(last_warning_equity_dd_pct, 0), COALESCE(last_warning_margin_dd_pct, 0),
     COALESCE(warning_equity_delta_pct, 0), COALESCE(warning_margin_delta_pct, 0),
     COALESCE(manual_mark_basis_rebaselined, 0), COALESCE(drawdown_reading_substituted, 0),
-    COALESCE(untrusted_over_limit_since, ''), COALESCE(kill_switch_close_applied, 0) FROM portfolio_risk`
+    COALESCE(untrusted_over_limit_since, ''), COALESCE(kill_switch_close_applied, 0),
+    COALESCE(equity_source, ''), COALESCE(equity_baseline_at, ''), COALESCE(equity_snapshot_at, ''),
+    COALESCE(equity_rearm_readings, 0), COALESCE(equity_unavailable_since, ''), COALESCE(entry_halt_only, 0)
+    FROM portfolio_risk`
 
 const correlationSnapshotScopedDDL = `CREATE TABLE correlation_snapshot_v2 (
     scope TEXT PRIMARY KEY CHECK (scope IN ('live','paper','')),
@@ -1695,13 +1717,16 @@ func (sdb *StateDB) saveStateSubset(state *AppState, req scopeSaveRequest) error
 		basisRebaselined := boolToInt(prs.ManualMarkBasisRebaselined)
 		ddSubstituted := boolToInt(prs.DrawdownReadingSubstituted)
 		closeApplied := boolToInt(prs.KillSwitchCloseApplied)
-		if _, err := tx.Exec(`INSERT OR REPLACE INTO portfolio_risk (scope, peak_value, current_drawdown_pct, current_margin_drawdown_pct, kill_switch_active, kill_switch_at, warning_sent, warn_band_entered_at, last_warning_equity_dd_pct, last_warning_margin_dd_pct, warning_equity_delta_pct, warning_margin_delta_pct, manual_mark_basis_rebaselined, drawdown_reading_substituted, untrusted_over_limit_since, kill_switch_close_applied)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		entryHaltOnly := boolToInt(prs.EntryHaltOnly)
+		if _, err := tx.Exec(`INSERT OR REPLACE INTO portfolio_risk (scope, peak_value, current_drawdown_pct, current_margin_drawdown_pct, kill_switch_active, kill_switch_at, warning_sent, warn_band_entered_at, last_warning_equity_dd_pct, last_warning_margin_dd_pct, warning_equity_delta_pct, warning_margin_delta_pct, manual_mark_basis_rebaselined, drawdown_reading_substituted, untrusted_over_limit_since, kill_switch_close_applied, equity_source, equity_baseline_at, equity_snapshot_at, equity_rearm_readings, equity_unavailable_since, entry_halt_only)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			string(scope), prs.PeakValue, prs.CurrentDrawdownPct, prs.CurrentMarginDrawdownPct,
 			ksActive, formatTime(prs.KillSwitchAt), warnSent, formatTime(prs.WarnBandEnteredAt),
 			prs.LastWarningEquityDDPct, prs.LastWarningMarginDDPct,
 			prs.WarningEquityDeltaPct, prs.WarningMarginDeltaPct,
 			basisRebaselined, ddSubstituted, formatTime(prs.UntrustedOverLimitSince), closeApplied,
+			prs.EquitySource, formatTime(prs.EquityBaselineAt), formatTime(prs.EquitySnapshotAt),
+			prs.EquityRearmReadings, formatTime(prs.EquityUnavailableSince), entryHaltOnly,
 		); err != nil {
 			return fmt.Errorf("upsert portfolio_risk: %w", err)
 		}
@@ -2475,22 +2500,29 @@ func (sdb *StateDB) loadScopeBooks(scopes []PortfolioScope) (*scopeLoad, error) 
 	}
 
 	scopeFilter, scopeArgs := scopePlaceholders(scopes)
-	prsRows, err := sdb.db.Query("SELECT scope, peak_value, current_drawdown_pct, current_margin_drawdown_pct, kill_switch_active, kill_switch_at, warning_sent, COALESCE(warn_band_entered_at, '') AS warn_band_entered_at, COALESCE(last_warning_equity_dd_pct, 0) AS last_warning_equity_dd_pct, COALESCE(last_warning_margin_dd_pct, 0) AS last_warning_margin_dd_pct, COALESCE(warning_equity_delta_pct, 0) AS warning_equity_delta_pct, COALESCE(warning_margin_delta_pct, 0) AS warning_margin_delta_pct, COALESCE(manual_mark_basis_rebaselined, 0) AS manual_mark_basis_rebaselined, COALESCE(drawdown_reading_substituted, 0) AS drawdown_reading_substituted, COALESCE(untrusted_over_limit_since, '') AS untrusted_over_limit_since, COALESCE(kill_switch_close_applied, 0) AS kill_switch_close_applied FROM portfolio_risk WHERE scope IN ("+scopeFilter+")", scopeArgs...)
+	prsRows, err := sdb.db.Query("SELECT scope, peak_value, current_drawdown_pct, current_margin_drawdown_pct, kill_switch_active, kill_switch_at, warning_sent, COALESCE(warn_band_entered_at, '') AS warn_band_entered_at, COALESCE(last_warning_equity_dd_pct, 0) AS last_warning_equity_dd_pct, COALESCE(last_warning_margin_dd_pct, 0) AS last_warning_margin_dd_pct, COALESCE(warning_equity_delta_pct, 0) AS warning_equity_delta_pct, COALESCE(warning_margin_delta_pct, 0) AS warning_margin_delta_pct, COALESCE(manual_mark_basis_rebaselined, 0) AS manual_mark_basis_rebaselined, COALESCE(drawdown_reading_substituted, 0) AS drawdown_reading_substituted, COALESCE(untrusted_over_limit_since, '') AS untrusted_over_limit_since, COALESCE(kill_switch_close_applied, 0) AS kill_switch_close_applied, COALESCE(equity_source, '') AS equity_source, COALESCE(equity_baseline_at, '') AS equity_baseline_at, COALESCE(equity_snapshot_at, '') AS equity_snapshot_at, COALESCE(equity_rearm_readings, 0) AS equity_rearm_readings, COALESCE(equity_unavailable_since, '') AS equity_unavailable_since, COALESCE(entry_halt_only, 0) AS entry_halt_only FROM portfolio_risk WHERE scope IN ("+scopeFilter+")", scopeArgs...)
 	if err != nil {
 		return nil, fmt.Errorf("load portfolio_risk: %w", err)
 	}
 	defer prsRows.Close()
 	for prsRows.Next() {
 		var scopeStr, ksAtStr, warnBandEnteredAtStr, untrustedOverLimitSinceStr string
-		var ksActiveInt, warnSentInt, basisRebaselinedInt, ddSubstitutedInt, closeAppliedInt int
+		var equityBaselineAtStr, equitySnapshotAtStr, equityUnavailableSinceStr string
+		var ksActiveInt, warnSentInt, basisRebaselinedInt, ddSubstitutedInt, closeAppliedInt, entryHaltOnlyInt int
 		prs := &PortfolioRiskState{}
 		if err := prsRows.Scan(&scopeStr, &prs.PeakValue, &prs.CurrentDrawdownPct, &prs.CurrentMarginDrawdownPct,
 			&ksActiveInt, &ksAtStr, &warnSentInt, &warnBandEnteredAtStr, &prs.LastWarningEquityDDPct,
 			&prs.LastWarningMarginDDPct, &prs.WarningEquityDeltaPct, &prs.WarningMarginDeltaPct,
-			&basisRebaselinedInt, &ddSubstitutedInt, &untrustedOverLimitSinceStr, &closeAppliedInt); err != nil {
+			&basisRebaselinedInt, &ddSubstitutedInt, &untrustedOverLimitSinceStr, &closeAppliedInt,
+			&prs.EquitySource, &equityBaselineAtStr, &equitySnapshotAtStr, &prs.EquityRearmReadings,
+			&equityUnavailableSinceStr, &entryHaltOnlyInt); err != nil {
 			return nil, fmt.Errorf("scan portfolio_risk: %w", err)
 		}
 		prs.KillSwitchCloseApplied = closeAppliedInt != 0
+		prs.EntryHaltOnly = entryHaltOnlyInt != 0
+		prs.EquityBaselineAt = parseTime(equityBaselineAtStr)
+		prs.EquitySnapshotAt = parseTime(equitySnapshotAtStr)
+		prs.EquityUnavailableSince = parseTime(equityUnavailableSinceStr)
 		prs.ManualMarkBasisRebaselined = basisRebaselinedInt != 0
 		prs.DrawdownReadingSubstituted = ddSubstitutedInt != 0
 		prs.UntrustedOverLimitSince = parseTime(untrustedOverLimitSinceStr)

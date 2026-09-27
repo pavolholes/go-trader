@@ -236,7 +236,6 @@ func notifyHLStopPastLiquidation(sc StrategyConfig, symbol, side string, trigger
 	if notifier != nil && notifier.HasBackends() {
 		msg := hlLiquidationAlertFullMessage(sc, symbol, side, triggerPx, clampedPx, liqPx, action)
 		notifier.SendToAllChannels(msg)
-		notifier.SendOwnerDM(msg)
 	}
 }
 

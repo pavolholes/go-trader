@@ -451,12 +451,7 @@ func main() {
 		func(job llmEntryAnalysisJob, res *LLMEntryAnalysisResult) {
 			for _, route := range notifier.tradeAlertRoutes(job.Platform, job.StratType, job.IsLive, job.PaperSource) {
 				msg := formatLLMEntryAnalysisDigest(job, res, route.plainText)
-				if job.Params.NotifyDM && route.dmDest != "" {
-					if err := sendTradeDestination(route.notifier, route.dmDest, msg); err != nil {
-						fmt.Printf("[notify] LLM analysis DM failed: %v\n", err)
-					}
-				}
-				if job.Params.NotifyChannel {
+				if job.Params.NotifyDM || job.Params.NotifyChannel {
 					if route.channel != "" {
 						if err := route.notifier.SendMessage(route.channel, msg); err != nil {
 							fmt.Printf("[notify] LLM analysis digest failed: %v\n", err)
@@ -480,7 +475,7 @@ func main() {
 	if d := notifier.DiscordBackend(); d != nil {
 		if err := d.RegisterSlashCommands(server, cfg); err != nil {
 			fmt.Printf("[WARN] Discord slash command registration failed: %v\n", err)
-			if notifier.HasOwner() {
+			if notifier.HasBackends() {
 				notifier.SendOwnerDM("[slash] registration failed: " + err.Error())
 			}
 		} else {
@@ -500,7 +495,7 @@ func main() {
 		fmt.Println("[shutdown] Complete.")
 	}()
 
-	if notifier.HasOwner() {
+	if notifier.HasBackends() {
 		tradePersistWarn = func(msg string) {
 			notifier.SendOwnerDM("[state] " + msg)
 		}
@@ -515,7 +510,7 @@ func main() {
 		}
 	}
 
-	if notifier.HasOwner() {
+	if notifier.HasBackends() {
 		for _, msg := range initialCapitalChangeInfos {
 			notifier.SendOwnerDM("[state] " + msg)
 		}
@@ -524,25 +519,25 @@ func main() {
 		}
 	}
 
-	if len(sharedWalletTransitionWarnings) > 0 && notifier.HasOwner() {
+	if len(sharedWalletTransitionWarnings) > 0 && notifier.HasBackends() {
 		for _, msg := range sharedWalletTransitionWarnings {
 			notifier.SendOwnerDM("[state] CRITICAL: " + msg)
 		}
 	}
 
-	if len(directionConfigWarnings) > 0 && notifier.HasOwner() {
+	if len(directionConfigWarnings) > 0 && notifier.HasBackends() {
 		for _, msg := range directionConfigWarnings {
 			notifier.SendOwnerDM("[state] " + msg)
 		}
 	}
 
-	if len(atrMethodDriftWarnings) > 0 && notifier.HasOwner() {
+	if len(atrMethodDriftWarnings) > 0 && notifier.HasBackends() {
 		for _, msg := range atrMethodDriftWarnings {
 			notifier.SendOwnerDM("[state] " + msg)
 		}
 	}
 
-	if len(hedgeStateWarnings) > 0 && notifier.HasOwner() {
+	if len(hedgeStateWarnings) > 0 && notifier.HasBackends() {
 		for _, msg := range hedgeStateWarnings {
 			notifier.SendOwnerDM("[state] " + msg)
 		}
@@ -550,13 +545,13 @@ func main() {
 
 	notifyDirectionalCertStartupSummary(notifier, directionalCertSummaryLines)
 
-	if len(deprecatedEdgeWarnings) > 0 && notifier.HasOwner() {
+	if len(deprecatedEdgeWarnings) > 0 && notifier.HasBackends() {
 		for _, msg := range deprecatedEdgeWarnings {
 			notifier.SendOwnerDM("[config] " + msg)
 		}
 	}
 
-	if missingStateWarning != "" && notifier.HasOwner() {
+	if missingStateWarning != "" && notifier.HasBackends() {
 		notifier.SendOwnerDM("[state] " + missingStateWarning)
 	}
 
@@ -598,12 +593,12 @@ func main() {
 	}()
 
 	if cfg.MigrationBaseVersion() < CurrentConfigVersion {
-		go runConfigMigrationDM(cfg, notifier, *configPath)
+		go runConfigMigrationNotices(cfg, notifier, *configPath)
 	}
 
 	if err := probeCheckScripts(cfg); err != nil {
 		fmt.Fprintf(os.Stderr, "[startup] check-script compatibility probe failed: %v\n", err)
-		if notifier != nil && notifier.HasOwner() {
+		if notifier != nil && notifier.HasBackends() {
 			notifier.SendOwnerDM(fmt.Sprintf("**Startup probe failed** — refusing to start (exit %d; fix deploy, then restart):\n```\n%v\n```", ExitProbeFailure, err))
 		}
 		os.Exit(ExitProbeFailure)
@@ -612,7 +607,7 @@ func main() {
 	var lastNotifiedHash string
 
 	if cfg.AutoUpdate != "off" {
-		checkForUpdates(cfg, notifier, &lastNotifiedHash, &mu, state, store)
+		checkForUpdates(notifier, &lastNotifiedHash)
 	}
 
 	deribitPricer := NewDeribitPricer()
@@ -698,7 +693,7 @@ func main() {
 
 		for _, msg := range newlyDeprecatedEdgeWarnings(prevStrategies, cfg.Strategies) {
 			fmt.Fprintln(os.Stderr, "[reload] "+msg)
-			if notifier.HasOwner() {
+			if notifier.HasBackends() {
 				notifier.SendOwnerDM("[reload] " + msg)
 			}
 		}
@@ -1012,6 +1007,13 @@ func main() {
 				}
 			}
 
+			var blofinLiveAll []StrategyConfig
+			for _, sc := range cfg.Strategies {
+				if sc.Platform == "blofin" && sc.Type == "perps" && blofinIsLive(sc.Args) {
+					blofinLiveAll = append(blofinLiveAll, sc)
+				}
+			}
+
 			var rhLiveCrypto []StrategyConfig
 			var rhLiveOptions []StrategyConfig
 			for _, sc := range cfg.Strategies {
@@ -1112,6 +1114,11 @@ func main() {
 					tsSnapshotAt = time.Now().UTC()
 				}
 			}
+			var blofinEquitySnapshot *blofinCopyEquitySnapshot
+			var blofinEquityFetchErr error
+			if len(blofinLiveAll) > 0 {
+				blofinEquitySnapshot, blofinEquityFetchErr = defaultBloFinCopyEquitySnapshot()
+			}
 
 			sharedWalletRiskGeneration++
 			mu.RLock()
@@ -1123,6 +1130,9 @@ func main() {
 			for _, part := range cyclePartitions {
 				sr := measureScopeCycleRisk(part, scopeRisk[part].Config, cfg.Strategies, state, prices,
 					riskWalletBalances, sharedWallets, pooledEquityComplete, usedStaleRiskBalance, time.Now().UTC())
+				if part.IsLive() && len(blofinLiveAll) > 0 {
+					applyBloFinCopyEquitySnapshot(sr, blofinEquitySnapshot, blofinEquityFetchErr)
+				}
 				scopeRisk[part] = sr
 				totalPV += sr.TotalPV
 			}
@@ -1133,7 +1143,8 @@ func main() {
 			if liveSR := scopeRisk[livePartition]; liveSR != nil {
 				livePrs := state.partitionRisk(livePartition)
 				liveCfgs := strategiesInScope(cfg.Strategies, ScopeLive)
-				if !livePrs.ManualMarkBasisRebaselined {
+				if !livePrs.ManualMarkBasisRebaselined && livePrs.EquitySource != blofinCopyEquitySource &&
+					(liveSR == nil || !liveSR.UsesBloFinEquity) {
 					if unmarked := missingManualOnlyMarks(liveCfgs, riskOpenSymbols, prices); len(unmarked) > 0 {
 						fmt.Printf("[INFO] manual mark valuation-basis peak migration deferred: no live mark this cycle for open manual-only coin(s) %s\n", strings.Join(unmarked, ", "))
 					} else {
@@ -1159,19 +1170,25 @@ func main() {
 			for _, part := range cyclePartitions {
 				sr := scopeRisk[part]
 				applyScopeCycleRisk(sr, state.partitionRisk(part))
+				sr.OperatorNotices = blofinRiskTransitionNotices(sr)
+				if sr.EquityFeedUnavailable {
+					fmt.Printf("[WARN] [%s] %s\n", partitionLabel(part), sr.Reason)
+				}
 				if sr.KillSwitchFired {
 					fmt.Printf("[CRITICAL] Portfolio kill switch [%s]: %s\n", partitionLabel(part), sr.Reason)
-					for _, id := range stateIDsInPartition(state.Strategies, cfg.Strategies, part) {
-						ss := state.Strategies[id]
-						if ss == nil {
-							continue
+					if !sr.EntryHaltOnly {
+						for _, id := range stateIDsInPartition(state.Strategies, cfg.Strategies, part) {
+							ss := state.Strategies[id]
+							if ss == nil {
+								continue
+							}
+							ss.RiskState.clearPendingCircuitClose(PlatformPendingCloseHyperliquid)
+							ss.RiskState.clearPendingCircuitClose(PlatformPendingCloseOKX)
+							ss.RiskState.clearPendingCircuitClose(PlatformPendingCloseOKXSpot)
+							ss.RiskState.clearPendingCircuitClose(PlatformPendingCloseRobinhood)
+							ss.RiskState.clearPendingCircuitClose(PlatformPendingCloseRobinhoodOptions)
+							ss.RiskState.clearPendingCircuitClose(PlatformPendingCloseTopStep)
 						}
-						ss.RiskState.clearPendingCircuitClose(PlatformPendingCloseHyperliquid)
-						ss.RiskState.clearPendingCircuitClose(PlatformPendingCloseOKX)
-						ss.RiskState.clearPendingCircuitClose(PlatformPendingCloseOKXSpot)
-						ss.RiskState.clearPendingCircuitClose(PlatformPendingCloseRobinhood)
-						ss.RiskState.clearPendingCircuitClose(PlatformPendingCloseRobinhoodOptions)
-						ss.RiskState.clearPendingCircuitClose(PlatformPendingCloseTopStep)
 					}
 				}
 				if sr.NotionalBlocked {
@@ -1187,6 +1204,15 @@ func main() {
 			ingestSharedWalletLedgers(storeLiveDB(store), state, cfg.Strategies, sharedWallets, walletLedgerFetches)
 			driftResults := reconcileSharedWalletDisplayValues(cfg.Strategies, state, storeLiveDB(store), sharedWallets, walletBalances, hlPositions, okxPositions, okxStateFetched)
 			mu.Unlock()
+			for _, part := range cyclePartitions {
+				for _, msg := range scopeRisk[part].OperatorNotices {
+					if part.IsLive() {
+						notifier.SendToTradeAlertChannels(msg)
+					} else {
+						notifier.SendToPartitionChannels(part, msg)
+					}
+				}
+			}
 
 			if manualBasisRebaselineDM != "" {
 				notifier.SendOwnerDM(manualBasisRebaselineDM)
@@ -1241,13 +1267,16 @@ func main() {
 
 			liveKillSwitchFired := scopeCycleRiskFired(scopeRisk, livePartition)
 			var liveReason string
-			if liveSR := scopeRisk[livePartition]; liveSR != nil {
+			liveSR := scopeRisk[livePartition]
+			liveEntryHaltOnly := liveSR != nil && liveSR.EntryHaltOnly
+			liveCloseKillSwitchFired := liveKillSwitchFired && !liveEntryHaltOnly
+			if liveSR != nil {
 				liveReason = liveSR.Reason
 			}
 
 			var plan KillSwitchClosePlan
 			var hlVirtualQty hlVirtualQuantitySnapshot
-			if liveKillSwitchFired {
+			if liveCloseKillSwitchFired {
 				mu.RLock()
 				hlSLOIDs := collectHLKillSwitchStopOIDs(state.Strategies, hlKillSwitchAll)
 				hlHedgeCoins := map[string]bool{}
@@ -1325,14 +1354,14 @@ func main() {
 				}
 			}
 
-			if liveKillSwitchFired && !plan.OnChainConfirmedFlat {
+			if liveCloseKillSwitchFired && !plan.OnChainConfirmedFlat {
 				mu.Lock()
 				applyKillSwitchSettledLegsWhileLatched(state.Strategies, strategiesInScope(cfg.Strategies, ScopeLive), &plan, hlKillSwitchAll, hlVirtualQty, prices, nil)
 				mu.Unlock()
 			}
 
 			killSwitchAutoReset := false
-			if liveKillSwitchFired && plan.OnChainConfirmedFlat {
+			if liveCloseKillSwitchFired && plan.OnChainConfirmedFlat {
 				liveSR := scopeRisk[livePartition]
 				mu.Lock()
 				for _, sc := range strategiesInScope(cfg.Strategies, ScopeLive) {
@@ -1360,7 +1389,7 @@ func main() {
 				mu.Unlock()
 			}
 
-			if liveKillSwitchFired && notifier.HasBackends() && plan.DiscordMessage != "" {
+			if liveCloseKillSwitchFired && notifier.HasBackends() && plan.DiscordMessage != "" {
 				killSwitchMsg := plan.DiscordMessage
 				if killSwitchAutoReset {
 					killSwitchMsg = formatKillSwitchAutoResetMessage(killSwitchMsg)
@@ -1393,7 +1422,7 @@ func main() {
 			}
 
 			for _, moAlert := range drainModelOnlyCloseAlerts() {
-				if notifier.HasOwner() {
+				if notifier.HasBackends() {
 					notifier.SendOwnerDM(formatModelOnlyCloseDM(moAlert))
 				}
 			}
@@ -1460,12 +1489,12 @@ func main() {
 						Recent:           recentTrades,
 						Now:              warnNow,
 						EquityGuardArmed: sr.EquityAvailable && prs.PeakValue > 0,
+						EquitySource:     sr.RiskEquitySource,
 					})
 				}
 				mu.Unlock()
 				if notifyWarn {
 					notifier.SendToPartitionChannels(part, warnMsg)
-					notifier.SendOwnerDM(warnMsg)
 				}
 				if warnLatchDeferredSince.IsZero() {
 					fmt.Printf("[WARN] [%s] %s\n", partitionLabel(part), sr.Reason)
@@ -1490,7 +1519,6 @@ func main() {
 					if len(corrSnap.Warnings) > 0 && notifier.HasBackends() {
 						msg := fmt.Sprintf("**CORRELATION WARNING [%s]**\n%s", partitionLabel(part), strings.Join(corrSnap.Warnings, "\n"))
 						notifier.SendToPartitionChannels(part, msg)
-						notifier.SendOwnerDM(msg)
 					}
 				}
 			}
@@ -1502,7 +1530,7 @@ func main() {
 			promptPlans := map[RiskPartition]KillSwitchClosePlan{}
 			for _, part := range cyclePartitions {
 				sr := scopeRisk[part]
-				if !sr.KillSwitchFired || !partitionInList(part, latchedNow) {
+				if !sr.KillSwitchFired || !partitionInList(part, latchedNow) || (part.IsLive() && sr.EntryHaltOnly) {
 					continue
 				}
 				promptScopes = append(promptScopes, part)
@@ -1555,7 +1583,7 @@ func main() {
 			var hlReconcileFillHintsJSON []byte
 			hlOnChainAbsQty, hlLiquidationPx, hlNetSideByCoin := buildHLLiquidationMaps(hlPositions)
 
-			if !liveKillSwitchFired {
+			if !liveCloseKillSwitchFired {
 				if len(hlLiveAll) > 0 {
 					runPendingHyperliquidCircuitCloses(
 						shutdownSideEffectCtx,
@@ -1681,6 +1709,13 @@ func main() {
 				sr := scopeRisk[stratPartition]
 				if sr == nil {
 					sr = &scopeCycleRisk{Partition: stratPartition, Config: partitionRiskConfig(cfg, stratPartition)}
+				}
+				portfolioEntryHold := sr.EntryHaltOnly && (sr.EntryHold || sr.KillSwitchFired)
+				if portfolioEntryHold {
+					// Reuse the common close-aware pause gates in every strategy
+					// dispatcher. This holds entries/adds while letting reductions
+					// and configured exit evaluators run.
+					sc.Paused = true
 				}
 
 				logger, err := logMgr.GetStrategyLogger(sc.ID)
@@ -1888,12 +1923,12 @@ func main() {
 				}
 				mu.Unlock()
 				for _, cbAlert := range drainCircuitBreakerSuppressionAlerts() {
-					if notifier.HasOwner() {
+					if notifier.HasBackends() {
 						notifier.SendOwnerDM(formatCircuitBreakerSuppressionDM(cbAlert))
 					}
 				}
 				for _, moAlert := range drainModelOnlyCloseAlerts() {
-					if notifier.HasOwner() {
+					if notifier.HasBackends() {
 						notifier.SendOwnerDM(formatModelOnlyCloseDM(moAlert))
 					}
 				}
@@ -1901,9 +1936,13 @@ func main() {
 				if !allowed {
 					notifyPerStrategyCircuitBreakerWithSnapshot(sc, cbSnapshot, reason, pv, sr.TotalPV, stratDB, notifier, sr.KillSwitchFired)
 					logger.Warn("Risk block: %s (portfolio=$%.2f)", reason, pv)
-					if circuitBreakerPermitsManagement(reason, sc.Platform, sc.Type, hlPosQty) {
+					managementQty := hlPosQty
+					if sc.Platform == "blofin" {
+						managementQty = blofinPosQty
+					}
+					if circuitBreakerPermitsManagement(reason, sc.Platform, sc.Type, managementQty) {
 						cbManageOnly = true
-						logger.Info("Circuit breaker latched — suppressing new entries but continuing trailing-SL/TP management for open position (#1046)")
+						logger.Info("Circuit breaker latched — suppressing new entries but continuing close-aware position management")
 					} else {
 						logger.Close()
 						markStrategyEvaluated(sc, websocketFeed, evaluationMarks, lastRun, lastEvaluated, time.Now())
@@ -2200,6 +2239,9 @@ func main() {
 						}
 					} else if sc.Platform == "blofin" || sc.Platform == "blofin_spot" {
 						if result, signalStr, price, ok := runBloFinCheck(sc, prices, blofinPosCtx, cfg.Regime, notifier, logger); ok {
+							if cbManageOnly {
+								result.Signal = 0
+							}
 							prices[result.Symbol] = price
 							storeRegime := globalRegimeStore.PayloadForStrategy(sc, cfg.Regime)
 							result.Regime = &storeRegime
@@ -3120,9 +3162,9 @@ func main() {
 		}
 
 		if cfg.AutoUpdate == "heartbeat" {
-			checkForUpdates(cfg, notifier, &lastNotifiedHash, &mu, state, store)
+			checkForUpdates(notifier, &lastNotifiedHash)
 		} else if cfg.AutoUpdate == "daily" && time.Since(lastAutoUpdateCheck) >= 24*time.Hour {
-			checkForUpdates(cfg, notifier, &lastNotifiedHash, &mu, state, store)
+			checkForUpdates(notifier, &lastNotifiedHash)
 			lastAutoUpdateCheck = time.Now()
 		}
 
@@ -3463,7 +3505,6 @@ func notifyPerStrategyCircuitBreakerWithSnapshot(sc StrategyConfig, snap perStra
 		RecentTrades:        recent,
 	})
 	notifier.SendToAllChannels(msg)
-	notifier.SendOwnerDM(msg)
 }
 
 func isFreshPerStrategyCircuitBreaker(reason string) bool {
@@ -3509,11 +3550,6 @@ func sendTradeAlertRows(sc StrategyConfig, newTrades []Trade, notifier tradeAler
 				msg = FormatTradeDMPlain(sc, t, mode, rc)
 			} else {
 				msg = FormatTradeDM(sc, t, mode, rc)
-			}
-			if route.dmDest != "" {
-				if err := sendTradeDestination(route.notifier, route.dmDest, msg); err != nil {
-					fmt.Printf("[notify] DM trade alert failed: %v\n", err)
-				}
 			}
 			if route.channel != "" {
 				if err := route.notifier.SendMessage(route.channel, msg); err != nil {
@@ -3863,7 +3899,6 @@ func runHyperliquidExecuteOrder(sc StrategyConfig, result *HyperliquidResult, pr
 				msg := fmt.Sprintf("**HL OPEN-ORDER CAP HIT** [%s] %s position is UNPROTECTED — SL placement rejected: %s",
 					sc.ID, result.Symbol, execResult.StopLossError)
 				notifier.SendToAllChannels(msg)
-				notifier.SendOwnerDM(msg)
 			}
 		} else {
 			logger.Warn("SL placement failed (non-fatal): %s", execResult.StopLossError)

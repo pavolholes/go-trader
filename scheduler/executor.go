@@ -1140,6 +1140,42 @@ type OKXBalanceResult struct {
 	Error         string  `json:"error,omitempty"`
 }
 
+type BloFinCopyBalanceResult struct {
+	TotalEquity       float64 `json:"total_equity"`
+	Available         float64 `json:"available"`
+	AccountType       string  `json:"account_type"`
+	Mode              string  `json:"mode"`
+	Timestamp         string  `json:"timestamp"`
+	ExchangeTimestamp int64   `json:"exchange_timestamp_ms"`
+	Error             string  `json:"error,omitempty"`
+}
+
+func RunBloFinCopyBalance(script, mode string) (*BloFinCopyBalanceResult, string, error) {
+	stdout, stderr, runErr := RunPythonScript(script, []string{mode})
+	return parseBloFinCopyBalanceOutput(stdout, string(stderr), runErr)
+}
+
+func parseBloFinCopyBalanceOutput(stdout []byte, stderrStr string, runErr error) (*BloFinCopyBalanceResult, string, error) {
+	var result BloFinCopyBalanceResult
+	parseErr := json.Unmarshal(stdout, &result)
+	switch {
+	case parseErr == nil && result.Error != "":
+		return &result, stderrStr, fmt.Errorf("fetch BloFin Copy balance failed: %s", result.Error)
+	case runErr != nil:
+		return &result, stderrStr, fmt.Errorf("fetch BloFin Copy balance subprocess failed: %w (stderr: %s)", runErr, stderrStr)
+	case parseErr != nil:
+		return nil, stderrStr, fmt.Errorf("parse BloFin Copy balance output: %w (stdout: %s)", parseErr, string(stdout))
+	case result.Mode != "perps" || result.AccountType != "copy_trading_futures":
+		return &result, stderrStr, fmt.Errorf("unexpected BloFin balance source: mode=%q account_type=%q", result.Mode, result.AccountType)
+	case math.IsNaN(result.TotalEquity) || math.IsInf(result.TotalEquity, 0) || result.TotalEquity <= 0:
+		return &result, stderrStr, fmt.Errorf("invalid BloFin Copy totalEquity %v", result.TotalEquity)
+	case result.Timestamp == "" || result.ExchangeTimestamp <= 0:
+		return &result, stderrStr, fmt.Errorf("BloFin Copy balance is missing a trustworthy timestamp")
+	default:
+		return &result, stderrStr, nil
+	}
+}
+
 func RunOKXFetchBalance(script string) (*OKXBalanceResult, string, error) {
 	stdout, stderr, runErr := RunPythonScript(script, nil)
 	return parseOKXBalanceOutput(stdout, string(stderr), runErr)

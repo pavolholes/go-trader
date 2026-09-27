@@ -141,6 +141,5 @@ func drainOperatorRequiredPendingCloses(state *AppState, notifier operatorRequir
 	}
 	if notifier != nil && notifier.HasBackends() && plan.Message != "" {
 		notifier.SendToAllChannels(plan.Message)
-		notifier.SendOwnerDM(plan.Message)
 	}
 }

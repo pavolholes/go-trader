@@ -706,10 +706,13 @@ func notifySpotLiveCashOverBudget(sender ownerDMSender, msg string) {
 	if msg == "" || sender == nil || isNilSender(sender) {
 		return
 	}
-	sender.SendOwnerDM(msg)
-	if mn, ok := sender.(*MultiNotifier); ok && mn != nil && mn.HasBackends() {
-		mn.SendToAllChannels(msg)
+	if mn, ok := sender.(*MultiNotifier); ok {
+		if mn != nil && mn.HasBackends() {
+			mn.SendToAllChannels(msg)
+		}
+		return
 	}
+	sender.SendOwnerDM(msg)
 }
 
 func maybeClearCashReconcileRequired(s *StrategyState) {

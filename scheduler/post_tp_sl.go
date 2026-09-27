@@ -1044,7 +1044,6 @@ func runPostTPStopLossAdjustment(
 			msg := fmt.Sprintf("**HL POST-TP SL CANCEL FAILED** [%s] %s old trigger OID %d may still be resting while new trigger OID %d was placed. Check HL open triggers before they accumulate toward the account cap. Error: %s",
 				sc.ID, symbol, currentOID, result.StopLossOID, result.CancelStopLossError)
 			notifier.SendToAllChannels(msg)
-			notifier.SendOwnerDM(msg)
 		}
 	}
 	if result.StopLossError != "" {
@@ -1057,7 +1056,6 @@ func runPostTPStopLossAdjustment(
 				msg := fmt.Sprintf("**HL OPEN-ORDER CAP HIT** [%s] %s post-TP SL update rejected: %s",
 					sc.ID, symbol, result.StopLossError)
 				notifier.SendToAllChannels(msg)
-				notifier.SendOwnerDM(msg)
 			}
 		} else if logger != nil {
 			logger.Warn("post-TP SL placement failed (non-fatal): %s", result.StopLossError)

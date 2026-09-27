@@ -333,7 +333,7 @@ var (
 )
 
 func notifyDirectionalCertStartupSummary(notifier *MultiNotifier, lines []string) {
-	if notifier == nil || !notifier.HasOwner() {
+	if notifier == nil || !notifier.HasBackends() {
 		return
 	}
 	filtered := directionalCertStartupLinesNeedingOwnerDM(lines)

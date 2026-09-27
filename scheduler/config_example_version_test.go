@@ -28,7 +28,7 @@ func TestConfigExampleCopyDoesNotTriggerTheUpgradePath(t *testing.T) {
 			}
 			if got := cfg.MigrationBaseVersion(); got < CurrentConfigVersion {
 				t.Fatalf("a fresh copy of %s reports MigrationBaseVersion %d < %d, so main.go's "+
-					"startup path would spawn runConfigMigrationDM and DM a brand-new operator that their "+
+					"startup path would migrate a brand-new operator's config even though the example "+
 					"config was upgraded", example, got, CurrentConfigVersion)
 			}
 			after, err := os.ReadFile(path)

@@ -864,7 +864,6 @@ func notifyHedgeCritical(notifier *MultiNotifier, sc StrategyConfig, msg string)
 	if notifier == nil {
 		return
 	}
-	notifier.SendOwnerDM(msg)
 	notifier.SendToAllChannels(msg)
 }
 

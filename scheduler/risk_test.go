@@ -2858,6 +2858,11 @@ func TestCircuitBreakerPermitsManagement(t *testing.T) {
 		{"latched CB, OKX perps -> skip (no HL walker)", RiskReasonCircuitBreakerActive, "okx", "perps", 0.5, false},
 		{"latched CB, HL futures -> skip", RiskReasonCircuitBreakerActive, "hyperliquid", "futures", 0.5, false},
 		{"latched CB, HL spot -> skip", RiskReasonCircuitBreakerActive, "hyperliquid", "spot", 0.5, false},
+		{"latched CB, open BloFin perps -> manage", RiskReasonCircuitBreakerActive, "blofin", "perps", 0.5, true},
+		{"first-fire BloFin max drawdown -> manage exits", RiskReasonMaxDrawdownExceeded + " (40.0% > 18.0%)", "blofin", "perps", 0.5, true},
+		{"first-fire BloFin loss streak -> manage exits", RiskReasonConsecutiveLosses + " (5 in a row)", "blofin", "perps", 0.5, true},
+		{"latched CB, flat BloFin perps -> skip", RiskReasonCircuitBreakerActive, "blofin", "perps", 0, false},
+		{"latched CB, BloFin spot -> skip", RiskReasonCircuitBreakerActive, "blofin_spot", "spot", 0.5, false},
 		{"empty reason (allowed) -> skip", "", "hyperliquid", "perps", 0.5, false},
 	}
 	for _, tc := range cases {

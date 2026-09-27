@@ -27,6 +27,7 @@ type PortfolioWarningMessageInputs struct {
 	Recent           []Trade
 	Now              time.Time
 	EquityGuardArmed bool
+	EquitySource     string
 }
 
 type portfolioWarningContributor struct {
@@ -67,6 +68,9 @@ func BuildPortfolioWarningMessage(in PortfolioWarningMessageInputs) string {
 		b.WriteString(strings.ToUpper(partitionLabel(in.Partition)))
 	}
 	b.WriteString("**\n")
+	if in.EquitySource != "" {
+		b.WriteString(fmt.Sprintf("Equity source: %s.\n", in.EquitySource))
+	}
 
 	if in.EquityGuardArmed {
 		note := ""
@@ -83,7 +87,11 @@ func BuildPortfolioWarningMessage(in PortfolioWarningMessageInputs) string {
 			prs.CurrentMarginDrawdownPct, in.PerpsLoss, in.PerpsMargin))
 	}
 
-	b.WriteString(fmt.Sprintf("Warning threshold (equity or margin): %.1f%%.\n", warnDD))
+	if in.EquitySource != "" {
+		b.WriteString(fmt.Sprintf("Warning threshold (account equity): %.1f%%.\n", warnDD))
+	} else {
+		b.WriteString(fmt.Sprintf("Warning threshold (equity or margin): %.1f%%.\n", warnDD))
+	}
 
 	switch {
 	case !prs.UntrustedOverLimitSince.IsZero():

@@ -8,13 +8,12 @@ import (
 )
 
 type mockNotifier struct {
-	mu         sync.Mutex
-	messages   []mockMessage
-	dms        []mockDM
-	askResp    string
-	askErr     error
-	closed     bool
-	failSendDM bool
+	mu       sync.Mutex
+	messages []mockMessage
+	dms      []mockDM
+	askResp  string
+	askErr   error
+	closed   bool
 }
 
 type mockMessage struct {
@@ -37,9 +36,6 @@ func (m *mockNotifier) SendMessage(channelID string, content string) error {
 func (m *mockNotifier) SendDM(userID, content string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.failSendDM {
-		return fmt.Errorf("mock SendDM failed")
-	}
 	m.dms = append(m.dms, mockDM{userID, content})
 	return nil
 }
@@ -55,32 +51,6 @@ func (m *mockNotifier) Close() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.closed = true
-}
-
-func TestSendTradeDestination_PrefersSendDM(t *testing.T) {
-	m := &mockNotifier{}
-	if err := sendTradeDestination(m, "user-1", "hello"); err != nil {
-		t.Fatal(err)
-	}
-	if len(m.dms) != 1 || m.dms[0].userID != "user-1" {
-		t.Fatalf("expected 1 DM, got %#v", m.dms)
-	}
-	if len(m.messages) != 0 {
-		t.Fatalf("expected no channel messages, got %#v", m.messages)
-	}
-}
-
-func TestSendTradeDestination_FallsBackToSendMessage(t *testing.T) {
-	m := &mockNotifier{failSendDM: true}
-	if err := sendTradeDestination(m, "channel-99", "hello"); err != nil {
-		t.Fatal(err)
-	}
-	if len(m.dms) != 0 {
-		t.Fatalf("expected no DMs when SendDM fails, got %#v", m.dms)
-	}
-	if len(m.messages) != 1 || m.messages[0].channelID != "channel-99" {
-		t.Fatalf("expected 1 channel message, got %#v", m.messages)
-	}
 }
 
 func TestMultiNotifier_NoBackends(t *testing.T) {
@@ -103,9 +73,10 @@ func TestMultiNotifier_NoBackends(t *testing.T) {
 func TestMultiNotifier_SingleBackend(t *testing.T) {
 	mock := &mockNotifier{}
 	mn := NewMultiNotifier(notifierBackend{
-		notifier: mock,
-		channels: map[string]string{"spot": "ch1", "hyperliquid": "ch2"},
-		ownerID:  "owner1",
+		notifier:           mock,
+		channels:           map[string]string{"spot": "ch1", "hyperliquid": "ch2"},
+		tradeAlertChannels: map[string]string{"default": "trade-alerts"},
+		ownerID:            "owner1",
 	})
 
 	if !mn.HasBackends() {
@@ -137,8 +108,11 @@ func TestMultiNotifier_SingleBackend(t *testing.T) {
 	}
 
 	mn.SendOwnerDM("hello owner")
-	if len(mock.dms) != 1 || mock.dms[0].userID != "owner1" {
-		t.Errorf("expected DM to owner1, got %v", mock.dms)
+	if len(mock.dms) != 0 {
+		t.Errorf("informational owner updates must not be sent as DMs: %v", mock.dms)
+	}
+	if len(mock.messages) != 3 || mock.messages[2].channelID != "trade-alerts" || mock.messages[2].content != "hello owner" {
+		t.Errorf("expected owner update in the configured trade-alert channel, got %v", mock.messages)
 	}
 
 	mock.messages = nil
@@ -154,14 +128,16 @@ func TestMultiNotifier_DualBackends(t *testing.T) {
 
 	mn := NewMultiNotifier(
 		notifierBackend{
-			notifier: discord,
-			channels: map[string]string{"spot": "discord-ch1"},
-			ownerID:  "discord-owner",
+			notifier:           discord,
+			channels:           map[string]string{"spot": "discord-ch1"},
+			tradeAlertChannels: map[string]string{"default": "discord-alerts"},
+			ownerID:            "discord-owner",
 		},
 		notifierBackend{
-			notifier: telegram,
-			channels: map[string]string{"spot": "telegram-ch1"},
-			ownerID:  "telegram-owner",
+			notifier:           telegram,
+			channels:           map[string]string{"spot": "telegram-ch1"},
+			tradeAlertChannels: map[string]string{"default": "telegram-alerts"},
+			ownerID:            "telegram-owner",
 		},
 	)
 
@@ -178,11 +154,14 @@ func TestMultiNotifier_DualBackends(t *testing.T) {
 	}
 
 	mn.SendOwnerDM("update available")
-	if len(discord.dms) != 1 || discord.dms[0].userID != "discord-owner" {
-		t.Errorf("expected discord DM to discord-owner, got %v", discord.dms)
+	if len(discord.dms) != 0 || len(telegram.dms) != 0 {
+		t.Errorf("informational updates must not be sent as DMs: discord=%v telegram=%v", discord.dms, telegram.dms)
 	}
-	if len(telegram.dms) != 1 || telegram.dms[0].userID != "telegram-owner" {
-		t.Errorf("expected telegram DM to telegram-owner, got %v", telegram.dms)
+	if len(discord.messages) != 2 || discord.messages[1].channelID != "discord-alerts" || discord.messages[1].content != "update available" {
+		t.Errorf("expected discord channel update, got %v", discord.messages)
+	}
+	if len(telegram.messages) != 2 || telegram.messages[1].channelID != "telegram-alerts" || telegram.messages[1].content != "update available" {
+		t.Errorf("expected telegram channel update, got %v", telegram.messages)
 	}
 
 	discord.askResp = "yes"

@@ -170,8 +170,8 @@ func TestSharedCoinFullCloseFloorExecutePath(t *testing.T) {
 			backend.mu.Lock()
 			messages, dms := len(backend.messages), len(backend.dms)
 			backend.mu.Unlock()
-			if messages != tc.wantAlerts || dms != tc.wantAlerts {
-				t.Fatalf("alerts = channels %d DMs %d, want %d each", messages, dms, tc.wantAlerts)
+			if messages != tc.wantAlerts || dms != 0 {
+				t.Fatalf("alerts = channels %d DMs %d, want %d channels and no DMs", messages, dms, tc.wantAlerts)
 			}
 			liveExecThrottle.mu.Lock()
 			throttled := len(liveExecThrottle.entries)
@@ -187,7 +187,7 @@ func TestSharedCoinFullCloseFloorExecutePath(t *testing.T) {
 			}
 			if tc.wantStranded {
 				backend.mu.Lock()
-				msg := backend.dms[0].content
+				msg := backend.messages[0].content
 				backend.mu.Unlock()
 				if strings.Contains(msg, "every peer is flat on-chain and in its own book, or") || !strings.Contains(msg, "a peer going flat does not resend it") {
 					t.Fatalf("venue-rejected alert promises a peer-flat resend: %s", msg)

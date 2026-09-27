@@ -1193,7 +1193,7 @@ func TestReconcileSharedCoin_OwnerStopLossFired_ClosesOwnerOnly(t *testing.T) {
 	}
 }
 
-func TestReconcileSoleOwnerSL_SendsTradeAlertAndProtectionDM(t *testing.T) {
+func TestReconcileSoleOwnerSL_SendsTradeAndProtectionChannelAlerts(t *testing.T) {
 	state := &AppState{
 		Strategies: map[string]*StrategyState{
 			"hl-owner-eth": {
@@ -1232,14 +1232,19 @@ func TestReconcileSoleOwnerSL_SendsTradeAlertAndProtectionDM(t *testing.T) {
 	var mu sync.RWMutex
 	reconcileHyperliquidAccountPositions([]StrategyConfig{sc}, []StrategyConfig{sc}, state, &mu, logMgr, nil, nil, nil, "0xtest", mn, true)
 
-	if len(mock.messages) != 1 {
-		t.Fatalf("trade alert messages = %d, want 1", len(mock.messages))
+	if len(mock.messages) != 2 {
+		t.Fatalf("channel alerts = %d, want trade and protection alerts", len(mock.messages))
 	}
-	if mock.messages[0].channelID != "trade-alerts" || !strings.Contains(mock.messages[0].content, "TRADE STOPPED") {
-		t.Errorf("trade alert = %+v, want configured live close alert", mock.messages[0])
+	sawTrade, sawProtection := false, false
+	for _, message := range mock.messages {
+		if message.channelID != "trade-alerts" {
+			t.Errorf("alert = %+v, want configured channel", message)
+		}
+		sawTrade = sawTrade || strings.Contains(message.content, "TRADE STOPPED")
+		sawProtection = sawProtection || strings.Contains(message.content, "SL filled")
 	}
-	if len(mock.dms) != 1 || !strings.Contains(mock.dms[0].content, "SL filled") {
-		t.Errorf("protection DMs = %+v, want one sole-owner SL fill DM", mock.dms)
+	if !sawTrade || !sawProtection || len(mock.dms) != 0 {
+		t.Errorf("trade/protection channel alerts missing or DM used: messages=%+v dms=%+v", mock.messages, mock.dms)
 	}
 }
 
@@ -1295,10 +1300,11 @@ func TestReconcileSharedCoinSLAndExternal_SendsTradeAlertPerBookedTrade(t *testi
 	var mu sync.RWMutex
 	reconcileHyperliquidAccountPositions(strategies, strategies, state, &mu, logMgr, nil, nil, nil, "0xtest", mn, true)
 
-	if len(mock.messages) != 2 {
-		t.Fatalf("trade alert messages = %d, want 2", len(mock.messages))
+	if len(mock.messages) != 3 {
+		t.Fatalf("channel alerts = %d, want two trade alerts plus the SL protection alert", len(mock.messages))
 	}
 	counts := map[string]int{}
+	sawProtection := false
 	for _, message := range mock.messages {
 		if message.channelID != "trade-alerts" {
 			t.Errorf("trade alert = %+v, want trade-alerts channel", message)
@@ -1315,6 +1321,8 @@ func TestReconcileSharedCoinSLAndExternal_SendsTradeAlertPerBookedTrade(t *testi
 				t.Errorf("peer external alert = %+v, want TRADE CLOSED", message)
 			}
 			counts["hl-peer-eth"]++
+		} else if strings.Contains(message.content, "SL filled") {
+			sawProtection = true
 		} else {
 			t.Errorf("trade alert = %+v, want known strategy", message)
 		}
@@ -1324,8 +1332,8 @@ func TestReconcileSharedCoinSLAndExternal_SendsTradeAlertPerBookedTrade(t *testi
 			t.Errorf("trade alerts for %s = %d, want 1", id, counts[id])
 		}
 	}
-	if len(mock.dms) != 1 || !strings.Contains(mock.dms[0].content, "SL filled") {
-		t.Errorf("protection DMs = %+v, want one owner SL fill DM", mock.dms)
+	if !sawProtection || len(mock.dms) != 0 {
+		t.Errorf("protection channel alert missing or DM used: messages=%+v dms=%+v", mock.messages, mock.dms)
 	}
 }
 
@@ -1376,14 +1384,21 @@ func TestReconcileHyperliquidHedgeCloseSkipsPublicTradeAlerts(t *testing.T) {
 			var mu sync.RWMutex
 			reconcileHyperliquidAccountPositions([]StrategyConfig{sc}, []StrategyConfig{sc}, state, &mu, logMgr, nil, tc.positions, nil, "", mn, false)
 
-			if len(mock.messages) != tc.wantPublicAlerts {
-				t.Fatalf("public trade alerts = %d, want %d: %+v", len(mock.messages), tc.wantPublicAlerts, mock.messages)
+			publicAlerts, hedgeAlerts := 0, 0
+			for _, message := range mock.messages {
+				if strings.Contains(message.content, "TRADE CLOSED") {
+					publicAlerts++
+					if message.channelID != "trade-alerts" {
+						t.Errorf("public trade alert = %+v, want trade-alerts channel", message)
+					}
+				} else if strings.Contains(message.content, "Hedge leg closed externally") {
+					hedgeAlerts++
+				} else {
+					t.Errorf("unexpected channel alert = %+v", message)
+				}
 			}
-			if tc.wantPublicAlerts == 1 && (mock.messages[0].channelID != "trade-alerts" || !strings.Contains(mock.messages[0].content, "TRADE CLOSED")) {
-				t.Errorf("public trade alert = %+v, want primary close alert", mock.messages[0])
-			}
-			if len(mock.dms) != 1 || !strings.Contains(mock.dms[0].content, "Hedge leg closed externally") {
-				t.Errorf("hedge DMs = %+v, want one hedge close DM", mock.dms)
+			if publicAlerts != tc.wantPublicAlerts || hedgeAlerts != 1 || len(mock.dms) != 0 {
+				t.Errorf("public/hedge channel alerts = %d/%d, want %d/1; DMs=%+v", publicAlerts, hedgeAlerts, tc.wantPublicAlerts, mock.dms)
 			}
 
 			tradeRows := map[string]int{}
@@ -1458,14 +1473,22 @@ func TestReconcileHyperliquidHedgeClosePublishesPrimaryTradeData(t *testing.T) {
 	var mu sync.RWMutex
 	reconcileHyperliquidAccountPositions([]StrategyConfig{sc}, []StrategyConfig{sc}, state, &mu, logMgr, nil, nil, nil, "", mn, false)
 
-	if len(mock.messages) != 1 {
-		t.Fatalf("public trade alerts = %d, want 1: %+v", len(mock.messages), mock.messages)
+	if len(mock.messages) != 2 {
+		t.Fatalf("channel alerts = %d, want one trade and one hedge alert: %+v", len(mock.messages), mock.messages)
 	}
-	if !strings.Contains(mock.messages[0].content, "\nETH") || strings.Contains(mock.messages[0].content, "\nBTC") {
-		t.Errorf("public trade alert = %q, want primary ETH data only", mock.messages[0].content)
+	publicAlerts, hedgeAlerts := 0, 0
+	for _, message := range mock.messages {
+		if strings.Contains(message.content, "TRADE CLOSED") {
+			publicAlerts++
+			if !strings.Contains(message.content, "\nETH") || strings.Contains(message.content, "\nBTC") {
+				t.Errorf("public trade alert = %q, want primary ETH data only", message.content)
+			}
+		} else if strings.Contains(message.content, "Hedge leg closed externally") {
+			hedgeAlerts++
+		}
 	}
-	if len(mock.dms) != 1 || !strings.Contains(mock.dms[0].content, "Hedge leg closed externally") {
-		t.Errorf("hedge DMs = %+v, want one hedge close DM", mock.dms)
+	if publicAlerts != 1 || hedgeAlerts != 1 || len(mock.dms) != 0 {
+		t.Errorf("public/hedge channel alerts = %d/%d, DMs=%+v", publicAlerts, hedgeAlerts, mock.dms)
 	}
 }
 

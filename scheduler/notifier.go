@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 )
@@ -254,15 +253,10 @@ func (m *MultiNotifier) SendToTradeAlertChannels(content string) {
 	}
 }
 
-// SendOwnerDM sends a DM to the owner on all backends that have an owner configured.
+// SendOwnerDM is retained as a compatibility name for existing alert producers.
+// Informational updates are sent to configured trade-alert channels only.
 func (m *MultiNotifier) SendOwnerDM(content string) {
-	for _, b := range m.snapshotBackends() {
-		if b.ownerID != "" {
-			if err := b.notifier.SendDM(b.ownerID, content); err != nil {
-				fmt.Printf("[WARN] Owner DM failed: %v\n", err)
-			}
-		}
-	}
+	m.SendToTradeAlertChannels(content)
 }
 
 func (m *MultiNotifier) AskOwnerDM(question string, timeout time.Duration) (string, error) {
@@ -387,7 +381,6 @@ func (m *MultiNotifier) AllChannelKeys() map[string]bool {
 type tradeAlertRoute struct {
 	notifier  Notifier
 	plainText bool
-	dmDest    string
 	channel   string
 	liveChan  string
 }
@@ -398,17 +391,7 @@ type tradeAlertRouter interface {
 
 func (m *MultiNotifier) tradeAlertRoutes(platform, stratType string, isLive bool, source string) []tradeAlertRoute {
 	var routes []tradeAlertRoute
-	// The DM key stays an exact match with no fallback: a sourced strategy
-	// reads only its own key, so a moved book never DMs another source's route.
-	dmKey := platform
-	if !isLive {
-		dmKey = paperChannelKeys(platform, source)[0]
-	}
 	for _, b := range m.snapshotBackends() {
-		dmDest := ""
-		if b.dmChannels != nil {
-			dmDest = b.dmChannels[dmKey]
-		}
 		ch := resolveTradeAlertChannel(b.tradeAlertChannels, b.channels, platform, stratType, isLive, source)
 
 		var liveCh string
@@ -422,31 +405,17 @@ func (m *MultiNotifier) tradeAlertRoutes(platform, stratType string, isLive bool
 			}
 		}
 
-		if dmDest == "" && ch == "" && liveCh == "" {
+		if ch == "" && liveCh == "" {
 			continue
 		}
 		routes = append(routes, tradeAlertRoute{
 			notifier:  b.notifier,
 			plainText: b.plainText,
-			dmDest:    dmDest,
 			channel:   ch,
 			liveChan:  liveCh,
 		})
 	}
 	return routes
-}
-
-func sendTradeDestination(n Notifier, id, content string) error {
-	id = strings.TrimSpace(id)
-	if id == "" {
-		return nil
-	}
-	if err := n.SendDM(id, content); err == nil {
-		return nil
-	} else {
-		fmt.Printf("[notify] SendDM(%s) failed, falling back to SendMessage: %v\n", id, err)
-	}
-	return n.SendMessage(id, content)
 }
 
 func (m *MultiNotifier) DiscordBackend() *DiscordNotifier {

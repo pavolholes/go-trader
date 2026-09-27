@@ -37,7 +37,7 @@ func newOrphanLaneState(strategyID string) *AppState {
 
 func newOrphanLaneNotifier() (*MultiNotifier, *mockNotifier) {
 	mock := &mockNotifier{}
-	return NewMultiNotifier(notifierBackend{notifier: mock, ownerID: "owner-1"}), mock
+	return NewMultiNotifier(notifierBackend{notifier: mock, ownerID: "owner-1", channels: map[string]string{"hyperliquid": "operator-alerts"}}), mock
 }
 
 func resetOrphanLimitCancelAlerts(t *testing.T) {
@@ -102,8 +102,8 @@ func TestReconcileCancelLaneConvergesRowWhoseStrategyIsAbsent(t *testing.T) {
 	if len(orders) != 0 {
 		t.Fatalf("row must be cleared once the order is off-book with no unbooked fill, got %+v", orders)
 	}
-	if len(mock.dms) != 1 || !strings.Contains(mock.dms[0].content, "cancel-only lane") {
-		t.Fatalf("operator must be told the lane cleared the order, dms = %+v", mock.dms)
+	if len(mock.messages) != 1 || !strings.Contains(mock.messages[0].content, "cancel-only lane") {
+		t.Fatalf("operator must be told in the channel that the lane cleared the order, messages = %+v", mock.messages)
 	}
 }
 
@@ -215,12 +215,12 @@ func TestReconcileCancelLaneKeepsRowAndBooksNothingOnUnadoptedFill(t *testing.T)
 	if pos := state.Strategies["hl-manual-eth-live"].Positions["ETH"]; pos != nil {
 		t.Fatalf("the lane must book no fill, position = %+v", pos)
 	}
-	if len(mock.dms) != 1 {
-		t.Fatalf("an unresolvable row must raise one owner alert, dms = %+v", mock.dms)
+	if len(mock.messages) != 1 {
+		t.Fatalf("an unresolvable row must raise one channel alert, messages = %+v", mock.messages)
 	}
-	if !strings.Contains(mock.dms[0].content, "oid=9001") ||
-		!strings.Contains(mock.dms[0].content, "hl-manual-eth-live/ETH") {
-		t.Fatalf("alert must name the order and its order id, got: %s", mock.dms[0].content)
+	if !strings.Contains(mock.messages[0].content, "oid=9001") ||
+		!strings.Contains(mock.messages[0].content, "hl-manual-eth-live/ETH") {
+		t.Fatalf("alert must name the order and its order id, got: %s", mock.messages[0].content)
 	}
 }
 
@@ -255,8 +255,8 @@ func TestReconcileCancelLaneRetriesAFailedCancelOnLaterTicks(t *testing.T) {
 	if orders, _ := db.LoadPendingLimitOrders(); len(orders) != 1 {
 		t.Fatalf("row must be retained while the cancel is unresolved, got %+v", orders)
 	}
-	if len(mock.dms) != 1 {
-		t.Fatalf("the owner alert must be throttled across ticks, dms = %+v", mock.dms)
+	if len(mock.messages) != 1 {
+		t.Fatalf("the channel alert must be throttled across ticks, messages = %+v", mock.messages)
 	}
 }
 
@@ -292,8 +292,8 @@ func TestReconcileCancelLaneRefusesWithoutAHyperliquidScript(t *testing.T) {
 	if orders, _ := db.LoadPendingLimitOrders(); len(orders) != 1 {
 		t.Fatalf("the row must survive a refusal, got %+v", orders)
 	}
-	if len(mock.dms) != 1 || !strings.Contains(mock.dms[0].content, "no Hyperliquid strategy with a script remains") {
-		t.Fatalf("a refusal must be reported to the owner, dms = %+v", mock.dms)
+	if len(mock.messages) != 1 || !strings.Contains(mock.messages[0].content, "no Hyperliquid strategy with a script remains") {
+		t.Fatalf("a refusal must be reported in the channel, messages = %+v", mock.messages)
 	}
 }
 
@@ -326,8 +326,8 @@ func TestReconcileCancelLaneLeavesAnIneligibleRowAloneWithNoCancelQueued(t *test
 	if orders, _ := db.LoadPendingLimitOrders(); len(orders) != 1 {
 		t.Fatalf("the row must be retained, got %+v", orders)
 	}
-	if len(mock.dms) != 0 {
-		t.Fatalf("a row nobody asked to cancel must not alert, dms = %+v", mock.dms)
+	if len(mock.messages) != 0 {
+		t.Fatalf("a row nobody asked to cancel must not alert, messages = %+v", mock.messages)
 	}
 }
 
@@ -401,8 +401,8 @@ func TestReconcileCancelLaneLeavesEligibleRowsToTheExistingBranch(t *testing.T) 
 	if orders, _ := db.LoadPendingLimitOrders(); len(orders) != 1 {
 		t.Fatalf("the existing branch finalizes next cycle, so the row stays, got %+v", orders)
 	}
-	if len(mock.dms) != 0 {
-		t.Fatalf("an eligible row must raise no orphan alert, dms = %+v", mock.dms)
+	if len(mock.messages) != 0 {
+		t.Fatalf("an eligible row must raise no orphan alert, messages = %+v", mock.messages)
 	}
 }
 
@@ -627,11 +627,11 @@ func TestReconcileCancelLaneReportsAFinalizeWithoutACancelHonestly(t *testing.T)
 	notifier, mock := newOrphanLaneNotifier()
 	reconcilePendingLimitOrders(state, cfg, openTestStore(t, db), &mu, notifier, nil)
 
-	if len(mock.dms) != 1 {
-		t.Fatalf("dms = %+v", mock.dms)
+	if len(mock.messages) != 1 {
+		t.Fatalf("channel messages = %+v", mock.messages)
 	}
-	if !strings.Contains(mock.dms[0].content, "already off-book and sent no cancel") {
-		t.Fatalf("the lane must not claim a cancel it never sent, got: %s", mock.dms[0].content)
+	if !strings.Contains(mock.messages[0].content, "already off-book and sent no cancel") {
+		t.Fatalf("the lane must not claim a cancel it never sent, got: %s", mock.messages[0].content)
 	}
 }
 
@@ -980,8 +980,8 @@ func TestReconcileStopsAlertingOnceTheOperatorClearsTheRow(t *testing.T) {
 
 	notifier, mock := newOrphanLaneNotifier()
 	reconcilePendingLimitOrders(state, cfg, openTestStore(t, db), &mu, notifier, nil)
-	if len(mock.dms) != 1 {
-		t.Fatalf("the first pass must alert, dms = %+v", mock.dms)
+	if len(mock.messages) != 1 {
+		t.Fatalf("the first pass must alert, messages = %+v", mock.messages)
 	}
 
 	orders, _ := db.LoadPendingLimitOrders()
@@ -1002,8 +1002,8 @@ func TestReconcileStopsAlertingOnceTheOperatorClearsTheRow(t *testing.T) {
 	if stubs.statusCalls != before {
 		t.Errorf("a cleared row must drive no further exchange poll, calls = %d want %d", stubs.statusCalls, before)
 	}
-	if len(mock.dms) != 1 {
-		t.Errorf("a cleared row must stop the CRITICAL alert, dms = %+v", mock.dms)
+	if len(mock.messages) != 1 {
+		t.Errorf("a cleared row must stop the CRITICAL alert, messages = %+v", mock.messages)
 	}
 }
 
@@ -1124,16 +1124,16 @@ func TestReconcileDeliversAnEscalationDMAfterARestingAlert(t *testing.T) {
 
 	notifier, mock := newOrphanLaneNotifier()
 	reconcilePendingLimitOrders(state, cfg, openTestStore(t, db), &mu, notifier, nil)
-	if len(mock.dms) != 1 || !strings.Contains(mock.dms[0].content, "IS STILL RESTING") {
-		t.Fatalf("the cancel failure must alert as a resting order, dms = %+v", mock.dms)
+	if len(mock.messages) != 1 || !strings.Contains(mock.messages[0].content, "IS STILL RESTING") {
+		t.Fatalf("the cancel failure must alert as a resting order, messages = %+v", mock.messages)
 	}
 
 	resting = false
 	reconcilePendingLimitOrders(state, cfg, openTestStore(t, db), &mu, notifier, nil)
-	if len(mock.dms) != 2 {
-		t.Fatalf("the untracked position must reach the owner in the same throttle window, dms = %d", len(mock.dms))
+	if len(mock.messages) != 2 {
+		t.Fatalf("the untracked position must reach the channel in the same throttle window, messages = %d", len(mock.messages))
 	}
-	if !strings.Contains(mock.dms[1].content, "UNTRACKED HYPERLIQUID POSITION") {
-		t.Fatalf("the escalation DM must describe the untracked position, got: %s", mock.dms[1].content)
+	if !strings.Contains(mock.messages[1].content, "UNTRACKED HYPERLIQUID POSITION") {
+		t.Fatalf("the escalation alert must describe the untracked position, got: %s", mock.messages[1].content)
 	}
 }

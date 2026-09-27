@@ -231,7 +231,6 @@ func reportSharedWalletDrift(notifier *MultiNotifier, results []sharedWalletDrif
 			if recovered, priorCount := sharedWalletDriftTracker.Clear(label); recovered && notifier != nil && notifier.HasBackends() {
 				msg := formatSharedWalletDriftRecovered(r.Key, priorCount)
 				notifier.SendToAllChannels(msg)
-				notifier.SendOwnerDM(msg)
 			}
 		}
 		orphanExposure := r.Basis == driftBasisJournal && len(r.OrphanCoins) > 0
@@ -272,7 +271,6 @@ func reportSharedWalletDrift(notifier *MultiNotifier, results []sharedWalletDrif
 				msg = formatSharedWalletDriftAlert(r.Key, r.Balance, r.MemberSum, r.Drift, count, r.OrphanCoins)
 			}
 			notifier.SendToAllChannels(msg)
-			notifier.SendOwnerDM(msg)
 			continue
 		}
 		recovered, priorCount := sharedWalletDriftTracker.Clear(trackerKey)
@@ -281,6 +279,5 @@ func reportSharedWalletDrift(notifier *MultiNotifier, results []sharedWalletDrif
 		}
 		msg := formatSharedWalletDriftRecovered(r.Key, priorCount)
 		notifier.SendToAllChannels(msg)
-		notifier.SendOwnerDM(msg)
 	}
 }

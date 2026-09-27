@@ -486,14 +486,13 @@ func TestDiagnosticsUpdateRoutedByRole(t *testing.T) {
 
 func TestTradeAlertRoutesSourceKeys(t *testing.T) {
 	cases := []struct {
-		name       string
-		channels   map[string]string
-		alerts     map[string]string
-		dms        map[string]string
-		source     string
-		isLive     bool
-		wantChan   string
-		wantDMDest string
+		name     string
+		channels map[string]string
+		alerts   map[string]string
+		dms      map[string]string
+		source   string
+		isLive   bool
+		wantChan string
 	}{
 		{
 			name:     "source channel key wins",
@@ -521,20 +520,18 @@ func TestTradeAlertRoutesSourceKeys(t *testing.T) {
 			wantChan: "alert-btc",
 		},
 		{
-			name:       "DM key is an exact match with no fallback",
-			channels:   map[string]string{"hyperliquid": "live"},
-			dms:        map[string]string{"hyperliquid-paper": "dm-paper"},
-			source:     "btc",
-			wantChan:   "live",
-			wantDMDest: "",
+			name:     "DM key does not alter the channel route",
+			channels: map[string]string{"hyperliquid": "live"},
+			dms:      map[string]string{"hyperliquid-paper": "dm-paper"},
+			source:   "btc",
+			wantChan: "live",
 		},
 		{
-			name:       "DM reaches the source's own key",
-			channels:   map[string]string{"hyperliquid": "live"},
-			dms:        map[string]string{"hyperliquid-paper:btc": "dm-btc"},
-			source:     "btc",
-			wantChan:   "live",
-			wantDMDest: "dm-btc",
+			name:     "source DM key is ignored for informational alerts",
+			channels: map[string]string{"hyperliquid": "live"},
+			dms:      map[string]string{"hyperliquid-paper:btc": "dm-btc"},
+			source:   "btc",
+			wantChan: "live",
 		},
 	}
 	for _, tc := range cases {
@@ -551,9 +548,6 @@ func TestTradeAlertRoutesSourceKeys(t *testing.T) {
 			}
 			if routes[0].channel != tc.wantChan {
 				t.Errorf("channel = %q, want %q", routes[0].channel, tc.wantChan)
-			}
-			if routes[0].dmDest != tc.wantDMDest {
-				t.Errorf("dm destination = %q, want %q", routes[0].dmDest, tc.wantDMDest)
 			}
 		})
 	}

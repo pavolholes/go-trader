@@ -13,7 +13,7 @@ import (
 
 const defaultGoTraderSystemdUnit = "go-trader"
 
-func checkForUpdates(cfg *Config, notifier *MultiNotifier, lastNotifiedHash *string, mu *sync.RWMutex, state *AppState, store *StateStore) bool {
+func checkForUpdates(notifier *MultiNotifier, lastNotifiedHash *string) bool {
 	if err := gitCheck(); err != nil {
 		fmt.Printf("[update] Not a git repo or git unavailable: %v\n", err)
 		return false
@@ -55,19 +55,6 @@ func checkForUpdates(cfg *Config, notifier *MultiNotifier, lastNotifiedHash *str
 
 	if notifier != nil && notifier.HasBackends() {
 		notifier.SendToAllChannels(msg)
-	}
-
-	if notifier != nil && notifier.HasOwner() {
-		go func() {
-			dmMsg := fmt.Sprintf("**Update available**: `%s` → `%s`\nWould you like me to upgrade automatically? (yes/no)\n_This will: git pull, rebuild, and restart._",
-				localHash[:8], remoteHash[:8])
-			resp, err := notifier.AskOwnerDM(dmMsg, 30*time.Minute)
-			if err != nil || strings.ToLower(strings.TrimSpace(resp)) != "yes" {
-				notifier.SendOwnerDM("Upgrade skipped.")
-				return
-			}
-			applyUpgrade(notifier, mu, state, cfg, store)
-		}()
 	}
 
 	if lastNotifiedHash != nil {

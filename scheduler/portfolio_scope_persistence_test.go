@@ -47,6 +47,11 @@ func TestMigrateSchema_PortfolioRiskScope_Idempotent(t *testing.T) {
 	if _, ok := portfolioRiskTableColumns(t, db, "kill_switch_events")["scope"]; !ok {
 		t.Error("kill_switch_events must carry a scope column")
 	}
+	for _, col := range []string{"equity_source", "equity_baseline_at", "equity_snapshot_at", "equity_rearm_readings", "equity_unavailable_since", "entry_halt_only"} {
+		if _, ok := cols[col]; !ok {
+			t.Errorf("portfolio_risk must persist %q", col)
+		}
+	}
 	corr := portfolioRiskTableColumns(t, db, "correlation_snapshot")
 	if !corr["scope"] {
 		t.Error("scope must be the correlation_snapshot primary key")
@@ -56,6 +61,9 @@ func TestMigrateSchema_PortfolioRiskScope_Idempotent(t *testing.T) {
 	prs := state.partitionRisk(livePartition)
 	prs.PeakValue = 4321
 	prs.KillSwitchActive = true
+	prs.EquitySource = blofinCopyEquitySource
+	prs.EntryHaltOnly = true
+	prs.EquityRearmReadings = 2
 	if err := db.SaveState(state); err != nil {
 		t.Fatalf("SaveState: %v", err)
 	}
@@ -68,7 +76,8 @@ func TestMigrateSchema_PortfolioRiskScope_Idempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadState: %v", err)
 	}
-	if got := loaded.partitionRisk(livePartition); got.PeakValue != 4321 || !got.KillSwitchActive {
+	if got := loaded.partitionRisk(livePartition); got.PeakValue != 4321 || !got.KillSwitchActive ||
+		got.EquitySource != blofinCopyEquitySource || !got.EntryHaltOnly || got.EquityRearmReadings != 2 {
 		t.Errorf("a repeated migration must be a no-op; got %+v", got)
 	}
 	var count int

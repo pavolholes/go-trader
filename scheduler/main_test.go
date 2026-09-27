@@ -112,10 +112,10 @@ func TestNotifyPerStrategyCircuitBreaker_BroadcastsFreshTriggers(t *testing.T) {
 			if len(mock.messages) != 2 {
 				t.Fatalf("expected 2 channel messages, got %d", len(mock.messages))
 			}
-			if len(mock.dms) != 1 {
-				t.Fatalf("expected 1 owner DM, got %d", len(mock.dms))
+			if len(mock.dms) != 0 {
+				t.Fatalf("informational circuit-breaker alerts must not use DMs, got %d", len(mock.dms))
 			}
-			for _, msg := range []string{mock.messages[0].content, mock.messages[1].content, mock.dms[0].content} {
+			for _, msg := range []string{mock.messages[0].content, mock.messages[1].content} {
 				if !strings.Contains(msg, "**CIRCUIT BREAKER**") ||
 					!strings.Contains(msg, "[test-strategy]") ||
 					!strings.Contains(msg, "Trigger:") ||
@@ -346,48 +346,44 @@ func TestSendTradeAlertsRouting(t *testing.T) {
 	cases := []struct {
 		name               string
 		sc                 StrategyConfig
-		ownerID            string
 		channels           map[string]string
 		dmChannels         map[string]string
 		tradeAlertChannels map[string]string
 		trades             []Trade
-		failSendDM         bool
-		wantDMs            int
-		wantDMUser         string
 		wantChanIDs        []string
 	}{
 		{
-			name: "dm and channel", sc: spotPaper, ownerID: "owner123",
-			channels:   map[string]string{"spot": "ch-spot-123"},
-			dmChannels: map[string]string{"binanceus-paper": "owner123"},
-			wantDMs:    1, wantChanIDs: []string{"ch-spot-123"},
+			name: "DM route config still posts to the channel only", sc: spotPaper,
+			channels:    map[string]string{"spot": "ch-spot-123"},
+			dmChannels:  map[string]string{"binanceus-paper": "owner123"},
+			wantChanIDs: []string{"ch-spot-123"},
 		},
 		{
-			name: "dm only", sc: spotPaper, ownerID: "owner123",
-			channels:   map[string]string{},
-			dmChannels: map[string]string{"binanceus-paper": "owner123"},
-			wantDMs:    1, wantChanIDs: nil,
+			name: "DM-only config does not produce a private alert", sc: spotPaper,
+			channels:    map[string]string{},
+			dmChannels:  map[string]string{"binanceus-paper": "owner123"},
+			wantChanIDs: nil,
 		},
 		{
-			name: "channel only", sc: spotPaper, ownerID: "owner123",
-			channels: map[string]string{"spot": "ch-spot-123"},
-			wantDMs:  0, wantChanIDs: []string{"ch-spot-123"},
+			name: "channel only", sc: spotPaper,
+			channels:    map[string]string{"spot": "ch-spot-123"},
+			wantChanIDs: []string{"ch-spot-123"},
 		},
 		{
-			name: "neither enabled", sc: spotPaper, ownerID: "owner123",
-			channels: map[string]string{},
-			wantDMs:  0, wantChanIDs: nil,
+			name: "no configured channel", sc: spotPaper,
+			channels:    map[string]string{},
+			wantChanIDs: nil,
 		},
 		{
-			name: "no channel for platform", sc: hlPaperNoChannelKey, ownerID: "owner123",
-			channels: map[string]string{"spot": "ch-spot-123"},
-			wantDMs:  0, wantChanIDs: nil,
+			name: "no channel for platform", sc: hlPaperNoChannelKey,
+			channels:    map[string]string{"spot": "ch-spot-123"},
+			wantChanIDs: nil,
 		},
 		{
-			name: "live channel routing", sc: hlLive, ownerID: "owner123",
-			channels:   map[string]string{"hyperliquid": "ch-hl", "hyperliquid-live": "ch-hl-live"},
-			dmChannels: map[string]string{"hyperliquid": "owner123"},
-			wantDMs:    1, wantChanIDs: []string{"ch-hl", "ch-hl-live"},
+			name: "live channel routing ignores DM config", sc: hlLive,
+			channels:    map[string]string{"hyperliquid": "ch-hl", "hyperliquid-live": "ch-hl-live"},
+			dmChannels:  map[string]string{"hyperliquid": "owner123"},
+			wantChanIDs: []string{"ch-hl", "ch-hl-live"},
 		},
 		{
 			name: "BloFin live partial close uses trade-alert channel", sc: blofinLive,
@@ -397,50 +393,51 @@ func TestSendTradeAlertsRouting(t *testing.T) {
 		},
 		{
 			name: "live channel dedup", sc: hlLive,
-			channels: map[string]string{"hyperliquid": "ch-hl", "hyperliquid-live": "ch-hl"},
-			wantDMs:  0, wantChanIDs: []string{"ch-hl"},
+			channels:    map[string]string{"hyperliquid": "ch-hl", "hyperliquid-live": "ch-hl"},
+			wantChanIDs: []string{"ch-hl"},
 		},
 		{
 			name: "paper takes no live channel", sc: hlPaper,
-			channels: map[string]string{"hyperliquid": "ch-hl", "hyperliquid-live": "ch-hl-live"},
-			wantDMs:  0, wantChanIDs: []string{"ch-hl"},
+			channels:    map[string]string{"hyperliquid": "ch-hl", "hyperliquid-live": "ch-hl-live"},
+			wantChanIDs: []string{"ch-hl"},
 		},
 		{
 			name: "paper channel routing", sc: hlPaper,
-			channels: map[string]string{"hyperliquid": "ch-hl-live", "hyperliquid-paper": "ch-hl-paper"},
-			wantDMs:  0, wantChanIDs: []string{"ch-hl-paper"},
+			channels:    map[string]string{"hyperliquid": "ch-hl-live", "hyperliquid-paper": "ch-hl-paper"},
+			wantChanIDs: []string{"ch-hl-paper"},
 		},
 		{
 			name: "paper falls back to base channel", sc: hlPaper,
-			channels: map[string]string{"hyperliquid": "ch-hl"},
-			wantDMs:  0, wantChanIDs: []string{"ch-hl"},
+			channels:    map[string]string{"hyperliquid": "ch-hl"},
+			wantChanIDs: []string{"ch-hl"},
 		},
 		{
-			name: "dm channel paper key", sc: hlPaper,
-			dmChannels: map[string]string{"hyperliquid-paper": "user-paper-dm"},
-			wantDMs:    1, wantDMUser: "user-paper-dm",
+			name: "paper DM-only route is ignored", sc: hlPaper,
+			dmChannels:  map[string]string{"hyperliquid-paper": "user-paper-dm"},
+			wantChanIDs: nil,
 		},
 		{
-			name: "dm channel live key", sc: hlLive,
-			dmChannels: map[string]string{"hyperliquid": "user-live-dm"},
-			wantDMs:    1, wantDMUser: "user-live-dm",
+			name: "live DM-only route is ignored", sc: hlLive,
+			dmChannels:  map[string]string{"hyperliquid": "user-live-dm"},
+			wantChanIDs: nil,
 		},
 		{
 			name: "dm key missing for mode", sc: hlPaper,
-			dmChannels: map[string]string{"hyperliquid": "only-live"},
-			channels:   map[string]string{},
-			wantDMs:    0, wantChanIDs: nil,
+			dmChannels:  map[string]string{"hyperliquid": "only-live"},
+			channels:    map[string]string{},
+			wantChanIDs: nil,
 		},
 		{
-			name: "dm send failure falls back to channel", sc: hlPaper, failSendDM: true,
-			dmChannels: map[string]string{"hyperliquid-paper": "private-log-channel"},
-			wantDMs:    0, wantChanIDs: []string{"private-log-channel"},
+			name: "channel route works without any DM route", sc: hlPaper,
+			channels:    map[string]string{"hyperliquid-paper": "paper-alerts"},
+			dmChannels:  map[string]string{"hyperliquid-paper": "private-log-channel"},
+			wantChanIDs: []string{"paper-alerts"},
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			mock := &mockNotifier{failSendDM: tc.failSendDM}
+			mock := &mockNotifier{}
 			trades := tc.trades
 			if trades == nil {
 				trades = []Trade{testTrade()}
@@ -451,7 +448,6 @@ func TestSendTradeAlertsRouting(t *testing.T) {
 				backends: []notifierBackend{
 					{
 						notifier:           mock,
-						ownerID:            tc.ownerID,
 						channels:           tc.channels,
 						dmChannels:         tc.dmChannels,
 						tradeAlertChannels: tc.tradeAlertChannels,
@@ -461,13 +457,8 @@ func TestSendTradeAlertsRouting(t *testing.T) {
 
 			sendTradeAlerts(tc.sc, state, 1, &mu, notifier, nil)
 
-			if len(mock.dms) != tc.wantDMs {
-				t.Errorf("dms = %d, want %d (%#v)", len(mock.dms), tc.wantDMs, mock.dms)
-			}
-			if tc.wantDMUser != "" {
-				if len(mock.dms) == 0 || mock.dms[0].userID != tc.wantDMUser {
-					t.Errorf("expected DM to %s, got %#v", tc.wantDMUser, mock.dms)
-				}
+			if len(mock.dms) != 0 {
+				t.Errorf("trade alerts must never use private DMs, got %#v", mock.dms)
 			}
 			if len(mock.messages) != len(tc.wantChanIDs) {
 				t.Fatalf("channel messages = %d, want %d (%#v)", len(mock.messages), len(tc.wantChanIDs), mock.messages)
@@ -1012,7 +1003,7 @@ func TestSendAuditCloseAlertsGroupsPerStrategy(t *testing.T) {
 			{
 				notifier:   mock,
 				ownerID:    "owner123",
-				channels:   map[string]string{},
+				channels:   map[string]string{"spot": "audit-alerts"},
 				dmChannels: map[string]string{"binanceus-paper": "owner123"},
 			},
 		},
@@ -1024,14 +1015,14 @@ func TestSendAuditCloseAlertsGroupsPerStrategy(t *testing.T) {
 
 	sendAuditCloseAlerts(details, map[string]*StrategyState{sc.ID: state}, &mu, notifier, nil)
 
-	if len(mock.dms) != 2 {
-		t.Fatalf("DMs = %d, want 2 (one per booked close)", len(mock.dms))
+	if len(mock.messages) != 2 {
+		t.Fatalf("channel alerts = %d, want 2 (one per booked close)", len(mock.messages))
 	}
 	saw := map[string]bool{}
-	for _, dm := range mock.dms {
-		saw[dm.content] = true
+	for _, message := range mock.messages {
+		saw[message.content] = true
 	}
 	if len(saw) != 2 {
-		t.Errorf("got %d distinct DM bodies, want 2 (the old close must not be swallowed by the newest-row emit)", len(saw))
+		t.Errorf("got %d distinct channel bodies, want 2 (the old close must not be swallowed by the newest-row emit)", len(saw))
 	}
 }

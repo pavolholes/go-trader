@@ -196,7 +196,6 @@ func notifyManualCloseRearmFailure(notifier *MultiNotifier, msg string) {
 		return
 	}
 	notifier.SendToAllChannels(msg)
-	notifier.SendOwnerDM(msg)
 }
 
 func hlPositionGoneForSide(onChainAbsQty map[string]float64, netSideByCoin map[string]string, symbol, side string) (bool, string) {

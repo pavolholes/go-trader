@@ -180,8 +180,8 @@ func TestAutomaticHyperliquidExecuteRejectsUnconfirmedOpenCloseFlip(t *testing.T
 			messages := len(backend.messages)
 			dms := len(backend.dms)
 			backend.mu.Unlock()
-			if messages == 0 || dms == 0 {
-				t.Fatalf("failure notifications = channels %d DMs %d, want both", messages, dms)
+			if messages == 0 || dms != 0 {
+				t.Fatalf("failure notifications = channels %d DMs %d, want channel-only delivery", messages, dms)
 			}
 		})
 	}

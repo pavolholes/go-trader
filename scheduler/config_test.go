@@ -2337,7 +2337,7 @@ func TestConfigValidationDMChannels(t *testing.T) {
 			wantErr: "dm_channels key",
 		},
 		{
-			name: "paper source dm key loads and the send path reads it",
+			name: "paper source dm key does not create a private notification route",
 			body: `{
 				"db_file": "live.db",
 				"paper_sources": [{"id": "btc", "db_file": "btc.db"}],
@@ -2347,8 +2347,8 @@ func TestConfigValidationDMChannels(t *testing.T) {
 			check: func(t *testing.T, cfg *Config) {
 				mn := NewMultiNotifier(notifierBackend{notifier: &mockNotifier{}, channels: cfg.Discord.Channels, dmChannels: cfg.Discord.DMChannels})
 				routes := mn.tradeAlertRoutes("hyperliquid", "perps", false, "btc")
-				if len(routes) != 1 || routes[0].dmDest != "555" {
-					t.Fatalf("a validated paper-source DM key must reach the send path: %+v", routes)
+				if len(routes) != 0 {
+					t.Fatalf("a DM-only config must not create an informational notification route: %+v", routes)
 				}
 			},
 		},

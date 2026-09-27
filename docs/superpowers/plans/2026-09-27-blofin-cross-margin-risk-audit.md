@@ -1,6 +1,6 @@
 # BloFin Copy Trading Cross-Margin Risk — Audit and Fix Plan
 
-**Status:** SPCX/USELESS ledger reconciled and client-order-ID correlation implemented. User policy decisions recorded: base live risk on actual BloFin Copy Trading equity; at the 20% threshold block new/increasing exposure but preserve existing positions and allow exits/partials; send updates to channels only. Baseline/re-arm and stop-protection details remain open.
+**Status:** SPCX/USELESS ledger reconciled and client-order-ID correlation implemented. The approved BloFin Copy `totalEquity` risk source, persisted baseline, entry-only 20% latch, three-reading auto-rearm below 16%, and channel-only notifications are implemented and deployed. First trusted baseline: **$375.460214 USDT**, tracked drawdown **0%**. Bot-managed close/stop evaluators remain active during the entry hold; exchange-native Copy TPSL orders are not currently verified.
 
 **Currently deployed:** portfolio warning threshold is configured at 80% of the 20% model limit (16%), with a simpler message and 2pp escalation. Those warning inputs are still model-derived and must not be represented as BloFin account-equity or cross-margin measurements.
 
@@ -60,8 +60,8 @@ Copy order-history IDs `16967850`, `16968008`, and `16968123` record the SPCX fi
 3. **Kill policy — user selected entry-halt only:** at a confirmed actual account-equity breach, latch and block new/increasing exposure. Do not automatically flatten existing Copy positions; continue risk-reducing exits and partial closes.
 4. **Close-only handling:** A portfolio/strategy breaker must reject new entries and scale-ins but permit risk-reducing closes, partial take-profits, stop maintenance, and reconciliation.
 5. **BloFin close confirmation:** Implement parent-position/order-ID correlation, stable `clientOrderId` where supported, exact fill/fee booking, retries that cannot over-close, and exchange-confirmed flat checks. Never clear virtual position state from a mark price alone.
-6. **Protection:** Decide whether Copy positions require exchange-native SL/TP attachments or a continuously running bot-managed exit monitor. Add a visible protection-status check and alert when a live position has neither verified exchange protection nor active management.
-7. **Notifications:** Keep the warning concise, name the actual metric/source and state whether action is required. Send all updates to configured channels only; do not DM. Route currently owner-only alerts to an operator channel. Add hysteresis/cooldown for re-entry.
+6. **Protection:** Current Copy positions use the configured bot-managed close evaluator; keep it running during the entry hold and circuit-breaker management mode. Do not claim exchange-native SL/TP protection until active Copy TPSL orders are verified. Add a visible protection-status check in a follow-up.
+7. **Notifications:** Name `BloFin Copy Trading totalEquity`, state that the latch holds entries but leaves existing positions open, and report the 3-reading re-arm rule. Send informational updates to configured channels only; suppress trade-alert DMs and ignore `notify_dm` for delivery routing.
 
 ## Implementation phases
 
@@ -77,21 +77,21 @@ Stable client-order-ID submission and Copy-history lookup are implemented and de
 
 ### P2 — Base risk on the actual Copy account
 
-Fetch and persist the Copy account equity/peak snapshot, replace virtual aggregate equity as the live account kill-switch basis, label estimated margin explicitly, and define reset/re-baseline rules.
+Fetch and persist Copy account `totalEquity`, establish a new source-tagged peak baseline on the first trusted snapshot, replace the virtual live-book value for the account risk gate, and omit model-estimated margin from Copy account warnings.
 
 ### P3 — Implement the chosen kill/exit policy
 
-Add a BloFin Copy closer and confirmed-flat verification if auto-flatten is selected. In either policy, ensure latches suppress entries but never suppress position-reducing management. Test partial close, stop trigger, API failure, fill delay, restart, and reset behavior.
+At 20% account drawdown, latch new/increasing exposure only. Never invoke the global close planner for this account latch. Keep position-reducing signals and bot-managed exit evaluation running; auto-rearm only after three consecutive trusted readings below the 16% warning band. Test partial close, stop trigger, API failure, fill delay, and restart behavior.
 
 ### P4 — Owner alerts and warning anti-spam
 
-Route every owner-only update to configured Discord channels and keep private DMs disabled. If channel reset commands require identity checks, set `DISCORD_OWNER_ID` for authorization only. Add re-entry hysteresis so fluctuations around the warning threshold do not produce repeated channel posts.
+Route every owner-only/informational alert to configured channel routes. Do not use `DISCORD_OWNER_ID` for notification delivery or ask update/migration questions by DM. The portfolio latch itself rearms after the selected three trusted readings below 16%.
 
 ## Decisions before live kill-switch implementation
 
-1. Approve re-baselining the peak from the first trusted BloFin `totalEquity` snapshot at rollout. The old `$1,253` virtual peak cannot be converted to exchange-equity history, so the new account drawdown starts at 0% from that baseline.
-2. Choose latch re-arm: automatic only after actual equity drawdown stays below the 16% warning threshold for three trusted snapshots, or manual `resume` from a channel command.
-3. Choose protection of record: exchange-native TP/SL if supported by Copy Trading, or a bot-managed close evaluator that remains active during entry latches/circuit breakers (native protection is preferable when available).
-4. If manual channel commands are selected, configure the owner ID for authorization only; keep private DMs disabled.
+1. **Approved:** Start a new account-equity history from the first trusted Copy `totalEquity` snapshot. The old virtual peak is discarded; tracked drawdown starts at 0%.
+2. **Approved:** Automatically re-arm after three consecutive trusted readings below the current 16% warning threshold.
+3. **Protection in current code:** Keep the configured bot-managed close evaluator active during entry latches/circuit breakers. No exchange-native Copy TPSL order was verified during the audit; verify before representing it as active protection.
+4. **Approved:** Informational/trade/risk updates go to channels only; no DMs for alerts, update discovery, or config migration. Owner ID is not needed for those updates.
 
-No exchange orders were submitted by the assistant. Strategy-generated SPCX and USELESS close fills were reconciled offline; the four remaining exchange positions were left unchanged. One recovery summary was posted to the configured live-trades channel. The real-account risk source and kill-switch policy are still pending the decisions below.
+No exchange orders were submitted by the assistant. The live Docker rebuild returned healthy and the first risk snapshot records `equity_source=BloFin Copy Trading totalEquity`, peak `$375.460214`, and drawdown `0%`. During the first post-restart strategy cycle, the bot itself filled SPCX order `16988309` (502 contracts @ `$149.1693`). Read-only Copy history also shows DOGE sells `16972650` and `16973342` (3 contracts each) and a filled USELESS sell `16988265` (40 contracts), while the live scheduler DB still showed DOGE `7.5` and USELESS `40`; live Copy positions report DOGE `1.5` remaining and no USELESS position. Do not edit `state.db` while the service is running; an offline fill reconciliation needs a separate approved stop/backup/recovery operation. Startup config-version persistence also logged `rename ... config.json: device or resource busy` because the config is bind-mounted as a single file; the service stayed healthy and completed risk initialization.

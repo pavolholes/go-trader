@@ -243,7 +243,6 @@ func notifySharedCloseStranded(notifier *MultiNotifier, sc StrategyConfig, symbo
 	}
 	msg := formatSharedCloseStrandedAlert(sc.ID, symbol, remainderUSD, reason, holdReason)
 	notifier.SendToAllChannels(msg)
-	notifier.SendOwnerDM(msg)
 }
 
 func applySharedCoinFullCloseFloor(sc StrategyConfig, result *HyperliquidResult, posQty float64, posSide string, price float64, hlLiveAll []StrategyConfig, onChain hlOnChainCoinView, peerVirtualQty float64, heldReason string, refetch func() (hlOnChainCoinView, error), notifier *MultiNotifier, logger *StrategyLogger) (hlSharedCloseFloorOutcome, float64) {

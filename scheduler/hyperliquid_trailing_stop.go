@@ -236,7 +236,6 @@ func hyperliquidArmFixedATRStopLossLive(sc StrategyConfig, symbol, side string, 
 				msg := fmt.Sprintf("**HL OPEN-ORDER CAP HIT** [%s] %s fixed ATR SL arm rejected: %s",
 					sc.ID, symbol, result.StopLossError)
 				notifier.SendToAllChannels(msg)
-				notifier.SendOwnerDM(msg)
 			}
 		} else if logger != nil {
 			logger.Warn("Fixed ATR SL arm placement failed (non-fatal): %s", result.StopLossError)
@@ -266,7 +265,6 @@ func notifyATRMultMissingEntryATROnce(sc StrategyConfig, symbol string, notifier
 		msg := fmt.Sprintf("**HL TRAILING ATR-MULT MISSING ENTRY ATR** [%s] %s — strategy is configured with trailing_stop_atr_mult but the open candle did not produce an ATR indicator, so no ATR-derived trigger has been armed for this strategy. Verify the entry strategy emits `atr`, or switch to a fixed `trailing_stop_pct`. (If a peer strategy on the same coin owns the trigger, this strategy is still covered by the shared exchange-side stop.)",
 			sc.ID, symbol)
 		notifier.SendToAllChannels(msg)
-		notifier.SendOwnerDM(msg)
 	}
 }
 
@@ -324,7 +322,6 @@ func notifyTieredTPATRMissingEntryATROnce(sc StrategyConfig, symbol string, noti
 		msg := fmt.Sprintf("**MISSING ENTRY ATR** [%s] %s — close strategy `tiered_tp_atr` is configured but the open candle did not produce an ATR indicator, so take-profit tiers are disabled until EntryATR is stamped. Ensure the entry strategy emits `atr` in its indicator output.",
 			sc.ID, symbol)
 		notifier.SendToAllChannels(msg)
-		notifier.SendOwnerDM(msg)
 	}
 }
 
@@ -574,7 +571,6 @@ func runHyperliquidTrailingStopUpdate(sc StrategyConfig, symbol, side string, qt
 			msg := fmt.Sprintf("**HL TRAILING SL REPLACEMENT DEFERRED** [%s] %s old trigger OID %d was not replaced because open-order lookup failed. The scheduler will retry next cycle. Error: %s",
 				sc.ID, symbol, currentOID, result.OpenOrderCheckError)
 			notifier.SendToAllChannels(msg)
-			notifier.SendOwnerDM(msg)
 		}
 		return highWater, result, false
 	}
@@ -589,7 +585,6 @@ func runHyperliquidTrailingStopUpdate(sc StrategyConfig, symbol, side string, qt
 			msg := fmt.Sprintf("**HL TRAILING SL CANCEL FAILED** [%s] %s old trigger OID %d was not replaced. The scheduler will retry next cycle. Error: %s",
 				sc.ID, symbol, currentOID, result.CancelStopLossError)
 			notifier.SendToAllChannels(msg)
-			notifier.SendOwnerDM(msg)
 		}
 		return highWater, result, false
 	}
@@ -601,7 +596,6 @@ func runHyperliquidTrailingStopUpdate(sc StrategyConfig, symbol, side string, qt
 				msg := fmt.Sprintf("**HL OPEN-ORDER CAP HIT** [%s] %s trailing SL update rejected: %s",
 					sc.ID, symbol, result.StopLossError)
 				notifier.SendToAllChannels(msg)
-				notifier.SendOwnerDM(msg)
 			}
 		} else {
 			logger.Warn("Trailing SL placement failed (non-fatal): %s", result.StopLossError)

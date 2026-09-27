@@ -177,6 +177,12 @@ func makeTestState() *AppState {
 		},
 		PortfolioRisk: map[RiskPartition]*PortfolioRiskState{livePartition: {
 			PeakValue: 2050, CurrentDrawdownPct: 1.5, CurrentMarginDrawdownPct: 18.7,
+			EquitySource:               blofinCopyEquitySource,
+			EquityBaselineAt:           now.Add(-2 * time.Hour),
+			EquitySnapshotAt:           now,
+			EquityRearmReadings:        2,
+			EquityUnavailableSince:     now.Add(-5 * time.Minute),
+			EntryHaltOnly:              true,
 			KillSwitchActive:           false,
 			WarningSent:                true,
 			WarnBandEnteredAt:          now.Add(-20 * time.Minute),
@@ -295,6 +301,15 @@ func TestSaveAndLoadDBRoundTrip(t *testing.T) {
 	}
 	if loaded.partitionRisk(livePartition).CurrentMarginDrawdownPct != 18.7 {
 		t.Errorf("PortfolioRisk.CurrentMarginDrawdownPct = %f, want 18.7", loaded.partitionRisk(livePartition).CurrentMarginDrawdownPct)
+	}
+	loadedRisk := loaded.partitionRisk(livePartition)
+	if loadedRisk.EquitySource != blofinCopyEquitySource || !loadedRisk.EntryHaltOnly || loadedRisk.EquityRearmReadings != 2 {
+		t.Errorf("BloFin account risk policy did not round-trip: %+v", loadedRisk)
+	}
+	if !loadedRisk.EquityBaselineAt.Equal(original.partitionRisk(livePartition).EquityBaselineAt) ||
+		!loadedRisk.EquitySnapshotAt.Equal(original.partitionRisk(livePartition).EquitySnapshotAt) ||
+		!loadedRisk.EquityUnavailableSince.Equal(original.partitionRisk(livePartition).EquityUnavailableSince) {
+		t.Errorf("BloFin account risk timestamps did not round-trip: %+v", loadedRisk)
 	}
 	if !loaded.partitionRisk(livePartition).ManualMarkBasisRebaselined {
 		t.Error("PortfolioRisk.ManualMarkBasisRebaselined = false, want true (one-shot latch must survive a restart)")
