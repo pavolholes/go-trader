@@ -1,6 +1,6 @@
 # BloFin Copy Trading Cross-Margin Risk — Audit and Fix Plan
 
-**Status:** SPCX/USELESS ledger reconciled and client-order-ID correlation implemented; exchange-risk and kill-switch redesign is pending operator policy decisions.
+**Status:** SPCX/USELESS ledger reconciled and client-order-ID correlation implemented. User policy decisions recorded: base live risk on actual BloFin Copy Trading equity; at the 20% threshold block new/increasing exposure but preserve existing positions and allow exits/partials; send updates to channels only. Baseline/re-arm and stop-protection details remain open.
 
 **Currently deployed:** portfolio warning threshold is configured at 80% of the 20% model limit (16%), with a simpler message and 2pp escalation. Those warning inputs are still model-derived and must not be represented as BloFin account-equity or cross-margin measurements.
 
@@ -57,13 +57,11 @@ Copy order-history IDs `16967850`, `16968008`, and `16968123` record the SPCX fi
 
 1. **Account-of-record:** Use BloFin Copy Trading account `totalEquity` for actual account drawdown; keep wallet balance, available balance, and unrealized PnL separately named. Establish and persist a new exchange-equity peak baseline; never compare the existing virtual `$1,253` peak to the account's `$396` balance.
 2. **Cross-margin measurement:** Prefer exchange-reported account/position fields. If true used margin is unavailable, label any notional/leverage figure as a model estimate and do not present it as BloFin Cross margin or as a liquidation threshold.
-3. **Kill policy — operator decision required:**
-   - **Auto-flatten:** on confirmed account-equity breach, close all Copy positions by contract, verify exchange fills and flat state, then keep the latch until explicit reset; or
-   - **Entry-halt only:** block new/increasing exposure, keep exits/partial TP/SL management running, and require an operator to close remaining positions.
+3. **Kill policy — user selected entry-halt only:** at a confirmed actual account-equity breach, latch and block new/increasing exposure. Do not automatically flatten existing Copy positions; continue risk-reducing exits and partial closes.
 4. **Close-only handling:** A portfolio/strategy breaker must reject new entries and scale-ins but permit risk-reducing closes, partial take-profits, stop maintenance, and reconciliation.
 5. **BloFin close confirmation:** Implement parent-position/order-ID correlation, stable `clientOrderId` where supported, exact fill/fee booking, retries that cannot over-close, and exchange-confirmed flat checks. Never clear virtual position state from a mark price alone.
 6. **Protection:** Decide whether Copy positions require exchange-native SL/TP attachments or a continuously running bot-managed exit monitor. Add a visible protection-status check and alert when a live position has neither verified exchange protection nor active management.
-7. **Notifications:** Keep the warning concise, name the actual metric/source and state whether action is required. Add hysteresis/cooldown for re-entry, and enable owner DMs only after configuring and testing the owner ID.
+7. **Notifications:** Keep the warning concise, name the actual metric/source and state whether action is required. Send all updates to configured channels only; do not DM. Route currently owner-only alerts to an operator channel. Add hysteresis/cooldown for re-entry.
 
 ## Implementation phases
 
@@ -87,12 +85,13 @@ Add a BloFin Copy closer and confirmed-flat verification if auto-flatten is sele
 
 ### P4 — Owner alerts and warning anti-spam
 
-Set/verify `DISCORD_OWNER_ID`; test delivery and failures. Add re-entry hysteresis so fluctuations around the warning threshold do not produce repeated channel posts.
+Route every owner-only update to configured Discord channels and keep private DMs disabled. If channel reset commands require identity checks, set `DISCORD_OWNER_ID` for authorization only. Add re-entry hysteresis so fluctuations around the warning threshold do not produce repeated channel posts.
 
 ## Decisions before live kill-switch implementation
 
-1. At the real BloFin account-equity threshold, should the bot automatically close all Copy positions, or only block new exposure and ask you to manage open positions?
-2. Should BloFin risk be protected by exchange-native SL/TP orders, bot-managed exits that continue during breakers, or both?
-3. Provide the Discord numeric user ID or set `DISCORD_OWNER_ID` in the live environment if private DMs are desired.
+1. Approve re-baselining the peak from the first trusted BloFin `totalEquity` snapshot at rollout. The old `$1,253` virtual peak cannot be converted to exchange-equity history, so the new account drawdown starts at 0% from that baseline.
+2. Choose latch re-arm: automatic only after actual equity drawdown stays below the 16% warning threshold for three trusted snapshots, or manual `resume` from a channel command.
+3. Choose protection of record: exchange-native TP/SL if supported by Copy Trading, or a bot-managed close evaluator that remains active during entry latches/circuit breakers (native protection is preferable when available).
+4. If manual channel commands are selected, configure the owner ID for authorization only; keep private DMs disabled.
 
 No exchange orders were submitted by the assistant. Strategy-generated SPCX and USELESS close fills were reconciled offline; the four remaining exchange positions were left unchanged. One recovery summary was posted to the configured live-trades channel. The real-account risk source and kill-switch policy are still pending the decisions below.
