@@ -177,15 +177,20 @@ func TestBloFinCopySyncDue(t *testing.T) {
 func TestRealizedNetPnLForStrategy(t *testing.T) {
 	db := blofinSyncTestDB(t)
 	if _, err := db.db.Exec(`INSERT INTO trades (strategy_id,timestamp,symbol,side,quantity,price,value,is_close,realized_pnl,exchange_fee,pnl_gross,fee_source) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+		"s1", "2026-09-25T00:00:00Z", "DOGE", "buy", 1, 1, 1, 0, 0.0, 0.3, 1, "userfills"); err != nil {
+		t.Fatalf("insert open: %v", err)
+	}
+	if _, err := db.db.Exec(`INSERT INTO trades (strategy_id,timestamp,symbol,side,quantity,price,value,is_close,realized_pnl,exchange_fee,pnl_gross,fee_source) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
 		"s1", "2026-09-25T00:00:00Z", "DOGE", "sell", 1, 1, 1, 1, 10.0, 0.5, 1, "userfills"); err != nil {
-		t.Fatalf("insert: %v", err)
+		t.Fatalf("insert close: %v", err)
 	}
 	got, err := db.RealizedNetPnLForStrategy("s1")
 	if err != nil {
 		t.Fatalf("net: %v", err)
 	}
-	if got-9.5 > 1e-9 || got-9.5 < -1e-9 {
-		t.Fatalf("net=%v, want 9.5", got)
+	// Full ledger: open -0.3 + close (10.0-0.5) = 9.2.
+	if got-9.2 > 1e-9 || got-9.2 < -1e-9 {
+		t.Fatalf("net=%v, want 9.2", got)
 	}
 	gross, err := db.RealizedPnLForStrategy("s1")
 	if err != nil || gross != 10.0 {
