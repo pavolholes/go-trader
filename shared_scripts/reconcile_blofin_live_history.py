@@ -456,6 +456,125 @@ def build_open_position_plan(adapter, position, trades, strategies, by_symbol, c
     return summary, events, position_state
 
 
+def incremental_sync_payload(adapter, symbols, since_ms):
+    """Read-only incremental payload for the Go auto-sync loop.
+
+    Returns raw closed fills with closeTime >= since_ms plus the order-history
+    rows needed to verify them, current Copy equity and recent copy_trading
+    transfers. Strategy matching happens in Go. Never writes.
+    """
+    open_buffer_ms = 7 * 86400 * 1000
+    wanted = {str(row).upper() for row in (symbols or []) if str(row).strip()}
+    history = []
+    for row in copy_position_history(adapter):
+        if timestamp_ms(row.get("closeTime")) < since_ms:
+            continue
+        if wanted and str(row.get("instId", "")).split("-", 1)[0].upper() not in wanted:
+            continue
+        history.append(row)
+    history.sort(key=lambda row: timestamp_ms(row.get("closeTime")))
+    exchange_open = [row for row in copy_open_positions_by_order(adapter) if dec(row.get("positions")) > 0]
+    if wanted:
+        exchange_open = [row for row in exchange_open if str(row.get("instId", "")).split("-", 1)[0].upper() in wanted]
+    inst_ids = {str(row.get("instId", "")) for row in history} | {str(row.get("instId", "")) for row in exchange_open}
+    inst_ids = {row for row in inst_ids if row}
+    order_history = copy_order_history(adapter, inst_ids, since_ms - open_buffer_ms) if inst_ids else {}
+    contract_values = {}
+    summaries = []
+    position_errors = []
+    for position in history:
+        try:
+            detail = adapter._private_get(POSITION_DETAILS_PATH, {"orderId": str(position.get("orderId", ""))}).get("data", {})
+            closes = detail.get("orderList", [])
+            if not closes:
+                raise RuntimeError("no close fills returned for order " + str(position.get("orderId", "")))
+            inst_id = str(position.get("instId", ""))
+            contract_value = instrument_contract_value(adapter, inst_id, contract_values)
+            summaries.append({
+                "order_id": str(position.get("orderId", "")),
+                "inst_id": inst_id,
+                "symbol": inst_id.split("-", 1)[0].upper(),
+                "side": str(position.get("side", "")),
+                "position_side": str(position.get("positionSide", "")),
+                "quantity": str(position.get("positions", "")),
+                "open_price": str(position.get("openAveragePrice", "")),
+                "open_ms": timestamp_ms(position.get("createTime")),
+                "close_ms": timestamp_ms(position.get("closeTime")),
+                "close_price": str(position.get("closeAveragePrice", "")),
+                "realized_pnl": str(position.get("pnl", "")),
+                "close_type": str(position.get("closeType", "")),
+                "contract_value": str(contract_value),
+                "closes": [{
+                    "closeOrderId": str(row.get("closeOrderId", "")),
+                    "side": str(row.get("side", "")),
+                    "size": str(row.get("size", "")),
+                    "averagePrice": str(row.get("averagePrice", "")),
+                    "fee": str(row.get("fee", "")),
+                    "realizedPnl": str(row.get("realizedPnl", "")),
+                    "orderTime": timestamp_ms(row.get("orderTime")),
+                } for row in closes],
+            })
+        except Exception as exc:
+            position_errors.append({"orderId": str(position.get("orderId", "")), "error": str(exc)[:300]})
+            continue
+    try:
+        equity_raw = adapter._private_get("/api/v1/copytrading/account/balance", {}).get("data", {})
+        equity = {"totalEquity": str(equity_raw.get("totalEquity", "")), "ts": str(equity_raw.get("ts", ""))}
+    except Exception as exc:
+        equity = {"error": str(exc)[:200]}
+    transfers = []
+    try:
+        cursor = None
+        for _ in range(5):
+            params = {"limit": "100"}
+            if cursor:
+                params["after"] = cursor
+            batch = adapter._private_get("/api/v1/asset/bills", params).get("data", [])
+            if not batch:
+                break
+            for row in batch:
+                if timestamp_ms(row.get("ts")) < since_ms:
+                    continue
+                if row.get("fromAccount") == "copy_trading" or row.get("toAccount") == "copy_trading":
+                    transfers.append({
+                        "transferId": str(row.get("transferId", "")),
+                        "fromAccount": str(row.get("fromAccount", "")),
+                        "toAccount": str(row.get("toAccount", "")),
+                        "amount": str(row.get("amount", "0")),
+                        "ts": str(row.get("ts", "")),
+                    })
+            if len(batch) < 100:
+                break
+            cursor = str(batch[-1].get("transferId", ""))
+            if not cursor:
+                break
+    except Exception as exc:
+        position_errors.append({"transfers": str(exc)[:200]})
+    orders = {}
+    for oid, row in order_history.items():
+        orders[str(oid)] = {
+            "orderId": str(row.get("orderId", "")),
+            "instId": str(row.get("instId", "")),
+            "side": str(row.get("side", "")),
+            "filledSize": str(row.get("filledSize", "")),
+            "averagePrice": str(row.get("averagePrice", "")),
+            "fee": str(row.get("fee", "")),
+            "pnl": str(row.get("pnl", "")),
+            "createTime": timestamp_ms(row.get("createTime")),
+        }
+    return {
+        "incremental": True,
+        "since_ms": since_ms,
+        "exchange_closed_positions": len(summaries),
+        "positions": summaries,
+        "orders": orders,
+        "exchange_open_positions": exchange_open,
+        "equity": equity,
+        "transfers": transfers,
+        "position_errors": position_errors,
+    }
+
+
 def write_staged_database(source_path, output_path, strategy_ids, summaries, open_summaries, open_positions, events):
     if os.path.exists(output_path):
         raise FileExistsError("staging DB already exists: " + output_path)
@@ -565,20 +684,28 @@ def write_staged_database(source_path, output_path, strategy_ids, summaries, ope
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--db", required=True, help="read-only source snapshot")
+    parser.add_argument("--db", required=False, default="", help="read-only source snapshot (not needed for --incremental)")
     parser.add_argument("--config", required=True, help="live config JSON")
     parser.add_argument("--since-ms", required=True, type=int, help="first timestamp of this live strategy cohort")
     parser.add_argument("--output-db", help="new staging database path; only written with --apply")
     parser.add_argument("--apply", action="store_true", help="write a new staging DB; source DB remains unchanged")
+    parser.add_argument("--incremental", action="store_true", help="read-only incremental sync JSON: closed fills + equity + transfers since --since-ms; never writes any DB")
     args = parser.parse_args()
     if args.apply and not args.output_db:
         parser.error("--apply requires --output-db")
+    if args.incremental and args.apply:
+        parser.error("--incremental cannot be combined with --apply")
 
     from adapter import BloFinExchangeAdapter
     adapter = BloFinExchangeAdapter()
     if not adapter.is_live:
         raise RuntimeError("BloFin adapter is not in live mode")
     strategies, by_symbol = config_live_blofin_strategies(args.config)
+    if args.incremental:
+        print(json.dumps(incremental_sync_payload(adapter, sorted(by_symbol.keys()), args.since_ms), separators=(",", ":")))
+        return
+    if not args.db:
+        parser.error("--db is required without --incremental")
     trades, old_positions, old_closed = load_source_rows(args.db, strategies.keys())
     active_symbols = set(by_symbol)
     exchange_open = [

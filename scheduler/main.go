@@ -1132,6 +1132,9 @@ func main() {
 			var blofinEquityFetchErr error
 			if len(blofinLiveAll) > 0 {
 				blofinEquitySnapshot, blofinEquityFetchErr = defaultBloFinCopyEquitySnapshot()
+				// Incremental backfill of missed Copy fills + funding drift
+				// booking. Runs at most every 6h; no-ops when nothing is new.
+				maybeRunBloFinCopyAutoSync(cfg, *configPath, state, store, &mu, time.Now().UTC())
 			}
 
 			sharedWalletRiskGeneration++
