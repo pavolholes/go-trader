@@ -174,6 +174,52 @@ func TestBloFinCopySyncDue(t *testing.T) {
 	}
 }
 
+func TestRealizedNetPnLForStrategy(t *testing.T) {
+	db := blofinSyncTestDB(t)
+	if _, err := db.db.Exec(`INSERT INTO trades (strategy_id,timestamp,symbol,side,quantity,price,value,is_close,realized_pnl,exchange_fee,pnl_gross,fee_source) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+		"s1", "2026-09-25T00:00:00Z", "DOGE", "sell", 1, 1, 1, 1, 10.0, 0.5, 1, "userfills"); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	got, err := db.RealizedNetPnLForStrategy("s1")
+	if err != nil {
+		t.Fatalf("net: %v", err)
+	}
+	if got-9.5 > 1e-9 || got-9.5 < -1e-9 {
+		t.Fatalf("net=%v, want 9.5", got)
+	}
+	gross, err := db.RealizedPnLForStrategy("s1")
+	if err != nil || gross != 10.0 {
+		t.Fatalf("gross=%v err=%v, want 10.0", gross, err)
+	}
+}
+
+func TestLiveBloFinOverviewShowsNetRealized(t *testing.T) {
+	strategy := StrategyConfig{
+		ID: "live-blofin-doge-1h", Type: "perps", Platform: "blofin",
+		Args: []string{"stoch_rsi", "DOGE", "1h", "--mode=live"}, Capital: 100, InitialCapital: 100,
+	}
+	state := NewAppState()
+	state.Strategies[strategy.ID] = &StrategyState{
+		ID: strategy.ID, Type: strategy.Type, Platform: strategy.Platform,
+		Cash: 100, InitialCapital: 100,
+		Positions: map[string]*Position{}, OptionPositions: map[string]*OptionPosition{},
+	}
+	ss := newOpsTestServer(t, []StrategyConfig{strategy}, state, true)
+	if _, err := ss.stateDB.primary().db.Exec(`INSERT INTO trades (
+		strategy_id,timestamp,symbol,position_id,side,quantity,price,value,trade_type,
+		is_close,realized_pnl,exchange_fee,pnl_gross,fee_source
+	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, strategy.ID, "2026-09-25T00:00:00Z", "DOGE", "p1", "sell", 1.0, 1.0, 1.0, "perps", 1, 10.0, 0.5, 1, "userfills"); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	overview, _, ok := ss.uiStrategyOverviewWithPrices(strategy.ID, map[string]float64{})
+	if !ok {
+		t.Fatal("overview not found")
+	}
+	if overview.RealizedPnL-9.5 > 1e-9 || overview.RealizedPnL-9.5 < -1e-9 {
+		t.Fatalf("overview realized=%v, want net 9.5", overview.RealizedPnL)
+	}
+}
+
 func TestMatchBloFinCopyOrder(t *testing.T) {
 	orders := blofinSyncTestPayload().Orders
 	got, err := matchBloFinCopyOrder(orders, "DOGE-USDT", 1790114664455, "sell", 1, 0.09963)

@@ -276,25 +276,42 @@ func (ss *StatusServer) handleAPIStrategiesOverview(w http.ResponseWriter, r *ht
 	cached := ss.overviewCache
 	cachedAt := ss.overviewCacheAt
 	ss.overviewCacheMu.RUnlock()
+	var rows []UIStrategyOverview
 	if cached != nil && time.Since(cachedAt) < 5*time.Minute {
-		writeJSON(w, map[string][]UIStrategyOverview{"strategies": cached})
-		return
-	}
-	configs := ss.uiStrategiesInPartition(filter)
-	prices := ss.fetchLiveMarkPrices()
-	out := make([]UIStrategyOverview, 0, len(configs))
-	for _, item := range configs {
-		overview, _, found := ss.uiStrategyOverviewWithPrices(item.ID, prices)
-		if !found {
-			continue
+		rows = cached
+	} else {
+		configs := ss.uiStrategiesInPartition(filter)
+		prices := ss.fetchLiveMarkPrices()
+		out := make([]UIStrategyOverview, 0, len(configs))
+		for _, item := range configs {
+			overview, _, found := ss.uiStrategyOverviewWithPrices(item.ID, prices)
+			if !found {
+				continue
+			}
+			out = append(out, overview)
 		}
-		out = append(out, overview)
+		ss.overviewCacheMu.Lock()
+		ss.overviewCache = out
+		ss.overviewCacheAt = time.Now()
+		ss.overviewCacheMu.Unlock()
+		rows = out
 	}
-	ss.overviewCacheMu.Lock()
-	ss.overviewCache = out
-	ss.overviewCacheAt = time.Now()
-	ss.overviewCacheMu.Unlock()
-	writeJSON(w, map[string][]UIStrategyOverview{"strategies": out})
+	resp := append([]UIStrategyOverview(nil), rows...)
+	if filter.All || filter.Partition.IsLive() {
+		// Funding/profit-share live outside strategy books; surface them as
+		// their own line so the header R ties to the exchange net.
+		ss.strategiesMu.RLock()
+		cfgs := append([]StrategyConfig(nil), ss.strategies...)
+		ss.strategiesMu.RUnlock()
+		if adj := blofinCopyAdjustmentsTotalStore(ss.stateDB, cfgs); adj != 0 {
+			resp = append(resp, UIStrategyOverview{
+				ID: "live-blofin-funding", Type: "funding", Platform: "blofin", Symbol: "FUNDING",
+				Mode: "live", PnL: adj, RealizedPnL: adj, PortfolioValue: adj,
+				Partition: livePartition.String(),
+			})
+		}
+	}
+	writeJSON(w, map[string][]UIStrategyOverview{"strategies": resp})
 }
 
 func (ss *StatusServer) handleAPIStrategy(w http.ResponseWriter, r *http.Request) {
@@ -591,6 +608,12 @@ func (ss *StatusServer) uiStrategyOverviewWithPrices(id string, prices map[strin
 	}
 	flat := len(snapshot.Positions) == 0 && len(snapshot.OptionPositions) == 0
 	liveBloFinLedger := realizedPnLFromLedger && sc.Platform == "blofin" && sc.Type == "perps" && partitionFor(sc).IsLive()
+	if liveBloFinLedger && ss.stateDB != nil {
+		// Exchange fills store gross PnL; dashboards must show net of fees.
+		if net, err := ss.stateDB.RealizedNetPnLForStrategy(id); err == nil {
+			realizedPnL = net
+		}
+	}
 	var unrealizedPnL float64
 	var openNotional float64
 	if liveBloFinLedger {

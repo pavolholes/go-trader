@@ -2772,6 +2772,26 @@ func (sdb *StateDB) RealizedPnLForStrategy(strategyID string) (float64, error) {
 	return out.Float64, nil
 }
 
+// RealizedNetPnLForStrategy sums ledger deltas of close legs (gross minus fee
+// where pnl_gross is set), so dashboards show costs instead of fantasy gross.
+func (sdb *StateDB) RealizedNetPnLForStrategy(strategyID string) (float64, error) {
+	if sdb == nil || sdb.db == nil {
+		return 0, fmt.Errorf("state db unavailable")
+	}
+	if strategyID == "" {
+		return 0, fmt.Errorf("strategy id required")
+	}
+	sid, err := sdb.toStorageID(strategyID)
+	if err != nil {
+		return 0, err
+	}
+	var out sql.NullFloat64
+	if err := sdb.db.QueryRow(`SELECT COALESCE(SUM(`+tradeNetPnLSQL+`),0) FROM trades WHERE strategy_id = ? AND is_close = 1`, sid).Scan(&out); err != nil {
+		return 0, fmt.Errorf("query realized net pnl for %s: %w", strategyID, err)
+	}
+	return out.Float64, nil
+}
+
 func (sdb *StateDB) LifetimeTradeStatsForStrategy(strategyID string) (LifetimeTradeStats, error) {
 	if sdb == nil || sdb.db == nil {
 		return LifetimeTradeStats{}, fmt.Errorf("state db unavailable")

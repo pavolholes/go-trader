@@ -1134,7 +1134,7 @@ func main() {
 				blofinEquitySnapshot, blofinEquityFetchErr = defaultBloFinCopyEquitySnapshot()
 				// Incremental backfill of missed Copy fills + funding drift
 				// booking. Runs at most every 6h; no-ops when nothing is new.
-				maybeRunBloFinCopyAutoSync(cfg, *configPath, state, store, &mu, time.Now().UTC())
+				maybeRunBloFinCopyAutoSync(cfg, *configPath, state, store, &mu, notifier, time.Now().UTC())
 			}
 
 			sharedWalletRiskGeneration++

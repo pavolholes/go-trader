@@ -675,7 +675,15 @@ func blofinCopySyncDue(lastRunMs int64, now time.Time) bool {
 // maybeRunBloFinCopyAutoSync executes one incremental sync when due. Fetch
 // happens unlocked; state mutation + persistence happen under mu. It returns
 // true when a sync ran (even if it found nothing new).
-func maybeRunBloFinCopyAutoSync(cfg *Config, configPath string, state *AppState, store *StateStore, mu *sync.RWMutex, now time.Time) bool {
+func notifyBloFinCopySync(notifier *MultiNotifier, content string) {
+	if notifier == nil || strings.TrimSpace(content) == "" {
+		return
+	}
+	// Channel-only on purpose: sync findings are operational info, never DMs.
+	notifier.SendToChannel("blofin", "perps", content)
+}
+
+func maybeRunBloFinCopyAutoSync(cfg *Config, configPath string, state *AppState, store *StateStore, mu *sync.RWMutex, notifier *MultiNotifier, now time.Time) bool {
 	live, _ := blofinCopyLiveStrategies(cfg.Strategies)
 	if len(live) == 0 || state == nil || store == nil {
 		return false
@@ -704,6 +712,7 @@ func maybeRunBloFinCopyAutoSync(cfg *Config, configPath string, state *AppState,
 	}
 	if len(payload.PositionErrors) > 0 {
 		fmt.Printf("[blofin-sync] WARN: %d exchange rows need operator review (first: %+v)\n", len(payload.PositionErrors), payload.PositionErrors[0])
+		notifyBloFinCopySync(notifier, fmt.Sprintf("⚠️ **BloFin Copy sync: %d exchange row(s) need review**\nFirst: %+v\nFill backfill skipped them instead of guessing — check the bot log.", len(payload.PositionErrors), payload.PositionErrors[0]))
 	}
 	mu.Lock()
 	defer mu.Unlock()
@@ -711,6 +720,14 @@ func maybeRunBloFinCopyAutoSync(cfg *Config, configPath string, state *AppState,
 	if err != nil {
 		fmt.Printf("[blofin-sync] WARN: apply failed: %v\n", err)
 		return false
+	}
+	if len(outcome.Skipped) > 0 {
+		fmt.Printf("[blofin-sync] WARN: %d fill(s) skipped (first: %+v)\n", len(outcome.Skipped), outcome.Skipped[0])
+		notifyBloFinCopySync(notifier, fmt.Sprintf("⚠️ **BloFin Copy sync skipped %d fill(s)**\nFirst: %+v\nMapping was ambiguous, nothing was guessed — check the bot log.", len(outcome.Skipped), outcome.Skipped[0]))
+	}
+	if outcome.PositionsInserted > 0 {
+		notifyBloFinCopySync(notifier, fmt.Sprintf("ℹ️ **BloFin Copy sync backfilled %d position(s), %d trade(s), ledger %+.4f**\nFills the live poller missed are now in the ledger.",
+			outcome.PositionsInserted, outcome.TradesInserted, outcome.LedgerDelta))
 	}
 	for _, id := range outcome.Touched {
 		ss := state.Strategies[id]
@@ -758,6 +775,7 @@ func maybeRunBloFinCopyAutoSync(cfg *Config, configPath string, state *AppState,
 	}
 	booked, detail := bookBloFinCopyFundingResidual(sdb, equityNow, st.LastEquity, outcome.LedgerDelta, transfersNet, now)
 	if booked != 0 {
+		notifyBloFinCopySync(notifier, fmt.Sprintf("ℹ️ **BloFin Copy funding adjustment booked: $%+.4f**\n%s", booked, detail))
 		outcome.FundingBooked = booked
 		outcome.FundingDetail = detail
 	}
@@ -772,6 +790,21 @@ func maybeRunBloFinCopyAutoSync(cfg *Config, configPath string, state *AppState,
 	fmt.Printf("[blofin-sync] done: checked=%d inserted_positions=%d inserted_trades=%d ledger_delta=%+.4f funding=%+.4f account_net=%+.4f\n",
 		outcome.PositionsChecked, outcome.PositionsInserted, outcome.TradesInserted, outcome.LedgerDelta, outcome.FundingBooked, ledger+adjustments)
 	return true
+}
+
+func blofinCopyAdjustmentsTotalStore(store *StateStore, cfgs []StrategyConfig) float64 {
+	if store == nil {
+		return 0
+	}
+	live, _ := blofinCopyLiveStrategies(cfgs)
+	if len(live) == 0 {
+		return 0
+	}
+	sdb, err := store.dbForStrategy(live[0].ID)
+	if err != nil {
+		return 0
+	}
+	return blofinCopyAdjustmentsTotal(sdb)
 }
 
 func blofinCopyTransfersNet(transfers []blofinCopySyncTransfer) float64 {

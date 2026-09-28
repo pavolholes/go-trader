@@ -221,6 +221,17 @@ func (st *StateStore) RealizedPnLForStrategy(strategyID string) (float64, error)
 	return db.RealizedPnLForStrategy(strategyID)
 }
 
+func (st *StateStore) RealizedNetPnLForStrategy(strategyID string) (float64, error) {
+	if st == nil {
+		return 0, fmt.Errorf("state store unavailable")
+	}
+	db, err := st.dbForStrategy(strategyID)
+	if err != nil {
+		return 0, err
+	}
+	return db.RealizedNetPnLForStrategy(strategyID)
+}
+
 func (st *StateStore) QueryClosedPositions(strategyID, symbol string, since, until time.Time, limit, offset int) ([]ClosedPosition, int, error) {
 	if st == nil {
 		return nil, 0, fmt.Errorf("state store unavailable")
