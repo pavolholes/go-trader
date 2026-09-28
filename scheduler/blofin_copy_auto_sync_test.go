@@ -2,6 +2,7 @@ package main
 
 import (
 	"math"
+	"strings"
 	"testing"
 	"time"
 )
@@ -215,6 +216,9 @@ func TestApplyBackfillsMissingCloseWithParentAlreadyTracked(t *testing.T) {
 	if out.PositionsInserted != 1 || out.TradesInserted != 1 || len(state.Strategies[strategyID].Positions) != 0 {
 		t.Fatalf("outcome=%+v positions=%+v", out, state.Strategies[strategyID].Positions)
 	}
+	if len(out.RecoveredCloseTrades) != 1 || out.RecoveredCloseTrades[0].Trade.ExchangeOrderID != "17008467" {
+		t.Fatalf("recovered close alerts=%+v, want close OID 17008467", out.RecoveredCloseTrades)
+	}
 	if math.Abs(out.LedgerDelta-(1.4587-0.45061758)) > 1e-9 {
 		t.Fatalf("ledger delta=%v, want %.8f", out.LedgerDelta, 1.4587-0.45061758)
 	}
@@ -229,6 +233,112 @@ func TestApplyBackfillsMissingCloseWithParentAlreadyTracked(t *testing.T) {
 	out2, err := applyBloFinCopySyncPayload(state, cfg, payload, store, now.Add(5*time.Minute))
 	if err != nil || out2.TradesInserted != 0 {
 		t.Fatalf("retry outcome=%+v err=%v", out2, err)
+	}
+}
+
+func TestApplyBloFinCopyCloseFillsSummarizeFullPosition(t *testing.T) {
+	const strategyID = "live-order_blocks-spcx-15m"
+	openedAt := time.UnixMilli(1790601906134).UTC()
+	state := &StrategyState{
+		ID: strategyID, Type: "perps", Platform: "blofin", Cash: 100,
+		Positions: map[string]*Position{
+			"SPCX": {
+				Symbol: "SPCX", TradePositionID: "spcx-parent", Quantity: 500,
+				InitialQuantity: 500, AvgCost: 149.96996, Side: "long",
+				Multiplier: 0.01, OpenedAt: openedAt,
+			},
+		},
+		TradeHistory: []Trade{{
+			StrategyID: strategyID, Symbol: "SPCX", PositionID: "spcx-parent",
+			Side: "buy", Quantity: 500, Price: 149.96996, ExchangeOrderID: "17014709",
+		}},
+	}
+	openMs := openedAt.UnixMilli()
+
+	firstNet, err := applyBloFinCopyCloseFill(state, "SPCX", "long", openMs, blofinCopySyncClose{
+		CloseOrderID: "7372889", Side: "sell", Size: "250", AveragePrice: "150.75",
+		Fee: "0.226125", RealizedPnl: "1.95", OrderTime: openMs + 600_000,
+	}, blofinCopySyncOrder{OrderID: "17014884", Side: "sell"}, 0.01)
+	if err != nil {
+		t.Fatalf("apply first partial close: %v", err)
+	}
+	if math.Abs(firstNet-(1.95-0.226125)) > 1e-9 {
+		t.Fatalf("first close net=%v", firstNet)
+	}
+	if got := state.Positions["SPCX"].Quantity; got != 250 {
+		t.Fatalf("remaining quantity=%v, want 250", got)
+	}
+	if len(state.ClosedPositions) != 0 {
+		t.Fatalf("closed positions after partial fill=%d, want 0", len(state.ClosedPositions))
+	}
+	if !strings.Contains(state.TradeHistory[1].Details, "partial-close") {
+		t.Fatalf("partial close details=%q", state.TradeHistory[1].Details)
+	}
+
+	secondNet, err := applyBloFinCopyCloseFill(state, "SPCX", "long", openMs, blofinCopySyncClose{
+		CloseOrderID: "7372940", Side: "sell", Size: "250", AveragePrice: "150.25",
+		Fee: "0.225375", RealizedPnl: "0.7002", OrderTime: openMs + 1_500_000,
+	}, blofinCopySyncOrder{OrderID: "17015301", Side: "sell"}, 0.01)
+	if err != nil {
+		t.Fatalf("apply final close: %v", err)
+	}
+	if math.Abs(secondNet-(0.7002-0.225375)) > 1e-9 {
+		t.Fatalf("second close net=%v", secondNet)
+	}
+	if _, ok := state.Positions["SPCX"]; ok {
+		t.Fatal("position remained open after final close")
+	}
+	if len(state.ClosedPositions) != 1 {
+		t.Fatalf("closed positions=%d, want 1", len(state.ClosedPositions))
+	}
+	closed := state.ClosedPositions[0]
+	if closed.Quantity != 500 {
+		t.Errorf("closed quantity=%v, want 500", closed.Quantity)
+	}
+	if math.Abs(closed.ClosePrice-150.50) > 1e-9 {
+		t.Errorf("closed VWAP=%v, want 150.50", closed.ClosePrice)
+	}
+	if math.Abs(closed.RealizedPnL-2.1987) > 1e-9 {
+		t.Errorf("closed net PnL=%v, want 2.1987", closed.RealizedPnL)
+	}
+	if strings.Contains(state.TradeHistory[2].Details, "partial-close") {
+		t.Errorf("final close details unexpectedly say partial: %q", state.TradeHistory[2].Details)
+	}
+}
+
+func TestNotifyBloFinCopyRecoveredCloseTradesUsesTradeAlerts(t *testing.T) {
+	const strategyID = "live-order_blocks-spcx-15m"
+	sc := StrategyConfig{
+		ID: strategyID, Type: "perps", Platform: "blofin",
+		Args: []string{"order_blocks", "SPCX", "15m", "--mode=live"},
+	}
+	mock := &mockNotifier{}
+	notifier := &MultiNotifier{backends: []notifierBackend{{
+		notifier: mock, tradeAlertChannels: map[string]string{"default": "blofin-trades"},
+	}}}
+	trades := []blofinCopyRecoveredClose{
+		{StrategyID: strategyID, Trade: Trade{
+			StrategyID: strategyID, Symbol: "SPCX", Side: "sell", Quantity: 250, Price: 150.75,
+			Value: 376.875, ExchangeOrderID: "17014884", IsClose: true,
+			Details: "BloFin incremental Copy partial-close fill recovery",
+		}},
+		{StrategyID: strategyID, Trade: Trade{
+			StrategyID: strategyID, Symbol: "SPCX", Side: "sell", Quantity: 250, Price: 150.25,
+			Value: 375.625, ExchangeOrderID: "17015301", IsClose: true,
+			Details: "BloFin incremental Copy close fill recovery",
+		}},
+	}
+
+	notifyBloFinCopyRecoveredCloseTrades(notifier, []StrategyConfig{sc}, nil, trades)
+
+	if len(mock.messages) != 2 {
+		t.Fatalf("trade-alert messages=%d, want 2: %+v", len(mock.messages), mock.messages)
+	}
+	if !strings.Contains(mock.messages[0].content, "TRADE PARTIAL") || !strings.Contains(mock.messages[0].content, "17014884") {
+		t.Errorf("partial close alert=%q", mock.messages[0].content)
+	}
+	if !strings.Contains(mock.messages[1].content, "TRADE CLOSED") || !strings.Contains(mock.messages[1].content, "17015301") {
+		t.Errorf("final close alert=%q", mock.messages[1].content)
 	}
 }
 

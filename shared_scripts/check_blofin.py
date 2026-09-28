@@ -314,9 +314,12 @@ def run_execute(symbol, side, size, mode, size_in_contracts=False, pos_side_hint
         fill = {}
         copy_filled = False
         if adapter.trade_account == "copy" and (oid or client_order_id):
+            # Copy order history can lag the place-order acknowledgement. Retry
+            # briefly without letting one live execute approach scriptTimeout.
             got = adapter.get_copy_order_fill(
-                str(oid or ""), f"{symbol}-USDT", tries=1,
+                str(oid or ""), f"{symbol}-USDT", tries=3,
                 client_order_id=client_order_id, max_pages=1,
+                request_timeout=4, retry_delay=1,
             )
             if got:
                 fill = got
@@ -340,6 +343,8 @@ def run_execute(symbol, side, size, mode, size_in_contracts=False, pos_side_hint
                 fill["oid"] = str(oid)
         elif fill_cv > 0:
             fill["contract_value"] = fill_cv
+        if client_order_id:
+            fill["client_order_id"] = client_order_id
 
         print(json.dumps({
             "execution": {

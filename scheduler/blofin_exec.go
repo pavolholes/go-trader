@@ -159,12 +159,16 @@ func executeBloFinResult(sc StrategyConfig, s *StrategyState, db *StateDB, resul
 	var fillQty float64
 	var fillFee float64
 	var fillOID string
-	if execResult != nil && execResult.Execution != nil && execResult.Execution.Fill != nil && execResult.Execution.Fill.AvgPx > 0 {
-		fillPrice = execResult.Execution.Fill.AvgPx
-		fillQty = execResult.Execution.Fill.TotalSz
-		fillFee = execResult.Execution.Fill.Fee
+	var fillClientOrderID string
+	if execResult != nil && execResult.Execution != nil && execResult.Execution.Fill != nil {
 		fillOID = execResult.Execution.Fill.OID
-		logger.Info("Live fill at $%.2f qty=%.6f (mid was $%.2f)", fillPrice, fillQty, price)
+		fillClientOrderID = execResult.Execution.Fill.ClientOrderID
+		if execResult.Execution.Fill.AvgPx > 0 {
+			fillPrice = execResult.Execution.Fill.AvgPx
+			fillQty = execResult.Execution.Fill.TotalSz
+			fillFee = execResult.Execution.Fill.Fee
+			logger.Info("Live fill at $%.2f qty=%.6f (mid was $%.2f)", fillPrice, fillQty, price)
+		}
 	}
 
 	if result.StopLossPrice > 0 {
@@ -174,8 +178,13 @@ func executeBloFinResult(sc StrategyConfig, s *StrategyState, db *StateDB, resul
 	// Live: bez burzoveho fillu sa nic nezapisuje do DB (ziadne fantomy).
 	// Paper fill=mark cena je OK len pre paper (execResult==nil).
 	if execResult != nil && fillQty <= 0 {
-		logger.Error("BloFin live order without fill for %s — skipping DB write", sym)
-		notifyLiveExecuteFailure(notifier, sc, fmt.Sprintf("live order without fill for %s (no exchange fill)", sym))
+		if fillOID != "" || fillClientOrderID != "" {
+			logger.Warn("BloFin order has no confirmed fill yet for %s (order=%s client=%s) — skipping DB write; Copy sync will reconcile", sym, fillOID, fillClientOrderID)
+			notifyBloFinOrderFillPending(notifier, sc, signalStr, sym, fillOID, fillClientOrderID)
+		} else {
+			logger.Error("BloFin live order without a fill reference for %s — skipping DB write", sym)
+			notifyLiveExecuteFailure(notifier, sc, fmt.Sprintf("live order without fill reference for %s", sym))
+		}
 		return 0, ""
 	}
 	exec, err := ExecutePerpsSignalWithLeverageDeferredOpen(s, result.Signal, result.Symbol, fillPrice, PerpsSizingFor(sc, fillPrice, result.ATRValue), fillQty, fillOID, fillFee, EffectiveDirection(sc), result.CloseFraction, logger)
@@ -202,4 +211,24 @@ func executeBloFinResult(sc StrategyConfig, s *StrategyState, db *StateDB, resul
 		detail = fmt.Sprintf("[%s] %s%s %s @ $%.2f", sc.ID, prefix, signalStr, result.Symbol, fillPrice)
 	}
 	return trades, detail
+}
+
+func notifyBloFinOrderFillPending(notifier *MultiNotifier, sc StrategyConfig, signal, symbol, orderID, clientOrderID string) {
+	if notifier == nil || !notifier.HasBackends() {
+		return
+	}
+	refs := "order reference unavailable"
+	if orderID != "" {
+		refs = "order=" + orderID
+	}
+	if clientOrderID != "" {
+		if refs == "order reference unavailable" {
+			refs = ""
+		} else {
+			refs += " "
+		}
+		refs += "client=" + clientOrderID
+	}
+	content := fmt.Sprintf("⏳ **BLOFIN FILL CONFIRMATION PENDING** [%s] %s %s (%s)\nNo exchange fill has been confirmed, so no trade was written. Check this reference in BloFin history before retrying; this alert does not mean the order was rejected.", sc.ID, signal, symbol, refs)
+	notifier.SendToTradeAlertChannels(content)
 }

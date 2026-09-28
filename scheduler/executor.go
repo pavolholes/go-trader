@@ -1394,6 +1394,7 @@ type BloFinFill struct {
 	AvgPx         float64 `json:"avg_px"`
 	TotalSz       float64 `json:"total_sz"`
 	OID           string  `json:"oid,omitempty"`
+	ClientOrderID string  `json:"client_order_id,omitempty"`
 	Fee           float64 `json:"fee,omitempty"`
 	ContractValue float64 `json:"contract_value,omitempty"`
 }

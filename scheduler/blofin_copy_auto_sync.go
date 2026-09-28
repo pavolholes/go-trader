@@ -3,9 +3,9 @@ package main
 // BloFin Copy Trading automatic ledger sync.
 //
 // Root causes fixed here:
-//   - The live fill poller (adapter.get_copy_order_fill) only scans 5 pages
-//     and never retries in a later cycle. A fill missed once (e.g. DOGE
-//     16780203/16780216) stayed missing until a manual offline rebuild.
+//   - Copy order history can lag a successful order acknowledgement. A bounded
+//     inline poll plus this five-minute sync prevent a late fill from becoming
+//     a phantom/missing trade in the live ledger.
 //   - Funding payments and Copy profit-share settle into totalEquity but were
 //     never booked into the trade ledger, so the virtual ledger drifted above
 //     the exchange net (~$3.25 over 2026-09-23..28).
@@ -128,16 +128,37 @@ type blofinCopySyncSkip struct {
 }
 
 type blofinCopySyncOutcome struct {
-	PositionsChecked  int
-	PositionsInserted int
-	TradesInserted    int
-	LedgerDelta       float64
-	Skipped           []blofinCopySyncSkip
-	Touched           []string
-	FundingBooked     float64
-	FundingDetail     string
-	EquityNow         float64
-	BaselineAdopted   bool
+	PositionsChecked     int
+	PositionsInserted    int
+	TradesInserted       int
+	RecoveredCloseTrades []blofinCopyRecoveredClose
+	LedgerDelta          float64
+	Skipped              []blofinCopySyncSkip
+	Touched              []string
+	FundingBooked        float64
+	FundingDetail        string
+	EquityNow            float64
+	BaselineAdopted      bool
+}
+
+type blofinCopyRecoveredClose struct {
+	StrategyID string
+	Trade      Trade
+}
+
+func notifyBloFinCopyRecoveredCloseTrades(notifier *MultiNotifier, strategies []StrategyConfig, regime *RegimeConfig, recovered []blofinCopyRecoveredClose) {
+	if notifier == nil || len(recovered) == 0 {
+		return
+	}
+	for _, item := range recovered {
+		for _, sc := range strategies {
+			if sc.ID != item.StrategyID {
+				continue
+			}
+			sendTradeAlertRows(sc, []Trade{item.Trade}, notifier, regime)
+			break
+		}
+	}
 }
 
 func (o *blofinCopySyncOutcome) touch(id string) {
@@ -473,16 +494,31 @@ func applyBloFinCopyCloseFill(ss *StrategyState, symbol, positionSide string, op
 	trade := Trade{
 		Timestamp: fillAt, StrategyID: ss.ID, Symbol: symbol, PositionID: positionID,
 		Side: closeSide, Quantity: qty, Price: price, Value: qty * price * multiplier,
-		TradeType: "perps", Details: fmt.Sprintf("BloFin incremental Copy fill recovery; positionOrderId=%s detailsCloseId=%s", order.OrderID, fill.CloseOrderID),
+		TradeType: "perps", Details: fmt.Sprintf("BloFin incremental Copy close fill recovery; positionOrderId=%s detailsCloseId=%s", order.OrderID, fill.CloseOrderID),
 		ExchangeOrderID: order.OrderID, ExchangeFee: fee, IsClose: true,
 		RealizedPnL: pnl, PnLGross: true, FeeSource: FeeSourceUserFills,
 		Regime: pos.Regime, EntryATR: pos.EntryATR, StopLossOID: pos.StopLossOID,
 		StopLossTriggerPx: pos.StopLossTriggerPx, StopLossATRMult: pos.StopLossATRMult, TPTiersJSON: pos.TPTiersJSON,
 	}
+	if qty < pos.Quantity-1e-8 {
+		trade.Details = strings.Replace(trade.Details, "close fill recovery", "partial-close fill recovery", 1)
+	}
 	RecordTrade(ss, trade)
 	ss.Cash += net
 	if qty >= pos.Quantity-1e-8 {
-		recordClosedPosition(ss, pos, price, pnlAccumBefore+net, "signal", fillAt)
+		closedQty, closeNotional := 0.0, 0.0
+		for _, closeTrade := range ss.TradeHistory {
+			if closeTrade.IsClose && closeTrade.PositionID == positionID {
+				closedQty += closeTrade.Quantity
+				closeNotional += closeTrade.Quantity * closeTrade.Price
+			}
+		}
+		if closedQty <= 0 {
+			closedQty, closeNotional = qty, qty*price
+		}
+		closedPosition := *pos
+		closedPosition.Quantity = closedQty
+		recordClosedPosition(ss, &closedPosition, closeNotional/closedQty, pnlAccumBefore+net, "signal", fillAt)
 		delete(ss.Positions, symbol)
 	} else {
 		pos.Quantity -= qty
@@ -694,6 +730,7 @@ func applyBloFinCopySyncPayload(state *AppState, cfgs []StrategyConfig, payload 
 			var failed error
 			repairedDelta := 0.0
 			for _, fill := range missing {
+				tradeCountBefore := len(ss.TradeHistory)
 				net, closeErr := applyBloFinCopyCloseFill(ss, symbol, positionSide, pos.OpenMs, blofinCopySyncClose{
 					CloseOrderID: fill.closeID, Side: fill.side, Size: strconv.FormatFloat(fill.qty, 'f', -1, 64),
 					AveragePrice: strconv.FormatFloat(fill.px, 'f', -1, 64), Fee: strconv.FormatFloat(fill.fee, 'f', -1, 64),
@@ -706,6 +743,12 @@ func applyBloFinCopySyncPayload(state *AppState, cfgs []StrategyConfig, payload 
 				out.LedgerDelta += net
 				repairedDelta += net
 				out.TradesInserted++
+				if len(ss.TradeHistory) > tradeCountBefore {
+					trade := ss.TradeHistory[len(ss.TradeHistory)-1]
+					if trade.IsClose && trade.ExchangeOrderID == fill.order.OrderID {
+						out.RecoveredCloseTrades = append(out.RecoveredCloseTrades, blofinCopyRecoveredClose{StrategyID: strategyID, Trade: trade})
+					}
+				}
 			}
 			if failed != nil {
 				out.Skipped = append(out.Skipped, blofinCopySyncSkip{OrderID: pos.OrderID, Reason: "missing close apply: " + failed.Error()})
@@ -732,17 +775,22 @@ func applyBloFinCopySyncPayload(state *AppState, cfgs []StrategyConfig, payload 
 		out.TradesInserted++
 		var accum float64
 		closePx, _ := parseBloFinFloat(pos.ClosePrice)
-		for _, fill := range fills {
+		for i, fill := range fills {
 			legNet := fill.pnl - fill.fee
 			accum += legNet
+			details := "BloFin auto-sync close fill; positionOrderId=" + pos.OrderID
+			if i < len(fills)-1 {
+				details = "BloFin auto-sync partial-close fill; positionOrderId=" + pos.OrderID
+			}
 			closeTrade := Trade{
 				Timestamp: time.UnixMilli(fill.ms).UTC(), StrategyID: strategyID, Symbol: symbol, PositionID: positionID,
 				Side: fill.side, Quantity: fill.qty, Price: fill.px, Value: fill.qty * fill.px * contractValue,
-				TradeType: "perps", Details: "BloFin auto-sync close fill; positionOrderId=" + pos.OrderID,
+				TradeType: "perps", Details: details,
 				ExchangeOrderID: fill.order.OrderID, ExchangeFee: fill.fee,
 				IsClose: true, RealizedPnL: fill.pnl, PnLGross: true, FeeSource: FeeSourceUserFills,
 			}
 			RecordTrade(ss, closeTrade)
+			out.RecoveredCloseTrades = append(out.RecoveredCloseTrades, blofinCopyRecoveredClose{StrategyID: strategyID, Trade: closeTrade})
 			out.LedgerDelta += blofinCopyLedgerDelta(closeTrade)
 			out.TradesInserted++
 			ss.Cash += legNet
@@ -912,7 +960,12 @@ func maybeRunBloFinCopyAutoSync(cfg *Config, configPath string, state *AppState,
 		notifyBloFinCopySync(notifier, "position-errors", fmt.Sprintf("⚠️ **BloFin Copy sync: %d exchange row(s) need review**\nFirst: %+v\nFill backfill skipped them instead of guessing — check the bot log.", len(payload.PositionErrors), payload.PositionErrors[0]))
 	}
 	mu.Lock()
-	defer mu.Unlock()
+	var recoveredCloseTrades []blofinCopyRecoveredClose
+	persistedStrategies := make(map[string]bool)
+	defer func() {
+		mu.Unlock()
+		notifyBloFinCopyRecoveredCloseTrades(notifier, cfg.Strategies, cfg.Regime, recoveredCloseTrades)
+	}()
 	outcome, err := applyBloFinCopySyncPayload(state, cfg.Strategies, payload, store, now)
 	if err != nil {
 		fmt.Printf("[blofin-sync] WARN: apply failed: %v\n", err)
@@ -937,6 +990,13 @@ func maybeRunBloFinCopyAutoSync(cfg *Config, configPath string, state *AppState,
 			persistOK = false
 			fmt.Printf("[blofin-sync] WARN: persist %s failed: %v\n", id, err)
 			notifyBloFinCopySync(notifier, "persist-"+id, fmt.Sprintf("⚠️ **BloFin Copy sync could not persist %s**\n%v\nSync will retry; no cursor advanced.", id, err))
+		} else {
+			persistedStrategies[id] = true
+		}
+	}
+	for _, recovered := range outcome.RecoveredCloseTrades {
+		if persistedStrategies[recovered.StrategyID] {
+			recoveredCloseTrades = append(recoveredCloseTrades, recovered)
 		}
 	}
 	equityNow, equityErr := parseBloFinFloat(payload.Equity["totalEquity"])

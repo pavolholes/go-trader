@@ -95,13 +95,13 @@ class BloFinExchangeAdapter:
             raise RuntimeError(f"BloFin API error {path}: {data.get('msg', data)}")
         return data
 
-    def _private_get(self, path: str, params: dict = None) -> dict:
+    def _private_get(self, path: str, params: dict = None, timeout: float = 15) -> dict:
         full_path = path
         if params:
             full_path += "?" + urlencode(params)
         headers = self._headers("GET", full_path)
         url = f"{self.base_url}{full_path}"
-        resp = http_requests.get(url, headers=headers, timeout=15)
+        resp = http_requests.get(url, headers=headers, timeout=timeout)
         data = resp.json()
         if data.get("code") != "0":
             raise RuntimeError(f"BloFin API error {path}: {data.get('msg', data)}")
@@ -296,7 +296,8 @@ class BloFinExchangeAdapter:
         return out
 
     def get_copy_order_fill(self, order_id: str, inst_id: str, tries: int = 10,
-                            client_order_id: str = "", max_pages: int = 5) -> dict:
+                            client_order_id: str = "", max_pages: int = 5,
+                            request_timeout: float = 15, retry_delay: float = 3) -> dict:
         """Poll copy order history by its order ID or stable client order ID."""
         wanted_order_id = str(order_id or "")
         wanted_client_order_id = str(client_order_id or "")
@@ -309,7 +310,10 @@ class BloFinExchangeAdapter:
                     params = {"instId": inst_id, "limit": "20"}
                     if cursor:
                         params["before"] = cursor
-                    items = self._private_get("/api/v1/copytrading/trade/orders-history", params).get("data", [])
+                    items = self._private_get(
+                        "/api/v1/copytrading/trade/orders-history", params,
+                        timeout=request_timeout,
+                    ).get("data", [])
                     for o in items:
                         copy_order_id = str(o.get("orderId", "") or "")
                         history_client_order_id = str(o.get("clientOrderId") or o.get("clOrdId") or "")
@@ -334,7 +338,7 @@ class BloFinExchangeAdapter:
             except Exception:
                 pass
             if _ + 1 < max(1, tries):
-                time.sleep(3)
+                time.sleep(retry_delay)
         return {}
 
     # ─────────────────────────────────────────────

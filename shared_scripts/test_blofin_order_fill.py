@@ -15,7 +15,7 @@ def adapter_with_history(pages):
     adapter = object.__new__(BloFinExchangeAdapter)
     calls = []
 
-    def private_get(path, params):
+    def private_get(path, params, timeout=15):
         calls.append((path, dict(params)))
         assert path == "/api/v1/copytrading/trade/orders-history"
         if params.get("before"):
@@ -38,6 +38,34 @@ def test_copy_order_fill_selects_matching_order_not_first_recent_fill():
     assert calls == [
         ("/api/v1/copytrading/trade/orders-history", {"instId": "DOGE-USDT", "limit": "20"})
     ]
+
+
+def test_copy_order_fill_retries_after_history_lags_order_ack(monkeypatch):
+    adapter = object.__new__(BloFinExchangeAdapter)
+    responses = iter([
+        {"data": []},
+        {"data": [{"orderId": "wanted", "filledSize": "250", "averagePrice": "150.25", "fee": "0.225375"}]},
+    ])
+    timeouts = []
+    sleeps = []
+
+    def private_get(path, params, timeout=15):
+        assert path == "/api/v1/copytrading/trade/orders-history"
+        assert params == {"instId": "SPCX-USDT", "limit": "20"}
+        timeouts.append(timeout)
+        return next(responses)
+
+    adapter._private_get = private_get
+    monkeypatch.setattr("adapter.time.sleep", lambda delay: sleeps.append(delay))
+
+    fill = adapter.get_copy_order_fill(
+        "wanted", "SPCX-USDT", tries=3, max_pages=1,
+        request_timeout=4, retry_delay=1,
+    )
+
+    assert fill == {"avg_px": 150.25, "total_sz": 250.0, "fee": 0.225375, "oid": "wanted"}
+    assert timeouts == [4, 4]
+    assert sleeps == [1]
 
 
 def test_copy_order_fill_paginates_by_symbol_to_find_old_order():
@@ -197,8 +225,9 @@ def test_execute_handles_object_shaped_copy_order_response(monkeypatch, capsys):
             # the parent Copy order ID used by orders-history.
             return {"code": "0", "data": {"orderId": "7361243"}, "contract_value": 0.01}
 
-        def get_copy_order_fill(self, order_id, inst_id, tries=10, client_order_id="", max_pages=5):
-            calls.append((order_id, inst_id, client_order_id, tries, max_pages))
+        def get_copy_order_fill(self, order_id, inst_id, tries=10, client_order_id="", max_pages=5,
+                                request_timeout=15, retry_delay=3):
+            calls.append((order_id, inst_id, client_order_id, tries, max_pages, request_timeout, retry_delay))
             return {
                 "avg_px": 2688.85,
                 "total_sz": 11.1,
@@ -213,13 +242,14 @@ def test_execute_handles_object_shaped_copy_order_response(monkeypatch, capsys):
     output = json.loads(capsys.readouterr().out)
     assert len(client_ids) == 1 and len(client_ids[0]) == 32
     int(client_ids[0], 16)
-    assert calls == [("7361243", "ETH-USDT", client_ids[0], 1, 1)]
+    assert calls == [("7361243", "ETH-USDT", client_ids[0], 3, 1, 4, 1)]
     assert output["execution"]["fill"] == {
         "avg_px": 2688.85,
         "total_sz": 11.1,
         "fee": 0.17907741,
         "oid": "16949003",
         "contract_value": 0.01,
+        "client_order_id": client_ids[0],
     }
 
 
@@ -230,14 +260,17 @@ def test_copy_order_ack_without_history_fill_does_not_assume_requested_size(monk
     spec = importlib.util.spec_from_file_location("check_blofin_unfilled_ack_test", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    client_ids = []
 
     class FakeAdapter:
         trade_account = "copy"
 
         def market_open(self, *args, **kwargs):
+            client_ids.append(kwargs["client_order_id"])
             return {"code": "0", "data": {"orderId": "unfilled"}, "contract_value": 0.01}
 
-        def get_copy_order_fill(self, order_id, inst_id, tries=10, client_order_id="", max_pages=5):
+        def get_copy_order_fill(self, order_id, inst_id, tries=10, client_order_id="", max_pages=5,
+                                request_timeout=15, retry_delay=3):
             return {}
 
     monkeypatch.setattr(adapter_module, "BloFinExchangeAdapter", FakeAdapter)
@@ -248,3 +281,4 @@ def test_copy_order_ack_without_history_fill_does_not_assume_requested_size(monk
     assert output["execution"]["fill"]["avg_px"] == 0
     assert output["execution"]["fill"]["total_sz"] == 0
     assert output["execution"]["fill"]["oid"] == "unfilled"
+    assert output["execution"]["fill"]["client_order_id"] == client_ids[0]
