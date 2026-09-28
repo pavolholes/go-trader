@@ -295,7 +295,8 @@ class BloFinExchangeAdapter:
             })
         return out
 
-    def get_copy_order_fill(self, order_id: str, inst_id: str, tries: int = 10, client_order_id: str = "") -> dict:
+    def get_copy_order_fill(self, order_id: str, inst_id: str, tries: int = 10,
+                            client_order_id: str = "", max_pages: int = 5) -> dict:
         """Poll copy order history by its order ID or stable client order ID."""
         wanted_order_id = str(order_id or "")
         wanted_client_order_id = str(client_order_id or "")
@@ -304,7 +305,7 @@ class BloFinExchangeAdapter:
         for _ in range(max(1, tries)):
             try:
                 cursor = ""
-                for _page in range(5):
+                for _page in range(max(1, max_pages)):
                     params = {"instId": inst_id, "limit": "20"}
                     if cursor:
                         params["before"] = cursor

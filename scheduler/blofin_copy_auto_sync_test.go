@@ -1,6 +1,7 @@
 package main
 
 import (
+	"math"
 	"testing"
 	"time"
 )
@@ -77,7 +78,7 @@ func TestMatchBloFinCopyStrategyAmbiguous(t *testing.T) {
 func TestApplyInsertsMissingDogePosition(t *testing.T) {
 	state := blofinSyncTestState()
 	now := time.UnixMilli(1790570000000).UTC()
-	out, err := applyBloFinCopySyncPayload(state, blofinSyncTestConfig(), blofinSyncTestPayload(), now)
+	out, err := applyBloFinCopySyncPayload(state, blofinSyncTestConfig(), blofinSyncTestPayload(), nil, now)
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
@@ -101,7 +102,7 @@ func TestApplyInsertsMissingDogePosition(t *testing.T) {
 	}
 
 	// Second apply must be a no-op (idempotent by exchange order ID).
-	out2, err := applyBloFinCopySyncPayload(state, blofinSyncTestConfig(), blofinSyncTestPayload(), now)
+	out2, err := applyBloFinCopySyncPayload(state, blofinSyncTestConfig(), blofinSyncTestPayload(), nil, now)
 	if err != nil {
 		t.Fatalf("re-apply: %v", err)
 	}
@@ -122,22 +123,24 @@ func blofinSyncTestDB(t *testing.T) *StateDB {
 
 func TestBookFundingResidualThreshold(t *testing.T) {
 	db := blofinSyncTestDB(t)
-	if got, _ := bookBloFinCopyFundingResidual(db, 351.0, 350.0, 1.0, 0.0, time.Now().UTC()); got != 0 {
+	if got, _, handled := bookBloFinCopyResidual(db, 0.05, time.Now().UTC(), "window-small"); got != 0 || handled {
 		t.Fatalf("sub-threshold residual booked %v", got)
 	}
 	if total := blofinCopyAdjustmentsTotal(db); total != 0 {
 		t.Fatalf("adjustments total=%v, want 0", total)
 	}
-	// (351.5-350.0) - 1.0 - 0.2 = 0.3 >= 0.10 -> booked.
-	got, detail := bookBloFinCopyFundingResidual(db, 351.5, 350.0, 1.0, 0.2, time.Now().UTC())
+	got, detail, handled := bookBloFinCopyResidual(db, 0.3, time.Now().UTC(), "window-1")
 	if diff := got - 0.3; diff > 1e-9 || diff < -1e-9 {
 		t.Fatalf("residual=%v, want 0.3 (%s)", got, detail)
+	}
+	if !handled {
+		t.Fatalf("residual should be handled")
 	}
 	if total := blofinCopyAdjustmentsTotal(db); total-0.3 > 1e-9 || total-0.3 < -1e-9 {
 		t.Fatalf("adjustments total=%v, want 0.3", total)
 	}
 	// Same window twice must not double-book (idempotent dedup).
-	if got, _ := bookBloFinCopyFundingResidual(db, 351.5, 350.0, 1.0, 0.2, time.Now().UTC()); got != 0 {
+	if got, _, handled := bookBloFinCopyResidual(db, 0.3, time.Now().UTC(), "window-1"); got != 0 || !handled {
 		t.Fatalf("second booking=%v, want 0 (dedup)", got)
 	}
 }
@@ -148,7 +151,7 @@ func TestSyncStateRoundTrip(t *testing.T) {
 	if err != nil || st.Found {
 		t.Fatalf("fresh state found=%v err=%v", st.Found, err)
 	}
-	want := blofinCopySyncState{FillsSinceMs: 1790558257392, LastRunMs: 1790570000000, LastEquity: 351.27, LastLedger: 77.52, LastTradesNet: 77.52, LastAdjustments: -3.24, LastAccountNet: 74.28, Found: true}
+	want := blofinCopySyncState{FillsSinceMs: 1790558257392, TransfersSinceMs: 1790570000000, LastRunMs: 1790570000000, LastEquity: 351.27, LastLedger: 77.52, LastTradesNet: 77.52, LastAdjustments: -3.24, LastAccountNet: 74.28, PendingResidual: 0.04, Found: true}
 	if err := storeBloFinCopySyncState(db, want); err != nil {
 		t.Fatalf("store: %v", err)
 	}
@@ -156,7 +159,7 @@ func TestSyncStateRoundTrip(t *testing.T) {
 	if err != nil || !got.Found {
 		t.Fatalf("reload found=%v err=%v", got.Found, err)
 	}
-	if got.LastAccountNet-74.28 > 1e-9 || got.FillsSinceMs != want.FillsSinceMs {
+	if got.LastAccountNet-74.28 > 1e-9 || got.FillsSinceMs != want.FillsSinceMs || got.TransfersSinceMs != want.TransfersSinceMs || got.PendingResidual != want.PendingResidual {
 		t.Fatalf("round trip mismatch: %+v", got)
 	}
 }
@@ -166,11 +169,66 @@ func TestBloFinCopySyncDue(t *testing.T) {
 	if !blofinCopySyncDue(0, now) {
 		t.Fatal("first run should be due")
 	}
-	if !blofinCopySyncDue(now.Add(-7*time.Hour).UnixMilli(), now) {
+	if !blofinCopySyncDue(now.Add(-10*time.Minute).UnixMilli(), now) {
 		t.Fatal("stale run should be due")
 	}
-	if blofinCopySyncDue(now.Add(-1*time.Hour).UnixMilli(), now) {
+	if blofinCopySyncDue(now.Add(-1*time.Minute).UnixMilli(), now) {
 		t.Fatal("fresh run should not be due")
+	}
+}
+
+func TestApplyBackfillsMissingCloseWithParentAlreadyTracked(t *testing.T) {
+	const strategyID = "live-order_blocks-spcx-15m"
+	openedAt := time.UnixMilli(1790587979013).UTC().Add(545 * time.Millisecond)
+	state := NewAppState()
+	state.Strategies[strategyID] = &StrategyState{
+		ID: strategyID, Type: "perps", Platform: "blofin", Cash: 350, InitialCapital: 100,
+		Positions: map[string]*Position{
+			"SPCX": {Symbol: "SPCX", TradePositionID: "spcx-parent", Quantity: 503, InitialQuantity: 503, AvgCost: 149.02, Side: "long", Multiplier: 0.01, Leverage: 75, OpenedAt: openedAt},
+		},
+		TradeHistory: []Trade{{Timestamp: openedAt, StrategyID: strategyID, Symbol: "SPCX", PositionID: "spcx-parent", Side: "buy", Quantity: 503, Price: 149.02, TradeType: "perps", ExchangeOrderID: "17008358", ExchangeFee: 0.44974236}},
+	}
+	cfg := []StrategyConfig{{ID: strategyID, Type: "perps", Platform: "blofin", Args: []string{"order_blocks", "SPCX", "15m", "--mode=live"}, Direction: DirectionLong, Leverage: 75}}
+	payload := &blofinCopySyncPayload{
+		Incremental: true,
+		Positions: []blofinCopySyncPosition{{
+			OrderID: "17008358", InstID: "SPCX-USDT", Symbol: "SPCX", Side: "buy", PositionSide: "long",
+			Quantity: "503", OpenPrice: "149.02", OpenMs: 1790587979013, CloseMs: 1790588285449,
+			ClosePrice: "149.31", RealizedPnL: "1.4587", CloseType: "close", ContractValue: "0.01",
+			Closes: []blofinCopySyncClose{{CloseOrderID: "7371387", Side: "sell", Size: "503", AveragePrice: "149.31", Fee: "0.45061758", RealizedPnl: "1.45", OrderTime: 1790588285449}},
+		}},
+		Orders: map[string]blofinCopySyncOrder{
+			"17008358": {OrderID: "17008358", InstID: "SPCX-USDT", Side: "buy", FilledSize: "503", AveragePrice: "149.02", Fee: "0.44974236", CreateTime: 1790587979013},
+			"17008467": {OrderID: "17008467", InstID: "SPCX-USDT", Side: "sell", FilledSize: "503", AveragePrice: "149.31", Fee: "0.45061758", Pnl: "1.4587", CreateTime: 1790588285449},
+		},
+	}
+	db := blofinSyncTestDB(t)
+	if err := db.SaveState(state); err != nil {
+		t.Fatalf("save source: %v", err)
+	}
+	store := singleFileStore(db)
+	now := time.UnixMilli(1790589000000).UTC()
+	out, err := applyBloFinCopySyncPayload(state, cfg, payload, store, now)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if out.PositionsInserted != 1 || out.TradesInserted != 1 || len(state.Strategies[strategyID].Positions) != 0 {
+		t.Fatalf("outcome=%+v positions=%+v", out, state.Strategies[strategyID].Positions)
+	}
+	if math.Abs(out.LedgerDelta-(1.4587-0.45061758)) > 1e-9 {
+		t.Fatalf("ledger delta=%v, want %.8f", out.LedgerDelta, 1.4587-0.45061758)
+	}
+	if err := db.SaveState(state); err != nil {
+		t.Fatalf("save repaired: %v", err)
+	}
+	var count int
+	if err := db.db.QueryRow("SELECT COUNT(*) FROM trades WHERE exchange_order_id=? AND is_close=1", "17008467").Scan(&count); err != nil || count != 1 {
+		t.Fatalf("close order rows=%d err=%v", count, err)
+	}
+	// A retry must see the close OID and avoid double-booking.
+	out2, err := applyBloFinCopySyncPayload(state, cfg, payload, store, now.Add(5*time.Minute))
+	if err != nil || out2.TradesInserted != 0 {
+		t.Fatalf("retry outcome=%+v err=%v", out2, err)
 	}
 }
 

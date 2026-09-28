@@ -11,6 +11,7 @@ import json
 import os
 import sqlite3
 import sys
+import time
 from collections import defaultdict
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -456,7 +457,7 @@ def build_open_position_plan(adapter, position, trades, strategies, by_symbol, c
     return summary, events, position_state
 
 
-def incremental_sync_payload(adapter, symbols, since_ms):
+def incremental_sync_payload(adapter, symbols, since_ms, transfers_since_ms=0):
     """Read-only incremental payload for the Go auto-sync loop.
 
     Returns raw closed fills with closeTime >= since_ms plus the order-history
@@ -479,6 +480,20 @@ def incremental_sync_payload(adapter, symbols, since_ms):
     inst_ids = {str(row.get("instId", "")) for row in history} | {str(row.get("instId", "")) for row in exchange_open}
     inst_ids = {row for row in inst_ids if row}
     order_history = copy_order_history(adapter, inst_ids, since_ms - open_buffer_ms) if inst_ids else {}
+    open_unrealized = ZERO
+    unrealized_complete = True
+    for row in exchange_open:
+        raw = row.get("unrealizedPnl")
+        try:
+            if raw in (None, ""):
+                raise ValueError("missing unrealizedPnl")
+            parsed = Decimal(str(raw))
+            if not parsed.is_finite():
+                raise ValueError("non-finite unrealizedPnl")
+            open_unrealized += parsed
+        except Exception:
+            unrealized_complete = False
+            break
     contract_values = {}
     summaries = []
     position_errors = []
@@ -523,33 +538,33 @@ def incremental_sync_payload(adapter, symbols, since_ms):
     except Exception as exc:
         equity = {"error": str(exc)[:200]}
     transfers = []
+    transfers_complete = True
+    transfers_error = ""
+    now_ms = int(time.time() * 1000)
+    if transfers_since_ms <= 0:
+        transfers_since_ms = now_ms
     try:
-        cursor = None
-        for _ in range(5):
-            params = {"limit": "100"}
-            if cursor:
-                params["after"] = cursor
-            batch = adapter._private_get("/api/v1/asset/bills", params).get("data", [])
-            if not batch:
-                break
-            for row in batch:
-                if timestamp_ms(row.get("ts")) < since_ms:
-                    continue
-                if row.get("fromAccount") == "copy_trading" or row.get("toAccount") == "copy_trading":
-                    transfers.append({
-                        "transferId": str(row.get("transferId", "")),
-                        "fromAccount": str(row.get("fromAccount", "")),
-                        "toAccount": str(row.get("toAccount", "")),
-                        "amount": str(row.get("amount", "0")),
-                        "ts": str(row.get("ts", "")),
-                    })
-            if len(batch) < 100:
-                break
-            cursor = str(batch[-1].get("transferId", ""))
-            if not cursor:
-                break
+        batch = adapter._private_get("/api/v1/asset/bills", {"limit": "100"}).get("data", [])
+        for row in batch:
+            ts = timestamp_ms(row.get("ts"))
+            if ts < transfers_since_ms or ts > now_ms:
+                continue
+            if row.get("fromAccount") == "copy_trading" or row.get("toAccount") == "copy_trading":
+                transfers.append({
+                    "transferId": str(row.get("transferId", "")),
+                    "fromAccount": str(row.get("fromAccount", "")),
+                    "toAccount": str(row.get("toAccount", "")),
+                    "amount": str(row.get("amount", "0")),
+                    "ts": str(row.get("ts", "")),
+                })
+        if len(batch) >= 100:
+            oldest_ms = min((timestamp_ms(row.get("ts")) for row in batch), default=now_ms)
+            if oldest_ms >= transfers_since_ms:
+                transfers_complete = False
+                transfers_error = "asset/bills reached 100-record limit before transfer cursor; residual booking deferred"
     except Exception as exc:
-        position_errors.append({"transfers": str(exc)[:200]})
+        transfers_complete = False
+        transfers_error = str(exc)[:200]
     orders = {}
     for oid, row in order_history.items():
         orders[str(oid)] = {
@@ -565,12 +580,18 @@ def incremental_sync_payload(adapter, symbols, since_ms):
     return {
         "incremental": True,
         "since_ms": since_ms,
+        "transfers_since_ms": transfers_since_ms,
+        "transfers_cursor_ms": now_ms if transfers_complete else transfers_since_ms,
         "exchange_closed_positions": len(summaries),
         "positions": summaries,
         "orders": orders,
         "exchange_open_positions": exchange_open,
+        "open_unrealized_pnl": str(open_unrealized),
+        "unrealized_complete": unrealized_complete,
         "equity": equity,
         "transfers": transfers,
+        "transfers_complete": transfers_complete,
+        "transfers_error": transfers_error,
         "position_errors": position_errors,
     }
 
@@ -687,6 +708,7 @@ def main():
     parser.add_argument("--db", required=False, default="", help="read-only source snapshot (not needed for --incremental)")
     parser.add_argument("--config", required=True, help="live config JSON")
     parser.add_argument("--since-ms", required=True, type=int, help="first timestamp of this live strategy cohort")
+    parser.add_argument("--transfers-since-ms", type=int, default=0, help="transfer-history cursor; defaults to now for --incremental adoption")
     parser.add_argument("--output-db", help="new staging database path; only written with --apply")
     parser.add_argument("--apply", action="store_true", help="write a new staging DB; source DB remains unchanged")
     parser.add_argument("--incremental", action="store_true", help="read-only incremental sync JSON: closed fills + equity + transfers since --since-ms; never writes any DB")
@@ -702,7 +724,7 @@ def main():
         raise RuntimeError("BloFin adapter is not in live mode")
     strategies, by_symbol = config_live_blofin_strategies(args.config)
     if args.incremental:
-        print(json.dumps(incremental_sync_payload(adapter, sorted(by_symbol.keys()), args.since_ms), separators=(",", ":")))
+        print(json.dumps(incremental_sync_payload(adapter, sorted(by_symbol.keys()), args.since_ms, args.transfers_since_ms), separators=(",", ":")))
         return
     if not args.db:
         parser.error("--db is required without --incremental")

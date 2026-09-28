@@ -55,6 +55,19 @@ def test_copy_order_fill_paginates_by_symbol_to_find_old_order():
     assert calls[1][1] == {"instId": "ADA-USDT", "limit": "20", "before": "new-19"}
 
 
+def test_bounded_execution_poll_can_stop_after_recent_page():
+    first_page = [
+        {"orderId": "recent-%d" % i, "filledSize": "1", "averagePrice": "10", "fee": "0.01"}
+        for i in range(20)
+    ]
+    adapter, calls = adapter_with_history([first_page, [{"orderId": "wanted", "filledSize": "2", "averagePrice": "12", "fee": "0.02"}]])
+
+    fill = adapter.get_copy_order_fill("wanted", "ADA-USDT", tries=1, max_pages=1)
+
+    assert fill == {}
+    assert len(calls) == 1
+
+
 def test_copy_order_fill_never_returns_a_different_order():
     adapter, _ = adapter_with_history([[
         {"orderId": "unrelated", "filledSize": "17.9", "averagePrice": "0.22264", "fee": "0.23911536"}
@@ -184,8 +197,8 @@ def test_execute_handles_object_shaped_copy_order_response(monkeypatch, capsys):
             # the parent Copy order ID used by orders-history.
             return {"code": "0", "data": {"orderId": "7361243"}, "contract_value": 0.01}
 
-        def get_copy_order_fill(self, order_id, inst_id, client_order_id=""):
-            calls.append((order_id, inst_id, client_order_id))
+        def get_copy_order_fill(self, order_id, inst_id, tries=10, client_order_id="", max_pages=5):
+            calls.append((order_id, inst_id, client_order_id, tries, max_pages))
             return {
                 "avg_px": 2688.85,
                 "total_sz": 11.1,
@@ -200,7 +213,7 @@ def test_execute_handles_object_shaped_copy_order_response(monkeypatch, capsys):
     output = json.loads(capsys.readouterr().out)
     assert len(client_ids) == 1 and len(client_ids[0]) == 32
     int(client_ids[0], 16)
-    assert calls == [("7361243", "ETH-USDT", client_ids[0])]
+    assert calls == [("7361243", "ETH-USDT", client_ids[0], 1, 1)]
     assert output["execution"]["fill"] == {
         "avg_px": 2688.85,
         "total_sz": 11.1,
@@ -224,7 +237,7 @@ def test_copy_order_ack_without_history_fill_does_not_assume_requested_size(monk
         def market_open(self, *args, **kwargs):
             return {"code": "0", "data": {"orderId": "unfilled"}, "contract_value": 0.01}
 
-        def get_copy_order_fill(self, order_id, inst_id, client_order_id=""):
+        def get_copy_order_fill(self, order_id, inst_id, tries=10, client_order_id="", max_pages=5):
             return {}
 
     monkeypatch.setattr(adapter_module, "BloFinExchangeAdapter", FakeAdapter)

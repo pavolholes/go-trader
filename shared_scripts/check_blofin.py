@@ -315,7 +315,8 @@ def run_execute(symbol, side, size, mode, size_in_contracts=False, pos_side_hint
         copy_filled = False
         if adapter.trade_account == "copy" and (oid or client_order_id):
             got = adapter.get_copy_order_fill(
-                str(oid or ""), f"{symbol}-USDT", client_order_id=client_order_id
+                str(oid or ""), f"{symbol}-USDT", tries=1,
+                client_order_id=client_order_id, max_pages=1,
             )
             if got:
                 fill = got
