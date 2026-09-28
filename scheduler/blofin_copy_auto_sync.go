@@ -672,7 +672,11 @@ func applyBloFinCopySyncPayload(state *AppState, cfgs []StrategyConfig, payload 
 			}
 			if len(missing) == 0 {
 				if remaining := ss.Positions[symbol]; remaining != nil {
-					out.Skipped = append(out.Skipped, blofinCopySyncSkip{OrderID: pos.OrderID, Reason: fmt.Sprintf("exchange parent closed but DB still has %.8f and all close OIDs are present", remaining.Quantity)})
+					// Same-symbol re-entry after this parent closed is a new
+					// position, not stale quantity from the old parent.
+					if remaining.OpenedAt.IsZero() || remaining.OpenedAt.UTC().UnixMilli() <= pos.CloseMs+2_000 {
+						out.Skipped = append(out.Skipped, blofinCopySyncSkip{OrderID: pos.OrderID, Reason: fmt.Sprintf("exchange parent closed but DB still has %.8f from the same/older position", remaining.Quantity)})
+					}
 				}
 				continue
 			}

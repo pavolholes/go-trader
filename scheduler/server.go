@@ -49,7 +49,7 @@ type StatusServer struct {
 	tradeDepsHook func(*manualCoreDeps)
 	restartFn     func() error
 
-	perpsErrMu              sync.Mutex
+	perpsErrMu                 sync.Mutex
 	lastFuturesErrLoggedAt     time.Time
 	lastFuturesModeLoggedAt    time.Time
 	lastHLPerpsErrLoggedAt     time.Time

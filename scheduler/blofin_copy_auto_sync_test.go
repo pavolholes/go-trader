@@ -232,6 +232,47 @@ func TestApplyBackfillsMissingCloseWithParentAlreadyTracked(t *testing.T) {
 	}
 }
 
+func TestApplyDoesNotTreatNewSameSymbolPositionAsStaleParent(t *testing.T) {
+	const strategyID = "live-order_blocks-spcx-15m"
+	parentOpenMs, parentCloseMs := int64(1790587979013), int64(1790588285449)
+	newOpenAt := time.UnixMilli(parentCloseMs + 10_000).UTC()
+	state := NewAppState()
+	state.Strategies[strategyID] = &StrategyState{
+		ID: strategyID, Type: "perps", Platform: "blofin", Cash: 350, InitialCapital: 100,
+		Positions: map[string]*Position{
+			"SPCX": {Symbol: "SPCX", TradePositionID: "new-parent", Quantity: 500, InitialQuantity: 500, AvgCost: 149.97, Side: "long", Multiplier: 0.01, Leverage: 75, OpenedAt: newOpenAt},
+		},
+		TradeHistory: []Trade{
+			{Timestamp: time.UnixMilli(parentOpenMs).UTC(), StrategyID: strategyID, Symbol: "SPCX", Side: "buy", Quantity: 503, Price: 149.02, ExchangeOrderID: "17008358"},
+			{Timestamp: time.UnixMilli(parentCloseMs).UTC(), StrategyID: strategyID, Symbol: "SPCX", Side: "sell", Quantity: 503, Price: 149.31, ExchangeOrderID: "17008467", IsClose: true, RealizedPnL: 1.4587, ExchangeFee: 0.45061758, PnLGross: true},
+		},
+	}
+	cfg := []StrategyConfig{{ID: strategyID, Type: "perps", Platform: "blofin", Args: []string{"order_blocks", "SPCX", "15m", "--mode=live"}, Direction: DirectionLong, Leverage: 75}}
+	payload := &blofinCopySyncPayload{
+		Incremental: true,
+		Positions: []blofinCopySyncPosition{{
+			OrderID: "17008358", InstID: "SPCX-USDT", Symbol: "SPCX", Side: "buy", PositionSide: "long",
+			Quantity: "503", OpenPrice: "149.02", OpenMs: parentOpenMs, CloseMs: parentCloseMs,
+			ClosePrice: "149.31", RealizedPnL: "1.4587", CloseType: "close", ContractValue: "0.01",
+			Closes: []blofinCopySyncClose{{CloseOrderID: "7371387", Side: "sell", Size: "503", AveragePrice: "149.31", Fee: "0.45061758", RealizedPnl: "1.45", OrderTime: parentCloseMs}},
+		}},
+		Orders: map[string]blofinCopySyncOrder{
+			"17008358": {OrderID: "17008358", InstID: "SPCX-USDT", Side: "buy", FilledSize: "503", AveragePrice: "149.02", Fee: "0.44974236", CreateTime: parentOpenMs},
+			"17008467": {OrderID: "17008467", InstID: "SPCX-USDT", Side: "sell", FilledSize: "503", AveragePrice: "149.31", Fee: "0.45061758", Pnl: "1.4587", CreateTime: parentCloseMs},
+		},
+	}
+	out, err := applyBloFinCopySyncPayload(state, cfg, payload, nil, newOpenAt.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if len(out.Skipped) != 0 || out.TradesInserted != 0 || out.PositionsInserted != 0 {
+		t.Fatalf("old parent sync outcome=%+v, should be a clean no-op", out)
+	}
+	if p := state.Strategies[strategyID].Positions["SPCX"]; p == nil || p.Quantity != 500 || !p.OpenedAt.Equal(newOpenAt) {
+		t.Fatalf("new same-symbol position was changed: %+v", p)
+	}
+}
+
 func TestRealizedNetPnLForStrategy(t *testing.T) {
 	db := blofinSyncTestDB(t)
 	if _, err := db.db.Exec(`INSERT INTO trades (strategy_id,timestamp,symbol,side,quantity,price,value,is_close,realized_pnl,exchange_fee,pnl_gross,fee_source) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
