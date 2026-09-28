@@ -110,23 +110,54 @@ func TestApplyInsertsMissingDogePosition(t *testing.T) {
 	}
 }
 
+func blofinSyncTestDB(t *testing.T) *StateDB {
+	t.Helper()
+	db, err := OpenStateDB(t.TempDir() + "/sync_test.db")
+	if err != nil {
+		t.Fatalf("OpenStateDB: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	return db
+}
+
 func TestBookFundingResidualThreshold(t *testing.T) {
-	state := NewAppState()
-	if got, _ := bookBloFinCopyFundingResidual(state, 351.0, 350.0, 1.0, 0.0, time.Now().UTC()); got != 0 {
+	db := blofinSyncTestDB(t)
+	if got, _ := bookBloFinCopyFundingResidual(db, 351.0, 350.0, 1.0, 0.0, time.Now().UTC()); got != 0 {
 		t.Fatalf("sub-threshold residual booked %v", got)
 	}
+	if total := blofinCopyAdjustmentsTotal(db); total != 0 {
+		t.Fatalf("adjustments total=%v, want 0", total)
+	}
 	// (351.5-350.0) - 1.0 - 0.2 = 0.3 >= 0.10 -> booked.
-	got, detail := bookBloFinCopyFundingResidual(state, 351.5, 350.0, 1.0, 0.2, time.Now().UTC())
+	got, detail := bookBloFinCopyFundingResidual(db, 351.5, 350.0, 1.0, 0.2, time.Now().UTC())
 	if diff := got - 0.3; diff > 1e-9 || diff < -1e-9 {
 		t.Fatalf("residual=%v, want 0.3 (%s)", got, detail)
 	}
-	ss := state.Strategies[blofinCopyFundingStrategyID]
-	if ss == nil || len(ss.TradeHistory) != 1 {
-		t.Fatalf("funding book missing")
+	if total := blofinCopyAdjustmentsTotal(db); total-0.3 > 1e-9 || total-0.3 < -1e-9 {
+		t.Fatalf("adjustments total=%v, want 0.3", total)
 	}
-	tr := ss.TradeHistory[0]
-	if tr.TradeType != TradeTypeFunding || !tr.PnLGross {
-		t.Fatalf("funding row type=%q gross=%v", tr.TradeType, tr.PnLGross)
+	// Same window twice must not double-book (idempotent dedup).
+	if got, _ := bookBloFinCopyFundingResidual(db, 351.5, 350.0, 1.0, 0.2, time.Now().UTC()); got != 0 {
+		t.Fatalf("second booking=%v, want 0 (dedup)", got)
+	}
+}
+
+func TestSyncStateRoundTrip(t *testing.T) {
+	db := blofinSyncTestDB(t)
+	st, err := loadBloFinCopySyncState(db)
+	if err != nil || st.Found {
+		t.Fatalf("fresh state found=%v err=%v", st.Found, err)
+	}
+	want := blofinCopySyncState{FillsSinceMs: 1790558257392, LastRunMs: 1790570000000, LastEquity: 351.27, LastLedger: 77.52, LastTradesNet: 77.52, LastAdjustments: -3.24, LastAccountNet: 74.28, Found: true}
+	if err := storeBloFinCopySyncState(db, want); err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	got, err := loadBloFinCopySyncState(db)
+	if err != nil || !got.Found {
+		t.Fatalf("reload found=%v err=%v", got.Found, err)
+	}
+	if got.LastAccountNet-74.28 > 1e-9 || got.FillsSinceMs != want.FillsSinceMs {
+		t.Fatalf("round trip mismatch: %+v", got)
 	}
 }
 

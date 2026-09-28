@@ -59,6 +59,44 @@ type StatusServer struct {
 
 const perpsErrLogInterval = 5 * time.Minute
 
+// BloFinCopyReconciliation is the stored account-net tie-out between the bot
+// trade ledger, booked funding/profit-share adjustments, and the exchange.
+type BloFinCopyReconciliation struct {
+	TradesNet   float64 `json:"trades_net"`
+	Adjustments float64 `json:"adjustments"`
+	AccountNet  float64 `json:"account_net"`
+	LastRunMs   int64   `json:"last_run_ms"`
+	LastEquity  float64 `json:"last_equity"`
+}
+
+func (ss *StatusServer) blofinCopyReconciliation() *BloFinCopyReconciliation {
+	if ss == nil || ss.stateDB == nil {
+		return nil
+	}
+	ss.strategiesMu.RLock()
+	strategies := append([]StrategyConfig(nil), ss.strategies...)
+	ss.strategiesMu.RUnlock()
+	live, _ := blofinCopyLiveStrategies(strategies)
+	if len(live) == 0 {
+		return nil
+	}
+	sdb, err := ss.stateDB.dbForStrategy(live[0].ID)
+	if err != nil {
+		return nil
+	}
+	st, err := loadBloFinCopySyncState(sdb)
+	if err != nil || !st.Found {
+		return nil
+	}
+	return &BloFinCopyReconciliation{
+		TradesNet:   st.LastTradesNet,
+		Adjustments: st.LastAdjustments,
+		AccountNet:  st.LastAccountNet,
+		LastRunMs:   st.LastRunMs,
+		LastEquity:  st.LastEquity,
+	}
+}
+
 const DefaultStatusPort = 8099
 
 const statusPortMaxAttempts = 5
@@ -372,6 +410,7 @@ func (ss *StatusServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 		MarketFeed           *marketFeedHealth               `json:"market_feed,omitempty"`
 		PaperSources         []PaperSourceStatus             `json:"paper_sources,omitempty"`
 		Partitions           []PartitionStatus               `json:"partitions,omitempty"`
+		BloFinCopy           *BloFinCopyReconciliation       `json:"blofin_copy_reconciliation,omitempty"`
 	}
 
 	ss.strategiesMu.RLock()
@@ -452,6 +491,7 @@ func (ss *StatusServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 		resp.PortfolioRisk = *prs
 	}
 	resp.Correlation = ss.state.partitionCorrelation(legacyScope)
+	resp.BloFinCopy = ss.blofinCopyReconciliation()
 
 	for id, s := range ss.state.Strategies {
 		pv := displayStrategyValue(s, prices)

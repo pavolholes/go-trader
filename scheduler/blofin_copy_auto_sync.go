@@ -34,10 +34,10 @@ import (
 )
 
 const (
-	blofinCopyFundingStrategyID = "live-blofin-funding"
-	blofinCopySyncAccount       = "copy"
-	blofinCopySyncInterval      = 6 * time.Hour
-	blofinCopySyncLookback      = 7 * 24 * time.Hour
+	blofinCopySyncAccount = "copy"
+	// The sync runs inside the live loop, so keep the window tight.
+	blofinCopySyncInterval = 6 * time.Hour
+	blofinCopySyncLookback = 7 * 24 * time.Hour
 	// Residuals below this are rounding noise, not funding.
 	blofinCopyResidualThreshold = 0.10
 	blofinCopySyncScript        = "shared_scripts/reconcile_blofin_live_history.py"
@@ -101,11 +101,14 @@ type blofinCopySyncPayload struct {
 }
 
 type blofinCopySyncState struct {
-	FillsSinceMs int64
-	LastRunMs    int64
-	LastEquity   float64
-	LastLedger   float64
-	Found        bool
+	FillsSinceMs    int64
+	LastRunMs       int64
+	LastEquity      float64
+	LastLedger      float64
+	LastTradesNet   float64
+	LastAdjustments float64
+	LastAccountNet  float64
+	Found           bool
 }
 
 type blofinCopySyncSkip struct {
@@ -135,47 +138,113 @@ func (o *blofinCopySyncOutcome) touch(id string) {
 	o.Touched = append(o.Touched, id)
 }
 
-func blofinCopySyncStateDDL() string {
+func blofinCopySyncTablesDDL() string {
 	return `CREATE TABLE IF NOT EXISTS blofin_copy_sync_state (
     account TEXT NOT NULL DEFAULT 'copy',
     fills_since_ms INTEGER NOT NULL DEFAULT 0,
     last_run_ms INTEGER NOT NULL DEFAULT 0,
     last_equity REAL NOT NULL DEFAULT 0,
     last_ledger REAL NOT NULL DEFAULT 0,
+    last_trades_net REAL NOT NULL DEFAULT 0,
+    last_adjustments REAL NOT NULL DEFAULT 0,
+    last_account_net REAL NOT NULL DEFAULT 0,
     PRIMARY KEY (account)
+);
+CREATE TABLE IF NOT EXISTS blofin_copy_adjustments (
+    rowid INTEGER PRIMARY KEY AUTOINCREMENT,
+    account TEXT NOT NULL DEFAULT 'copy',
+    time_ms INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    amount_usd REAL NOT NULL,
+    details TEXT NOT NULL DEFAULT '',
+    dedup_id TEXT NOT NULL UNIQUE
 );`
+}
+
+func ensureBloFinCopySyncTables(sdb *StateDB) error {
+	if sdb == nil || sdb.db == nil {
+		return fmt.Errorf("state db unavailable")
+	}
+	for _, stmt := range []string{
+		`CREATE TABLE IF NOT EXISTS blofin_copy_sync_state (
+    account TEXT NOT NULL DEFAULT 'copy',
+    fills_since_ms INTEGER NOT NULL DEFAULT 0,
+    last_run_ms INTEGER NOT NULL DEFAULT 0,
+    last_equity REAL NOT NULL DEFAULT 0,
+    last_ledger REAL NOT NULL DEFAULT 0,
+    last_trades_net REAL NOT NULL DEFAULT 0,
+    last_adjustments REAL NOT NULL DEFAULT 0,
+    last_account_net REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (account)
+);`,
+		`CREATE TABLE IF NOT EXISTS blofin_copy_adjustments (
+    rowid INTEGER PRIMARY KEY AUTOINCREMENT,
+    account TEXT NOT NULL DEFAULT 'copy',
+    time_ms INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    amount_usd REAL NOT NULL,
+    details TEXT NOT NULL DEFAULT '',
+    dedup_id TEXT NOT NULL UNIQUE
+);`,
+	} {
+		if _, err := sdb.db.Exec(stmt); err != nil {
+			return fmt.Errorf("ensure copy sync table: %w", err)
+		}
+	}
+	return nil
 }
 
 func loadBloFinCopySyncState(sdb *StateDB) (blofinCopySyncState, error) {
 	var st blofinCopySyncState
-	if sdb == nil || sdb.db == nil {
-		return st, fmt.Errorf("state db unavailable")
+	if err := ensureBloFinCopySyncTables(sdb); err != nil {
+		return st, err
 	}
-	if _, err := sdb.db.Exec(blofinCopySyncStateDDL()); err != nil {
-		return st, fmt.Errorf("ensure sync state table: %w", err)
-	}
-	row := sdb.db.QueryRow(`SELECT fills_since_ms, last_run_ms, last_equity, last_ledger FROM blofin_copy_sync_state WHERE account = ?`, blofinCopySyncAccount)
+	row := sdb.db.QueryRow(`SELECT fills_since_ms, last_run_ms, last_equity, last_ledger, last_trades_net, last_adjustments, last_account_net FROM blofin_copy_sync_state WHERE account = ?`, blofinCopySyncAccount)
 	var fills, run int64
-	var eq, ledger float64
-	if err := row.Scan(&fills, &run, &eq, &ledger); err != nil {
+	var eq, ledger, tradesNet, adjustments, accountNet float64
+	if err := row.Scan(&fills, &run, &eq, &ledger, &tradesNet, &adjustments, &accountNet); err != nil {
 		return st, nil
 	}
-	st = blofinCopySyncState{FillsSinceMs: fills, LastRunMs: run, LastEquity: eq, LastLedger: ledger, Found: true}
+	st = blofinCopySyncState{FillsSinceMs: fills, LastRunMs: run, LastEquity: eq, LastLedger: ledger, LastTradesNet: tradesNet, LastAdjustments: adjustments, LastAccountNet: accountNet, Found: true}
 	return st, nil
 }
 
 func storeBloFinCopySyncState(sdb *StateDB, st blofinCopySyncState) error {
-	if sdb == nil || sdb.db == nil {
-		return fmt.Errorf("state db unavailable")
+	if err := ensureBloFinCopySyncTables(sdb); err != nil {
+		return err
 	}
-	if _, err := sdb.db.Exec(blofinCopySyncStateDDL()); err != nil {
-		return fmt.Errorf("ensure sync state table: %w", err)
-	}
-	_, err := sdb.db.Exec(`INSERT INTO blofin_copy_sync_state (account, fills_since_ms, last_run_ms, last_equity, last_ledger)
-		VALUES (?, ?, ?, ?, ?)
-		ON CONFLICT(account) DO UPDATE SET fills_since_ms=excluded.fills_since_ms, last_run_ms=excluded.last_run_ms, last_equity=excluded.last_equity, last_ledger=excluded.last_ledger`,
-		blofinCopySyncAccount, st.FillsSinceMs, st.LastRunMs, st.LastEquity, st.LastLedger)
+	_, err := sdb.db.Exec(`INSERT INTO blofin_copy_sync_state (account, fills_since_ms, last_run_ms, last_equity, last_ledger, last_trades_net, last_adjustments, last_account_net)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(account) DO UPDATE SET fills_since_ms=excluded.fills_since_ms, last_run_ms=excluded.last_run_ms, last_equity=excluded.last_equity, last_ledger=excluded.last_ledger, last_trades_net=excluded.last_trades_net, last_adjustments=excluded.last_adjustments, last_account_net=excluded.last_account_net`,
+		blofinCopySyncAccount, st.FillsSinceMs, st.LastRunMs, st.LastEquity, st.LastLedger, st.LastTradesNet, st.LastAdjustments, st.LastAccountNet)
 	return err
+}
+
+func blofinCopyAdjustmentsTotal(sdb *StateDB) float64 {
+	if sdb == nil || sdb.db == nil {
+		return 0
+	}
+	var total float64
+	if err := sdb.db.QueryRow(`SELECT COALESCE(SUM(amount_usd), 0) FROM blofin_copy_adjustments WHERE account = ?`, blofinCopySyncAccount).Scan(&total); err != nil {
+		return 0
+	}
+	return total
+}
+
+func insertBloFinCopyAdjustment(sdb *StateDB, timeMs int64, kind string, amount float64, details, dedupID string) (bool, error) {
+	if err := ensureBloFinCopySyncTables(sdb); err != nil {
+		return false, err
+	}
+	res, err := sdb.db.Exec(`INSERT OR IGNORE INTO blofin_copy_adjustments (account, time_ms, kind, amount_usd, details, dedup_id) VALUES (?, ?, ?, ?, ?, ?)`,
+		blofinCopySyncAccount, timeMs, kind, amount, details, dedupID)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 func blofinCopyLiveStrategies(cfgs []StrategyConfig) ([]StrategyConfig, map[string][]string) {
@@ -532,20 +601,16 @@ func applyBloFinCopySyncPayload(state *AppState, cfgs []StrategyConfig, payload 
 }
 
 // blofinCopyAccountLedgerTotal sums trade-ledger deltas over the live BloFin
-// perps books plus the funding book.
+// perps books. Funding/profit-share live in blofin_copy_adjustments, never in
+// strategy books, so per-strategy stats stay pure trading performance.
 func blofinCopyAccountLedgerTotal(state *AppState, cfgs []StrategyConfig) float64 {
 	if state == nil {
 		return 0
 	}
 	total := 0.0
 	live, _ := blofinCopyLiveStrategies(cfgs)
-	ids := make(map[string]bool, len(live)+1)
 	for _, sc := range live {
-		ids[sc.ID] = true
-	}
-	ids[blofinCopyFundingStrategyID] = true
-	for id := range ids {
-		ss := state.Strategies[id]
+		ss := state.Strategies[sc.ID]
 		if ss == nil {
 			continue
 		}
@@ -576,50 +641,26 @@ func fetchBloFinCopySyncPayload(configPath string, sinceMs int64) (*blofinCopySy
 	return &payload, stderrStr, nil
 }
 
-func ensureBloFinFundingBook(state *AppState) *StrategyState {
-	if state == nil {
-		return nil
-	}
-	if state.Strategies == nil {
-		state.Strategies = make(map[string]*StrategyState)
-	}
-	if ss, ok := state.Strategies[blofinCopyFundingStrategyID]; ok && ss != nil {
-		return ss
-	}
-	ss := NewStrategyState(StrategyConfig{ID: blofinCopyFundingStrategyID})
-	ss.Type = "manual"
-	ss.Platform = "blofin"
-	state.Strategies[blofinCopyFundingStrategyID] = ss
-	return ss
-}
-
 // bookBloFinCopyFundingResidual records the equity-vs-ledger-vs-transfers
-// residual (funding payments + profit-share) as an auditable funding row.
-// Caller persists the funding book afterwards.
-func bookBloFinCopyFundingResidual(state *AppState, equityNow, equityPrev, ledgerDelta, transfersNet float64, now time.Time) (float64, string) {
+// residual (funding payments + profit-share) as an auditable adjustments-table
+// row. It never touches strategy books, so per-strategy stats stay pure
+// trading performance. The row is idempotent per sync window.
+func bookBloFinCopyFundingResidual(sdb *StateDB, equityNow, equityPrev, ledgerDelta, transfersNet float64, now time.Time) (float64, string) {
 	residual := (equityNow - equityPrev) - ledgerDelta - transfersNet
 	if math.Abs(residual) < blofinCopyResidualThreshold {
 		return 0, ""
 	}
-	ss := ensureBloFinFundingBook(state)
-	dailyPnL, dailyDate := ss.RiskState.DailyPnL, ss.RiskState.DailyPnLDate
 	detail := fmt.Sprintf("BloFin Copy funding/profit-share auto-adjustment: equity %+.4f - ledger %+.4f - transfers %+.4f = %+.4f",
 		equityNow-equityPrev, ledgerDelta, transfersNet, residual)
-	trade := Trade{
-		Timestamp: now.UTC(), StrategyID: blofinCopyFundingStrategyID, Symbol: "USDT",
-		Side: "funding", TradeType: TradeTypeFunding, Details: detail,
-		ExchangeOrderID: fmt.Sprintf("blofin-copy-funding-%d", now.UTC().UnixMilli()),
-		IsClose:         false, RealizedPnL: residual, PnLGross: true,
+	dedup := fmt.Sprintf("blofin-copy-funding-%d", (now.UTC().UnixMilli()/int64(blofinCopySyncInterval/time.Millisecond))*int64(blofinCopySyncInterval/time.Millisecond))
+	inserted, err := insertBloFinCopyAdjustment(sdb, now.UTC().UnixMilli(), "funding", residual, detail, dedup)
+	if err != nil {
+		fmt.Printf("[blofin-sync] WARN: funding adjustment persist failed: %v\n", err)
+		return 0, ""
 	}
-	RecordTrade(ss, trade)
-	ss.Cash += residual
-	if residual >= 0 {
-		ss.RiskState.ConsecutiveLosses = 0
-	} else {
-		ss.RiskState.ConsecutiveLosses++
+	if !inserted {
+		return 0, ""
 	}
-	ss.RiskState.DailyPnL = dailyPnL
-	ss.RiskState.DailyPnLDate = dailyDate
 	fmt.Printf("[blofin-sync] %s\n", detail)
 	return residual, detail
 }
@@ -639,13 +680,10 @@ func maybeRunBloFinCopyAutoSync(cfg *Config, configPath string, state *AppState,
 	if len(live) == 0 || state == nil || store == nil {
 		return false
 	}
-	ownerID := live[0].ID
-	sdb, err := store.dbForStrategy(ownerID)
+	sdb, err := store.dbForStrategy(live[0].ID)
 	if err != nil {
-		if sdb, err = store.dbForStrategy(blofinCopyFundingStrategyID); err != nil {
-			fmt.Printf("[blofin-sync] WARN: no state file for sync watermarks: %v\n", err)
-			return false
-		}
+		fmt.Printf("[blofin-sync] WARN: no state file for sync watermarks: %v\n", err)
+		return false
 	}
 	st, err := loadBloFinCopySyncState(sdb)
 	if err != nil {
@@ -692,41 +730,47 @@ func maybeRunBloFinCopyAutoSync(cfg *Config, configPath string, state *AppState,
 			maxCloseMs = pos.CloseMs
 		}
 	}
+	ledgerAfterFills := blofinCopyAccountLedgerTotal(state, cfg.Strategies)
+	adjustmentsAfterFills := blofinCopyAdjustmentsTotal(sdb)
+	snapshot := func(fills, run int64, eq, ledger float64) blofinCopySyncState {
+		return blofinCopySyncState{
+			FillsSinceMs: fills, LastRunMs: run, LastEquity: eq, LastLedger: ledger,
+			LastTradesNet: ledgerAfterFills, LastAdjustments: adjustmentsAfterFills,
+			LastAccountNet: ledgerAfterFills + adjustmentsAfterFills, Found: true,
+		}
+	}
 	if !equityOK || equityNow <= 0 {
 		fmt.Printf("[blofin-sync] WARN: no trustworthy equity snapshot; fills applied, funding deferred\n")
-		if err := storeBloFinCopySyncState(sdb, blofinCopySyncState{FillsSinceMs: maxCloseMs, LastRunMs: now.UTC().UnixMilli(), LastEquity: st.LastEquity, LastLedger: blofinCopyAccountLedgerTotal(state, cfg.Strategies), Found: true}); err != nil {
+		if err := storeBloFinCopySyncState(sdb, snapshot(maxCloseMs, now.UTC().UnixMilli(), st.LastEquity, ledgerAfterFills)); err != nil {
 			fmt.Printf("[blofin-sync] WARN: watermark persist failed: %v\n", err)
 		}
 		return true
 	}
 	outcome.EquityNow = equityNow
 	if !st.Found || st.LastEquity <= 0 {
-		ledger := blofinCopyAccountLedgerTotal(state, cfg.Strategies)
-		if err := storeBloFinCopySyncState(sdb, blofinCopySyncState{FillsSinceMs: maxCloseMs, LastRunMs: now.UTC().UnixMilli(), LastEquity: equityNow, LastLedger: ledger, Found: true}); err != nil {
+		if err := storeBloFinCopySyncState(sdb, snapshot(maxCloseMs, now.UTC().UnixMilli(), equityNow, ledgerAfterFills)); err != nil {
 			fmt.Printf("[blofin-sync] WARN: baseline persist failed: %v\n", err)
 		} else {
-			fmt.Printf("[blofin-sync] adopted equity/ledger baseline equity=$%.4f ledger=%+.4f\n", equityNow, ledger)
+			fmt.Printf("[blofin-sync] adopted equity/ledger baseline equity=$%.4f ledger=%+.4f\n", equityNow, ledgerAfterFills)
 		}
 		outcome.BaselineAdopted = true
 		return true
 	}
-	booked, detail := bookBloFinCopyFundingResidual(state, equityNow, st.LastEquity, outcome.LedgerDelta, transfersNet, now)
+	booked, detail := bookBloFinCopyFundingResidual(sdb, equityNow, st.LastEquity, outcome.LedgerDelta, transfersNet, now)
 	if booked != 0 {
 		outcome.FundingBooked = booked
 		outcome.FundingDetail = detail
-		outcome.touch(blofinCopyFundingStrategyID)
-		if ss := state.Strategies[blofinCopyFundingStrategyID]; ss != nil {
-			if err := store.SaveStrategyBook(ss); err != nil {
-				fmt.Printf("[blofin-sync] WARN: persist funding book failed: %v\n", err)
-			}
-		}
 	}
 	ledger := blofinCopyAccountLedgerTotal(state, cfg.Strategies)
-	if err := storeBloFinCopySyncState(sdb, blofinCopySyncState{FillsSinceMs: maxCloseMs, LastRunMs: now.UTC().UnixMilli(), LastEquity: equityNow, LastLedger: ledger, Found: true}); err != nil {
+	adjustments := blofinCopyAdjustmentsTotal(sdb)
+	if err := storeBloFinCopySyncState(sdb, blofinCopySyncState{
+		FillsSinceMs: maxCloseMs, LastRunMs: now.UTC().UnixMilli(), LastEquity: equityNow, LastLedger: ledger,
+		LastTradesNet: ledger, LastAdjustments: adjustments, LastAccountNet: ledger + adjustments, Found: true,
+	}); err != nil {
 		fmt.Printf("[blofin-sync] WARN: watermark persist failed: %v\n", err)
 	}
-	fmt.Printf("[blofin-sync] done: checked=%d inserted_positions=%d inserted_trades=%d ledger_delta=%+.4f funding=%+.4f\n",
-		outcome.PositionsChecked, outcome.PositionsInserted, outcome.TradesInserted, outcome.LedgerDelta, outcome.FundingBooked)
+	fmt.Printf("[blofin-sync] done: checked=%d inserted_positions=%d inserted_trades=%d ledger_delta=%+.4f funding=%+.4f account_net=%+.4f\n",
+		outcome.PositionsChecked, outcome.PositionsInserted, outcome.TradesInserted, outcome.LedgerDelta, outcome.FundingBooked, ledger+adjustments)
 	return true
 }
 
