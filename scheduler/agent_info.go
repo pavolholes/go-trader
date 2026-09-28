@@ -73,6 +73,7 @@ var agentInfoEnvVars = []agentEnvVar{
 	{Name: "BLOFIN_API_KEY", Purpose: "BloFin API key for live BloFin perps.", Secret: true},
 	{Name: "BLOFIN_API_SECRET", Purpose: "BloFin API secret for live BloFin perps.", Secret: true},
 	{Name: "BLOFIN_PASSPHRASE", Purpose: "BloFin API passphrase for live BloFin perps.", Secret: true},
+	{Name: "BLOFIN_BASE_URL", Purpose: "BloFin API host; use the production OpenAPI URL for live Copy Trading.", Secret: false},
 	{Name: "BLOFIN_TRADE_ACCOUNT", Purpose: "Set to copy for BloFin Copy Trading execution and totalEquity risk monitoring.", Secret: false},
 	{Name: "INSTANCE_LABEL", Purpose: "Instance label shown in tab title and header badge (Demo/Live).", Secret: false},
 	{Name: "ROBINHOOD_PASSWORD", Purpose: "Robinhood password for live options.", Secret: true},

@@ -5,18 +5,27 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
-var blofinMainnetURL = "https://demo-trading-openapi.blofin.com"
+const blofinDefaultAPIBaseURL = "https://demo-trading-openapi.blofin.com"
 
-func fetchBloFinPerpsMids(coins []string) (map[string]float64, error) {
+func blofinAPIBaseURL() string {
+	if base := strings.TrimRight(strings.TrimSpace(os.Getenv("BLOFIN_BASE_URL")), "/"); base != "" {
+		return base
+	}
+	return blofinDefaultAPIBaseURL
+}
+
+func fetchBloFinPerpsMarks(coins []string) (map[string]float64, error) {
 	if len(coins) == 0 {
 		return map[string]float64{}, nil
 	}
 
-	url := blofinMainnetURL + "/api/v1/market/tickers?instType=SWAP"
+	url := blofinAPIBaseURL() + "/api/v1/market/mark-price"
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Get(url)
 	if err != nil {
@@ -37,8 +46,8 @@ func fetchBloFinPerpsMids(coins []string) (map[string]float64, error) {
 		Code string `json:"code"`
 		Msg  string `json:"msg"`
 		Data []struct {
-			InstID string `json:"instId"`
-			Last   string `json:"last"`
+			InstID    string `json:"instId"`
+			MarkPrice string `json:"markPrice"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &env); err != nil {
@@ -59,7 +68,7 @@ func fetchBloFinPerpsMids(coins []string) (map[string]float64, error) {
 		if !ok {
 			continue
 		}
-		p, err := strconv.ParseFloat(t.Last, 64)
+		p, err := strconv.ParseFloat(t.MarkPrice, 64)
 		if err != nil || p <= 0 {
 			continue
 		}

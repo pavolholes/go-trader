@@ -50,10 +50,11 @@ type StatusServer struct {
 	restartFn     func() error
 
 	perpsErrMu              sync.Mutex
-	lastFuturesErrLoggedAt  time.Time
-	lastFuturesModeLoggedAt time.Time
-	lastHLPerpsErrLoggedAt  time.Time
-	lastOKXPerpsErrLoggedAt time.Time
+	lastFuturesErrLoggedAt     time.Time
+	lastFuturesModeLoggedAt    time.Time
+	lastHLPerpsErrLoggedAt     time.Time
+	lastOKXPerpsErrLoggedAt    time.Time
+	lastBloFinPerpsErrLoggedAt time.Time
 }
 
 const perpsErrLogInterval = 5 * time.Minute
@@ -164,6 +165,17 @@ func (ss *StatusServer) logOKXPerpsErrThrottled(err error) {
 	ss.lastOKXPerpsErrLoggedAt = now
 	fmt.Printf("[WARN] /status OKX perps marks fetch failed for %v: %v — PortfolioNotional/Value will fall back to entry cost (throttled, next log in %s)\n",
 		ss.okxPerpsCoins, err, perpsErrLogInterval)
+}
+
+func (ss *StatusServer) logBloFinPerpsErrThrottled(err error) {
+	ss.perpsErrMu.Lock()
+	defer ss.perpsErrMu.Unlock()
+	now := time.Now()
+	if !ss.lastBloFinPerpsErrLoggedAt.IsZero() && now.Sub(ss.lastBloFinPerpsErrLoggedAt) < perpsErrLogInterval {
+		return
+	}
+	ss.lastBloFinPerpsErrLoggedAt = now
+	fmt.Printf("[WARN] /status BloFin perps marks fetch failed: %v — PortfolioNotional/Value will fall back to entry cost (throttled, next log in %s)\n", err, perpsErrLogInterval)
 }
 
 func resolveStatusPort(cliFlag, cfgPort int) int {
@@ -533,6 +545,16 @@ func (ss *StatusServer) fetchLiveMarkPrices() map[string]float64 {
 			mergePerpsMarks(prices, okxMarks)
 		} else {
 			ss.logOKXPerpsErrThrottled(err)
+		}
+	}
+	ss.strategiesMu.RLock()
+	blofinPerpsCoins := collectBloFinPerpsMarkSymbols(ss.strategies)
+	ss.strategiesMu.RUnlock()
+	if len(blofinPerpsCoins) > 0 {
+		if blofinMarks, err := fetchBloFinPerpsMarks(blofinPerpsCoins); err == nil {
+			mergeBloFinPerpsMarks(prices, blofinMarks)
+		} else {
+			ss.logBloFinPerpsErrThrottled(err)
 		}
 	}
 	if len(ss.futuresSymbols) > 0 {

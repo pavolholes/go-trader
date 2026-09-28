@@ -19,9 +19,7 @@ func markSchedulerStarted() {
 func collectPriceSymbols(strategies []StrategyConfig) []string {
 	set := make(map[string]bool)
 	for _, sc := range strategies {
-		isSpot := sc.Type == "spot"
-		isBloFin := sc.Platform == "blofin" || sc.Platform == "blofin_spot"
-		if !isSpot && !isBloFin {
+		if sc.Type != "spot" {
 			continue
 		}
 		if len(sc.Args) < 2 {
@@ -86,6 +84,24 @@ func collectPerpsMarkSymbols(strategies []StrategyConfig) (hlCoins, okxCoins []s
 	return hlCoins, okxCoins
 }
 
+func collectBloFinPerpsMarkSymbols(strategies []StrategyConfig) []string {
+	set := make(map[string]bool)
+	for _, sc := range strategies {
+		if sc.Platform != "blofin" || sc.Type != "perps" || len(sc.Args) < 2 {
+			continue
+		}
+		if coin := blofinSymbol(sc.Args); coin != "" {
+			set[coin] = true
+		}
+	}
+	coins := make([]string, 0, len(set))
+	for coin := range set {
+		coins = append(coins, coin)
+	}
+	sort.Strings(coins)
+	return coins
+}
+
 func mergePerpsMarks(prices map[string]float64, marks map[string]float64) {
 	for sym, p := range marks {
 		if p <= 0 {
@@ -95,6 +111,14 @@ func mergePerpsMarks(prices map[string]float64, marks map[string]float64) {
 			continue
 		}
 		prices[sym] = p
+	}
+}
+
+func mergeBloFinPerpsMarks(prices map[string]float64, marks map[string]float64) {
+	for sym, p := range marks {
+		if p > 0 {
+			prices[sym] = p
+		}
 	}
 }
 

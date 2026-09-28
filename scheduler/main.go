@@ -834,6 +834,7 @@ func main() {
 		symbols := collectPriceSymbols(cfg.Strategies)
 		futuresSymbols := collectFuturesMarkSymbols(cfg.Strategies)
 		hlPerpsCoins, okxPerpsCoins := collectPerpsMarkSymbols(cfg.Strategies)
+		blofinPerpsCoins := collectBloFinPerpsMarkSymbols(cfg.Strategies)
 
 		feedCtx := &marketFeedContext{Enabled: websocketFeed, Requirements: feedReq, Interval: cfg.IntervalSeconds}
 		var cycleFeedReqs cycleMarketRequirements
@@ -911,6 +912,19 @@ func main() {
 				for _, coin := range okxPerpsCoins {
 					if _, ok := prices[coin]; !ok {
 						fmt.Printf("[WARN] No OKX perps mark for %s — PortfolioNotional/Value will fall back to entry cost\n", coin)
+					}
+				}
+			}
+		}
+		if len(blofinPerpsCoins) > 0 {
+			blofinMarks, err := fetchBloFinPerpsMarks(blofinPerpsCoins)
+			if err != nil {
+				fmt.Printf("[WARN] BloFin perps marks fetch failed for %v: %v — portfolio notional will use entry cost for open BloFin perps positions\n", blofinPerpsCoins, err)
+			} else {
+				mergeBloFinPerpsMarks(prices, blofinMarks)
+				for _, coin := range blofinPerpsCoins {
+					if _, ok := prices[coin]; !ok {
+						fmt.Printf("[WARN] No BloFin perps mark for %s — PortfolioNotional/Value will fall back to entry cost\n", coin)
 					}
 				}
 			}
@@ -4618,6 +4632,7 @@ func findLeaderboardSummariesByChannel(cfg *Config, channelID string) []Leaderbo
 
 func augmentMarksBestEffort(cfg *Config, prices map[string]float64) {
 	hlPerpsCoins, okxPerpsCoins := collectPerpsMarkSymbols(cfg.Strategies)
+	blofinPerpsCoins := collectBloFinPerpsMarkSymbols(cfg.Strategies)
 	futuresSymbols := collectFuturesMarkSymbols(cfg.Strategies)
 
 	if len(hlPerpsCoins) > 0 {
@@ -4632,6 +4647,13 @@ func augmentMarksBestEffort(cfg *Config, prices map[string]float64) {
 			fmt.Fprintf(os.Stderr, "[WARN] OKX perps marks fetch failed for %v: %v — summary will use entry cost\n", okxPerpsCoins, err)
 		} else {
 			mergePerpsMarks(prices, marks)
+		}
+	}
+	if len(blofinPerpsCoins) > 0 {
+		if marks, err := fetchBloFinPerpsMarks(blofinPerpsCoins); err != nil {
+			fmt.Fprintf(os.Stderr, "[WARN] BloFin perps marks fetch failed for %v: %v — summary will use entry cost\n", blofinPerpsCoins, err)
+		} else {
+			mergeBloFinPerpsMarks(prices, marks)
 		}
 	}
 	if len(futuresSymbols) > 0 {
