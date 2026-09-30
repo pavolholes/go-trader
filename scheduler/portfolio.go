@@ -559,7 +559,7 @@ func PortfolioValue(s *StrategyState, prices map[string]float64) float64 {
 		if !ok {
 			price = pos.AvgCost
 		}
-		if pos.Multiplier > 0 {
+		if s.Type != "spot" && s.Platform != "blofin_spot" && pos.Multiplier > 0 {
 			if pos.Side == "long" {
 				total += pos.Quantity * pos.Multiplier * (price - pos.AvgCost)
 			} else {
@@ -1283,6 +1283,49 @@ func perpsSizingLabel(sizing PerpsSizing) string {
 		return fmt.Sprintf("%.1fx exchange, risk %g%%/trade", sizing.ExchangeLeverage, sizing.RiskPerTradePct)
 	}
 	return perpsLeverageLabel(sizing.ExchangeLeverage, sizing.SizingLeverage)
+}
+
+func reconcilePaperSpotCashFromLedger(sc StrategyConfig, s *StrategyState, db *StateDB) (before, after float64, changed bool, err error) {
+	if s == nil {
+		return 0, 0, false, nil
+	}
+	before, after = s.Cash, s.Cash
+	if db == nil || sc.Type != "spot" || partitionFor(sc).IsLive() || s.CashReconcileRequired || s.SharedWalletPoolBudget {
+		return before, after, false, nil
+	}
+	initialCapital := EffectiveInitialCapital(sc, s)
+	if initialCapital <= 0 {
+		return before, after, false, nil
+	}
+	recent, err := db.RecentTradesForStrategy(sc.ID, 1)
+	if err != nil {
+		return before, after, false, err
+	}
+	if len(recent) == 0 {
+		return before, after, false, nil
+	}
+	realizedNet, err := db.RealizedNetPnLForStrategy(sc.ID)
+	if err != nil {
+		return before, after, false, err
+	}
+	openCostBasis := 0.0
+	for _, pos := range s.Positions {
+		if pos == nil || pos.Quantity <= 0 || pos.AvgCost <= 0 {
+			continue
+		}
+		// Spot quantity is in base-asset units; legacy multipliers are not contracts.
+		openCostBasis += pos.Quantity * pos.AvgCost
+	}
+	targetCash := initialCapital + realizedNet - openCostBasis
+	if targetCash < 0 {
+		targetCash = 0
+	}
+	after = targetCash
+	if math.Abs(before-after) <= 0.01 {
+		return before, after, false, nil
+	}
+	s.Cash = after
+	return before, after, true, nil
 }
 
 func ExecuteSpotSignalWithFillFee(s *StrategyState, signal int, symbol string, price float64, fillQty float64, fillFee float64, fillOID string, closeFraction float64, logger *StrategyLogger) (int, error) {

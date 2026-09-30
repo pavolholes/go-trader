@@ -547,3 +547,90 @@ func TestAPICorrelation(t *testing.T) {
 		t.Errorf("warnings = %v, want 1 warning", resp.Correlation.Warnings)
 	}
 }
+
+func TestPaperSpotOverviewUsesNetFillLedgerAndOpenMark(t *testing.T) {
+	type fill struct {
+		timestamp   string
+		side        string
+		quantity    float64
+		price       float64
+		value       float64
+		isClose     bool
+		realizedPnL float64
+		fee         float64
+		feeSource   string
+	}
+	tests := []struct {
+		name               string
+		position           *Position
+		prices             map[string]float64
+		fills              []fill
+		wantPnL            float64
+		wantRealized       float64
+		wantUnrealized     float64
+		wantPortfolioValue float64
+	}{
+		{
+			name: "flat book uses closed net ledger instead of stale cash",
+			fills: []fill{
+				{timestamp: "2026-09-23T01:25:36Z", side: "buy", quantity: 10, price: 10, value: 100.1, fee: 0.1, feeSource: FeeSourceModeled},
+				{timestamp: "2026-09-23T23:17:53Z", side: "sell", quantity: 10, price: 8, value: 80, isClose: true, realizedPnL: -20, feeSource: FeeSourceReconcileAdjustment},
+			},
+			wantPnL: -20.1, wantRealized: -20.1, wantUnrealized: 0, wantPortfolioValue: 79.9,
+		},
+		{
+			name:     "open spot inventory adds mark PnL to net fills",
+			position: &Position{Symbol: "COTI", Quantity: 10, AvgCost: 10, Side: "long", Multiplier: 1},
+			prices:   map[string]float64{"COTI": 8},
+			fills: []fill{
+				{timestamp: "2026-09-23T01:25:36Z", side: "buy", quantity: 10, price: 10, value: 100.1, fee: 0.1, feeSource: FeeSourceModeled},
+			},
+			wantPnL: -20.1, wantRealized: -0.1, wantUnrealized: -20, wantPortfolioValue: 79.9,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			strategy := StrategyConfig{
+				ID: "bls-paper-spot-coti-1h", Type: "spot", Platform: "blofin_spot",
+				Args:    []string{"anchored_vwap", "COTI", "1h", "--mode=paper"},
+				Capital: 100, InitialCapital: 100,
+			}
+			positions := map[string]*Position{}
+			if tc.position != nil {
+				positions[tc.position.Symbol] = tc.position
+			}
+			state := NewAppState()
+			state.Strategies[strategy.ID] = &StrategyState{
+				ID: strategy.ID, Type: strategy.Type, Platform: strategy.Platform,
+				Cash: 0, InitialCapital: 100, Positions: positions,
+				OptionPositions: map[string]*OptionPosition{},
+			}
+			ss := newOpsTestServer(t, []StrategyConfig{strategy}, state, true)
+			for _, f := range tc.fills {
+				isClose := 0
+				if f.isClose {
+					isClose = 1
+				}
+				_, err := ss.stateDB.primary().db.Exec(`INSERT INTO trades (
+					strategy_id,timestamp,symbol,position_id,side,quantity,price,value,trade_type,
+					is_close,realized_pnl,exchange_fee,pnl_gross,fee_source
+				) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+					strategy.ID, f.timestamp, "COTI", "coti-position", f.side, f.quantity, f.price, f.value,
+					"spot", isClose, f.realizedPnL, f.fee, 1, f.feeSource)
+				if err != nil {
+					t.Fatalf("insert spot fill: %v", err)
+				}
+			}
+			overview, _, ok := ss.uiStrategyOverviewWithPrices(strategy.ID, tc.prices)
+			if !ok {
+				t.Fatal("spot overview not found")
+			}
+			if math.Abs(overview.PnL-tc.wantPnL) > 1e-8 || math.Abs(overview.RealizedPnL-tc.wantRealized) > 1e-8 || math.Abs(overview.UnrealizedPnL-tc.wantUnrealized) > 1e-8 || math.Abs(overview.PortfolioValue-tc.wantPortfolioValue) > 1e-8 {
+				t.Fatalf("overview pnl/realized/unrealized/value = %.4f/%.4f/%.4f/%.4f; want %.4f/%.4f/%.4f/%.4f",
+					overview.PnL, overview.RealizedPnL, overview.UnrealizedPnL, overview.PortfolioValue,
+					tc.wantPnL, tc.wantRealized, tc.wantUnrealized, tc.wantPortfolioValue)
+			}
+		})
+	}
+}

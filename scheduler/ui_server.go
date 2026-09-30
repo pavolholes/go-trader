@@ -616,7 +616,37 @@ func (ss *StatusServer) uiStrategyOverviewWithPrices(id string, prices map[strin
 	}
 	var unrealizedPnL float64
 	var openNotional float64
-	if liveBloFinLedger {
+	paperSpotLedger := realizedPnLFromLedger && sc.Type == "spot" && !partitionFor(sc).IsLive() && ss.stateDB != nil
+	if paperSpotLedger {
+		netPnL, err := ss.stateDB.RealizedNetPnLForStrategy(id)
+		if err != nil {
+			paperSpotLedger = false
+		} else {
+			realizedPnL = netPnL
+		}
+	}
+	if paperSpotLedger {
+		for sym, pos := range snapshot.Positions {
+			if pos == nil {
+				continue
+			}
+			px, ok := prices[sym]
+			if !ok || px <= 0 {
+				px = pos.AvgCost
+			}
+			move := px - pos.AvgCost
+			if strings.EqualFold(pos.Side, "short") {
+				move = -move
+			}
+			unrealizedPnL += pos.Quantity * move
+		}
+		pnl = realizedPnL + unrealizedPnL
+		pv = initCap + pnl
+		pnlPct = 0
+		if initCap > 0 {
+			pnlPct = pnl / initCap * 100
+		}
+	} else if liveBloFinLedger {
 		// For live BloFin, realized comes from exchange fills. Calculate open PnL
 		// directly so stale virtual cash/old fees are not mislabelled as U.
 		for sym, pos := range snapshot.Positions {

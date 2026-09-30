@@ -340,6 +340,42 @@ func main() {
 		pruned = true
 	}
 
+	if !readOnlyReport {
+		spotCashRebaseCount := 0
+		spotCashRebaseDelta := 0.0
+		for _, sc := range cfg.Strategies {
+			if sc.Type != "spot" || partitionFor(sc).IsLive() {
+				continue
+			}
+			spotState := state.Strategies[sc.ID]
+			if spotState == nil {
+				continue
+			}
+			spotDB, err := store.dbForStrategy(sc.ID)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "[state] paper spot cash reconciliation failed for", sc.ID, ":", err)
+				os.Exit(1)
+			}
+			before, after, changed, err := reconcilePaperSpotCashFromLedger(sc, spotState, spotDB)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "[state] paper spot cash reconciliation failed for", sc.ID, ":", err)
+				os.Exit(1)
+			}
+			if changed {
+				spotCashRebaseCount++
+				spotCashRebaseDelta += after - before
+			}
+		}
+		if spotCashRebaseCount > 0 {
+			fmt.Printf("[state] Reconciled paper spot cash for %d strategies from net fills and open cost basis (net change $%.2f)", spotCashRebaseCount, spotCashRebaseDelta)
+			fmt.Println()
+			if err := SaveStateWithStore(state, store); err != nil {
+				fmt.Fprintln(os.Stderr, "Failed to persist paper spot cash reconciliation:", err)
+				os.Exit(1)
+			}
+		}
+	}
+
 	startupPartitions := activePartitions(cfg.Strategies)
 	liveCount, paperCount := scopeStrategyCounts(cfg.Strategies)
 	fmt.Printf("[config] portfolio scopes: live=%d paper=%d strategies\n", liveCount, paperCount)

@@ -3435,3 +3435,35 @@ func TestMarkGatedManagers_ScopedToHyperliquidPerpsAndManual(t *testing.T) {
 		})
 	}
 }
+
+func TestForceCloseAllPositionsSpotCreditsSaleProceedsWithLegacyMultiplier(t *testing.T) {
+	previousRecorder := tradeRecorder
+	tradeRecorder = nil
+	t.Cleanup(func() { tradeRecorder = previousRecorder })
+
+	s := &StrategyState{
+		ID:       "bls-spot-coti-1h",
+		Type:     "spot",
+		Platform: "blofin_spot",
+		Cash:     0,
+		Positions: map[string]*Position{
+			"COTI": {Symbol: "COTI", Quantity: 10, AvgCost: 10, Side: "long", Multiplier: 1},
+		},
+		OptionPositions: make(map[string]*OptionPosition),
+		TradeHistory:    []Trade{},
+		ClosedPositions: []ClosedPosition{},
+	}
+	sc := &StrategyConfig{ID: s.ID, Type: "spot", Platform: "blofin_spot"}
+	forceCloseAllPositions(s, sc, map[string]float64{"COTI": 8}, nil)
+
+	if s.Cash != 80 {
+		t.Fatalf("cash after spot model close = %.4f, want sale proceeds 80", s.Cash)
+	}
+	if len(s.Positions) != 0 || len(s.TradeHistory) != 1 || len(s.ClosedPositions) != 1 {
+		t.Fatalf("spot model close state: positions=%d trades=%d closed=%d", len(s.Positions), len(s.TradeHistory), len(s.ClosedPositions))
+	}
+	trade := s.TradeHistory[0]
+	if trade.Value != 80 || trade.RealizedPnL != -20 || !trade.IsClose {
+		t.Fatalf("spot close trade = %+v, want value=80 gross PnL=-20 close=true", trade)
+	}
+}

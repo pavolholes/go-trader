@@ -1250,7 +1250,7 @@ func closeVirtualPositionAtMark(s *StrategyState, sc *StrategyConfig, symbol str
 		if logger != nil {
 			logger.Warn("Circuit breaker: corrupt %s position %s (qty=%.6f avg_cost=%.4f) — booking zero realized PnL, not qty*(price-avgCost)", pos.Side, symbol, pos.Quantity, pos.AvgCost)
 		}
-	} else if pos.Multiplier > 0 {
+	} else if pos.Multiplier > 0 && s.Type != "spot" && s.Platform != "blofin_spot" && (sc == nil || (sc.Type != "spot" && sc.Platform != "blofin_spot")) {
 		if pos.Side == "long" {
 			pnl = pos.Quantity * pos.Multiplier * (price - pos.AvgCost)
 		} else {

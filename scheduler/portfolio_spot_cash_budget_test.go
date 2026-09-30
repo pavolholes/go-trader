@@ -680,3 +680,59 @@ func TestRunOKXExecuteOrder_CashReconcileGate(t *testing.T) {
 		t.Fatalf("unlatched buy calls=%v, want [buy]", calls)
 	}
 }
+
+func TestReconcilePaperSpotCashFromLedger(t *testing.T) {
+	db := openTestDB(t)
+	id := "bls-paper-spot-coti-1h"
+	sc := StrategyConfig{
+		ID: id, Type: "spot", Platform: "blofin_spot",
+		Args:    []string{"anchored_vwap", "COTI", "1h", "--mode=paper"},
+		Capital: 100, InitialCapital: 100,
+	}
+	_, err := db.db.Exec(`INSERT INTO trades (
+		strategy_id,timestamp,symbol,position_id,side,quantity,price,value,trade_type,
+		is_close,realized_pnl,exchange_fee,pnl_gross,fee_source
+	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		id, "2026-09-23T01:25:36Z", "COTI", "coti-position", "buy", 10.0, 10.0, 100.1, "spot", 0, 0.0, 0.1, 1, FeeSourceModeled)
+	if err != nil {
+		t.Fatalf("insert spot open fill: %v", err)
+	}
+	_, err = db.db.Exec(`INSERT INTO trades (
+		strategy_id,timestamp,symbol,position_id,side,quantity,price,value,trade_type,
+		is_close,realized_pnl,exchange_fee,pnl_gross,fee_source
+	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		id, "2026-09-23T23:17:53Z", "COTI", "coti-position", "sell", 10.0, 8.0, 80.0, "spot", 1, -20.0, 0.0, 1, FeeSourceReconcileAdjustment)
+	if err != nil {
+		t.Fatalf("insert spot close fill: %v", err)
+	}
+
+	s := &StrategyState{
+		ID: id, Type: "spot", Platform: "blofin_spot", Cash: 0, InitialCapital: 100,
+		Positions: map[string]*Position{}, OptionPositions: map[string]*OptionPosition{},
+	}
+	before, after, changed, err := reconcilePaperSpotCashFromLedger(sc, s, db)
+	if err != nil {
+		t.Fatalf("reconcile paper spot cash: %v", err)
+	}
+	if !changed || before != 0 || math.Abs(after-79.9) > 1e-8 || math.Abs(s.Cash-79.9) > 1e-8 {
+		t.Fatalf("reconcile before/after/changed = %.4f/%.4f/%v, state cash %.4f; want 0/79.9/true/79.9", before, after, changed, s.Cash)
+	}
+	_, after, changed, err = reconcilePaperSpotCashFromLedger(sc, s, db)
+	if err != nil {
+		t.Fatalf("idempotent reconcile: %v", err)
+	}
+	if changed || math.Abs(after-79.9) > 1e-8 {
+		t.Fatalf("second reconcile changed=%v cash=%.4f; want false/79.9", changed, after)
+	}
+
+	live := sc
+	live.Args = []string{"anchored_vwap", "COTI", "1h", "--mode=live"}
+	liveState := &StrategyState{ID: id, Type: "spot", Platform: "blofin_spot", Cash: 0, InitialCapital: 100}
+	before, after, changed, err = reconcilePaperSpotCashFromLedger(live, liveState, db)
+	if err != nil {
+		t.Fatalf("live spot reconcile guard: %v", err)
+	}
+	if changed || before != 0 || after != 0 || liveState.Cash != 0 {
+		t.Fatalf("live spot state was rebased: before %.4f after %.4f changed %v", before, after, changed)
+	}
+}
