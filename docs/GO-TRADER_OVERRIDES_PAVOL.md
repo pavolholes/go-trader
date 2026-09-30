@@ -12,6 +12,8 @@ upstream merges. Base: v0.103.0 (`623566b`). This file is referenced from
 | `shared_scripts/export_spot_top.py` | USDT-volume ranking (`volCurrency24h × last`) of spot symbols per category; outputs phase-1 symbol set |
 | `scheduler/blofin_spot_test.go` | `TestSpotEffectiveDirectionIsLongOnly` — spot is long-only |
 | `docs/GO-TRADER_OVERRIDES_PAVOL.md` | This file |
+| `shared_strategies/open/ob_touch.py` | `ob_touch_core` SMC order-block touch entries with 1H overlap confirmation (TradingView Institutional Level entry port; section 10) |
+| `shared_strategies/open/test_ob_touch.py` | 18 behavior tests for `ob_touch` (zone math, first-touch, mitigation, HTF gate, no-lookahead) |
 
 ## 2. BloFin perps (platform `blofin`, prefix `bl-`)
 
@@ -21,7 +23,8 @@ upstream merges. Base: v0.103.0 (`623566b`). This file is referenced from
 | `scheduler/blofin_exec.go` | `blofinIsLive`, `blofinSymbol`, `runBloFinCheck`, `executeBloFinResult`, copy-trading dispatch |
 | `scheduler/blofin_close.go` | Force-close / circuit-breaker close via `close_blofin_position.py` |
 | `scheduler/blofin_marks.go` | `fetchBloFinPerpsMids` via `/api/v1/market/tickers?instType=SWAP` |
-| `shared_scripts/check_blofin.py` | `--inst-type {swap,spot}` (default `swap`); spot branch uses `spot_adapter`; `--atr-method`; regime/HTF passthrough |
+| `shared_scripts/check_blofin.py` | `--inst-type {swap,spot}` (default `swap`); spot branch uses `spot_adapter`; `--atr-method`; regime/HTF passthrough; `--htf-timeframe/--htf-limit` (deep HTF fetch injected as `htf_df` for `ob_touch`, fail-closed) |
+| `shared_scripts/check_topstep.py` | `--htf-timeframe/--htf-limit` (same HTF injection; paper serves yfinance NQ=F) |
 | `shared_scripts/close_blofin_position.py` | Emergency close via `adapter.market_close()` (swap only) |
 | `shared_scripts/fetch_blofin_positions.py` | Open positions fetch (swap) |
 | `shared_scripts/fetch_blofin_balance.py` | USDT equity fetch (futures) |
@@ -72,7 +75,7 @@ upstream merges. Base: v0.103.0 (`623566b`). This file is referenced from
 1. `git fetch upstream`; merge `upstream/main` (or version tag) into `main`.
 2. Expected conflict zones: `scheduler/config.go`, `main.go`, `db.go`, `discord*.go`, `notifier*.go`, `ui_server.go`, `ui_summary.go`, `static/ui/*`, `CLAUDE.md`/`SKILL.md`, `README.md`.
 3. Keep ALL files from section 1 (new files never conflict — verify they survive).
-4. Re-apply sections 2–5 item by item; upstream refactors (e.g. paper-source partitions, notifier rewrites) may relocate the code — search by function name, not line number.
+4. Re-apply sections 2–5 and 10 item by item; upstream refactors (e.g. paper-source partitions, notifier rewrites) may relocate the code — search by function name, not line number.
 5. `gofmt -l`, `go build ./...`, `go vet`, `go test`, `py_compile` on Python touchpoints.
 6. Push → CI green → rebuild demo image → verify `/api/strategies/overview` + dashboard.
 7. Live (`go-trader-live`) rebuild only after demo proves stable.
@@ -86,3 +89,15 @@ Prevádzkové poznatky: LEARNINGS_PAVOL.md (rovnaký adresár).
 ## 9. Sidebar odstraneny
 
 Lavy stlpec (zoznam strategii + search + sparklines) je odstraneny z Table aj Summary view: index.html (aside, toggle, backdrop), app.js (renderStrategies/loadSparklines no-op, ziadny search listener), styles.css (.shell na 1 stlpec). Dovod: nepouzivane + 1300+ sparkline requestov brzdilo nacitanie. Pri upstream mergi neobnovovat.
+
+## 10. Custom strategy ob_touch (SMC order-block touch + 1H overlap)
+
+| File | Override |
+|---|---|
+| `shared_strategies/open/ob_touch.py`, `test_ob_touch.py` | New files (section 1) keep on merge |
+| `shared_strategies/open/registry.py` | `@register("ob_touch", ...)` block after `mtf_confluence_strategy`; `PLATFORM_ORDER` spot+futures entries before `"hold"`; defaults mirror the TradingView screenshot (internal 5, swing 50, 7 levels, Absolute/Precise/Previous, touch `wick`, spot `allow_short: False`, futures `True`); description documents the HTF factor guide (5m x 12 = 1H, 15m x 4 = 1H, 5m x 3 = 15m, 1 = single-TF) |
+| `backtest/optimizer.py` | `DEFAULT_PARAM_RANGES["ob_touch"]` (CI param-ranges test fails without it) |
+| `scheduler/init.go` | `knownShortNames["ob_touch"]="obt"` (`"ob"` is taken); `bidirectionalPerpsStrategies["ob_touch"]=true` |
+| `shared_scripts/check_blofin.py`, `check_topstep.py` | `--htf-timeframe/--htf-limit` + `htf_df` injection gated on the effective open strategy being `ob_touch` |
+
+Demo-side (outside this repo, survives merges by location): `dockge/go-trader-demo/compose.yaml` installs `yfinance` (Topstep paper); `go-trader-demo/config/config.json` paper set = 64x perps (`bl-ob_touch-*`, incl. `QQQ` Nasdaq proxy, per-symbol max leverage, `direction: both`) + 24x spot (`bls-ob_touch-*`, long-only) + 4x Topstep (`ts-ob_touch-{nq,mnq}-{5m,15m}`, capital 25000/3000, `maxContracts: 1`); 5m entries carry `--params {"htf_factor": 12}`, 15m use default 4. Backup: `config.json.bak-ob_touch-20260930`. `direction` is INVALID on `type: futures` (config load fails) never add it there.
