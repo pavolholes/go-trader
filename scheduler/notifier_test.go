@@ -2,56 +2,14 @@ package main
 
 import (
 	"fmt"
-	"sync"
 	"testing"
 	"time"
 )
 
-type mockNotifier struct {
-	mu       sync.Mutex
-	messages []mockMessage
-	dms      []mockDM
-	askResp  string
-	askErr   error
-	closed   bool
-}
-
-type mockMessage struct {
-	channelID string
-	content   string
-}
-
-type mockDM struct {
-	userID  string
-	content string
-}
-
-func (m *mockNotifier) SendMessage(channelID string, content string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.messages = append(m.messages, mockMessage{channelID, content})
-	return nil
-}
-
-func (m *mockNotifier) SendDM(userID, content string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.dms = append(m.dms, mockDM{userID, content})
-	return nil
-}
-
-func (m *mockNotifier) AskDM(userID, question string, timeout time.Duration) (string, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.dms = append(m.dms, mockDM{userID, question})
-	return m.askResp, m.askErr
-}
-
-func (m *mockNotifier) Close() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.closed = true
-}
+// mockNotifier/mockMessage/mockDM live in hyperliquid_balance_test.go
+// (upstream #1597 colocated a superset mock there when notifier_test.go
+// was deleted; our merge restored this file, so the shared mock is kept
+// in exactly one place).
 
 func TestMultiNotifier_NoBackends(t *testing.T) {
 	mn := NewMultiNotifier()
