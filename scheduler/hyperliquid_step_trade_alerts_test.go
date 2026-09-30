@@ -433,7 +433,7 @@ func TestHLStepAlertsBookedStopFillsAfterZeroSignalExecute(t *testing.T) {
 			if n != 1 {
 				t.Fatalf("selected rows = %d, want the one booked stop row counted once after the zero-signal execute", n)
 			}
-			if len(mock.messages) != 1 || !strings.Contains(mock.messages[0].content, "CLOSED") {
+			if len(mock.messages) != 1 || !strings.Contains(mock.messages[0].content, "STOPPED") {
 				t.Fatalf("trade alerts = %+v, want one close alert", mock.messages)
 			}
 			lines := hlStepDetailLines(detail)

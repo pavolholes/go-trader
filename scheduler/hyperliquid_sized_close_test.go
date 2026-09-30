@@ -459,7 +459,7 @@ func TestHedgeUnwindSizesThePrimaryAgainstPeers(t *testing.T) {
 			}
 			exec.Refetch = func() (hlOnChainCoinView, error) { return tc.chain, nil }
 			n := &mockNotifier{}
-			notifier := NewMultiNotifier(notifierBackend{notifier: n, ownerID: "o"})
+			notifier := NewMultiNotifier(notifierBackend{notifier: n, ownerID: "o", channels: map[string]string{"hyperliquid": "ch-test"}})
 			if tc.fresh < tc.primary {
 				s.Positions["BTC"] = hedgePos(0.4, "short", tc.primary-tc.fresh)
 			}
@@ -488,8 +488,8 @@ func TestHedgeUnwindSizesThePrimaryAgainstPeers(t *testing.T) {
 			}
 			var alerts []string
 			n.mu.Lock()
-			for _, dm := range n.dms {
-				alerts = append(alerts, dm.content)
+			for _, msg := range n.messages {
+				alerts = append(alerts, msg.content)
 			}
 			n.mu.Unlock()
 			if !strings.Contains(strings.Join(alerts, "\n"), tc.wantAlert) {
@@ -525,15 +525,15 @@ func TestHedgeUnwindNearFullFillClearsCancelledProtection(t *testing.T) {
 			return res, nil
 		}
 		n := &mockNotifier{}
-		notifier := NewMultiNotifier(notifierBackend{notifier: n, ownerID: "o"})
+		notifier := NewMultiNotifier(notifierBackend{notifier: n, ownerID: "o", channels: map[string]string{"hyperliquid": "ch-test"}})
 		runHedgeSync(sc, s, &mu, exec, hedgeSyncInputs{
 			PrimaryPx: testPrimaryPx, HedgePx: testHedgePx, FreshExposureQty: 0.01,
 			PrimaryCancelOIDs: []int64{555, 666}, PrimaryPeers: hedgePrimaryPeers{Known: true, Side: "long"}, Live: true,
 		}, notifier, silentStrategyLogger("eth-long"))
 		var alerts []string
 		n.mu.Lock()
-		for _, dm := range n.dms {
-			alerts = append(alerts, dm.content)
+		for _, msg := range n.messages {
+			alerts = append(alerts, msg.content)
 		}
 		n.mu.Unlock()
 		return s, alerts

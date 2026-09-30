@@ -275,8 +275,8 @@ func TestSameSideCloseIsZeroedOnce(t *testing.T) {
 		t.Fatalf("same-side close survived: %+v", same)
 	}
 	guardSameSideClose(sc, &HyperliquidResult{Symbol: "ETH", Signal: -1, StrategyDecisionFields: StrategyDecisionFields{CloseFraction: 1}}, "short", 1, notifier, logger)
-	if len(mock.dms) != 1 {
-		t.Fatalf("owner alerts = %d, want 1", len(mock.dms))
+	if len(mock.messages) != 1 {
+		t.Fatalf("owner alerts = %d, want 1", len(mock.messages))
 	}
 	closing := &HyperliquidResult{Symbol: "ETH", Signal: 1, StrategyDecisionFields: StrategyDecisionFields{CloseFraction: 1}}
 	guardSameSideClose(sc, closing, "short", 1, notifier, logger)

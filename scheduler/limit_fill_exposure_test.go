@@ -141,11 +141,11 @@ func TestReconcilePendingLimitOrdersRefusesFillWithNoLiveExposure(t *testing.T) 
 	if orders[0].FilledSize != 0 {
 		t.Fatalf("watermark = %g, want 0 — nothing was booked so nothing may advance the watermark", orders[0].FilledSize)
 	}
-	if len(mock.dms) != 1 || !strings.Contains(mock.dms[0].content, "NO LIVE EXPOSURE") {
-		t.Fatalf("owner DM = %+v, want one refusal alert naming the missing exposure", mock.dms)
+	if len(mock.messages) != 1 || !strings.Contains(mock.messages[0].content, "NO LIVE EXPOSURE") {
+		t.Fatalf("owner DM = %+v, want one refusal alert naming the missing exposure", mock.messages)
 	}
-	if !strings.Contains(mock.dms[0].content, "manual-clear-limit-row 9001 --flattened") {
-		t.Fatalf("owner DM must name the only path that clears the record, got: %s", mock.dms[0].content)
+	if !strings.Contains(mock.messages[0].content, "manual-clear-limit-row 9001 --flattened") {
+		t.Fatalf("owner DM must name the only path that clears the record, got: %s", mock.messages[0].content)
 	}
 }
 
@@ -169,8 +169,8 @@ func TestReconcilePendingLimitOrdersDefersFillWhenAccountUnreadable(t *testing.T
 	if len(orders) != 1 {
 		t.Fatalf("rows = %+v — an unreadable account must defer, never delete", orders)
 	}
-	if len(mock.dms) != 1 || !strings.Contains(mock.dms[0].content, "account state unreadable") {
-		t.Fatalf("owner DM = %+v, want one deferral alert", mock.dms)
+	if len(mock.messages) != 1 || !strings.Contains(mock.messages[0].content, "account state unreadable") {
+		t.Fatalf("owner DM = %+v, want one deferral alert", mock.messages)
 	}
 }
 
@@ -341,8 +341,8 @@ func TestReconcilePendingLimitOrdersGivesEachRowASnapshotNewerThanItsOwnStatusPo
 		t.Fatalf("BTC position = %+v, want the 0.25 fill booked — an earlier row's refusal must not spend this row's re-read", pos)
 	}
 	tr.assertNoFetchBeforeAnyPoll(t)
-	if len(mock.dms) != 1 || !strings.Contains(mock.dms[0].content, "ETH") {
-		t.Fatalf("owner DMs = %+v, want exactly one, for the genuinely unbacked ETH row", mock.dms)
+	if len(mock.messages) != 1 || !strings.Contains(mock.messages[0].content, "ETH") {
+		t.Fatalf("owner DMs = %+v, want exactly one, for the genuinely unbacked ETH row", mock.messages)
 	}
 	if orders, _ := db.LoadPendingLimitOrders(); len(orders) != 1 || orders[0].Symbol != "ETH" {
 		t.Fatalf("rows = %+v, want only the refused ETH recovery record kept", orders)
@@ -383,8 +383,8 @@ func TestReconcilePendingLimitOrdersRefusesALaterRowWhoseCoinClosedMidPass(t *te
 	if len(orders) != 1 || orders[0].Symbol != "BTC" {
 		t.Fatalf("rows = %+v, want only the BTC recovery record kept — a refused row is never deleted", orders)
 	}
-	if len(mock.dms) != 1 || !strings.Contains(mock.dms[0].content, "NO LIVE EXPOSURE") {
-		t.Fatalf("owner DMs = %+v, want one refusal alert for BTC", mock.dms)
+	if len(mock.messages) != 1 || !strings.Contains(mock.messages[0].content, "NO LIVE EXPOSURE") {
+		t.Fatalf("owner DMs = %+v, want one refusal alert for BTC", mock.messages)
 	}
 }
 
@@ -437,7 +437,7 @@ func runSharedCoinPass(t *testing.T, legs []sharedCoinLeg, onChainETH float64) s
 	notifier, mock := newOrphanLaneNotifier()
 	reconcilePendingLimitOrders(state, cfg, openTestStore(t, db), &mu, notifier, nil)
 
-	out := sharedCoinOutcome{booked: map[string]float64{}, dms: len(mock.dms)}
+	out := sharedCoinOutcome{booked: map[string]float64{}, dms: len(mock.messages)}
 	for _, leg := range legs {
 		if pos := state.Strategies[leg.strategyID].Positions["ETH"]; pos != nil {
 			out.booked[leg.strategyID] = pos.Quantity

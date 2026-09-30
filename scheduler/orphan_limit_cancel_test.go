@@ -36,7 +36,7 @@ func newOrphanLaneState(strategyID string) *AppState {
 
 func newOrphanLaneNotifier() (*MultiNotifier, *mockNotifier) {
 	mock := &mockNotifier{}
-	return NewMultiNotifier(notifierBackend{notifier: mock, ownerID: "owner-1"}), mock
+	return NewMultiNotifier(notifierBackend{notifier: mock, ownerID: "owner-1", channels: map[string]string{"hyperliquid": "ch-test"}}), mock
 }
 
 func resetOrphanLimitCancelAlerts(t *testing.T) {
@@ -101,8 +101,8 @@ func TestReconcileCancelLaneConvergesRowWhoseStrategyIsAbsent(t *testing.T) {
 	if len(orders) != 0 {
 		t.Fatalf("row must be cleared once the order is off-book with no unbooked fill, got %+v", orders)
 	}
-	if len(mock.dms) != 1 || !strings.Contains(mock.dms[0].content, "cancel-only lane") {
-		t.Fatalf("operator must be told the lane cleared the order, dms = %+v", mock.dms)
+	if len(mock.messages) != 1 || !strings.Contains(mock.messages[0].content, "cancel-only lane") {
+		t.Fatalf("operator must be told the lane cleared the order, dms = %+v", mock.messages)
 	}
 }
 
@@ -135,12 +135,12 @@ func TestReconcileCancelLaneKeepsRowAndBooksNothingOnUnadoptedFill(t *testing.T)
 	if pos := state.Strategies["hl-manual-eth-live"].Positions["ETH"]; pos != nil {
 		t.Fatalf("the lane must book no fill, position = %+v", pos)
 	}
-	if len(mock.dms) != 1 {
-		t.Fatalf("an unresolvable row must raise one owner alert, dms = %+v", mock.dms)
+	if len(mock.messages) != 1 {
+		t.Fatalf("an unresolvable row must raise one owner alert, dms = %+v", mock.messages)
 	}
-	if !strings.Contains(mock.dms[0].content, "oid=9001") ||
-		!strings.Contains(mock.dms[0].content, "hl-manual-eth-live/ETH") {
-		t.Fatalf("alert must name the order and its order id, got: %s", mock.dms[0].content)
+	if !strings.Contains(mock.messages[0].content, "oid=9001") ||
+		!strings.Contains(mock.messages[0].content, "hl-manual-eth-live/ETH") {
+		t.Fatalf("alert must name the order and its order id, got: %s", mock.messages[0].content)
 	}
 }
 

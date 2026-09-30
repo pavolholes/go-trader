@@ -209,14 +209,14 @@ func TestShareResize(t *testing.T) {
 	}
 
 	mock := &mockNotifier{}
-	mn := NewMultiNotifier(notifierBackend{notifier: mock, ownerID: "owner"})
+	mn := NewMultiNotifier(notifierBackend{notifier: mock, ownerID: "owner", channels: map[string]string{"hyperliquid": "ch-test"}})
 	states["A"].Positions["ETH"].StopLossOID = 11
 	runHyperliquidCancelOrderFn = func(_, _ string, oid int64) (*HyperliquidCancelOrderResult, string, error) {
 		return &HyperliquidCancelOrderResult{Cancelled: false, OID: oid, CancelError: "rejected"}, "", nil
 	}
 	runHyperliquidShareResize([]StrategyConfig{a}, state, flat, hlAllOpenOrders{Orders: []hlListedOpenOrder{{OID: 11, Coin: "ETH", Sz: 10}}, Decimals: map[string]int{"ETH": 1}}, false, nil, &mu, mn)
-	if len(mock.dms) != 1 || !strings.Contains(mock.dms[0].content, "11") {
-		t.Fatalf("refused cancel alerts=%v", mock.dms)
+	if len(mock.messages) != 1 || !strings.Contains(mock.messages[0].content, "11") {
+		t.Fatalf("refused cancel alerts=%v", mock.messages)
 	}
 
 	runHyperliquidUpdateStopLossFunc = func(_, _, _ string, size, _ float64, _ int64) (*HyperliquidStopLossUpdateResult, string, error) {
@@ -239,13 +239,13 @@ func TestShareResize(t *testing.T) {
 		runHyperliquidShareResize(nil, state, share, hlAllOpenOrders{}, true, nil, &mu, mn)
 	}
 	found := false
-	for _, dm := range mock.dms {
-		if strings.Contains(dm.content, "3 consecutive") {
+	for _, msg := range mock.messages {
+		if strings.Contains(msg.content, "3 consecutive") {
 			found = true
 		}
 	}
 	if !found {
-		t.Fatalf("listing failures did not alert once on the third cycle: %v", mock.dms)
+		t.Fatalf("listing failures did not alert once on the third cycle: %v", mock.messages)
 	}
 }
 
@@ -407,16 +407,16 @@ func TestSoleOwnerDriftAlertsOnlyAfterItsReconcile(t *testing.T) {
 	sc := StrategyConfig{ID: "S", Type: "perps", Platform: "hyperliquid", Args: []string{"x", "SOL", "1h", "--mode=live"}}
 	states := map[string]*StrategyState{"S": {ID: "S", Positions: map[string]*Position{"SOL": {Symbol: "SOL", Side: "long", Quantity: 10, StopLossOID: 1}}}}
 	mock := &mockNotifier{}
-	mn := NewMultiNotifier(notifierBackend{notifier: mock, ownerID: "owner"})
+	mn := NewMultiNotifier(notifierBackend{notifier: mock, ownerID: "owner", channels: map[string]string{"hyperliquid": "ch-test"}})
 	view := hlOnChainCoinView{Known: true, AbsQty: map[string]float64{"SOL": 6}, NetSide: map[string]string{"SOL": "long"}}
 	share := newHLCycleShare(view, hlCoinSubmitSnapshot(), nil, states, []StrategyConfig{sc}, mn)
-	if q := share.StopQty(sc, "SOL", "long", 10, true, nil, 0); math.Abs(q.Qty-6) > 1e-9 || len(mock.dms) != 0 {
-		t.Fatalf("unreconciled sole owner Q=%g alerts=%d, want Q 6 and no alert", q.Qty, len(mock.dms))
+	if q := share.StopQty(sc, "SOL", "long", 10, true, nil, 0); math.Abs(q.Qty-6) > 1e-9 || len(mock.messages) != 0 {
+		t.Fatalf("unreconciled sole owner Q=%g alerts=%d, want Q 6 and no alert", q.Qty, len(mock.messages))
 	}
 	share.markReconciled([]StrategyConfig{sc})
 	share.StopQty(sc, "SOL", "long", 10, true, nil, 0)
-	if len(mock.dms) != 1 {
-		t.Fatalf("reconciled sole owner still above the chain sent %d alerts, want 1", len(mock.dms))
+	if len(mock.messages) != 1 {
+		t.Fatalf("reconciled sole owner still above the chain sent %d alerts, want 1", len(mock.messages))
 	}
 }
 
@@ -437,12 +437,12 @@ func TestSoleManualStopCancelAlertsOnlyAfterItsReconcile(t *testing.T) {
 		return &HyperliquidCancelOrderResult{Cancelled: true, OID: oid}, "", nil
 	}
 	mock := &mockNotifier{}
-	mn := NewMultiNotifier(notifierBackend{notifier: mock, ownerID: "owner"})
+	mn := NewMultiNotifier(notifierBackend{notifier: mock, ownerID: "owner", channels: map[string]string{"hyperliquid": "ch-test"}})
 	flat := hlOnChainCoinView{Known: true, AbsQty: map[string]float64{}, NetSide: map[string]string{}}
 	listed := hlAllOpenOrders{Decimals: map[string]int{"SOL": 2}, Orders: []hlListedOpenOrder{{OID: 7, Coin: "SOL", Sz: 10, TriggerPx: 90}}}
 	runHyperliquidShareResize([]StrategyConfig{m}, state, newHLCycleShare(flat, hlCoinSubmitSnapshot(), nil, states, []StrategyConfig{m}, mn), listed, false, nil, &mu, mn)
-	if pos.StopLossOID != 0 || len(mock.dms) != 0 {
-		t.Fatalf("unreconciled sole manual book: oid=%d alerts=%d, want cancelled and no alert", pos.StopLossOID, len(mock.dms))
+	if pos.StopLossOID != 0 || len(mock.messages) != 0 {
+		t.Fatalf("unreconciled sole manual book: oid=%d alerts=%d, want cancelled and no alert", pos.StopLossOID, len(mock.messages))
 	}
 	pos.StopLossOID, pos.StopLossTriggerPx = 7, 90
 	resetHLShareAlerts()
@@ -450,12 +450,12 @@ func TestSoleManualStopCancelAlertsOnlyAfterItsReconcile(t *testing.T) {
 	share.markReconciled([]StrategyConfig{m})
 	runHyperliquidShareResize([]StrategyConfig{m}, state, share, listed, false, nil, &mu, mn)
 	found := false
-	for _, dm := range mock.dms {
-		if strings.Contains(dm.content, "trigger $90.0000") {
+	for _, msg := range mock.messages {
+		if strings.Contains(msg.content, "trigger $90.0000") {
 			found = true
 		}
 	}
 	if pos.StopLossOID != 0 || !found {
-		t.Fatalf("reconciled sole manual book: oid=%d alerts=%v, want cancelled and one trigger alert", pos.StopLossOID, mock.dms)
+		t.Fatalf("reconciled sole manual book: oid=%d alerts=%v, want cancelled and one trigger alert", pos.StopLossOID, mock.messages)
 	}
 }

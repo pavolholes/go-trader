@@ -129,8 +129,8 @@ func TestRunPostTPStopLossAdjustment_LiquidationClampFallback(t *testing.T) {
 		if pos.StopLossOID != 555 || pos.StopLossTriggerPx != clampedTrigger {
 			t.Errorf("stop = oid %d @ %.4f, want 555 @ %.4f", pos.StopLossOID, pos.StopLossTriggerPx, clampedTrigger)
 		}
-		if len(mock.dms) != 1 || !strings.Contains(mock.dms[0].content, "STOP PAST LIQUIDATION") {
-			t.Fatalf("dms = %v, want one clamp alert", mock.dms)
+		if len(mock.messages) != 1 || !strings.Contains(mock.messages[0].content, "STOP PAST LIQUIDATION") {
+			t.Fatalf("dms = %v, want one clamp alert", mock.messages)
 		}
 	})
 
@@ -158,11 +158,11 @@ func TestRunPostTPStopLossAdjustment_LiquidationClampFallback(t *testing.T) {
 		if pos.StopLossOID != 0 {
 			t.Errorf("StopLossOID = %d, want 0 after a landed cancel with nothing resting", pos.StopLossOID)
 		}
-		if len(mock.dms) != 1 {
-			t.Fatalf("dms = %v, want exactly one clamp alert (no duplicate protection-lost alert)", mock.dms)
+		if len(mock.messages) != 1 {
+			t.Fatalf("dms = %v, want exactly one clamp alert (no duplicate protection-lost alert)", mock.messages)
 		}
-		if strings.Contains(mock.dms[0].content, "first boom") {
-			t.Errorf("clamp alert cites the first attempt's error: %s", mock.dms[0].content)
+		if strings.Contains(mock.messages[0].content, "first boom") {
+			t.Errorf("clamp alert cites the first attempt's error: %s", mock.messages[0].content)
 		}
 		var criticalLog string
 		for _, line := range strings.Split(logOutput, "\n") {

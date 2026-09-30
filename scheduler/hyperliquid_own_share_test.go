@@ -184,34 +184,34 @@ func TestHLCycleShareFreshnessAndLatch(t *testing.T) {
 	}
 
 	mock := &mockNotifier{}
-	mn := NewMultiNotifier(notifierBackend{notifier: mock, ownerID: "owner"})
+	mn := NewMultiNotifier(notifierBackend{notifier: mock, ownerID: "owner", channels: map[string]string{"hyperliquid": "ch-test"}})
 	driftView := hlOnChainCoinView{Known: true, AbsQty: map[string]float64{"ETH": 12}, NetSide: map[string]string{"ETH": "long"}}
 	alertShare := newHLCycleShare(driftView, hlCoinSubmitSnapshot(), nil, states, live, mn)
 	aPeers := []hlShareBook{{Qty: 5, Armed: true}}
 	first := alertShare.StopQty(longA, "ETH", "long", 10, true, aPeers, 0)
 	second := alertShare.StopQty(longA, "ETH", "long", 10, true, aPeers, 0)
-	if math.Abs(first.Qty-8) > 1e-9 || len(mock.dms) != 1 {
-		t.Fatalf("first unbacked Q=%g alerts=%d, want Q 8 and one alert", first.Qty, len(mock.dms))
+	if math.Abs(first.Qty-8) > 1e-9 || len(mock.messages) != 1 {
+		t.Fatalf("first unbacked Q=%g alerts=%d, want Q 8 and one alert", first.Qty, len(mock.messages))
 	}
-	if math.Abs(second.Qty-first.Qty) > 1e-9 || len(mock.dms) != 1 {
-		t.Fatalf("repeat sent %d alerts, want 1", len(mock.dms))
+	if math.Abs(second.Qty-first.Qty) > 1e-9 || len(mock.messages) != 1 {
+		t.Fatalf("repeat sent %d alerts, want 1", len(mock.messages))
 	}
 	netShare := newHLCycleShare(hlOnChainCoinView{Known: true, AbsQty: map[string]float64{"ETH": 6}, NetSide: map[string]string{"ETH": "long"}}, hlCoinSubmitSnapshot(), nil, states, live, mn)
 	netQ := netShare.StopQty(StrategyConfig{ID: "N"}, "ETH", "long", 10, true, nil, 4)
-	if math.Abs(netQ.Qty-6) > 1e-9 || len(mock.dms) != 1 {
-		t.Fatalf("opposite-side netting Q=%g alerts=%d, want Q 6 and no new alert", netQ.Qty, len(mock.dms))
+	if math.Abs(netQ.Qty-6) > 1e-9 || len(mock.messages) != 1 {
+		t.Fatalf("opposite-side netting Q=%g alerts=%d, want Q 6 and no new alert", netQ.Qty, len(mock.messages))
 	}
 	changed := newHLCycleShare(hlOnChainCoinView{Known: true, AbsQty: map[string]float64{"ETH": 6}, NetSide: map[string]string{"ETH": "long"}}, hlCoinSubmitSnapshot(), nil, states, live, mn)
 	changed.StopQty(longA, "ETH", "long", 10, true, aPeers, 0)
-	if len(mock.dms) != 2 {
-		t.Fatalf("changed Q sent %d alerts, want 2", len(mock.dms))
+	if len(mock.messages) != 2 {
+		t.Fatalf("changed Q sent %d alerts, want 2", len(mock.messages))
 	}
 	cleared := newHLCycleShare(hlOnChainCoinView{Known: true, AbsQty: map[string]float64{"ETH": 15}, NetSide: map[string]string{"ETH": "long"}}, hlCoinSubmitSnapshot(), nil, states, live, mn)
 	cleared.StopQty(longA, "ETH", "long", 10, true, aPeers, 0)
 	again := newHLCycleShare(driftView, hlCoinSubmitSnapshot(), nil, states, live, mn)
 	again.StopQty(longA, "ETH", "long", 10, true, aPeers, 0)
-	if len(mock.dms) != 3 {
-		t.Fatalf("cleared latch then the same state sent %d alerts, want 3", len(mock.dms))
+	if len(mock.messages) != 3 {
+		t.Fatalf("cleared latch then the same state sent %d alerts, want 3", len(mock.messages))
 	}
 
 	resetHLShareAlerts()
@@ -220,7 +220,7 @@ func TestHLCycleShareFreshnessAndLatch(t *testing.T) {
 		s := newHLCycleShare(unknownView, hlCoinSubmitSnapshot(), nil, states, live, mn)
 		s.StopQty(longA, "ETH", "long", 10, true, aPeers, 0)
 	}
-	if len(mock.dms) != 4 {
-		t.Fatalf("three unknown cycles sent %d alerts after the latch cases, want 4", len(mock.dms))
+	if len(mock.messages) != 4 {
+		t.Fatalf("three unknown cycles sent %d alerts after the latch cases, want 4", len(mock.messages))
 	}
 }
