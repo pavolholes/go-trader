@@ -72,7 +72,8 @@ def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=
                      regime_enabled=False, regime_windows_spec=None, ohlcv_limit=200, regime_atr_window="",
                      regime_payload_json=None,
                      atr_method="simple",
-                     close_params_by_name=None):
+                     close_params_by_name=None,
+                     htf_timeframe="", htf_limit=300):
     """Run strategy signal check using BloFin OHLCV data."""
     try:
         from adapter import BloFinExchangeAdapter
@@ -144,6 +145,38 @@ def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=
             sys.exit(1)
 
         df = _make_dataframe(candles)
+        # Deep HTF frame for strategies with in-chart HTF confirmation
+        # (ob_touch): fetched separately because the LTF window is too short
+        # to resample enough HTF history. Injected as htf_df; the core drops
+        # the forming HTF candle. Fetch failure here is fatal (fail-closed).
+        eff_open = (open_strategy or strategy_name or "").strip()
+        if htf_timeframe and eff_open == "ob_touch":
+            print(f"Fetching {symbol} {htf_timeframe} HTF from BloFin ({mode})...", file=sys.stderr)
+            try:
+                if inst_type == "spot":
+                    from spot_adapter import BloFinSpotExchangeAdapter
+                    htf_spot = BloFinSpotExchangeAdapter()
+                    htf_candles = htf_spot.get_spot_ohlcv(symbol, interval=htf_timeframe, limit=htf_limit)
+                else:
+                    htf_candles = adapter.get_perp_ohlcv(symbol, interval=htf_timeframe, limit=htf_limit)
+            except Exception as e:
+                htf_candles = []
+                print(f"HTF fetch error: {e}", file=sys.stderr)
+            if not htf_candles or len(htf_candles) < 3:
+                print(json.dumps({
+                    "strategy": strategy_name,
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "signal": 0,
+                    "price": 0,
+                    "indicators": {},
+                    "mode": mode,
+                    "platform": "blofin",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "error": f"Insufficient HTF data: {len(htf_candles) if htf_candles else 0} candles",
+                }))
+                sys.exit(1)
+            strategy_params["htf_df"] = _make_dataframe(htf_candles)
         stdout_regime, live_regime, strategy_regime = prepare_check_regime(
             df,
             regime_enabled=regime_enabled,
@@ -405,6 +438,10 @@ def main():
         parser.add_argument("--regime-enabled", action="store_true", default=False)
         parser.add_argument("--regime-windows-spec-json", default="")
         parser.add_argument("--ohlcv-limit", type=int, default=200)
+        parser.add_argument("--htf-timeframe", default="",
+                            help="Deep HTF candles for in-chart HTF confirmation (ob_touch); "
+                                 "empty disables the separate HTF fetch.")
+        parser.add_argument("--htf-limit", type=int, default=300)
         parser.add_argument("--regime-atr-window", default="")
         parser.add_argument("--regime-payload-json", default=None)
         parser.add_argument("--regime-directional-window", default="")
@@ -445,6 +482,8 @@ def main():
             regime_payload_json=args.regime_payload_json,
             atr_method=args.atr_method,
             close_params_by_name=close_params_by_name,
+            htf_timeframe=args.htf_timeframe,
+            htf_limit=args.htf_limit,
         )
 
 

@@ -96,7 +96,8 @@ def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=
                      regime_enabled=False, regime_windows_spec=None, ohlcv_limit=200, regime_atr_window="",
                      regime_payload_json=None,
                      close_params_by_name=None,
-                     atr_method="simple"):
+                     atr_method="simple",
+                     htf_timeframe="", htf_limit=300):
     try:
         from adapter import TopStepExchangeAdapter
         from strategies import apply_strategy, get_strategy, list_strategies
@@ -174,6 +175,34 @@ def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=
         )
         strategy_params = (strategy_params or {})
         strategy_params["regime"] = strategy_regime
+        # Deep HTF frame for strategies with in-chart HTF confirmation
+        # (ob_touch). Paper mode serves it from yfinance (NQ=F); the core
+        # drops the forming HTF candle. Fetch failure is fatal (fail-closed).
+        eff_open = (open_strategy or strategy_name or "").strip()
+        if htf_timeframe and eff_open == "ob_touch":
+            print(f"Fetching {symbol} {htf_timeframe} HTF from TopStepX ({mode})...", file=sys.stderr)
+            try:
+                htf_candles = adapter.get_ohlcv(symbol, interval=htf_timeframe, limit=htf_limit)
+            except Exception as e:
+                htf_candles = []
+                print(f"HTF fetch error: {e}", file=sys.stderr)
+            if not htf_candles or len(htf_candles) < 3:
+                print(json.dumps({
+                    "strategy": strategy_name,
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "signal": 0,
+                    "price": 0,
+                    "contract_spec": adapter.get_contract_spec(symbol),
+                    "market_open": market_open,
+                    "indicators": {},
+                    "mode": mode,
+                    "platform": "topstep",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "error": f"Insufficient HTF data: {len(htf_candles) if htf_candles else 0} candles",
+                }))
+                sys.exit(1)
+            strategy_params["htf_df"] = _make_dataframe(htf_candles)
         decision = None
         if open_close_enabled:
             market_ctx = {"mark_price": float(df["close"].iloc[-1])}
@@ -365,6 +394,10 @@ def main():
         parser.add_argument("--regime-enabled", action="store_true", default=False)
         parser.add_argument("--regime-windows-spec-json", default="")
         parser.add_argument("--ohlcv-limit", type=int, default=200)
+        parser.add_argument("--htf-timeframe", default="",
+                            help="Deep HTF candles for in-chart HTF confirmation (ob_touch); "
+                                 "empty disables the separate HTF fetch.")
+        parser.add_argument("--htf-limit", type=int, default=300)
         parser.add_argument("--regime-atr-window", default="")
         parser.add_argument("--regime-payload-json", default=None)
         parser.add_argument("--atr-method", default="simple", choices=["simple", "wilder"])
@@ -405,6 +438,8 @@ def main():
             regime_payload_json=args.regime_payload_json,
             close_params_by_name=close_params_by_name,
             atr_method=args.atr_method,
+            htf_timeframe=args.htf_timeframe,
+            htf_limit=args.htf_limit,
         )
 
 

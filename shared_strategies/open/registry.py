@@ -43,6 +43,7 @@ from anchored_vwap import anchored_vwap_core
 from anchored_vwap_channel import anchored_vwap_channel_core
 from anchored_vwap_reversion import anchored_vwap_reversion_core
 from analog_retrieval import analog_retrieval_core
+from ob_touch import ob_touch_core
 
 
 VALID_PLATFORMS: Tuple[str, ...] = ("spot", "futures")
@@ -1502,6 +1503,37 @@ def mtf_confluence_strategy(df: pd.DataFrame, **params) -> pd.DataFrame:
 
 
 @register(
+    "ob_touch",
+    "OB Touch — SMC order-block touch entries with 1H confirmation: long on "
+    "the first wick into the overlap of an active LTF institutional zone and "
+    "an active 1H zone (short mirrors). HTF factor guide: 5m native x12 = 1H, "
+    "15m native x4 = 1H, 5m native x3 = 15m, 1 = single-TF (no gate). "
+    "Zones use Absolute mitigation and Previous overlap handling.",
+    {
+        "internal_lookback": 5, "swing_lookback": 50, "inl_num": 7,
+        "use_swing_levels": True, "use_swing_filter": True,
+        "htf_factor": 4, "touch_mode": "wick", "allow_short": False,
+    },
+    variants={
+        "futures": {
+            "description": "OB Touch — bidirectional: SMC order-block touch "
+            "entries with 1H overlap confirmation (long and short)",
+            "default_params": {"allow_short": True},
+        },
+    },
+    constraints=[
+        "internal_lookback > 0",
+        "swing_lookback > 0",
+        "inl_num > 0",
+        "htf_factor > 0",
+        "internal_lookback < swing_lookback",
+    ],
+)
+def ob_touch_strategy(df: pd.DataFrame, **params) -> pd.DataFrame:
+    return ob_touch_core(df, **params)
+
+
+@register(
     "vol_momentum",
     "Vol Momentum — volatility-targeted time-series momentum: ATR-normalized N-bar net move with Kaufman efficiency-ratio trend confirmation; hysteresis exit on momentum decay or efficiency collapse",
     {
@@ -1614,7 +1646,7 @@ PLATFORM_ORDER: Dict[str, List[str]] = {
         "sweep_squeeze_combo", "adx_trend", "donchian_breakout", "tema_cross",
         "momentum_pro", "mean_reversion_pro", "rsi_bb_combo", "atr_band_revert", "mtf_confluence",
         "vol_momentum", "regime_adaptive", "regime_adaptive_htf",
-        "analog_retrieval",
+        "analog_retrieval", "ob_touch",
         "hold",
     ],
     "futures": [
@@ -1629,6 +1661,6 @@ PLATFORM_ORDER: Dict[str, List[str]] = {
         "funding_skew", "donchian_breakout", "session_breakout", "bear_pullback_st",
         "vwap_rejection_st", "momentum_pro", "mean_reversion_pro", "rsi_bb_combo",
         "consolidation_range", "atr_band_revert", "mtf_confluence", "vol_momentum",
-        "regime_adaptive", "regime_adaptive_htf", "analog_retrieval", "hold",
+        "regime_adaptive", "regime_adaptive_htf", "analog_retrieval", "ob_touch", "hold",
     ],
 }

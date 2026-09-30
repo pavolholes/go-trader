@@ -573,6 +573,12 @@ DEFAULT_PARAM_RANGES = {
         "ob_lookback": [15, 20, 30],
         "max_ob_age": [30, 50, 80],
     },
+    "ob_touch": {
+        "internal_lookback": [3, 5, 8],
+        "swing_lookback": [30, 50, 80],
+        "inl_num": [5, 7],
+        "htf_factor": [1, 4, 12],
+    },
     "vwap_reversion": {
         "entry_std": [1.0, 1.5, 2.0],
         "exit_std": [0.0, 0.2, 0.5],
