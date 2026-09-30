@@ -25,6 +25,7 @@ const (
 	manualCloseTPUnverified
 	manualCloseTPOutcomeUnknown
 	manualCloseTPMissing
+	manualCloseTPRemoved
 )
 
 type manualCloseTPTierOutcome struct {
@@ -91,6 +92,8 @@ func manualCloseTPAffectedOIDs(classes []manualCloseTPTierClass, tpOIDs []int64,
 
 func manualCloseTPRestorePlanInputs(plan hlProtectionPlan, classes []manualCloseTPTierClass, tpOIDs []int64, size float64) hlProtectionPlan {
 	plan.StopLossATRMult = 0
+	plan.StopLossTriggerPx = 0
+	plan.PreserveMovedStop = false
 	plan.StopLossOID = 0
 	plan.ForceSLReplace = false
 	plan.ForceTPReplace = nil
@@ -228,7 +231,7 @@ func applyRestoredTakeProfitTiers(pos *Position, outcomes []manualCloseTPTierOut
 		case manualCloseTPOutcomeUnknown:
 			pos.TPOIDs[i] = 0
 			pos.TPArmedTiers[i] = true
-		case manualCloseTPMissing:
+		case manualCloseTPMissing, manualCloseTPRemoved:
 			pos.TPOIDs[i] = 0
 			pos.TPArmedTiers[i] = false
 		}
@@ -259,7 +262,7 @@ func restoredTakeProfitActionVectors(outcomes []manualCloseTPTierOutcome) ([]int
 			armed[i] = o.PrevOID > 0
 		case manualCloseTPOutcomeUnknown:
 			armed[i] = true
-		case manualCloseTPMissing:
+		case manualCloseTPMissing, manualCloseTPRemoved:
 			armed[i] = false
 		default:
 			armed[i] = o.PrevOID <= 0
@@ -282,7 +285,7 @@ func restoreManualTakeProfitsAfterFailedClose(d manualCoreDeps, res *manualCoreR
 		msg := fmt.Sprintf("CRITICAL: [%s] %s: the venue rejected the manual close after a cancel of the exchange-side take-profit orders was requested (order ids %v) and the take-profit restore did not complete: %s. %s Verify the open orders on Hyperliquid and restore the tiers or close the position.",
 			strategyID, snap.Symbol, lostOIDs, reason, manualTPRestoreUnverifiedState)
 		res.outf("%s", msg)
-		notifyManualCloseRearmFailure(d.notifier, msg)
+		notifyCloseRearm(d.notifier, msg)
 	}
 
 	if positionFlat {
@@ -344,9 +347,20 @@ func restoreManualTakeProfitsAfterFailedClose(d manualCoreDeps, res *manualCoreR
 		alertf(fmt.Sprintf("the strategy now resolves %d take-profit tiers, so the cancelled order ids %v have no tier to restore", len(plan.Tiers), dropped))
 	}
 
-	size, capped := hlSLEffectiveQty(snap.Symbol, pos.Quantity, onChainAbsQty)
+	account := hlOnChainCoinView{Known: true, AbsQty: onChainAbsQty, NetSide: netSideByCoin}
+	shareRes := hlOwnStopShareOnView(snap.Symbol, pos.Side, hlShareBook{Qty: pos.Quantity, Armed: hlBookArmed(pos)}, view.PeerSame, view.PeerOppQty, account)
+	size := pos.Quantity
+	capped := false
+	if shareRes.Known {
+		size = shareRes.Qty
+		capped = size < pos.Quantity-hlSharedCloseQtyTolerance
+	}
+	if shareRes.Known && size <= hlSharedCloseQtyTolerance {
+		res.outf("manual-close %s %s: the chain share is zero, so the cancelled take-profit tiers (order ids %v) were not restored.", strategyID, snap.Symbol, lostOIDs)
+		return
+	}
 	if capped {
-		res.errf("warning: take-profit restore size for %s capped from the book %.6f to the on-chain %.6f", snap.Symbol, pos.Quantity, size)
+		res.errf("warning: take-profit restore size for %s capped from the book %.6f to the chain share %.6f", snap.Symbol, pos.Quantity, size)
 	}
 	planClasses := classifyManualCloseTPTiers(len(plan.Tiers), snap.TPOIDs, snap.TPArmedTiers, requestedCancelOIDs, execResult)
 	prevOIDs := tpOIDsForTierCount(snap.TPOIDs, len(plan.Tiers))
@@ -363,7 +377,79 @@ func restoreManualTakeProfitsAfterFailedClose(d manualCoreDeps, res *manualCoreR
 		msg := fmt.Sprintf("CRITICAL: [%s] %s: the take-profit restore outcome could not be recorded in the book (%v) — the restored order ids %v may be resting untracked. Verify the open orders on Hyperliquid and reconcile before the next close.",
 			strategyID, snap.Symbol, recErr, restoredTakeProfitPlacedOIDs(outcomes))
 		res.outf("%s", msg)
-		notifyManualCloseRearmFailure(d.notifier, msg)
+		notifyCloseRearm(d.notifier, msg)
+	}
+}
+
+func removeManualUnconfirmedTakeProfits(d manualCoreDeps, sc StrategyConfig, strategyID string, snap manualCloseProtectionSnapshot, execResult *HyperliquidExecuteResult, requestedCancelOIDs []int64) (hlCloseRemovalReport, error) {
+	classes := classifyManualCloseTPTiers(manualCloseTPSnapshotTierCount(snap), snap.TPOIDs, snap.TPArmedTiers, requestedCancelOIDs, execResult)
+	var oids []int64
+	for i, class := range classes {
+		if class == manualCloseTPTierUnconfirmed && i < len(snap.TPOIDs) && snap.TPOIDs[i] > 0 {
+			oids = append(oids, snap.TPOIDs[i])
+		}
+	}
+	if len(oids) == 0 {
+		return hlCloseRemovalReport{}, nil
+	}
+	if d.syncProtection == nil {
+		rep := hlCloseRemovalReport{Unverified: oids}
+		rep.addDetail("no take-profit removal path is configured")
+		return rep, nil
+	}
+	plan := hlProtectionPlan{Symbol: snap.Symbol, Side: snap.Side, AvgCost: snap.AvgCost, EntryATR: snap.EntryATR, CancelTPOIDs: cloneInt64s(oids)}
+	result, _, syncErr := d.syncProtection(sc, plan)
+	rep := classifyHLTakeProfitRemoval(oids, result, syncErr)
+	if len(rep.Removed)+len(rep.Filled) == 0 {
+		return rep, nil
+	}
+	if d.recordRestoredTakeProfits == nil {
+		return rep, fmt.Errorf("no take-profit bookkeeping path is configured")
+	}
+	outcomes := make([]manualCloseTPTierOutcome, len(classes))
+	for i, class := range classes {
+		o := manualCloseTPTierOutcome{Class: class, Kind: manualCloseTPSkipped}
+		if i < len(snap.TPOIDs) {
+			o.PrevOID = snap.TPOIDs[i]
+		}
+		o.NewOID = o.PrevOID
+		switch {
+		case o.PrevOID > 0 && containsInt64(rep.Removed, o.PrevOID):
+			o.Kind = manualCloseTPRemoved
+			o.NewOID = 0
+		case o.PrevOID > 0 && containsInt64(rep.Filled, o.PrevOID):
+			o.Kind = manualCloseTPFilledExternally
+			o.NewOID = 0
+		}
+		outcomes[i] = o
+	}
+	return rep, d.recordRestoredTakeProfits(strategyID, snap.Symbol, snap.Side, snap.PositionID, outcomes)
+}
+
+func removeManualTakeProfitsAfterShortFill(d manualCoreDeps, res *manualCoreResult, sc StrategyConfig, strategyID string, snap manualCloseProtectionSnapshot, execResult *HyperliquidExecuteResult, requestedCancelOIDs []int64) {
+	if !hyperliquidIsLive(sc.Args) {
+		return
+	}
+	unlockSymbol := lockHyperliquidProtectionSync(snap.Symbol)
+	rep, recErr := removeManualUnconfirmedTakeProfits(d, sc, strategyID, snap, execResult, requestedCancelOIDs)
+	unlockSymbol()
+	for _, oid := range rep.Removed {
+		res.outf("Take-profit OID=%d for %s was removed after the short fill because its cancel was not confirmed; the tier returns at the next scheduler protection sync, sized to the book.", oid, snap.Symbol)
+	}
+	for _, oid := range rep.Filled {
+		res.outf("Take-profit OID=%d for %s had already filled on-chain, so nothing was removed — the reconciler books the fill.", oid, snap.Symbol)
+	}
+	if len(rep.Resting) > 0 || len(rep.Unverified) > 0 {
+		msg := fmt.Sprintf("CRITICAL: [%s] %s: the %s filled short of the book and left %.6f open, and the take-profit orders whose cancel was not confirmed were not all removed, so they can rest at their pre-close size.%s",
+			strategyID, snap.Symbol, snap.closeName(), snap.Quantity, formatCloseRemovalReport(sc, snap.Symbol, rep))
+		res.outf("%s", msg)
+		notifyCloseRearm(d.notifier, msg)
+	}
+	if recErr != nil {
+		msg := fmt.Sprintf("CRITICAL: [%s] %s: the take-profit removal outcome could not be recorded in the book (%v) — the book may still list the removed order ids %v. Verify the open orders on Hyperliquid and reconcile before the next close.",
+			strategyID, snap.Symbol, recErr, rep.Removed)
+		res.outf("%s", msg)
+		notifyCloseRearm(d.notifier, msg)
 	}
 }
 

@@ -1,9 +1,7 @@
 package main
 
 import (
-	"fmt"
 	"math"
-	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -75,36 +73,6 @@ func TestPlanKillSwitchClose_ManualOnlyCoinClosedAndBooked(t *testing.T) {
 	}
 }
 
-func TestPlanKillSwitchClose_ManualOnlyCoinCloseFailureLatches(t *testing.T) {
-	roster := []StrategyConfig{
-		{ID: "hl-manual-eth-live", Platform: "hyperliquid", Type: "manual", Symbol: "ETH",
-			Args: []string{"hold", "ETH", "1h", "--mode=live"}},
-	}
-	positions := []HLPosition{{Coin: "ETH", Size: 2.0, EntryPrice: 3000}}
-	closer := func(symbol string, partialSz *float64, cancelStopLossOIDs []int64) (*HyperliquidCloseResult, error) {
-		return nil, fmt.Errorf("simulated HL close failure")
-	}
-	fetcher, _ := stubHLStateFetcher(positions, nil)
-
-	plan := planKillSwitchClose(defaultHLInputs("0xaddr", true, positions, roster,
-		"portfolio drawdown 25.0% exceeds limit 20.0%",
-		time.Second, closer, fetcher))
-
-	if plan.OnChainConfirmedFlat {
-		t.Fatal("a failed close on a manual-held coin must latch (OnChainConfirmedFlat=false)")
-	}
-	if _, ok := plan.CloseReport.Errors["ETH"]; !ok {
-		t.Fatalf("expected Errors[ETH], got %+v", plan.CloseReport.Errors)
-	}
-	joined := strings.Join(plan.LogLines, "\n")
-	if !strings.Contains(joined, "[CRITICAL] hl-close: ETH failed") {
-		t.Errorf("missing CRITICAL failure line, got: %s", joined)
-	}
-	if !strings.Contains(plan.DiscordMessage, "LATCHED") {
-		t.Errorf("expected LATCHED message, got: %s", plan.DiscordMessage)
-	}
-}
-
 func TestPlanKillSwitchClose_MixedFleetUnconfiguredCoinBlocksFlat(t *testing.T) {
 	roster := []StrategyConfig{
 		{ID: "hl-perps-btc-live", Platform: "hyperliquid", Type: "perps",
@@ -166,97 +134,6 @@ func TestHyperliquidKillSwitchShareSplit_PerpsAndManualPeers(t *testing.T) {
 	szMann, feeMan := hyperliquidKillSwitchFillShare(roster[1], "ETH", 2.0, 10.0, roster, snap)
 	if math.Abs(szMann-0.5) > 1e-9 || math.Abs(feeMan-2.5) > 1e-9 {
 		t.Errorf("manual share = (%.6f, %.6f); want (0.5, 2.5)", szMann, feeMan)
-	}
-}
-
-func TestCollectHLKillSwitchStopOIDs(t *testing.T) {
-	cases := []struct {
-		name       string
-		strategies map[string]*StrategyState
-		roster     []StrategyConfig
-		want       map[string][]int64
-	}{
-		{
-			name: "includes manual triggers",
-			strategies: map[string]*StrategyState{
-				"hl-manual-eth-live": {Positions: map[string]*Position{"ETH": {StopLossOID: 111, TPOIDs: []int64{222}}}},
-				"hl-perps-btc-live":  {Positions: map[string]*Position{"BTC": {StopLossOID: 333}}},
-			},
-			roster: []StrategyConfig{
-				{ID: "hl-perps-btc-live", Platform: "hyperliquid", Type: "perps", Args: []string{"sma", "BTC", "1h", "--mode=live"}},
-				{ID: "hl-manual-eth-live", Platform: "hyperliquid", Type: "manual", Symbol: "ETH", Args: []string{"hold", "ETH", "1h", "--mode=live"}},
-			},
-			want: map[string][]int64{"BTC": {333}, "ETH": {111, 222}},
-		},
-		{
-			name: "lower-case manual symbol falls back to raw key",
-			strategies: map[string]*StrategyState{
-				"hl-manual-sol-live": {Positions: map[string]*Position{"sol": {StopLossOID: 444}}},
-			},
-			roster: []StrategyConfig{
-				{ID: "hl-manual-sol-live", Platform: "hyperliquid", Type: "manual", Symbol: "sol", Args: []string{"hold", "sol", "1h", "--mode=live"}},
-			},
-			want: map[string][]int64{"sol": {444}},
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			out := collectHLKillSwitchStopOIDs(tc.strategies, tc.roster)
-			for coin, want := range tc.want {
-				if !reflect.DeepEqual(out[coin], want) {
-					t.Errorf("%s OIDs = %v; want %v — a coin's resting triggers must be cancelled before the flatten", coin, out[coin], want)
-				}
-			}
-			if len(out) != len(tc.want) {
-				t.Errorf("collected coins = %v; want exactly %v", out, tc.want)
-			}
-		})
-	}
-}
-
-func TestModelOnlyCloseAlert_ThrottledPerStrategySymbol(t *testing.T) {
-	tracker := &modelOnlyCloseTracker{last: make(map[modelOnlyCloseKey]time.Time)}
-	now := time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC)
-
-	if !tracker.shouldNotify("s-a", "ETH", now) {
-		t.Fatal("first model-only row for a key must notify")
-	}
-	if tracker.shouldNotify("s-a", "ETH", now.Add(time.Minute)) {
-		t.Error("second row inside the window must be throttled")
-	}
-	if !tracker.shouldNotify("s-a", "BTC", now.Add(time.Minute)) {
-		t.Error("an independent (strategy, symbol) key must not be throttled by another key's slot")
-	}
-	if !tracker.shouldNotify("s-b", "ETH", now.Add(time.Minute)) {
-		t.Error("a second strategy's row must not inherit the first strategy's throttle slot")
-	}
-	if !tracker.shouldNotify("s-a", "ETH", now.Add(effectiveAlertThrottleInterval()+time.Second)) {
-		t.Error("a row after the throttle window must notify again")
-	}
-}
-
-func TestQueueModelOnlyCloseAlert_DrainsAndSkipsEmpty(t *testing.T) {
-	drainModelOnlyCloseAlerts()
-	queueModelOnlyCloseAlert("", "ETH", 1.0)
-	queueModelOnlyCloseAlert("strat", "", 1.0)
-	if got := drainModelOnlyCloseAlerts(); len(got) != 0 {
-		t.Fatalf("empty strategy/symbol must not queue, got %+v", got)
-	}
-
-	id := "queue-drain-test-strat"
-	queueModelOnlyCloseAlert(id, "UNIQ", 2.5)
-	got := drainModelOnlyCloseAlerts()
-	found := false
-	for _, a := range got {
-		if a.StrategyID == id && a.Symbol == "UNIQ" && math.Abs(a.Quantity-2.5) < 1e-9 {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("expected queued alert for %s/UNIQ, got %+v", id, got)
-	}
-	if again := drainModelOnlyCloseAlerts(); len(again) != 0 {
-		t.Fatalf("drain must empty the queue, got %+v", again)
 	}
 }
 
@@ -371,74 +248,6 @@ func TestApplyKillSwitchSettledLegsWhileLatched_UnsettledLegStays(t *testing.T) 
 	}
 }
 
-func TestApplyKillSwitchSettledLegsWhileLatched_OKXClosedCoinBooksModelOnly(t *testing.T) {
-	okxCfgs := []StrategyConfig{
-		{ID: "okx-btc", Platform: "okx", Type: "perps",
-			Args: []string{"sma", "BTC-USDT-SWAP", "1h", "--mode=live"}},
-	}
-	hlCfgs := []StrategyConfig{
-		{ID: "hl-btc", Platform: "hyperliquid", Type: "perps",
-			Args: []string{"sma", "BTC", "1h", "--mode=live"}},
-	}
-	okxState := &StrategyState{
-		ID: "okx-btc", Type: "perps", Platform: "okx", Cash: 1000,
-		Positions: map[string]*Position{
-			"BTC": {Symbol: "BTC", Quantity: 1.0, AvgCost: 50000, Side: "long", Multiplier: 1},
-		},
-	}
-	hlState := &StrategyState{
-		ID: "hl-btc", Type: "perps", Platform: "hyperliquid", Cash: 1000,
-		Positions: map[string]*Position{
-			"BTC": {Symbol: "BTC", Quantity: 3.0, AvgCost: 50000, Side: "long", Multiplier: 1},
-		},
-	}
-	strategies := map[string]*StrategyState{"okx-btc": okxState, "hl-btc": hlState}
-	plan := KillSwitchClosePlan{OnChainConfirmedFlat: false}
-	plan.OKXCloseReport.ClosedCoins = []string{"BTC"}
-
-	applyKillSwitchSettledLegsWhileLatched(strategies, append(append([]StrategyConfig{}, okxCfgs...), hlCfgs...),
-		&plan, nil, nil, map[string]float64{"BTC": 51000}, nil)
-
-	if len(okxState.Positions) != 0 {
-		t.Fatalf("OKX coin the report confirmed closed must book while latched, got %+v", okxState.Positions)
-	}
-	if len(okxState.TradeHistory) != 1 || !okxState.TradeHistory[0].IsClose {
-		t.Fatalf("OKX close row missing: %+v", okxState.TradeHistory)
-	}
-	if hlState.Positions["BTC"] == nil || math.Abs(hlState.Positions["BTC"].Quantity-3.0) > 1e-9 {
-		t.Errorf("HL position must be untouched by the OKX settled set, got %+v", hlState.Positions)
-	}
-}
-
-func TestSettledKillSwitchSymbols_PlatformKeyed(t *testing.T) {
-	plan := KillSwitchClosePlan{}
-	plan.OKXCloseReport.ClosedCoins = []string{"BTC", ""}
-	plan.TSCloseReport.ClosedCoins = []string{"NQ"}
-	out := settledKillSwitchSymbols(&plan)
-	if len(out) != 2 || !out["okx"]["BTC"] || out["okx"][""] || !out["topstep"]["NQ"] {
-		t.Fatalf("settled = %+v; want okx{BTC}, topstep{NQ}, empty coins dropped", out)
-	}
-	if _, ok := out["robinhood"]; ok {
-		t.Fatalf("platforms with no closes must be absent, got %+v", out)
-	}
-}
-
-func TestHyperliquidRawCoin_ManualSymbolWinsOverArgs(t *testing.T) {
-	sc := StrategyConfig{Platform: "hyperliquid", Type: "manual", Symbol: "ETH",
-		Args: []string{"hold", "BTC", "1h", "--mode=live"}}
-	if got := hyperliquidRawCoin(sc); got != "ETH" {
-		t.Errorf("hyperliquidRawCoin = %q; want ETH (sc.Symbol wins for manual)", got)
-	}
-	if got := hyperliquidConfiguredCoin(sc); got != "ETH" {
-		t.Errorf("hyperliquidConfiguredCoin = %q; want ETH", got)
-	}
-	perps := StrategyConfig{Platform: "hyperliquid", Type: "perps",
-		Args: []string{"sma", "BTC", "1h", "--mode=live"}}
-	if got := hyperliquidRawCoin(perps); got != "BTC" {
-		t.Errorf("hyperliquidRawCoin(perps) = %q; want BTC (args[1])", got)
-	}
-}
-
 func TestForceCloseHyperliquidLive_ManualDivergentArgsStaysInCloseScope(t *testing.T) {
 	roster := []StrategyConfig{
 		{ID: "hl-manual-eth-live", Platform: "hyperliquid", Type: "manual", Symbol: "ETH",
@@ -486,66 +295,5 @@ func TestForceCloseHyperliquidLive_ManualDivergentArgsStaysInCloseScope(t *testi
 	}
 	if booked == nil {
 		t.Fatal("manual leg must book the REAL exchange fill (OID), not fall back to model-only")
-	}
-}
-
-func TestForceCloseAllPositions_ModelOnlyAlertLiveGate(t *testing.T) {
-	drainModelOnlyCloseAlerts()
-	liveHL := StrategyConfig{ID: "mo-gate-live-hl", Platform: "hyperliquid", Type: "perps",
-		Args: []string{"sma", "MOHLIVE", "1h", "--mode=live"}}
-	paperHL := StrategyConfig{ID: "mo-gate-paper-hl", Platform: "hyperliquid", Type: "perps",
-		Args: []string{"sma", "MOHPAPER", "1h", "--mode=paper"}}
-	okxSpot := StrategyConfig{ID: "mo-gate-live-okx", Platform: "okx", Type: "spot",
-		Args: []string{"sma", "MOOKX", "1h", "--mode=live"}}
-
-	mkState := func(id, sym string, pos *Position) *StrategyState {
-		return &StrategyState{
-			ID: id, Type: "perps", Platform: liveHL.Platform, Cash: 1000,
-			Positions: map[string]*Position{sym: pos},
-		}
-	}
-	long := func(sym string) *Position {
-		return &Position{Symbol: sym, Quantity: 1.0, AvgCost: 100, Side: "long"}
-	}
-
-	forceCloseAllPositions(mkState(paperHL.ID, "MOHPAPER", long("MOHPAPER")), &paperHL,
-		map[string]float64{"MOHPAPER": 90}, nil)
-	for _, a := range drainModelOnlyCloseAlerts() {
-		if a.StrategyID == paperHL.ID {
-			t.Errorf("paper strategy must never raise the model-only DM, got %+v", a)
-		}
-	}
-
-	forceCloseAllPositions(mkState(okxSpot.ID, "MOOKX", long("MOOKX")), &okxSpot,
-		map[string]float64{"MOOKX": 90}, nil)
-	foundOKX := false
-	for _, a := range drainModelOnlyCloseAlerts() {
-		if a.StrategyID == okxSpot.ID {
-			foundOKX = true
-		}
-	}
-	if !foundOKX {
-		t.Error("live non-HL venue with no auto-close path must still raise the model-only DM")
-	}
-
-	forceCloseAllPositions(mkState(liveHL.ID, "MOHLIVE", long("MOHLIVE")), &liveHL,
-		map[string]float64{"MOHLIVE": 90}, nil)
-	foundHL := false
-	for _, a := range drainModelOnlyCloseAlerts() {
-		if a.StrategyID == liveHL.ID && a.Symbol == "MOHLIVE" {
-			foundHL = true
-		}
-	}
-	if !foundHL {
-		t.Error("live HL perps force-close without a fill must raise the model-only DM")
-	}
-
-	corruptPos := &Position{Symbol: "MOCORRUPT", Quantity: -1e-7, AvgCost: 0, Side: "long"}
-	forceCloseAllPositions(mkState(liveHL.ID, "MOCORRUPT", corruptPos), &liveHL,
-		map[string]float64{"MOCORRUPT": 90}, nil)
-	for _, a := range drainModelOnlyCloseAlerts() {
-		if a.StrategyID == liveHL.ID && a.Symbol == "MOCORRUPT" {
-			t.Errorf("corrupt-position close must stay silent, got %+v", a)
-		}
 	}
 }

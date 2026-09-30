@@ -323,6 +323,9 @@ func (ss *StatusServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"version": Version,
 		"pid":     pid,
 	}
+	if ss.statusToken == "" || r.Header.Get("Authorization") == "Bearer "+ss.statusToken {
+		resp["run_evidence"] = globalRunEvidence.healthView()
+	}
 	if !lastCycle.IsZero() && time.Since(lastCycle) > 30*time.Minute {
 		resp["status"] = "unhealthy"
 		resp["reason"] = "main loop stale"

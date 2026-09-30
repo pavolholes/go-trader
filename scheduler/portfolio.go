@@ -39,6 +39,9 @@ type Position struct {
 	RegimePendingCount              int               `json:"regime_pending_count,omitempty"`
 	RegimeAppliedLabel              string            `json:"regime_applied_label,omitempty"`
 	SLAdjustedTiersProcessed        int               `json:"sl_adjusted_tiers_processed,omitempty"`
+	SLAfterMoved                    bool              `json:"sl_after_moved,omitempty"`
+	SLAfterTriggerPx                float64           `json:"sl_after_trigger_px,omitempty"`
+	TPConsumptions                  []TPConsumption   `json:"tp_consumptions,omitempty"`
 	PostTPTrailingATRMult           *float64          `json:"post_tp_trailing_atr_mult,omitempty"`
 	ScaleInCount                    int               `json:"scale_in_count,omitempty"`
 	LastAddPrice                    float64           `json:"last_add_price,omitempty"`
@@ -347,7 +350,9 @@ func stopLossCloseDetailsPrefix(reason string) string {
 		return "Trailing SL close"
 	case "liquidation_clamp_sl_immediate":
 		return "Liquidation-clamp SL close"
-	case "stop_loss_atr_paper":
+	case "post_tp_stop_loss_immediate":
+		return "Post-TP SL close"
+	case "stop_loss_atr_paper", "stop_loss_pct_paper":
 		return "Paper SL close"
 	case "replay_live_mirror":
 		return "Live mirror replay close"
@@ -619,7 +624,20 @@ func PerpsOrderSkipReason(signal int, posSide, direction string) string {
 	return ""
 }
 
+type perpsLiveOrderKind int
+
+const (
+	perpsLiveOrderOpen perpsLiveOrderKind = iota
+	perpsLiveOrderFlip
+	perpsLiveOrderClose
+)
+
 func perpsLiveOrderSize(signal int, price, cash, posQty, avgCost float64, sizing PerpsSizing, posSide, direction string, closeFraction float64) (size float64, ok bool, reason string) {
+	size, _, ok, reason = perpsLiveOrderSizeKind(signal, price, cash, posQty, avgCost, sizing, posSide, direction, closeFraction)
+	return size, ok, reason
+}
+
+func perpsLiveOrderSizeKind(signal int, price, cash, posQty, avgCost float64, sizing PerpsSizing, posSide, direction string, closeFraction float64) (size float64, kind perpsLiveOrderKind, ok bool, reason string) {
 	isBuy := signal == 1
 	allowsLong := direction == DirectionLong || direction == DirectionBoth || direction == ""
 	allowsShort := direction == DirectionShort || direction == DirectionBoth
@@ -633,8 +651,12 @@ func perpsLiveOrderSize(signal int, price, cash, posQty, avgCost float64, sizing
 	}
 
 	if openingFresh || flipping {
+		kind = perpsLiveOrderOpen
+		if flipping {
+			kind = perpsLiveOrderFlip
+		}
 		if openingFresh && sizing.RiskPerTradePct > 0 && sizing.RiskStopDistance <= 0 {
-			return 0, false, fmt.Sprintf("risk_per_trade_pct sizing: %s — refusing open (fail-closed)", sizing.riskUnresolvedLabel())
+			return 0, kind, false, fmt.Sprintf("risk_per_trade_pct sizing: %s — refusing open (fail-closed)", sizing.riskUnresolvedLabel())
 		}
 		effectiveCash := cash
 		if flipping {
@@ -653,27 +675,27 @@ func perpsLiveOrderSize(signal int, price, cash, posQty, avgCost float64, sizing
 		budget := PerpsOpenNotionalSized(effectiveCash, price, sizing)
 		if budget < 1 || price <= 0 {
 			if flipping {
-				return posQty, true, ""
+				return posQty, kind, true, ""
 			}
 			label := "buy"
 			if !isBuy {
 				label = "sell (short-open)"
 			}
-			return 0, false, fmt.Sprintf("insufficient cash ($%.2f effective) for live %s", effectiveCash, label)
+			return 0, kind, false, fmt.Sprintf("insufficient cash ($%.2f effective) for live %s", effectiveCash, label)
 		}
 		newSize := budget / price
 		if flipping {
-			return posQty + newSize, true, ""
+			return posQty + newSize, kind, true, ""
 		}
-		return newSize, true, ""
+		return newSize, kind, true, ""
 	}
 	if posQty <= 0 {
-		return 0, false, "no position to close"
+		return 0, perpsLiveOrderClose, false, "no position to close"
 	}
 	if closeFraction > 0 && closeFraction < 1 {
-		return posQty * closeFraction, true, ""
+		return posQty * closeFraction, perpsLiveOrderClose, true, ""
 	}
-	return posQty, true, ""
+	return posQty, perpsLiveOrderClose, true, ""
 }
 
 func perpsCloseActionSuppressesNewSL(signal int, posSide string, allowsLong, allowsShort bool, closeFraction float64) bool {

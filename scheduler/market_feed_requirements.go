@@ -84,11 +84,13 @@ type feedStrategyRequirement struct {
 }
 
 type feedRequirements struct {
-	Keys       map[marketFeedKey]int
-	Order      []marketFeedKey
-	MidCoins   []string
-	Funding    map[string]feedFundingNeed
-	Strategies map[string]feedStrategyRequirement
+	Keys        map[marketFeedKey]int
+	Order       []marketFeedKey
+	MidCoins    []string
+	Funding     map[string]feedFundingNeed
+	Strategies  map[string]feedStrategyRequirement
+	KeyCadences map[marketFeedKey][]int
+	SignalKeys  map[marketFeedKey]bool
 }
 
 func (r feedRequirements) requires(key marketFeedKey) bool {
@@ -196,7 +198,7 @@ func deriveFeedRequirements(cfg *Config) (feedRequirements, error) {
 	}
 	if len(errs) > 0 {
 		sort.Strings(errs)
-		return feedRequirements{}, fmt.Errorf("market_feed=websocket rejects this config:\n  %s", strings.Join(errs, "\n  "))
+		return feedRequirements{}, fmt.Errorf("market_feed=%s rejects this config:\n  %s", cfg.marketFeedMode(), strings.Join(errs, "\n  "))
 	}
 	hlCoins, _ := collectPerpsMarkSymbols(cfg.Strategies)
 	req.MidCoins = hlCoins
@@ -210,12 +212,24 @@ func validateMarketFeedConfig(cfg *Config) error {
 	}
 	switch cfg.marketFeedMode() {
 	case marketFeedREST:
+		if errs := sharedMarketFeedConfigErrors(cfg); len(errs) > 0 {
+			return fmt.Errorf("%s", strings.Join(errs, "; "))
+		}
 		return nil
 	case marketFeedWebsocket:
+		if errs := sharedMarketFeedConfigErrors(cfg); len(errs) > 0 {
+			return fmt.Errorf("%s", strings.Join(errs, "; "))
+		}
+		_, err := deriveFeedRequirements(cfg)
+		return err
+	case marketFeedShared:
+		if errs := sharedMarketFeedConfigErrors(cfg); len(errs) > 0 {
+			return fmt.Errorf("%s", strings.Join(errs, "; "))
+		}
 		_, err := deriveFeedRequirements(cfg)
 		return err
 	default:
-		return fmt.Errorf("market_feed must be %q or %q, got %q", marketFeedREST, marketFeedWebsocket, cfg.MarketFeed)
+		return fmt.Errorf("market_feed must be %q, %q or %q, got %q", marketFeedREST, marketFeedWebsocket, marketFeedShared, cfg.MarketFeed)
 	}
 }
 
@@ -320,6 +334,7 @@ func (o *marketFeedOwner) EnsureFunding(ctx context.Context, earliestBarMs map[s
 	if len(needs) == 0 {
 		return
 	}
+	ctx = withFeedReason(ctx, string(feedRestFunding))
 	coins := make([]string, 0, len(needs))
 	for coin := range needs {
 		coins = append(coins, coin)

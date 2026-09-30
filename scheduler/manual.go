@@ -262,10 +262,10 @@ func runManualClose(args []string) int {
 }
 
 func runForceClose(args []string) int {
-	return runForceCloseWithCloser(args, defaultHyperliquidForceCloseCloser)
+	return runForceCloseWithClosers(args, defaultHyperliquidForceCloseCloser, defaultHyperliquidSizedCloser)
 }
 
-func runForceCloseWithCloser(args []string, closer HyperliquidLiveCloser) int {
+func runForceCloseWithClosers(args []string, closer HyperliquidLiveCloser, sizedCloser hlSizedCloser) int {
 	fs := flag.NewFlagSet("force-close", flag.ContinueOnError)
 	configPath := fs.String("config", "scheduler/config.json", "Path to config file")
 	qty := fs.Float64("qty", 0, "Quantity to close in base units (0 = full strategy position)")
@@ -302,6 +302,7 @@ func runForceCloseWithCloser(args []string, closer HyperliquidLiveCloser) int {
 
 	deps := newCLIManualCoreDeps(cfg, stateDB, nil)
 	deps.closer = closer
+	deps.sizedCloser = sizedCloser
 	res, coreErr := forceCloseCore(deps, sc, sym, forceCloseInputs{
 		StrategyID: strategyID,
 		Qty:        *qty,
@@ -348,6 +349,7 @@ type manualAlert struct {
 	sc     StrategyConfig
 	ss     *StrategyState
 	trades int
+	rows   []Trade
 }
 
 // drainPendingManualActions applies every queued action and records its
@@ -393,6 +395,10 @@ func drainPendingManualActions(state *AppState, cfg *Config, store *StateStore) 
 			}
 			part = livePartition
 		}
+		var historyBefore int
+		if applyState := state.Strategies[a.StrategyID]; applyState != nil {
+			historyBefore = len(applyState.TradeHistory)
+		}
 		actionCriticals, err := applyManualActionWithCriticals(state, cfg, scByID, a)
 		if err != nil {
 			if !manualActionRetryExpired(a, time.Now().UTC()) {
@@ -412,7 +418,8 @@ func drainPendingManualActions(state *AppState, cfg *Config, store *StateStore) 
 		store.recordAppliedManualAction(a.StrategyID, role, a.ID)
 		appliedPartitions[part] = true
 		appliedAny = true
-		if !manualActionRecordsTrade(a.Action) {
+		booked := drainedPublicRows(state.Strategies[a.StrategyID], historyBefore)
+		if len(booked) == 0 {
 			continue
 		}
 		ma := applied[a.StrategyID]
@@ -421,7 +428,8 @@ func drainPendingManualActions(state *AppState, cfg *Config, store *StateStore) 
 			applied[a.StrategyID] = ma
 			order = append(order, a.StrategyID)
 		}
-		ma.trades++
+		ma.rows = append(ma.rows, booked...)
+		ma.trades = len(ma.rows)
 	}
 
 	// Persist at once so an on-chain fill is durable before the cycle runs.
@@ -446,6 +454,51 @@ func drainPendingManualActions(state *AppState, cfg *Config, store *StateStore) 
 		alerts = append(alerts, *applied[id])
 	}
 	return alerts, criticals
+}
+
+func drainedPublicRows(ss *StrategyState, before int) []Trade {
+	if ss == nil || before < 0 || before >= len(ss.TradeHistory) {
+		return nil
+	}
+	return hyperliquidPublicTradeAlertRows(ss.TradeHistory[before:])
+}
+
+type manualDrainReport struct {
+	sc   StrategyConfig
+	rows []Trade
+}
+
+func foldManualDrainTrades(reports []manualDrainReport, notifier *MultiNotifier, totalTrades *int, channelTrades map[string]int, channelTradeDetails map[string][]string) map[string]bool {
+	drained := make(map[string]bool)
+	for _, report := range reports {
+		if len(report.rows) == 0 {
+			continue
+		}
+		chKey := notifier.resolveChannelKey(report.sc.Platform, report.sc.Type, isLiveArgs(report.sc.Args), report.sc.PaperSource)
+		if chKey == "" {
+			continue
+		}
+		drained[chKey] = true
+		*totalTrades += len(report.rows)
+		channelTrades[chKey] += len(report.rows)
+		key := chKey + "|" + extractAsset(report.sc)
+		for _, row := range report.rows {
+			channelTradeDetails[key] = append(channelTradeDetails[key], hlStepTradeLine(report.sc, row))
+		}
+	}
+	return drained
+}
+
+func summaryChannelActive(notifier *MultiNotifier, chKey string, due []StrategyConfig, drained map[string]bool) bool {
+	if drained[chKey] {
+		return true
+	}
+	for _, sc := range due {
+		if notifier.resolveChannelKey(sc.Platform, sc.Type, isLiveArgs(sc.Args), sc.PaperSource) == chKey {
+			return true
+		}
+	}
+	return false
 }
 
 func applyManualAction(state *AppState, cfg *Config, scByID map[string]StrategyConfig, a PendingManualAction) error {
@@ -544,7 +597,7 @@ func applyManualActionWithCriticals(state *AppState, cfg *Config, scByID map[str
 		if !manualPositionOwnedByStrategy(pos, a.StrategyID) {
 			return nil, fmt.Errorf("position %s/%s is owned by %q, not %q", a.StrategyID, a.Symbol, pos.OwnerStrategyID, a.StrategyID)
 		}
-		closedFull := a.IsFullClose
+		closedFull := a.IsFullClose || pos.Quantity-a.Quantity <= 1e-9
 		side := closeTradeSide(pos.Side)
 		closeLabel := operatorCloseLabel(sc)
 
@@ -639,6 +692,7 @@ func applyManualActionWithCriticals(state *AppState, cfg *Config, scByID map[str
 		}
 		pos.StopLossOID = a.StopLossOID
 		pos.StopLossTriggerPx = a.StopLossTriggerPx
+		noteMovedStopTrigger(pos)
 		fmt.Printf("[manual] applied update-sl: %s %s stop-loss -> $%.4f (OID=%d)\n",
 			a.StrategyID, a.Symbol, a.StopLossTriggerPx, a.StopLossOID)
 
@@ -650,8 +704,7 @@ func applyManualActionWithCriticals(state *AppState, cfg *Config, scByID map[str
 		if !manualPositionOwnedByStrategy(pos, a.StrategyID) {
 			return nil, fmt.Errorf("position %s/%s is owned by %q, not %q", a.StrategyID, a.Symbol, pos.OwnerStrategyID, a.StrategyID)
 		}
-		pos.StopLossOID = 0
-		pos.StopLossTriggerPx = 0
+		clearRecordedStopLoss(pos)
 		fmt.Printf("[manual] applied cancel-sl: %s %s (stop-loss removed)\n",
 			a.StrategyID, a.Symbol)
 
@@ -780,8 +833,7 @@ func clearForceCloseCanceledProtectionOIDs(pos *Position, canceledSLOID int64, c
 		return
 	}
 	if canceledSLOID > 0 && pos.StopLossOID == canceledSLOID {
-		pos.StopLossOID = 0
-		pos.StopLossTriggerPx = 0
+		clearRecordedStopLoss(pos)
 	}
 	for idx, canceledOID := range canceledTPOIDs {
 		if canceledOID <= 0 {
@@ -986,8 +1038,8 @@ func runManualCloseEval(sc StrategyConfig, ss *StrategyState, cfg *Config, notif
 		return 0, 0, true
 	}
 
-	posCtx := positionCtxFromPosition(pos)
-	result, _, price, ok := runHyperliquidCheck(&sc, nil, posCtx, cfg.Regime, resolveATRMethod(sc, cfg), notifier, logger, nil, feed)
+	posCtx := positionCtxForCheck(sc, pos, cfg.Regime)
+	result, _, price, ok := runHyperliquidCheck(&sc, feed.manualCheckPrices(), posCtx, cfg.Regime, resolveATRMethod(sc, cfg), notifier, logger, nil, feed)
 	if !ok {
 		return 0, 0, false
 	}

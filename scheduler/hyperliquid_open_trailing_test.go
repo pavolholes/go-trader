@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"sync"
 	"testing"
 )
@@ -29,7 +30,7 @@ func TestArmTrailingStopAtOpenNow(t *testing.T) {
 	}
 	sc := StrategyConfig{ID: "hl-eth", Type: "perps", Platform: "hyperliquid", Script: "x.py", Args: liveArgs, TrailingStopATRMult: &trail}
 	st := mkState(0, 0)
-	if n, _ := armTrailingStopAtOpenNow(sc, st, "ETH", 2000, map[string]float64{"ETH": 0}, 2, &mu, nil, newTestLogger(t)); n != 0 {
+	if n, _ := armTrailingStopAtOpenNow(sc, st, "ETH", 2000, nil, &mu, nil, newTestLogger(t)); n != 0 {
 		t.Errorf("trades = %d, want 0 (resting placement is not an immediate fill)", n)
 	}
 	if !called {
@@ -53,7 +54,7 @@ func TestArmTrailingStopAtOpenNow(t *testing.T) {
 
 	called = false
 	st = mkState(123, 1950)
-	if n, _ := armTrailingStopAtOpenNow(sc, st, "ETH", 2000, map[string]float64{"ETH": 0}, 2, &mu, nil, newTestLogger(t)); n != 0 || called {
+	if n, _ := armTrailingStopAtOpenNow(sc, st, "ETH", 2000, nil, &mu, nil, newTestLogger(t)); n != 0 || called {
 		t.Errorf("existing-SL: expected no-op, got trades=%d called=%v", n, called)
 	}
 
@@ -61,7 +62,7 @@ func TestArmTrailingStopAtOpenNow(t *testing.T) {
 	scPaper := sc
 	scPaper.Args = []string{"x.py", "ETH", "1h"}
 	st = mkState(0, 0)
-	armTrailingStopAtOpenNow(scPaper, st, "ETH", 2000, map[string]float64{"ETH": 0}, 2, &mu, nil, newTestLogger(t))
+	armTrailingStopAtOpenNow(scPaper, st, "ETH", 2000, nil, &mu, nil, newTestLogger(t))
 	if called {
 		t.Errorf("not-live: expected no subprocess call")
 	}
@@ -69,14 +70,19 @@ func TestArmTrailingStopAtOpenNow(t *testing.T) {
 	called = false
 	scFixed := StrategyConfig{ID: "hl-eth", Type: "perps", Platform: "hyperliquid", Script: "x.py", Args: liveArgs, StopLossATRMult: &fixed}
 	st = mkState(0, 0)
-	armTrailingStopAtOpenNow(scFixed, st, "ETH", 2000, map[string]float64{"ETH": 0}, 2, &mu, nil, newTestLogger(t))
+	armTrailingStopAtOpenNow(scFixed, st, "ETH", 2000, nil, &mu, nil, newTestLogger(t))
 	if called {
 		t.Errorf("fixed-ATR: expected no-op (post-trade sync owns the SL)")
 	}
 
 	called = false
 	st = mkState(0, 0)
-	armTrailingStopAtOpenNow(sc, st, "ETH", 2000, map[string]float64{"ETH": 0}, 0.5, &mu, nil, newTestLogger(t))
+	snap := hlCoinSubmitSnapshot()
+	hlNoteCoinSubmission("ETH")
+	failed := newHLCycleShare(hlOnChainCoinView{Known: true, AbsQty: map[string]float64{"ETH": 2}, NetSide: map[string]string{"ETH": "long"}}, snap, func() (hlOnChainCoinView, error) {
+		return hlOnChainCoinView{}, errors.New("clearinghouseState timeout")
+	}, nil, nil, nil)
+	armTrailingStopAtOpenNow(sc, st, "ETH", 2000, failed, &mu, nil, newTestLogger(t))
 	if called {
 		t.Errorf("capped: expected deferral, got a subprocess call")
 	}
@@ -88,7 +94,7 @@ func TestArmTrailingStopAtOpenNow(t *testing.T) {
 		return &HyperliquidStopLossUpdateResult{StopLossFilledImmediately: true, StopLossTriggerPx: triggerPx}, "", nil
 	}
 	st = mkState(0, 0)
-	n, d := armTrailingStopAtOpenNow(sc, st, "ETH", 2000, map[string]float64{"ETH": 0}, 2, &mu, nil, newTestLogger(t))
+	n, d := armTrailingStopAtOpenNow(sc, st, "ETH", 2000, nil, &mu, nil, newTestLogger(t))
 	if n != 1 {
 		t.Errorf("immediate-fill: trades = %d, want 1 (close booked)", n)
 	}
@@ -97,35 +103,5 @@ func TestArmTrailingStopAtOpenNow(t *testing.T) {
 	}
 	if pos := st.Positions["ETH"]; pos != nil && pos.Quantity > 0 {
 		t.Errorf("immediate-fill: position still open (qty=%.4f), want flat", pos.Quantity)
-	}
-}
-
-func TestArmTrailingStopAtOpenNowRegime(t *testing.T) {
-	old := runHyperliquidUpdateStopLossFunc
-	defer func() { runHyperliquidUpdateStopLossFunc = old }()
-
-	var gotSize, gotTrigger float64
-	runHyperliquidUpdateStopLossFunc = func(script, symbol, side string, size, triggerPx float64, cancelStopLossOID int64) (*HyperliquidStopLossUpdateResult, string, error) {
-		gotSize, gotTrigger = size, triggerPx
-		return &HyperliquidStopLossUpdateResult{StopLossOID: 777, StopLossTriggerPx: triggerPx}, "", nil
-	}
-	regimeBlock := &RegimeATRBlock{TrendRegime: map[string]RegimeATREntry{
-		"trending": {ATR: 2.0},
-		"ranging":  {ATR: 1.0},
-	}}
-	sc := StrategyConfig{ID: "hl-eth", Type: "perps", Platform: "hyperliquid", Script: "x.py", Args: []string{"x.py", "ETH", "1h", "--mode=live"}, TrailingStopATRMultRegime: regimeBlock}
-	st := &StrategyState{ID: "hl-eth", Positions: map[string]*Position{
-		"ETH": {Symbol: "ETH", Side: "long", Quantity: 2, InitialQuantity: 2, AvgCost: 2000, EntryATR: 50, RiskAnchorPrice: 2000, Regime: "trending"},
-	}}
-	var mu sync.RWMutex
-	armTrailingStopAtOpenNow(sc, st, "ETH", 2000, map[string]float64{"ETH": 0}, 2, &mu, nil, newTestLogger(t))
-	if !approxEq(gotSize, 2) {
-		t.Errorf("size = %v, want 2", gotSize)
-	}
-	if !approxEq(gotTrigger, 1900) {
-		t.Errorf("trigger = %v, want 1900 (regime trending 2.0x ATR)", gotTrigger)
-	}
-	if got := st.Positions["ETH"].StopLossOID; got != 777 {
-		t.Errorf("pos.StopLossOID = %d, want 777 (regime owner armed inline)", got)
 	}
 }

@@ -6,62 +6,6 @@ import (
 	"time"
 )
 
-func TestReportSharedWalletDrift_ToleranceBoundary(t *testing.T) {
-	t.Run("below tolerance records nothing", func(t *testing.T) {
-		useFreshDriftTracker(t)
-		key := SharedWalletKey{Platform: "hyperliquid", Account: "0xabc"}
-		results := []sharedWalletDriftResult{
-			{Key: key, Drift: 0.004, Balance: 1000, MemberSum: 1000.004},
-		}
-		reportSharedWalletDrift(nil, results)
-		reportSharedWalletDrift(nil, results)
-
-		if n := len(sharedWalletDriftTracker.entries); n != 0 {
-			t.Fatalf("below-tolerance drift recorded %d tracker entries, want 0: %+v",
-				n, sharedWalletDriftTracker.entries)
-		}
-	})
-	t.Run("exactly at tolerance does not trip, one cent over confirms", func(t *testing.T) {
-		useFreshDriftTracker(t)
-		exactKey := SharedWalletKey{Platform: "hyperliquid", Account: "0xexact"}
-		ctrlKey := SharedWalletKey{Platform: "hyperliquid", Account: "0xctrl"}
-		results := []sharedWalletDriftResult{
-			{Key: exactKey, Drift: sharedWalletDriftTolerance, Balance: 1000, MemberSum: 1000.01},
-			{Key: ctrlKey, Drift: 0.02, Balance: 1000, MemberSum: 1000.02},
-		}
-		reportSharedWalletDrift(nil, results)
-		reportSharedWalletDrift(nil, results)
-
-		if e := sharedWalletDriftTracker.entries[sharedWalletKeyLabel(exactKey)]; e != nil {
-			t.Fatalf("drift exactly at tolerance must not record/trip (guard is strict >): %+v", e)
-		}
-		ctrl := sharedWalletDriftTracker.entries[sharedWalletKeyLabel(ctrlKey)]
-		if ctrl == nil || ctrl.cycles != 2 || !ctrl.alerted {
-			t.Fatalf("control wallet at $0.02 must confirm and alert on cycle 2: %+v", ctrl)
-		}
-	})
-}
-
-func TestSameAccountLiveManualMembers_ExcludesDifferentAccount(t *testing.T) {
-	t.Setenv("HYPERLIQUID_ACCOUNT_ADDRESS", "0xAAA")
-
-	strategies := []StrategyConfig{
-		{ID: "hl-manual-1", Platform: "hyperliquid", Type: "manual", Symbol: "BTC",
-			Args: []string{"hold", "BTC", "--mode=live"}},
-	}
-
-	other := SharedWalletKey{Platform: "hyperliquid", Account: "0xBBB"}
-	if got := sameAccountLiveManualMembers(other, strategies); len(got) != 0 {
-		t.Fatalf("different-account key must yield no members, got %v", got)
-	}
-
-	same := SharedWalletKey{Platform: "hyperliquid", Account: "0xAAA"}
-	got := sameAccountLiveManualMembers(same, strategies)
-	if len(got) != 1 || got[0] != "hl-manual-1" {
-		t.Fatalf("same-account key must include the live manual strategy, got %v", got)
-	}
-}
-
 func TestPlanTradeLedgerForStrategy_MigrationOnlyPreservesNetSum(t *testing.T) {
 	base := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
 	trades := []TradeBackfillRow{

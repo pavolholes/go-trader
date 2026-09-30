@@ -21,6 +21,13 @@ var probeArgv = []string{
 	"--regime-atr-window", "",
 	"--regime-payload-json", `{"default":{"regime":"trending_up","score":0.5,"classifier":"adx","metrics":{"adx":25.0,"plus_di":20.0,"minus_di":10.0,"atr_pct":1.0}}}`,
 	"--atr-method=simple",
+	"--position-side", "long",
+	"--position-avg-cost=1",
+	"--position-qty=1",
+	"--position-initial-qty=1",
+	"--position-entry-atr=1",
+	"--position-regime", "trending_up",
+	"--position-risk-anchor-price=1",
 	"--probe-only",
 }
 
@@ -33,6 +40,13 @@ var probeCompositeArgv = []string{
 	"--regime-atr-window", "",
 	"--regime-payload-json", `{"macro":{"regime":"trending_up_clean","score":0.5,"classifier":"composite","metrics":{"adx":30.0}}}`,
 	"--atr-method=simple",
+	"--position-side", "long",
+	"--position-avg-cost=1",
+	"--position-qty=1",
+	"--position-initial-qty=1",
+	"--position-entry-atr=1",
+	"--position-regime", "trending_up",
+	"--position-risk-anchor-price=1",
 	"--probe-only",
 }
 
@@ -54,6 +68,14 @@ var executeProbeArgv = []string{
 	"--mode=paper",
 	"--margin-mode=cross", "--leverage=1",
 	"--account-leverage=1", "--account-margin-mode=cross",
+	"--close-mode=reduce_only",
+	"--probe-only",
+}
+
+var sizedCloseProbeArgv = []string{
+	"--symbol=BTC", "--mode=live", "--sz=0.01",
+	"--side=sell", "--close-mode=reduce_only",
+	"--cancel-stop-loss-oid=1", "--cancel-protection-after-close", "--cancel-min-fill=0.01",
 	"--probe-only",
 }
 
@@ -69,8 +91,29 @@ var limitStatusProbeArgv = []string{
 	"--limit-status", "--symbol=BTC", "--oids-json=[1]", "--probe-only",
 }
 
+var syncProtectionProbeArgv = []string{
+	"--sync-protection",
+	"--symbol=BTC", "--side=long", "--size=0.01",
+	"--avg-cost=1", "--entry-atr=1", "--stop-loss-atr-mult=1",
+	"--mode=live",
+	"--stop-loss-trigger-px=1", "--preserve-moved-stop",
+	`--tp-tiers-json=[{"atr_multiple":1,"close_fraction":0.5},{"atr_multiple":2,"close_fraction":1}]`,
+	"--stop-loss-oid=1",
+	"--tp-oids-json=[1,2]",
+	"--tp-armed-tiers-json=[true,false]",
+	"--force-sl-replace",
+	"--force-tp-replace-json=[true,false]",
+	"--cancel-tp-oids-json=[3]",
+	"--reconcile-fill-hints-json=[]",
+	"--probe-only",
+}
+
 var cancelOrderProbeArgv = []string{
 	"--cancel-order", "--symbol=BTC", "--oid=1", "--probe-only",
+}
+
+var listOpenOrdersProbeArgv = []string{
+	"--list-open-order-oids", "--probe-only",
 }
 
 var hyperliquidBatchProbeArgv = []string{
@@ -133,7 +176,13 @@ func probeCheckScripts(cfg *Config) error {
 			if err := probeOneCheckScriptFn(script, limitStatusProbeArgv); err != nil {
 				return err
 			}
+			if err := probeOneCheckScriptFn(script, syncProtectionProbeArgv); err != nil {
+				return err
+			}
 			if err := probeOneCheckScriptFn(script, cancelOrderProbeArgv); err != nil {
+				return err
+			}
+			if err := probeOneCheckScriptFn(script, listOpenOrdersProbeArgv); err != nil {
 				return err
 			}
 			if err := probeOneCheckScriptFn(script, hyperliquidBatchProbeArgv); err != nil {
@@ -145,6 +194,11 @@ func probeCheckScripts(cfg *Config) error {
 			if err := probeOneCheckScriptFn(script, hyperliquidMarketCheckCompositeProbeArgv); err != nil {
 				return err
 			}
+		}
+	}
+	if anyHLLiveReconcilable(cfg) {
+		if err := probeOneCheckScriptFn(hyperliquidLiveCloseScript, sizedCloseProbeArgv); err != nil {
+			return err
 		}
 	}
 	if anyStrategyUsesLLMEntryAnalysis(cfg) {
@@ -170,6 +224,15 @@ func probeCheckScripts(cfg *Config) error {
 		}
 	}
 	return nil
+}
+
+func anyHLLiveReconcilable(cfg *Config) bool {
+	for _, sc := range cfg.Strategies {
+		if isHLLiveReconcilable(sc) {
+			return true
+		}
+	}
+	return false
 }
 
 func uniqueCheckScripts(cfg *Config) []string {

@@ -8,12 +8,15 @@ User=go-trader
 Group=go-trader
 WorkingDirectory=/opt/go-trader
 StateDirectory=go-trader
+RuntimeDirectory=go-trader-main
+RuntimeDirectoryMode=0750
 ExecStart=/opt/go-trader/go-trader --config /var/lib/go-trader/config.json
 Restart=always
 RestartSec=10
 RestartPreventExitStatus=78 79 80
 StandardOutput=journal
 StandardError=journal
+LogNamespace=go-trader
 
 EnvironmentFile=-/opt/go-trader/.env
 

@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 var deprecatedConfigKeyWarned sync.Map
@@ -822,6 +824,9 @@ func validatePostTPStopLossRules(sc StrategyConfig) []string {
 }
 
 func validatePostTPStopLossRulesWithLabels(sc StrategyConfig, labels []string) []string {
+	if strategyUsesUnifiedRegimeClose(sc) {
+		return validateUnifiedPostTPStopLossRules(sc, labels)
+	}
 	rules, errs := parseStrategyTPSLAfterRulesWithLabels(sc, labels)
 	out := append([]string(nil), errs...)
 	for _, ref := range sc.closeRefs() {
@@ -873,6 +878,86 @@ func validatePostTPStopLossRulesWithLabels(sc StrategyConfig, labels []string) [
 				out = append(out, fmt.Sprintf("sl_after (tier[%d]): trail_from_here is not supported on manual strategies (perps only in v1) — use breakeven or atr_mult instead", i))
 			}
 		}
+	}
+	return out
+}
+
+func validateUnifiedPostTPStopLossRules(sc StrategyConfig, labels []string) []string {
+	var out []string
+	for _, ref := range sc.closeRefs() {
+		n := strings.ToLower(strings.TrimSpace(ref.Name))
+		if isTieredTPATRCloseName(n) {
+			continue
+		}
+		if isTrailingTPRatchetCloseName(n) {
+			if _, ok := ref.Params["sl_after"]; ok {
+				out = append(out, fmt.Sprintf("sl_after is not used with %q — use per-tier trailing_mult_after / tp_atr_fraction instead", ref.Name))
+			}
+			continue
+		}
+		if _, ok := ref.Params["sl_after"]; ok {
+			out = append(out, fmt.Sprintf("sl_after is only honored on tiered_tp_atr / tiered_tp_atr_live close refs; found on %q", ref.Name))
+		}
+	}
+	hasAny := false
+	hasLabelStop := false
+	for _, label := range unifiedCloseConfiguredLabels(sc) {
+		rules, _ := parseStrategyTPSLAfterRulesForRegime(sc, labels, label)
+		if rules.HasAny() {
+			hasAny = true
+		}
+		if sl, ok := unifiedCloseStopLossATR(sc, label); ok && sl > 0 {
+			hasLabelStop = true
+		}
+		if sc.Type == "manual" {
+			out = append(out, manualUnifiedTrailFromHereErrors(sc, label)...)
+		}
+	}
+	if !hasAny {
+		return out
+	}
+	if (sc.TrailingStopATRMult != nil && *sc.TrailingStopATRMult > 0) ||
+		(sc.TrailingStopPct != nil && *sc.TrailingStopPct > 0) {
+		out = append(out, "sl_after cannot be combined with trailing_stop_atr_mult or trailing_stop_pct — trailing already walks the SL continuously")
+	}
+	if !hasLabelStop {
+		out = append(out, "sl_after requires a fixed stop-loss to adjust (set stop_loss_atr_mult, stop_loss_atr_mult_regime, stop_loss_pct, or stop_loss_margin_pct)")
+	}
+	return out
+}
+
+func manualUnifiedTrailFromHereErrors(sc StrategyConfig, label string) []string {
+	params := unifiedCloseRefParams(sc)
+	if params == nil {
+		return nil
+	}
+	trend, ok := params[regimeClassifierKey].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	block, ok := trend[label].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	items, ok := block["tp_tiers"].([]interface{})
+	if !ok {
+		return nil
+	}
+	var out []string
+	for i, item := range items {
+		m, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		raw, ok := m["sl_after"]
+		if !ok || raw == nil {
+			continue
+		}
+		rule, err := parseSLAfterRuleRuntime(raw)
+		if err != nil || rule.Kind != "trail_from_here" {
+			continue
+		}
+		out = append(out, fmt.Sprintf("sl_after (%s tier[%d]): trail_from_here is not supported on manual strategies (perps only in v1) — use breakeven or atr_mult instead", label, i))
 	}
 	return out
 }
@@ -944,100 +1029,251 @@ func runPostTPStopLossAdjustment(
 	mu *sync.RWMutex,
 	notifier *MultiNotifier,
 	logger *StrategyLogger,
-	hlOnChainAbsQty map[string]float64,
-) bool {
+	share *hlCycleShare,
+	hlLiquidationPx map[string]float64,
+	hlNetSideByCoin map[string]string,
+) (applied bool, fills int, detail string) {
 	if sc.Platform != "hyperliquid" || (sc.Type != "perps" && sc.Type != "manual") {
-		return false
+		return false, 0, ""
 	}
 	if stratState == nil || symbol == "" {
-		return false
+		return false, 0, ""
 	}
-	rules, _ := parseStrategyTPSLAfterRules(sc)
-	if !rules.HasAny() {
-		return false
+	defer sendTPConsumptionDeferNotices(notifier)
+	if !strategyHasPostTPStopRules(sc) {
+		return false, 0, ""
 	}
+	unified := strategyUsesUnifiedRegimeClose(sc)
 
 	mu.RLock()
 	pos, ok := stratState.Positions[symbol]
 	if !ok || pos == nil || pos.Quantity <= 0 || pos.InitialQuantity <= 0 {
 		mu.RUnlock()
-		return false
+		return false, 0, ""
 	}
 	if pos.Quantity >= pos.InitialQuantity-1e-9 {
 		mu.RUnlock()
-		return false
+		return false, 0, ""
 	}
-	clearedIdx, clearedOK := findHighestClearedTier(pos.TPOIDs, pos.TPArmedTiers, pos.SLAdjustedTiersProcessed)
+	var clearedIdx int
+	var clearedOK bool
+	var consumptionLabel string
+	var posRegime string
+	if unified {
+		consumptionLabel, clearedIdx, clearedOK = nextBookedConsumptionGroup(pos)
+		posRegime = consumptionLabel
+	} else {
+		clearedIdx, clearedOK = findHighestClearedTier(pos.TPOIDs, pos.TPArmedTiers, pos.SLAdjustedTiersProcessed)
+		posRegime = protectionATRRegimeLabel(pos, sc)
+	}
 	if !clearedOK {
 		mu.RUnlock()
-		return false
+		return false, 0, ""
 	}
 	side := pos.Side
 	avgCost := pos.riskAnchorPrice()
 	entryATR := pos.EntryATR
 	qty := pos.Quantity
+	currentTrigger := pos.StopLossTriggerPx
+	crossLabelDone := unified && unifiedCrossLabelDone(pos, consumptionLabel)
 	currentOID := pos.StopLossOID
-	posRegime := protectionATRRegimeLabel(pos, sc)
+	armed := hlBookArmed(pos)
+	var peers []hlShareBook
+	var opp float64
+	if share != nil {
+		peers, opp = share.peers(symbol, sc.ID, side)
+	}
 	mu.RUnlock()
 
-	if strategyUsesRegimeTieredTPATRClose(sc) {
+	var rules tierSLAfterRules
+	if unified {
+		if !unifiedCloseLabelResolves(sc, consumptionLabel) {
+			mu.Lock()
+			if p, ok := stratState.Positions[symbol]; ok && p != nil {
+				deferBookedConsumptionGroup(p, sc.ID, symbol, consumptionLabel, tpDeferLabelUnresolved)
+			}
+			mu.Unlock()
+			return false, 0, ""
+		}
+		if clearedIdx >= len(strategyTPTiersForRegime(sc, consumptionLabel)) {
+			mu.Lock()
+			if p, ok := stratState.Positions[symbol]; ok && p != nil {
+				deferBookedConsumptionGroup(p, sc.ID, symbol, consumptionLabel, tpDeferTierOutside)
+			}
+			mu.Unlock()
+			return false, 0, ""
+		}
+		rules, _ = parseStrategyTPSLAfterRulesForRegime(sc, nil, consumptionLabel)
+	} else if strategyUsesRegimeTieredTPATRClose(sc) {
 		rules, _ = parseStrategyTPSLAfterRulesForRegime(sc, nil, posRegime)
+	} else {
+		rules, _ = parseStrategyTPSLAfterRules(sc)
 	}
 	rawRule := rules.ForTier(clearedIdx)
 	tierMultiple := rules.TierMultiple(clearedIdx)
 
 	if rawRule.IsEmpty() {
 		mu.Lock()
-		if p, ok := stratState.Positions[symbol]; ok && p != nil && p.SLAdjustedTiersProcessed <= clearedIdx {
-			p.SLAdjustedTiersProcessed = clearedIdx + 1
+		if p, ok := stratState.Positions[symbol]; ok && p != nil {
+			if unified {
+				completeBookedConsumptionGroup(p, consumptionLabel, false)
+			} else if p.SLAdjustedTiersProcessed <= clearedIdx {
+				p.SLAdjustedTiersProcessed = clearedIdx + 1
+			}
 		}
 		mu.Unlock()
-		return false
+		return false, 0, ""
 	}
 
 	if currentOID == 0 {
-		return false
+		return false, 0, ""
 	}
 
 	rule, resolved := rawRule.resolveForRegimeAndTier(posRegime, tierMultiple)
 	if !resolved {
+		if unified {
+			mu.Lock()
+			if p, ok := stratState.Positions[symbol]; ok && p != nil {
+				deferBookedConsumptionGroup(p, sc.ID, symbol, consumptionLabel, tpDeferRuleUnresolved)
+			}
+			mu.Unlock()
+		}
 		if logger != nil {
 			logger.Info("post-TP SL adjustment for %s deferred: tier %d rule is regime-aware but pos.Regime=%q yields no entry",
 				symbol, clearedIdx, posRegime)
 		}
-		return false
+		return false, 0, ""
 	}
 
 	triggerPx, mode, computeOK := computePostTPStopLossTrigger(rule, side, avgCost, entryATR, mark)
 	if !computeOK {
-		return false
+		return false, 0, ""
+	}
+	restPx := triggerPx
+	if clamped, wasClamped := clampStopInsideLiquidation(side, triggerPx, hlLiquidationPxForSide(hlLiquidationPx, hlNetSideByCoin, symbol, side)); wasClamped {
+		restPx = clamped
+	}
+	if crossLabelDone && !hlTriggerStrictlyTighter(side, restPx, currentTrigger) {
+		mu.Lock()
+		if p, ok := stratState.Positions[symbol]; ok && p != nil {
+			completeBookedConsumptionGroup(p, consumptionLabel, false)
+		}
+		mu.Unlock()
+		if logger != nil {
+			logger.Info("post-TP SL for %s label %q is not tighter than $%.4f; completing the group without a stop replace", symbol, consumptionLabel, currentTrigger)
+		}
+		return false, 0, ""
 	}
 
-	slEffectiveQty, capped := hlSLEffectiveQty(symbol, qty, hlOnChainAbsQty)
+	liqPx := hlLiquidationPxForSide(hlLiquidationPx, hlNetSideByCoin, symbol, side)
+	clampTriggered := false
+	clampAction := hlLiquidationActionReplaceDeferred
+	if clamped, wasClamped := clampStopInsideLiquidation(side, triggerPx, liqPx); wasClamped {
+		if logger != nil {
+			logger.Warn("post-TP SL for %s would rest past liquidation $%.4f; tightening $%.4f -> $%.4f",
+				symbol, liqPx, triggerPx, clamped)
+		}
+		clampOffendingPx := triggerPx
+		triggerPx = clamped
+		clampTriggered = true
+		defer func() {
+			notifyHLStopPastLiquidation(sc, symbol, side, clampOffendingPx, clamped, liqPx, clampAction, notifier, logger, time.Now().UTC())
+		}()
+	}
+
+	q := hlStopQty{Qty: qty, Fresh: true}
+	if share != nil {
+		q = share.StopQty(sc, symbol, side, qty, armed, peers, opp)
+	}
+	placedQty, capped, place := hlReplaceQty(q, qty)
+	if !place {
+		return false, 0, ""
+	}
 	if capped && logger != nil {
-		logger.Warn("post-TP SL replace: virtual qty %.6f > on-chain %.6f for %s; capping SL size to on-chain qty (#621)", qty, slEffectiveQty, symbol)
+		logger.Warn("post-TP SL replace: virtual qty %.6f > chain share %.6f for %s; capping", qty, placedQty, symbol)
 	}
 
 	if logger != nil {
 		logger.Info("post-TP SL adjustment for %s: tier %d cleared, mode=%s new_trigger=$%.4f (cancel oid=%d)",
 			symbol, clearedIdx, mode, triggerPx, currentOID)
 	}
-	result, stderr, err := runHyperliquidUpdateStopLossFunc(sc.Script, symbol, side, slEffectiveQty, triggerPx, currentOID)
-	if stderr != "" && logger != nil {
-		logger.Info("post-TP SL stderr: %s", stderr)
+	if hlStopPlaceUnread(symbol, currentOID) {
+		released, adopted, alert := hlReleaseUnreadableStop(sc.Script, symbol, side, currentOID, placedQty, triggerPx)
+		if !released {
+			if logger != nil {
+				logger.Info("post-TP SL for %s held: the order book could not be read, so old OID %d stays", symbol, currentOID)
+			}
+			return false, 0, ""
+		}
+		if alert != "" {
+			hlStopReplaceNotifyOnce(sc.ID+"|unread-end|"+symbol+"|"+strconv.FormatInt(currentOID, 10), notifier, alert)
+		}
+		if adopted != nil {
+			msg := fmt.Sprintf("**HL POST-TP SL OUTCOME UNKNOWN** [%s] %s: the earlier replacement could not be read. Open order %d is now recorded and old OID %d may still be resting.",
+				sc.ID, symbol, adopted.StopLossOID, currentOID)
+			hlStopReplaceNotifyOnce(sc.ID+"|adopt|"+symbol+"|"+strconv.FormatInt(currentOID, 10), notifier, msg)
+			mu.Lock()
+			if p, ok := stratState.Positions[symbol]; ok && p != nil && p.Side == side && p.StopLossOID == currentOID {
+				p.StopLossOID = adopted.StopLossOID
+				if adopted.StopLossTriggerPx > 0 {
+					p.StopLossTriggerPx = adopted.StopLossTriggerPx
+				}
+				noteMovedStopTrigger(p)
+			}
+			mu.Unlock()
+			return false, 0, ""
+		}
 	}
-	if err != nil {
+	first, result, retryOutcomeUnknown, retryReason, err := func() (*HyperliquidStopLossUpdateResult, *HyperliquidStopLossUpdateResult, bool, string, error) {
+		unlock := lockHyperliquidTrailingUpdate(symbol)
+		defer unlock()
+		res, stderr, runErr := runHyperliquidUpdateStopLossFunc(sc.Script, symbol, side, placedQty, triggerPx, currentOID)
+		if stderr != "" && logger != nil {
+			logger.Info("post-TP SL stderr: %s", stderr)
+		}
+		if runErr != nil || res == nil {
+			return nil, nil, false, "", runErr
+		}
+		if !clampTriggered || !classifyPostTPStopReply(res).protectionLost {
+			return res, res, false, "", nil
+		}
+		retry, outcome := hlLiquidationPlaceFresh(sc.Script, symbol, side, placedQty, triggerPx, logger)
+		switch outcome {
+		case hlReplacePlaced, hlReplaceFilled:
+			return res, retry, false, "", nil
+		case hlReplaceOutcomeUnknown:
+			return res, retry, true, "", nil
+		}
+		// The retry is the attempt that left the position unprotected; its
+		// error, not the first attempt's, belongs in the protection-lost line.
+		reason := ""
+		if retry != nil {
+			reason = retry.StopLossError
+			if reason == "" {
+				reason = retry.Error
+			}
+		}
+		return res, res, false, reason, nil
+	}()
+	if err != nil || result == nil {
 		if logger != nil {
-			logger.Error("post-TP SL update failed: %v", err)
+			if err != nil {
+				logger.Error("post-TP SL update failed: %v", err)
+			} else {
+				logger.Error("post-TP SL update returned no result")
+			}
 		}
-		return false
+		return false, 0, ""
 	}
-	if result == nil || result.Error != "" {
-		if logger != nil && result != nil && result.Error != "" {
-			logger.Error("post-TP SL update returned error: %s", result.Error)
+	if first.Error != "" && logger != nil {
+		if first.CancelStopLossSucceeded {
+			logger.Error("post-TP SL update returned error after the old trigger OID %d was cancelled (%s); treating as cancel-landed", currentOID, first.Error)
+		} else {
+			logger.Error("post-TP SL update returned error: %s", first.Error)
 		}
-		return false
 	}
+	// Pavol fork: alert when the old trigger cancel failed but a new trigger
+	// was placed — both may be resting (account cap risk).
 	if result.CancelStopLossError != "" && logger != nil {
 		logger.Warn("post-TP SL cancel failed (non-fatal): %s", result.CancelStopLossError)
 		if result.StopLossOID > 0 && currentOID > 0 && notifier != nil && notifier.HasBackends() {
@@ -1046,54 +1282,292 @@ func runPostTPStopLossAdjustment(
 			notifier.SendToAllChannels(msg)
 		}
 	}
-	if result.StopLossError != "" {
-		if isHLOpenOrderCapRejection(result.StopLossError) {
+	if first.StopLossError != "" {
+		if isHLOpenOrderCapRejection(first.StopLossError) {
 			if logger != nil {
 				logger.Error("CRITICAL: HL open-order-cap rejected post-TP SL update for %s — position may be under-protected: %s",
-					symbol, result.StopLossError)
+					symbol, first.StopLossError)
 			}
 			if notifier != nil && notifier.HasBackends() {
 				msg := fmt.Sprintf("**HL OPEN-ORDER CAP HIT** [%s] %s post-TP SL update rejected: %s",
-					sc.ID, symbol, result.StopLossError)
-				notifier.SendToAllChannels(msg)
+					sc.ID, symbol, first.StopLossError)
+				hlStopReplaceNotifyOnce(sc.ID+"|post-tp-cap|"+symbol, notifier, msg)
 			}
 		} else if logger != nil {
-			logger.Warn("post-TP SL placement failed (non-fatal): %s", result.StopLossError)
+			logger.Warn("post-TP SL placement failed (non-fatal): %s", first.StopLossError)
 		}
+	}
+
+	cls := classifyPostTPStopReply(result)
+	switch {
+	case cls.filledAtSubmit:
+		clampAction = hlLiquidationActionExited
+	case cls.restingConfirmed:
+		clampAction = hlLiquidationActionClamped
+	case retryOutcomeUnknown:
+		clampAction = hlLiquidationActionPlacementUnknown
+	case cls.outcomeUnknown && result.CancelStopLossSucceeded:
+		clampAction = hlLiquidationActionOutcomeUnknown
+	case cls.outcomeUnknown:
+		clampAction = hlLiquidationActionPlacementUnknown
+	case cls.protectionLost:
+		clampAction = hlLiquidationActionProtectionLost
+	case result.StopLossFilledExternally:
+		clampAction = hlLiquidationActionFilledOnChain
 	}
 
 	mu.Lock()
 	p, ok := stratState.Positions[symbol]
 	if !ok || p == nil || p.Quantity <= 0 || p.Side != side {
 		mu.Unlock()
-		return false
+		return false, 0, ""
 	}
 	oldTrigger := p.StopLossTriggerPx
-	if result.StopLossOID > 0 {
-		p.StopLossOID = result.StopLossOID
+	highWater := 0.0
+	if rule.Kind == "trail_from_here" && rule.TrailATRMult > 0 && mark > 0 {
+		highWater = mark
 	}
-	if result.StopLossTriggerPx > 0 {
-		p.StopLossTriggerPx = result.StopLossTriggerPx
-	} else {
-		p.StopLossTriggerPx = triggerPx
-	}
-	p.SLAdjustedTiersProcessed = clearedIdx + 1
+	immediateFill, fillPx := applyTrailingStopUpdateResult(stratState, symbol, side, currentOID, highWater, cls.updateConfirmed, result, "post_tp_stop_loss_immediate", logger, placedQty)
 	transitionedToTrailing := false
-	if rule.Kind == "trail_from_here" && rule.TrailATRMult > 0 {
-		mult := rule.TrailATRMult
-		p.PostTPTrailingATRMult = &mult
-		if mark > 0 {
-			p.StopLossHighWaterPx = mark
+	newTrigger := 0.0
+	newOID := int64(0)
+	if cur, ok := stratState.Positions[symbol]; ok && cur != nil && cur.Quantity > 0 && cur.Side == side {
+		if cls.updateConfirmed {
+			if cls.restingConfirmed && !cls.filledAtSubmit && cur.StopLossTriggerPx <= 0 {
+				cur.StopLossTriggerPx = triggerPx
+			}
+			if unified {
+				completeBookedConsumptionGroup(cur, consumptionLabel, true)
+			} else {
+				cur.SLAfterMoved = true
+				if cur.SLAdjustedTiersProcessed <= clearedIdx {
+					cur.SLAdjustedTiersProcessed = clearedIdx + 1
+				}
+			}
+			noteMovedStopTrigger(cur)
+			if rule.Kind == "trail_from_here" && rule.TrailATRMult > 0 {
+				mult := rule.TrailATRMult
+				cur.PostTPTrailingATRMult = &mult
+				transitionedToTrailing = true
+			}
 		}
-		transitionedToTrailing = true
-	}
-	newTrigger := p.StopLossTriggerPx
-	if logger != nil {
-		logger.Info("post-TP SL adjusted: oid=%d trigger=$%.4f→$%.4f (mode=%s tier=%d)",
-			p.StopLossOID, oldTrigger, newTrigger, mode, clearedIdx)
+		newTrigger = cur.StopLossTriggerPx
+		newOID = cur.StopLossOID
 	}
 	mu.Unlock()
 
+	if immediateFill {
+		if logger != nil {
+			logger.Warn("post-TP SL for %s filled at submit @ $%.4f (tier=%d, placed qty %.6f)", symbol, fillPx, clearedIdx, placedQty)
+		}
+		return true, 1, fmt.Sprintf("[%s] LIVE POST-TP SL %s @ $%.2f", sc.ID, symbol, fillPx)
+	}
+	if cls.updateConfirmed {
+		if logger != nil {
+			logger.Info("post-TP SL adjusted: oid=%d trigger=$%.4f→$%.4f (mode=%s tier=%d)",
+				newOID, oldTrigger, newTrigger, mode, clearedIdx)
+		}
+		if cfg != nil {
+			notifySLAdjustment(notifier, cfg.NotifyTPSLFillsEnabled(), SLAdjustmentAlert{
+				StrategyID:           sc.ID,
+				Symbol:               symbol,
+				Side:                 side,
+				TierIdx:              clearedIdx,
+				OldTriggerPx:         oldTrigger,
+				NewTriggerPx:         newTrigger,
+				Mode:                 mode,
+				TransitionToTrailing: transitionedToTrailing,
+			})
+		}
+		hlStopReplaceAlertOnce.Delete(sc.ID + "|post-tp-cap|" + symbol)
+		return true, 0, ""
+	}
+
+	var msg string
+	switch {
+	case cls.outcomeUnknown && result.StopLossOldStillOpen:
+		if logger != nil {
+			logger.Error("CRITICAL: post-TP SL for %s: replacement at $%.4f could NOT be read; old OID=%d still rests, tier %d not marked done, and no further place is made for that OID",
+				symbol, triggerPx, currentOID, clearedIdx)
+		}
+		msg = fmt.Sprintf("**HL POST-TP SL OUTCOME UNKNOWN** [%s] %s %s: the replacement at $%.4f could NOT be read. The old stop OID %d was left resting. No further stop is placed for that OID. Verify the order book on Hyperliquid.",
+			sc.ID, symbol, side, triggerPx, currentOID)
+	case cls.outcomeUnknown:
+		if logger != nil {
+			logger.Error("CRITICAL: post-TP SL for %s: old OID=%d is no longer resting and the replacement's outcome at $%.4f could NOT be read; recorded trigger kept with oid unknown, tier %d not marked done",
+				symbol, currentOID, triggerPx, clearedIdx)
+		}
+		msg = fmt.Sprintf("**HL POST-TP SL OUTCOME UNKNOWN** [%s] %s %s: the old stop OID %d is no longer resting and the replacement at $%.4f returned an outcome that could NOT be read, so it may rest untracked. The recorded trigger is kept with no OID, nothing is re-placed automatically, and the liquidation audit reports it as placement unknown. Verify the order book on Hyperliquid.",
+			sc.ID, symbol, side, currentOID, triggerPx)
+	case cls.protectionLost:
+		reason := result.StopLossError
+		if reason == "" {
+			reason = result.Error
+		}
+		if retryReason != "" {
+			reason = retryReason
+		}
+		if logger != nil {
+			logger.Error("CRITICAL: post-TP SL for %s cancelled OID=%d but the replacement at $%.4f did not rest: the position has NO exchange-side stop (%s)",
+				symbol, currentOID, triggerPx, reason)
+		}
+		msg = fmt.Sprintf("**HL POST-TP SL PROTECTION LOST** [%s] %s %s: the old stop OID %d was cancelled but the replacement at $%.4f did NOT rest, so the position has no exchange-side stop right now. The next protection sync re-arms the stop (at the preserved trigger if an earlier rule moved it, else the label stop), and the post-%s stop rule runs again once a stop OID exists. Error: %s",
+			sc.ID, symbol, side, currentOID, triggerPx, tpTierLabel(clearedIdx), reason)
+	default:
+		if logger != nil {
+			logger.Warn("post-TP SL for %s not applied (tier %d kept for retry): no confirmed replacement", symbol, clearedIdx)
+		}
+	}
+	if msg != "" && !clampTriggered && notifier != nil && notifier.HasBackends() {
+		notifier.SendToAllChannels(msg)
+		notifier.SendOwnerDM(msg)
+	}
+	return false, 0, ""
+}
+
+type postTPStopReply struct {
+	restingConfirmed bool
+	filledAtSubmit   bool
+	updateConfirmed  bool
+	outcomeUnknown   bool
+	protectionLost   bool
+}
+
+func classifyPostTPStopReply(result *HyperliquidStopLossUpdateResult) postTPStopReply {
+	var c postTPStopReply
+	if result == nil {
+		return c
+	}
+	c.restingConfirmed = result.StopLossOID > 0
+	c.filledAtSubmit = result.StopLossFilledImmediately && result.StopLossTriggerPx > 0
+	c.updateConfirmed = c.restingConfirmed || c.filledAtSubmit
+	c.outcomeUnknown = !c.updateConfirmed && result.StopLossOutcomeUnknown
+	c.protectionLost = !c.updateConfirmed && result.CancelStopLossSucceeded && !result.StopLossOutcomeUnknown
+	return c
+}
+
+func paperSLAfterTierThresholds(sc StrategyConfig, regime string) []float64 {
+	tiers := strategyTPTiersForRegime(sc, regime)
+	if len(tiers) == 0 {
+		return nil
+	}
+	sorted := append([]hlProtectionTier(nil), tiers...)
+	sort.SliceStable(sorted, func(i, j int) bool { return sorted[i].Multiple < sorted[j].Multiple })
+	out := make([]float64, len(sorted))
+	for i, tier := range sorted {
+		out[i] = tier.Fraction
+	}
+	out[len(out)-1] = 1
+	return out
+}
+
+func findHighestClearedTierByClosedRatio(thresholds []float64, closedRatio float64, fromIdx int) (int, bool) {
+	if fromIdx < 0 {
+		fromIdx = 0
+	}
+	highest := -1
+	for i := fromIdx; i < len(thresholds); i++ {
+		if closedRatio+1e-9 >= thresholds[i] {
+			highest = i
+		}
+	}
+	if highest >= 0 {
+		return highest, true
+	}
+	return 0, false
+}
+
+func runPaperPostTPStopLossAdjustment(
+	sc StrategyConfig,
+	stratState *StrategyState,
+	symbol string,
+	mark float64,
+	cfg *Config,
+	mu *sync.RWMutex,
+	notifier *MultiNotifier,
+	logger *StrategyLogger,
+) bool {
+	if sc.Platform != "hyperliquid" || sc.Type != "perps" || hyperliquidIsLive(sc.Args) {
+		return false
+	}
+	if stratState == nil || symbol == "" || mu == nil {
+		return false
+	}
+	defer sendTPConsumptionDeferNotices(notifier)
+	if !strategyHasPostTPStopRules(sc) {
+		return false
+	}
+	if strategyUsesUnifiedRegimeClose(sc) {
+		return runUnifiedPaperPostTPStopLossAdjustment(sc, stratState, symbol, mark, cfg, mu, notifier, logger)
+	}
+	rules, _ := parseStrategyTPSLAfterRules(sc)
+	if !rules.HasAny() {
+		return false
+	}
+
+	mu.Lock()
+	pos, ok := stratState.Positions[symbol]
+	if !ok || pos == nil || pos.Quantity <= 0 || pos.InitialQuantity <= 0 {
+		mu.Unlock()
+		return false
+	}
+	closedRatio := 1 - pos.Quantity/pos.InitialQuantity
+	if closedRatio <= 0 {
+		mu.Unlock()
+		return false
+	}
+	posRegime := protectionATRRegimeLabel(pos, sc)
+	clearedIdx, clearedOK := findHighestClearedTierByClosedRatio(paperSLAfterTierThresholds(sc, posRegime), closedRatio, pos.SLAdjustedTiersProcessed)
+	if !clearedOK {
+		mu.Unlock()
+		return false
+	}
+	if strategyUsesRegimeTieredTPATRClose(sc) {
+		rules, _ = parseStrategyTPSLAfterRulesForRegime(sc, nil, posRegime)
+	}
+	rawRule := rules.ForTier(clearedIdx)
+	if rawRule.IsEmpty() {
+		pos.SLAdjustedTiersProcessed = clearedIdx + 1
+		mu.Unlock()
+		return false
+	}
+	if pos.StopLossTriggerPx <= 0 {
+		mu.Unlock()
+		return false
+	}
+	rule, resolved := rawRule.resolveForRegimeAndTier(posRegime, rules.TierMultiple(clearedIdx))
+	if !resolved {
+		mu.Unlock()
+		if logger != nil {
+			logger.Info("paper post-TP SL adjustment for %s deferred: tier %d rule is regime-aware but pos.Regime=%q yields no entry",
+				symbol, clearedIdx, posRegime)
+		}
+		return false
+	}
+	side := pos.Side
+	triggerPx, mode, computeOK := computePostTPStopLossTrigger(rule, side, pos.riskAnchorPrice(), pos.EntryATR, mark)
+	if !computeOK {
+		mu.Unlock()
+		return false
+	}
+	oldTrigger := pos.StopLossTriggerPx
+	pos.StopLossTriggerPx = triggerPx
+	pos.SLAdjustedTiersProcessed = clearedIdx + 1
+	pos.SLAfterMoved = true
+	transitionedToTrailing := false
+	if rule.Kind == "trail_from_here" && rule.TrailATRMult > 0 {
+		mult := rule.TrailATRMult
+		pos.PostTPTrailingATRMult = &mult
+		if mark > 0 {
+			pos.StopLossHighWaterPx = mark
+		}
+		transitionedToTrailing = true
+	}
+	mu.Unlock()
+
+	if logger != nil {
+		logger.Info("paper post-TP SL adjusted: trigger=$%.4f→$%.4f (mode=%s tier=%d)", oldTrigger, triggerPx, mode, clearedIdx)
+	}
 	if cfg != nil {
 		notifySLAdjustment(notifier, cfg.NotifyTPSLFillsEnabled(), SLAdjustmentAlert{
 			StrategyID:           sc.ID,
@@ -1101,7 +1575,103 @@ func runPostTPStopLossAdjustment(
 			Side:                 side,
 			TierIdx:              clearedIdx,
 			OldTriggerPx:         oldTrigger,
-			NewTriggerPx:         newTrigger,
+			NewTriggerPx:         triggerPx,
+			Mode:                 mode,
+			TransitionToTrailing: transitionedToTrailing,
+		})
+	}
+	return true
+}
+
+func runUnifiedPaperPostTPStopLossAdjustment(
+	sc StrategyConfig,
+	stratState *StrategyState,
+	symbol string,
+	mark float64,
+	cfg *Config,
+	mu *sync.RWMutex,
+	notifier *MultiNotifier,
+	logger *StrategyLogger,
+) bool {
+	mu.Lock()
+	pos, ok := stratState.Positions[symbol]
+	if !ok || pos == nil || pos.Quantity <= 0 || pos.InitialQuantity <= 0 {
+		mu.Unlock()
+		return false
+	}
+	label, clearedIdx, clearedOK := nextBookedConsumptionGroup(pos)
+	if !clearedOK {
+		mu.Unlock()
+		return false
+	}
+	if !unifiedCloseLabelResolves(sc, label) || clearedIdx >= len(strategyTPTiersForRegime(sc, label)) {
+		reason := tpDeferLabelUnresolved
+		if unifiedCloseLabelResolves(sc, label) {
+			reason = tpDeferTierOutside
+		}
+		deferBookedConsumptionGroup(pos, sc.ID, symbol, label, reason)
+		mu.Unlock()
+		return false
+	}
+	rules, _ := parseStrategyTPSLAfterRulesForRegime(sc, nil, label)
+	rawRule := rules.ForTier(clearedIdx)
+	if rawRule.IsEmpty() {
+		completeBookedConsumptionGroup(pos, label, false)
+		mu.Unlock()
+		return false
+	}
+	if pos.StopLossTriggerPx <= 0 {
+		mu.Unlock()
+		return false
+	}
+	rule, resolved := rawRule.resolveForRegimeAndTier(label, rules.TierMultiple(clearedIdx))
+	if !resolved {
+		deferBookedConsumptionGroup(pos, sc.ID, symbol, label, tpDeferRuleUnresolved)
+		mu.Unlock()
+		if logger != nil {
+			logger.Info("paper post-TP SL adjustment for %s deferred: tier %d rule does not resolve under label %q", symbol, clearedIdx, label)
+		}
+		return false
+	}
+	side := pos.Side
+	triggerPx, mode, computeOK := computePostTPStopLossTrigger(rule, side, pos.riskAnchorPrice(), pos.EntryATR, mark)
+	if !computeOK {
+		mu.Unlock()
+		return false
+	}
+	if unifiedCrossLabelDone(pos, label) && !hlTriggerStrictlyTighter(side, triggerPx, pos.StopLossTriggerPx) {
+		completeBookedConsumptionGroup(pos, label, false)
+		mu.Unlock()
+		if logger != nil {
+			logger.Info("paper post-TP SL for %s label %q is not tighter than the stop a prior label moved; completing the group", symbol, label)
+		}
+		return false
+	}
+	oldTrigger := pos.StopLossTriggerPx
+	pos.StopLossTriggerPx = triggerPx
+	completeBookedConsumptionGroup(pos, label, true)
+	transitionedToTrailing := false
+	if rule.Kind == "trail_from_here" && rule.TrailATRMult > 0 {
+		mult := rule.TrailATRMult
+		pos.PostTPTrailingATRMult = &mult
+		if mark > 0 {
+			pos.StopLossHighWaterPx = mark
+		}
+		transitionedToTrailing = true
+	}
+	mu.Unlock()
+
+	if logger != nil {
+		logger.Info("paper post-TP SL adjusted: trigger=$%.4f→$%.4f (mode=%s tier=%d label=%s)", oldTrigger, triggerPx, mode, clearedIdx, label)
+	}
+	if cfg != nil {
+		notifySLAdjustment(notifier, cfg.NotifyTPSLFillsEnabled(), SLAdjustmentAlert{
+			StrategyID:           sc.ID,
+			Symbol:               symbol,
+			Side:                 side,
+			TierIdx:              clearedIdx,
+			OldTriggerPx:         oldTrigger,
+			NewTriggerPx:         triggerPx,
 			Mode:                 mode,
 			TransitionToTrailing: transitionedToTrailing,
 		})

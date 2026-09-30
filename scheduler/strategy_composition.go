@@ -6,18 +6,22 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 type StrategyDecisionFields struct {
-	StopLossPrice   float64        `json:"sl_price,omitempty"`
-	ATRValue        float64        `json:"atr_value,omitempty"`
-	OpenStrategy    string         `json:"open_strategy,omitempty"`
-	CloseStrategies []string       `json:"close_strategies,omitempty"`
-	OpenAction      string         `json:"open_action,omitempty"`
-	CloseFraction   float64        `json:"close_fraction"`
-	CloseStrategy   string         `json:"close_strategy,omitempty"`
-	CloseGate       string         `json:"close_gate,omitempty"`
-	Regime          *RegimePayload `json:"regime,omitempty"`
+	StopLossPrice      float64        `json:"sl_price,omitempty"`
+	ATRValue           float64        `json:"atr_value,omitempty"`
+	OpenStrategy       string         `json:"open_strategy,omitempty"`
+	CloseStrategies    []string       `json:"close_strategies,omitempty"`
+	OpenAction         string         `json:"open_action,omitempty"`
+	CloseFraction      float64        `json:"close_fraction"`
+	CloseStrategy      string         `json:"close_strategy,omitempty"`
+	CloseGate          string         `json:"close_gate,omitempty"`
+	CloseOwner         string         `json:"close_owner,omitempty"`
+	CloseTierFillPrice float64        `json:"close_tier_fill_price,omitempty"`
+	OpenSignalInverted bool           `json:"open_signal_inverted,omitempty"`
+	Regime             *RegimePayload `json:"regime,omitempty"`
 }
 
 type PositionCtx struct {
@@ -26,12 +30,15 @@ type PositionCtx struct {
 	Quantity                       float64
 	InitialQuantity                float64
 	EntryATR                       float64
+	RiskAnchorPrice                float64
 	Regime                         string
 	DirectionalRegime              string
 	RegimeWindows                  map[string]string
 	Profile                        string
 	DirectionCertifiedAtOpen       bool
 	DirectionCertifiedStatesAtOpen map[string]string
+	OnChainTPResting               bool
+	OnChainTPBlocked               string
 }
 
 func usesOpenCloseConfig(sc StrategyConfig) bool {
@@ -78,13 +85,14 @@ func appendOpenCloseArgs(args []string, sc StrategyConfig, pos PositionCtx) []st
 	out = appendPositionFloatArg(out, "--position-qty", pos.Quantity)
 	out = appendPositionFloatArg(out, "--position-initial-qty", pos.InitialQuantity)
 	out = appendPositionFloatArg(out, "--position-entry-atr", pos.EntryATR)
+	out = appendPositionFloatArg(out, "--position-risk-anchor-price", pos.RiskAnchorPrice)
 	if r := strings.TrimSpace(pos.Regime); r != "" {
 		out = append(out, "--position-regime", r)
 	}
 	return out
 }
 
-func buildStrategyRefsArg(sc StrategyConfig) ([]string, error) {
+func buildStrategyRefsArg(sc StrategyConfig, closeOwner string, invertOpen bool) ([]string, error) {
 	openName := effectiveOpenStrategy(sc)
 	if openName == "" && sc.CloseStrategy == nil {
 		return nil, nil
@@ -95,6 +103,12 @@ func buildStrategyRefsArg(sc StrategyConfig) ([]string, error) {
 	}
 	if refs := sc.closeRefs(); len(refs) > 0 {
 		payload["closes"] = refs
+	}
+	if closeOwner != "" {
+		payload["close_owner"] = closeOwner
+	}
+	if invertOpen {
+		payload["invert_open_signal"] = true
 	}
 	blob, err := json.Marshal(payload)
 	if err != nil {
@@ -158,6 +172,7 @@ func positionCtxFromPosition(pos *Position) PositionCtx {
 		Quantity:                       pos.Quantity,
 		InitialQuantity:                pos.InitialQuantity,
 		EntryATR:                       pos.EntryATR,
+		RiskAnchorPrice:                pos.RiskAnchorPrice,
 		Regime:                         pos.Regime,
 		DirectionalRegime:              pos.Regime,
 		RegimeWindows:                  cloneStringMap(pos.RegimeWindows),
@@ -241,5 +256,41 @@ func composeOpenCloseSignal(openAction string, closeFraction float64, positionSi
 		return -1
 	default:
 		return 0
+	}
+}
+
+var sameSideCloseAlerted sync.Map
+
+func guardSameSideClose(sc StrategyConfig, result *HyperliquidResult, posSide string, posQty float64, notifier *MultiNotifier, logger *StrategyLogger) {
+	if result == nil {
+		return
+	}
+	symbol := result.Symbol
+	if symbol == "" {
+		symbol = hyperliquidSymbol(sc.Args)
+	}
+	key := sc.ID + "|" + symbol
+	if posQty <= 0 {
+		sameSideCloseAlerted.Delete(key)
+		return
+	}
+	if result.CloseFraction <= 0 {
+		return
+	}
+	sameSide := (posSide == "long" && result.Signal > 0) || (posSide == "short" && result.Signal < 0)
+	if !sameSide {
+		return
+	}
+	result.Signal = 0
+	result.CloseFraction = 0
+	if logger != nil {
+		logger.Warn("Same-side close on %s %s zeroed before the gates — a close must not become an add", posSide, symbol)
+	}
+	if _, loaded := sameSideCloseAlerted.LoadOrStore(key, struct{}{}); loaded {
+		return
+	}
+	if notifier != nil && notifier.HasBackends() {
+		msg := fmt.Sprintf("**HL SAME-SIDE CLOSE HELD** [%s] %s — a close signal arrived on the %s side already held, so this cycle takes no order. On-chain stops still rest.", sc.ID, symbol, posSide)
+		notifier.SendOwnerDM(msg)
 	}
 }

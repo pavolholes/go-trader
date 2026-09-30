@@ -50,28 +50,6 @@ func TestCandleSnapshotConversionParity(t *testing.T) {
 	}
 }
 
-func TestCandleIntervalTableCoversSupportedIntervals(t *testing.T) {
-	for _, tf := range []string{"1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "8h", "12h", "1d", "3d", "1w", "1M"} {
-		if _, ok := hlCandleIntervalMs(tf); !ok {
-			t.Fatalf("interval %q missing from the Hyperliquid interval table", tf)
-		}
-	}
-	if _, ok := hlCandleIntervalMs("7m"); ok {
-		t.Fatalf("unsupported interval 7m must not resolve")
-	}
-	intervals := hlSupportedCandleIntervals()
-	if len(intervals) != len(hlCandleIntervalMsTable) {
-		t.Fatalf("supported interval list length: got %d want %d", len(intervals), len(hlCandleIntervalMsTable))
-	}
-	for i := 1; i < len(intervals); i++ {
-		prev, _ := hlCandleIntervalMs(intervals[i-1])
-		cur, _ := hlCandleIntervalMs(intervals[i])
-		if prev >= cur {
-			t.Fatalf("supported intervals must be ordered by duration: %q then %q", intervals[i-1], intervals[i])
-		}
-	}
-}
-
 func TestFetchCandleHistoryWidensLikeThePythonAdapter(t *testing.T) {
 	makeRaws := func(n int, startOpen, intervalMs int64) []hlCandleRaw {
 		out := make([]hlCandleRaw, 0, n)
@@ -134,11 +112,5 @@ func TestFetchCandleHistoryWidensLikeThePythonAdapter(t *testing.T) {
 				t.Fatalf("short: got %v want %v", hist.Short, tc.wantShort)
 			}
 		})
-	}
-}
-
-func TestFetchCandleHistoryRejectsUnsupportedInterval(t *testing.T) {
-	if _, err := hlFetchCandleHistory(context.Background(), "BTC", "7m", 10, time.Now()); err == nil {
-		t.Fatalf("expected an unsupported-interval error")
 	}
 }

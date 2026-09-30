@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"math"
 	"os"
 	"sort"
 	"strconv"
@@ -190,15 +189,14 @@ func buildHyperliquidBatchSlot(sc StrategyConfig, posCtx PositionCtx, regime *Re
 		HTFFilter:       sc.HTFFilter,
 		RegimeATRWindow: hlBatchRegimeATRWindow(sc, regime),
 	}
-	scForCheck := strategyConfigWithOnChainProtectionFilter(sc)
-	refsArgs, err := buildStrategyRefsArg(scForCheck)
+	refsArgs, err := buildStrategyRefsArg(sc, hlCloseOwnerForCheck(sc, posCtx), hlInvertOpenSignalForCheck(sc, posCtx, regime))
 	if err != nil {
 		return hlBatchSlot{}, fmt.Errorf("marshal strategy refs: %w", err)
 	}
 	if len(refsArgs) == 2 {
 		slot.StrategyRefs = json.RawMessage(refsArgs[1])
 	}
-	if usesOpenCloseConfig(scForCheck) {
+	if usesOpenCloseConfig(sc) {
 		ctx := map[string]any{}
 		if side := strings.TrimSpace(posCtx.Side); side != "" {
 			slot.PositionSide = side
@@ -208,6 +206,7 @@ func buildHyperliquidBatchSlot(sc StrategyConfig, posCtx PositionCtx, regime *Re
 		hlBatchPutFloat(ctx, "current_quantity", posCtx.Quantity)
 		hlBatchPutFloat(ctx, "initial_quantity", posCtx.InitialQuantity)
 		hlBatchPutFloat(ctx, "entry_atr", posCtx.EntryATR)
+		hlBatchPutFloat(ctx, "risk_anchor_price", posCtx.RiskAnchorPrice)
 		if r := strings.TrimSpace(posCtx.Regime); r != "" {
 			ctx["regime"] = r
 		}
@@ -293,10 +292,6 @@ func hyperliquidBatchSlotFingerprint(sc StrategyConfig, posCtx PositionCtx, regi
 		return "", err
 	}
 	return string(blob), nil
-}
-
-func hyperliquidBatchDisplayPrice(markPrice float64) float64 {
-	return math.Round(markPrice*100) / 100
 }
 
 type hlBatchMemberOutcome struct {
@@ -438,6 +433,10 @@ func runHyperliquidBatchGroups(inputs []hlBatchGroupInput, cfg *Config, notifier
 			continue
 		}
 		var market *marketPayload
+		if feed.active() && feed.SharedKey != 0 && in.MarkPrice <= 0 {
+			logf("[WARN] hl-batch %s: no verified mark for the shared cycle; members fall back to their own checks", in.Key)
+			continue
+		}
 		if feed.active() {
 			built, err := feed.batchPayload(in.Key, in.Members)
 			if err != nil {
@@ -481,7 +480,9 @@ func runHyperliquidBatchGroups(inputs []hlBatchGroupInput, cfg *Config, notifier
 			logf("[WARN] hl-batch %s: request is %d bytes, over the %d-byte cap; members fall back to their own sealed-snapshot checks", in.Key, len(stdin), marketPayloadMaxBytes)
 			continue
 		}
-		logf("[INFO] hl-batch %s: %d strategies in one call (%s)", in.Key, len(in.Members), strings.Join(in.MemberIDsOrdered(), ", "))
+		if debugLogging() {
+			logf("[INFO] hl-batch %s: %d strategies in one call (%s)", in.Key, len(in.Members), strings.Join(in.MemberIDsOrdered(), ", "))
+		}
 		started := time.Now()
 		out, stderr, err := runHyperliquidBatchCheckFn(hyperliquidCheckScript, args, stdin)
 		elapsed := time.Since(started)
@@ -498,8 +499,8 @@ func runHyperliquidBatchGroups(inputs []hlBatchGroupInput, cfg *Config, notifier
 			continue
 		}
 		drift := hlBatchApplySlots(results, in, fingerprints, out, stderr, logf)
-		if stderr != "" {
-			logf("[INFO] hl-batch %s: stderr: %s", in.Key, stderr)
+		if text, show, _ := scriptStderrLogText(stderr); show {
+			logf("[INFO] hl-batch %s: stderr: %s", in.Key, text)
 		}
 		if drift > 0 {
 			msg := fmt.Sprintf("batch response accounted for %d of %d strategies; the rest ran their own checks",
@@ -515,7 +516,9 @@ func runHyperliquidBatchGroups(inputs []hlBatchGroupInput, cfg *Config, notifier
 				logf("[INFO] hl-batch %s: shared state recovered; batching resumed", in.Key)
 			}
 		}
-		logf("[INFO] hl-batch %s: %d slots returned in %s", in.Key, len(out.Results), elapsed.Round(time.Millisecond))
+		if debugLogging() {
+			logf("[INFO] hl-batch %s: %d slots returned in %s", in.Key, len(out.Results), elapsed.Round(time.Millisecond))
+		}
 	}
 	return results
 }

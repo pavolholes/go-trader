@@ -64,21 +64,26 @@ def _safe_int(v) -> int:
         return 0
 
 
-def _round_perps_px(px: float, sz_decimals: int) -> float:
-    if px <= 0:
-        return px
+def _perps_px_decimals(px: float, sz_decimals: int) -> int:
     px_decimals = max(0, 6 - sz_decimals)
     log = math.floor(math.log10(abs(px)))
     sig_decimals = max(0, 5 - 1 - int(log))
-    decimals = min(px_decimals, sig_decimals)
-    return round(px, decimals)
+    return min(px_decimals, sig_decimals)
 
 
-def _floor_size(sz: float, sz_decimals: int) -> float:
+def _round_perps_px(px: float, sz_decimals: int) -> float:
+    if px <= 0:
+        return px
+    return round(px, _perps_px_decimals(px, sz_decimals))
+
+
+def floor_lot_size(sz: float, sz_decimals: int) -> float:
     if sz <= 0:
-        return sz
-    quant = Decimal("1").scaleb(-max(sz_decimals, 0))
-    return float(Decimal(str(sz)).quantize(quant, rounding=ROUND_DOWN))
+        return 0.0
+    decimals = max(int(sz_decimals), 0)
+    quant = Decimal("1").scaleb(-decimals)
+    slack = Decimal("1e-9").scaleb(-decimals)
+    return float((Decimal(str(sz)) + slack).quantize(quant, rounding=ROUND_DOWN))
 
 
 def _load_meta_cache(path: str = META_CACHE_PATH, ttl_s: int = META_CACHE_TTL_S, now: float = None):
@@ -627,6 +632,25 @@ class HyperliquidExchangeAdapter:
                 raise ValueError(f"Size rounded to zero for {symbol} (sz_decimals={sz_decimals})")
         return exchange.market_close(symbol, sz)
 
+    def sized_close_price(self, symbol: str, is_buy: bool) -> float:
+        sz_decimals = self._sz_decimals(symbol)
+        mid = _safe_float(self._info.all_mids().get(symbol))
+        if mid <= 0 or not math.isfinite(mid):
+            raise ValueError(f"no usable mid price for {symbol}")
+        return _round_perps_px(mid * (1.01 if is_buy else 0.99), sz_decimals)
+
+    def market_close_sized(self, symbol: str, is_buy: bool, size: float, px: float, reduce_only: bool) -> dict:
+        exchange = self._require_exchange("market_close_sized")
+        sz_decimals = self._sz_decimals(symbol)
+        size = floor_lot_size(size, sz_decimals)
+        if size <= 0:
+            raise ValueError(f"Size floored to zero for {symbol} (sz_decimals={sz_decimals})")
+        px = _safe_float(px)
+        if px <= 0 or not math.isfinite(px):
+            raise ValueError(f"no usable limit price for {symbol}")
+        order_type = {"limit": {"tif": "Ioc"}}
+        return exchange.order(symbol, is_buy, size, px, order_type, reduce_only=bool(reduce_only))
+
     def lookup_fill_fee_by_oid(
         self,
         oid: int,
@@ -722,6 +746,12 @@ class HyperliquidExchangeAdapter:
         sz_decimals = self._sz_decimals(symbol) if self._info else 3
         return _round_perps_px(px, sz_decimals)
 
+    def perps_trigger_px_tick(self, symbol: str, px: float) -> float:
+        if px <= 0:
+            return 0.0
+        sz_decimals = self._sz_decimals(symbol) if self._info else 3
+        return 10.0 ** -_perps_px_decimals(px, sz_decimals)
+
     def place_stop_loss(
         self,
         symbol: str,
@@ -732,9 +762,9 @@ class HyperliquidExchangeAdapter:
     ) -> dict:
         exchange = self._require_exchange("place_stop_loss")
         sz_decimals = self._sz_decimals(symbol)
-        sz = round(sz, sz_decimals)
+        sz = floor_lot_size(sz, sz_decimals)
         if sz <= 0:
-            raise ValueError(f"Size rounded to zero for {symbol} (sz_decimals={sz_decimals})")
+            raise ValueError(f"Size floored to zero for {symbol} (sz_decimals={sz_decimals})")
         if trigger_px <= 0:
             raise ValueError(f"trigger_px must be > 0, got {trigger_px}")
 
@@ -751,6 +781,36 @@ class HyperliquidExchangeAdapter:
             symbol, is_buy, sz, limit_px, order_type, reduce_only=True
         )
 
+    def modify_stop_loss(
+        self,
+        symbol: str,
+        oid: int,
+        sz: float,
+        trigger_px: float,
+        is_buy: bool,
+        limit_slippage_pct: float = 5.0,
+    ) -> dict:
+        exchange = self._require_exchange("modify_stop_loss")
+        sz_decimals = self._sz_decimals(symbol)
+        sz = floor_lot_size(sz, sz_decimals)
+        if sz <= 0:
+            raise ValueError(f"Size floored to zero for {symbol} (sz_decimals={sz_decimals})")
+        if trigger_px <= 0:
+            raise ValueError(f"trigger_px must be > 0, got {trigger_px}")
+        if oid <= 0:
+            raise ValueError(f"oid must be > 0, got {oid}")
+        slip = max(limit_slippage_pct, 0.0) / 100.0
+        if is_buy:
+            limit_px = trigger_px * (1.0 + slip)
+        else:
+            limit_px = trigger_px * (1.0 - slip)
+        limit_px = _round_perps_px(limit_px, sz_decimals)
+        trigger_px = _round_perps_px(trigger_px, sz_decimals)
+        order_type = {"trigger": {"triggerPx": trigger_px, "isMarket": True, "tpsl": "sl"}}
+        return exchange.modify_order(
+            int(oid), symbol, is_buy, sz, limit_px, order_type, reduce_only=True
+        )
+
     def place_take_profit_limit(
         self,
         symbol: str,
@@ -760,7 +820,7 @@ class HyperliquidExchangeAdapter:
     ) -> dict:
         exchange = self._require_exchange("place_take_profit_limit")
         sz_decimals = self._sz_decimals(symbol)
-        sz = _floor_size(sz, sz_decimals)
+        sz = floor_lot_size(sz, sz_decimals)
         if sz <= 0:
             raise ValueError(f"Size floored to zero for {symbol} (sz_decimals={sz_decimals})")
         if limit_px <= 0:
@@ -773,11 +833,27 @@ class HyperliquidExchangeAdapter:
 
     def floor_size(self, symbol: str, sz: float) -> float:
         sz_decimals = self._sz_decimals(symbol) if self._info else 3
-        return _floor_size(sz, sz_decimals)
+        return floor_lot_size(sz, sz_decimals)
 
     def round_size(self, symbol: str, sz: float) -> float:
         sz_decimals = self._sz_decimals(symbol) if self._info else 3
         return round(sz, sz_decimals)
+
+    def frontend_open_orders(self, symbol: str | None = None) -> list:
+        if not self._account_address:
+            return []
+        orders = self._info.frontend_open_orders(self._account_address)
+        out = []
+        for order in orders or []:
+            if not isinstance(order, dict):
+                continue
+            if symbol and order.get("coin") != symbol:
+                continue
+            out.append(order)
+            for child in order.get("children") or []:
+                if isinstance(child, dict):
+                    out.append(child)
+        return out
 
     def open_order_oids(self, symbol: str | None = None) -> set[int]:
         if not self._account_address:

@@ -196,7 +196,34 @@ func validRegimeTimeframes() []string {
 const (
 	marketFeedREST      = "rest"
 	marketFeedWebsocket = "websocket"
+	marketFeedShared    = "shared"
 )
+
+const (
+	configRoleScheduler = "scheduler"
+	configRoleFeed      = "feed"
+)
+
+type SharedMarketFeedConfig struct {
+	PrimarySocket string `json:"primary_socket"`
+	BackupSocket  string `json:"backup_socket,omitempty"`
+}
+
+func (c *Config) marketFeedSharedEnabled() bool {
+	return c.marketFeedMode() == marketFeedShared
+}
+
+func (c *Config) marketFeedDeadlineScheduled() bool {
+	mode := c.marketFeedMode()
+	return mode == marketFeedWebsocket || mode == marketFeedShared
+}
+
+func (c *Config) sharedMarketFeedSockets() (primary, backup string) {
+	if c == nil || c.SharedMarketFeed == nil {
+		return "", ""
+	}
+	return strings.TrimSpace(c.SharedMarketFeed.PrimarySocket), strings.TrimSpace(c.SharedMarketFeed.BackupSocket)
+}
 
 func (c *Config) marketFeedMode() string {
 	if c == nil {
@@ -216,6 +243,13 @@ func (c *Config) marketFeedWebsocketEnabled() bool {
 func marketFeedStartupLine(cfg *Config) string {
 	if cfg.marketFeedWebsocketEnabled() {
 		return "Market feed: websocket (Hyperliquid perps + manual)"
+	}
+	if cfg.marketFeedSharedEnabled() {
+		primary, backup := cfg.sharedMarketFeedSockets()
+		if backup == "" {
+			backup = "none"
+		}
+		return fmt.Sprintf("Market feed: shared (Hyperliquid perps + manual; primary=%s backup=%s)", primary, backup)
 	}
 	return "Market feed: rest (legacy polling)"
 }
@@ -261,6 +295,7 @@ type Config struct {
 	ConfigVersion            int                        `json:"config_version,omitempty"`
 	IntervalSeconds          int                        `json:"interval_seconds"`
 	LogDir                   string                     `json:"log_dir"`
+	LogLevel                 string                     `json:"log_level,omitempty"`
 	DBFile                   string                     `json:"db_file,omitempty"`
 	PaperDBFile              string                     `json:"paper_db_file,omitempty"`
 	PaperSources             []PaperSourceConfig        `json:"paper_sources,omitempty"`
@@ -289,6 +324,9 @@ type Config struct {
 	UserDefaults             *UserDefaultsConfig        `json:"user_defaults,omitempty"`
 	Tuning                   *TuningConfig              `json:"tuning,omitempty"`
 	MarketFeed               string                     `json:"market_feed,omitempty"`
+	SharedMarketFeed         *SharedMarketFeedConfig    `json:"shared_market_feed,omitempty"`
+	Role                     string                     `json:"role,omitempty"`
+	Feed                     *FeedRoleConfig            `json:"feed,omitempty"`
 
 	migrationBaseVersion    int
 	migrationBaseVersionSet bool
@@ -1017,6 +1055,9 @@ func loadConfig(path string, skipLiveCredentialChecks bool, readOnly bool) (*Con
 	}
 	cfg.migrationBaseVersion = migrationBaseVersion
 	cfg.migrationBaseVersionSet = true
+	if err := validateSchedulerRole(&cfg); err != nil {
+		return nil, err
+	}
 	unknownErrs := validateStrategyJSONKeys(data)
 	unknownErrs = append(unknownErrs, validateUserDefaultsJSONKeys(data)...)
 	if len(unknownErrs) > 0 {
@@ -1084,25 +1125,12 @@ func loadConfig(path string, skipLiveCredentialChecks bool, readOnly bool) (*Con
 		}
 	}
 
-	configHasToken := cfg.Discord.Token != ""
-	envToken := os.Getenv("DISCORD_BOT_TOKEN")
-	if envToken != "" {
-		if configHasToken {
-			fmt.Println("[WARN] Discord token found in both config file and DISCORD_BOT_TOKEN env var. Remove it from config.json to avoid accidental exposure.")
-		}
-		cfg.Discord.Token = envToken
-	} else if configHasToken {
-		fmt.Println("[WARN] Discord token found in config file. Prefer setting DISCORD_BOT_TOKEN env var instead.")
-	}
+	applyNotifierEnvOverrides(&cfg)
 
-	if ownerID := os.Getenv("DISCORD_OWNER_ID"); ownerID != "" {
-		cfg.Discord.OwnerID = ownerID
-	}
-
-	// Discord channel IDs from env vars fill the "default" fallback where
-	// the config file has no entry. Explicit config keys always win; env
-	// only provides defaults so single-channel stacks do not need hardcoded
-	// channel IDs in config.json. Lookup order stays:
+	// Pavol fork: Discord channel IDs from env vars fill the "default"
+	// fallback where the config file has no entry. Explicit config keys
+	// always win; env only provides defaults so single-channel stacks do
+	// not need hardcoded channel IDs in config.json. Lookup order stays:
 	// <platform>[-live|-paper] -> platform -> stratType -> default.
 	if cfg.Discord.Channels == nil {
 		cfg.Discord.Channels = map[string]string{}
@@ -1122,22 +1150,6 @@ func loadConfig(path string, skipLiveCredentialChecks bool, readOnly bool) (*Con
 			// Legacy alias: the original single channel var feeds trade alerts.
 			cfg.Discord.TradeAlertChannels["default"] = ch
 		}
-	}
-
-	// Telegram bot token from env var takes priority over config file.
-	// Warn if token is present in config file (env var is preferred).
-	configHasTelegramToken := cfg.Telegram.BotToken != ""
-	envTelegramToken := os.Getenv("TELEGRAM_BOT_TOKEN")
-	if envTelegramToken != "" {
-		if configHasTelegramToken {
-			fmt.Println("[WARN] Telegram bot token found in both config file and TELEGRAM_BOT_TOKEN env var. Remove it from config.json to avoid accidental exposure.")
-		}
-		cfg.Telegram.BotToken = envTelegramToken
-	} else if configHasTelegramToken {
-		fmt.Println("[WARN] Telegram bot token found in config file. Prefer setting TELEGRAM_BOT_TOKEN env var instead.")
-	}
-	if telegramOwner := os.Getenv("TELEGRAM_OWNER_CHAT_ID"); telegramOwner != "" {
-		cfg.Telegram.OwnerChatID = telegramOwner
 	}
 
 	cfg.StatusToken = os.Getenv("STATUS_AUTH_TOKEN")
@@ -1323,7 +1335,39 @@ func loadConfig(path string, skipLiveCredentialChecks bool, readOnly bool) (*Con
 	if err := validateConfig(&cfg, skipLiveCredentialChecks); err != nil {
 		return nil, err
 	}
+	warnHyperliquidTieredATRSourceLive(&cfg)
 	return &cfg, nil
+}
+
+func applyNotifierEnvOverrides(cfg *Config) {
+	configHasToken := cfg.Discord.Token != ""
+	envToken := os.Getenv("DISCORD_BOT_TOKEN")
+	if envToken != "" {
+		if configHasToken {
+			fmt.Println("[WARN] Discord token found in both config file and DISCORD_BOT_TOKEN env var. Remove it from config.json to avoid accidental exposure.")
+		}
+		cfg.Discord.Token = envToken
+	} else if configHasToken {
+		fmt.Println("[WARN] Discord token found in config file. Prefer setting DISCORD_BOT_TOKEN env var instead.")
+	}
+
+	if ownerID := os.Getenv("DISCORD_OWNER_ID"); ownerID != "" {
+		cfg.Discord.OwnerID = ownerID
+	}
+
+	configHasTelegramToken := cfg.Telegram.BotToken != ""
+	envTelegramToken := os.Getenv("TELEGRAM_BOT_TOKEN")
+	if envTelegramToken != "" {
+		if configHasTelegramToken {
+			fmt.Println("[WARN] Telegram bot token found in both config file and TELEGRAM_BOT_TOKEN env var. Remove it from config.json to avoid accidental exposure.")
+		}
+		cfg.Telegram.BotToken = envTelegramToken
+	} else if configHasTelegramToken {
+		fmt.Println("[WARN] Telegram bot token found in config file. Prefer setting TELEGRAM_BOT_TOKEN env var instead.")
+	}
+	if telegramOwner := os.Getenv("TELEGRAM_OWNER_CHAT_ID"); telegramOwner != "" {
+		cfg.Telegram.OwnerChatID = telegramOwner
+	}
 }
 
 func normalizeHyperliquidPeerStopLosses(strategies []StrategyConfig) {
@@ -2250,6 +2294,9 @@ func validateConfig(cfg *Config, skipLiveCredentialChecks bool) error {
 	if _, err := ParseAlertThrottleInterval(cfg.AlertThrottleInterval); err != nil {
 		errs = append(errs, err.Error())
 	}
+	if _, err := parseLogLevel(cfg.LogLevel); err != nil {
+		errs = append(errs, err.Error())
+	}
 	if _, err := ParseKillSwitchResetDMTimeout(cfg.KillSwitchResetDMTimeout); err != nil {
 		errs = append(errs, err.Error())
 	}
@@ -2268,6 +2315,7 @@ func validateConfig(cfg *Config, skipLiveCredentialChecks bool) error {
 	}
 
 	errs = append(errs, validateRegimeATRConfig(cfg)...)
+	errs = append(errs, validateTPTierLadders(cfg)...)
 
 	if len(errs) > 0 {
 		return fmt.Errorf("config validation errors:\n  %s", strings.Join(errs, "\n  "))

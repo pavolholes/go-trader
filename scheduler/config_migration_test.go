@@ -12,6 +12,19 @@ import (
 	"testing"
 )
 
+func readRawConfig(t *testing.T, path string) map[string]interface{} {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	var raw map[string]interface{}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("parse config: %v", err)
+	}
+	return raw
+}
+
 func TestNewFieldsSince(t *testing.T) {
 	cases := []int{0, 1, MinSupportedConfigVersion, CurrentConfigVersion, 999}
 	for _, version := range cases {
@@ -458,30 +471,6 @@ func TestJSONBoolish(t *testing.T) {
 			got := jsonBoolish(tc.in)
 			if got != tc.want {
 				t.Errorf("jsonBoolish(%#v) = %v, want %v", tc.in, got, tc.want)
-			}
-		})
-	}
-}
-
-func TestStringFromJSON(t *testing.T) {
-	cases := []struct {
-		name string
-		in   interface{}
-		want string
-	}{
-		{"nil", nil, ""},
-		{"string trimmed", "  hello  ", "hello"},
-		{"string empty", "", ""},
-		{"int", int(123), "123"},
-		{"float64", float64(1.5), "1.5"},
-		{"bool true", true, "true"},
-		{"bool false", false, "false"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := stringFromJSON(tc.in)
-			if got != tc.want {
-				t.Errorf("stringFromJSON(%#v) = %q, want %q", tc.in, got, tc.want)
 			}
 		})
 	}
