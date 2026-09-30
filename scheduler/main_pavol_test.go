@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 )
+
 func TestNotifyPerStrategyCircuitBreaker_BroadcastsFreshTriggers(t *testing.T) {
 	cases := []struct {
 		name   string

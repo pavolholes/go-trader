@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 )
+
 func TestLoadConfigPerpsLeverageDefault(t *testing.T) {
 	dir := t.TempDir()
 	cfgJSON := `{

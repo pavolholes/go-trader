@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 )
+
 func TestForceCloseAllPositionsLiveBloFinPreservesExchangePosition(t *testing.T) {
 	drainModelOnlyCloseAlerts()
 	s := &StrategyState{
@@ -70,7 +71,6 @@ func TestForceCloseAllPositionsLiveBloFinPreservesPositionWithoutExchangeFill(t 
 		t.Fatalf("cash = %.4f, want unchanged 105", s.Cash)
 	}
 }
-
 
 func TestBuildPortfolioWarningMessage_IsConciseAndDoesNotRequestManualClose(t *testing.T) {
 	now := time.Date(2026, 6, 6, 6, 5, 0, 0, time.UTC)
@@ -201,7 +201,6 @@ func TestBuildPortfolioWarningMessage_DoesNotListPoolStrategyPnL(t *testing.T) {
 		}
 	}
 }
-
 
 func TestForceCloseAllPositionsSpotCreditsSaleProceedsWithLegacyMultiplier(t *testing.T) {
 	previousRecorder := tradeRecorder

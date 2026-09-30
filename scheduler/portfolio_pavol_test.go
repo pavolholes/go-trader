@@ -7,7 +7,6 @@ import (
 	"testing"
 )
 
-
 func TestPortfolioValueSpotUsesAssetValueWithLegacyMultiplier(t *testing.T) {
 	s := &StrategyState{
 		Type: "spot",
