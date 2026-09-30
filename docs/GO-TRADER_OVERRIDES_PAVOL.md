@@ -1,8 +1,9 @@
 # GO-TRADER OVERRIDES PAVOL
 
 Pavol fork overrides vs upstream `richkuo/go-trader`. MUST be preserved across
-upstream merges. Base: v0.103.0 (`623566b`). This file is referenced from
-`CLAUDE.md` (root `AGENTS.md` is a symlink to it).
+upstream merges. Base: v0.106.0 (`0064f5d`, merged 2026-10-01; previous base
+v0.104.0). This file is referenced from `CLAUDE.md` (root `AGENTS.md` is a
+symlink to it).
 
 ## 1. New files (upstream does not have them — keep on merge)
 
@@ -14,6 +15,10 @@ upstream merges. Base: v0.103.0 (`623566b`). This file is referenced from
 | `docs/GO-TRADER_OVERRIDES_PAVOL.md` | This file |
 | `shared_strategies/open/ob_touch.py` | `ob_touch_core` SMC order-block touch entries with 1H overlap confirmation (TradingView Institutional Level entry port; section 10) |
 | `shared_strategies/open/test_ob_touch.py` | 18 behavior tests for `ob_touch` (zone math, first-touch, mitigation, HTF gate, no-lookahead) |
+| `scheduler/config_pavol_test.go` | Fork config tests (perps leverage, spot rejection, Discord channel env) — upstream #1597 deleted the original file content, ours live here |
+| `scheduler/risk_pavol_test.go` | Fork risk tests (BloFin force-close, concise warning, spot multiplier) — same reason |
+| `scheduler/portfolio_pavol_test.go` | Fork spot valuation test — same reason |
+| `scheduler/main_pavol_test.go` | Fork routing tests (channel-only trade alerts incl. BloFin, circuit-breaker) — same reason |
 
 ## 2. BloFin perps (platform `blofin`, prefix `bl-`)
 
@@ -63,19 +68,22 @@ upstream merges. Base: v0.103.0 (`623566b`). This file is referenced from
 | `scheduler/discord.go`, `notifier.go` | `DISCORD_TRADES_CHANNEL_ID` + `DISCORD_DAILY_SUMMARY_CHANNEL_ID` env (fallback `default`); paper suppression (`blofin-paper: ""` = no spam) |
 | `scheduler/agent_info.go` | New env vars surfaced |
 
-## 6. CI / tests
+## 6. CI / tests (upstream #1597 policy: no unit tests except money math,
+parity, migrations, rare venue states — verify by running real binaries)
 
 - `check_strategy.py --exchange`, `data_fetcher` blofin branches: `py_compile` covered.
-- `blofin_spot_test.go`, `portfolio_closedpnl_gross_test.go`, `hurst_gate_wiring_test.go`, `config_test.go`, `discord_test.go`, `ui_accent_test.go`.
+- `blofin_spot_test.go`, `portfolio_closedpnl_gross_test.go`, `hurst_gate_wiring_test.go`, `discord_test.go`, `ui_accent_test.go` (kept as-is on merge — upstream deleted these files, we restore ours).
+- `config_pavol_test.go`, `risk_pavol_test.go`, `portfolio_pavol_test.go`, `main_pavol_test.go` (fork tests moved here — upstream trimmed the original files beyond recognition; `test_budget_baseline.json` points at the new paths).
 - `TestUpdateShell*` skipped (env-specific `safe.directory`).
 - `gofmt` clean required (CI `Format check` gates).
+- `CLAUDE.md` must stay under the 17000-byte CI ceiling (upstream sits at 16992 — any fork sentence needs a wording shorten elsewhere).
 
 ## 7. Merge checklist (upstream → fork)
 
 1. `git fetch upstream`; merge `upstream/main` (or version tag) into `main`.
-2. Expected conflict zones: `scheduler/config.go`, `main.go`, `db.go`, `discord*.go`, `notifier*.go`, `ui_server.go`, `ui_summary.go`, `static/ui/*`, `CLAUDE.md`/`SKILL.md`, `README.md`.
+2. Expected conflict zones: `scheduler/config.go`, `main.go`, `db.go`, `discord*.go`, `notifier*.go`, `ui_server.go`, `ui_summary.go`, `static/ui/*`, `CLAUDE.md`/`SKILL.md`, `README.md`, backtester + close evaluators (upstream refactors fast here).
 3. Keep ALL files from section 1 (new files never conflict — verify they survive).
-4. Re-apply sections 2–5 and 10 item by item; upstream refactors (e.g. paper-source partitions, notifier rewrites) may relocate the code — search by function name, not line number.
+4. Re-apply sections 2–5 and 10 item by item; upstream refactors (e.g. paper-source partitions, notifier rewrites, `_book_close`, `regime_ladder_for`, `applyNotifierEnvOverrides`) may relocate the code — search by function name, not line number. `db.go` rule: UNION of position columns (fork `realized_pnl_accum` + upstream additions) in schema, migrations, INSERT/SELECT/Scan.
 5. `gofmt -l`, `go build ./...`, `go vet`, `go test`, `py_compile` on Python touchpoints.
 6. Push → CI green → rebuild demo image → verify `/api/strategies/overview` + dashboard.
 7. Live (`go-trader-live`) rebuild only after demo proves stable.
