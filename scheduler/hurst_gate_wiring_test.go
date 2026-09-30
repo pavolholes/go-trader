@@ -9,6 +9,33 @@ import (
 	"testing"
 )
 
+// Helpers below moved here on the v0.106.0 merge: upstream #1597 deleted
+// hurst_gate_test.go which used to define them, but this wiring test
+// (including the fork's 7-dispatch-site count) still needs them.
+func hfp(v float64) *float64 { return &v }
+
+func hurstTestRegimeConfig(classifier string) *RegimeConfig {
+	return &RegimeConfig{
+		Enabled: true,
+		Windows: RegimeWindowsMap{
+			"medium": RegimeWindowSpec{Classifier: classifier, Period: 20},
+			"long":   RegimeWindowSpec{Classifier: classifier, Period: 50},
+		},
+	}
+}
+
+func hurstPayload(windowKey string, h float64, present bool) RegimePayload {
+	snap := RegimeSnapshot{Regime: "trending_up", Metrics: map[string]float64{"adx": 30}}
+	if present {
+		snap.Metrics["hurst"] = h
+	}
+	return RegimePayload{MultiMode: true, Windows: map[string]RegimeSnapshot{windowKey: snap}}
+}
+
+func hurstStrategy(hg *HurstGateConfig) StrategyConfig {
+	return StrategyConfig{ID: "s1", Type: "perps", Platform: "hyperliquid", HurstGate: hg}
+}
+
 func readMainSource(t *testing.T) string {
 	t.Helper()
 	b, err := os.ReadFile("main.go")
