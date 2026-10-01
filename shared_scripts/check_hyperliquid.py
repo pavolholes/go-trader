@@ -44,9 +44,10 @@ def _hyperliquid_adapter():
     """
     mod = sys.modules.get("hyperliquid_platform_adapter")
     if mod is None:
-        import importlib
         try:
-            cand = importlib.import_module("adapter")
+            # NOTE: plain __import__ (not importlib.import_module) so test
+            # doubles patching builtins.__import__ keep working.
+            cand = __import__("adapter", fromlist=["HyperliquidExchangeAdapter"])
         except ImportError:
             cand = None
         if cand is not None and hasattr(cand, "HyperliquidExchangeAdapter"):

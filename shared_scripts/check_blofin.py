@@ -35,9 +35,10 @@ def _blofin_adapter():
     import os as _os
     mod = _sys.modules.get("blofin_platform_adapter")
     if mod is None:
-        import importlib as _il
         try:
-            cand = _il.import_module("adapter")
+            # NOTE: plain __import__ (not importlib.import_module) so test
+            # doubles patching builtins.__import__ keep working.
+            cand = __import__("adapter", fromlist=["BloFinExchangeAdapter"])
         except ImportError:
             cand = None
         if cand is not None and hasattr(cand, "BloFinExchangeAdapter"):
