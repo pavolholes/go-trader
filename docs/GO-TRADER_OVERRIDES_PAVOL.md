@@ -9,7 +9,7 @@ symlink to it).
 
 | File | Purpose |
 |---|---|
-| `platforms/blofin/spot_adapter.py` | `BloFinSpotExchangeAdapter` — spot market data via `/api/v1/spot/market/*` (candles 9→6 fields, tickers, instruments, price). Phase 1 = market data only |
+| `platforms/blofin/spot_adapter.py` | `BloFinSpotExchangeAdapter` — spot market data via `/api/v1/spot/market/*` (candles 9→6 fields, tickers, instruments, price); cursor-paged candles above 1440. Phase 1 = market data only |
 | `shared_scripts/export_spot_top.py` | USDT-volume ranking (`volCurrency24h × last`) of spot symbols per category; outputs phase-1 symbol set |
 | `scheduler/blofin_spot_test.go` | `TestSpotEffectiveDirectionIsLongOnly` — spot is long-only |
 | `docs/GO-TRADER_OVERRIDES_PAVOL.md` | This file |
@@ -24,12 +24,12 @@ symlink to it).
 
 | File | Override |
 |---|---|
-| `platforms/blofin/adapter.py` | HMAC signing (ms timestamp, field order, base64); copy-trading routing via `BLOFIN_TRADE_ACCOUNT=copy` (`/api/v1/copytrading/*` for place/close/positions/leverage); balance response shape fix |
+| `platforms/blofin/adapter.py` | HMAC signing (ms timestamp, field order, base64); copy-trading routing via `BLOFIN_TRADE_ACCOUNT=copy` (`/api/v1/copytrading/*` for place/close/positions/leverage); balance response shape fix; OHLCV cursor pagination for requests above the 1440-candle endpoint cap |
 | `scheduler/blofin_exec.go` | `blofinIsLive`, `blofinSymbol`, `runBloFinCheck`, `executeBloFinResult`, copy-trading dispatch |
 | `scheduler/blofin_close.go` | Force-close / circuit-breaker close via `close_blofin_position.py` |
 | `scheduler/blofin_marks.go` | `fetchBloFinPerpsMids` via `/api/v1/market/tickers?instType=SWAP` |
 | `shared_scripts/check_blofin.py` | `--inst-type {swap,spot}` (default `swap`); spot branch uses `spot_adapter`; `--atr-method`; regime/HTF passthrough; `--htf-timeframe/--htf-limit` (deep HTF fetch injected as `htf_df` for `ob_touch`, fail-closed); `_detect_inst_type` accepts `--inst-type spot` and `--inst-type=swap`; LTF floor 600 bars for `ob_touch`+HTF (swing-50 needs ~500+ bars to mature) | Accepts `--position-risk-anchor-price` (upstream probe parity, ignored like Topstep) |
-| `shared_scripts/check_topstep.py` | `--htf-timeframe/--htf-limit` (same HTF injection; paper serves yfinance NQ=F); yahoo fetch has bounded retry (3x/5s) for flaky `fc.yahoo.com`; same LTF floor 600 |
+| `shared_scripts/check_topstep.py` | `--htf-timeframe/--htf-limit` (same HTF injection; paper serves yfinance NQ=F); yahoo fetch has bounded retry (3x/5s) for flaky `fc.yahoo.com`; 5m/15m queries use 60d Yahoo history (1m stays 7d); same LTF floors 2000/1200 |
 | `shared_scripts/close_blofin_position.py` | Emergency close via `adapter.market_close()` (swap only) |
 | `shared_scripts/fetch_blofin_positions.py` | Open positions fetch (swap) |
 | `shared_scripts/fetch_blofin_balance.py` | USDT equity fetch (futures) |

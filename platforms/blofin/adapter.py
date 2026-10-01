@@ -158,27 +158,42 @@ class BloFinExchangeAdapter:
         bar = self._ccxt_to_blofin_bar(interval)
         # Perps need "-USDT" suffix; keep raw symbol if it already has a dash
         inst_id = symbol if "-" in symbol else f"{symbol}-USDT"
-        data = self._public_get("/api/v1/market/candles", {
-            "instId": inst_id,
-            "bar": bar,
-            "limit": str(limit),
-        })
-        candles = data.get("data", [])
-        result = []
-        for c in candles:
-            try:
-                result.append([
-                    int(c[0]),
-                    float(c[1]),
-                    float(c[2]),
-                    float(c[3]),
-                    float(c[4]),
-                    float(c[5]),
-                ])
-            except (IndexError, ValueError, TypeError):
-                continue
-        result.sort(key=lambda x: x[0])
-        return result
+        requested = max(int(limit), 0)
+        if requested == 0:
+            return []
+        page_size = min(requested, 1440)
+        after = None
+        by_ts = {}
+        while len(by_ts) < requested:
+            params = {"instId": inst_id, "bar": bar, "limit": str(page_size)}
+            if after is not None:
+                params["after"] = str(after)
+            data = self._public_get("/api/v1/market/candles", params)
+            candles = data.get("data", [])
+            if not candles:
+                break
+            page_ts = []
+            for c in candles:
+                try:
+                    row = [int(c[0]), float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[5])]
+                except (IndexError, ValueError, TypeError):
+                    continue
+                page_ts.append(row[0])
+                by_ts[row[0]] = row
+            if not page_ts:
+                break
+            oldest = min(page_ts)
+            if after is not None and oldest >= after:
+                break  # Endpoint ignored cursor; avoid an infinite loop.
+            if len(by_ts) >= requested:
+                break
+            if len(page_ts) == 0:
+                break
+            after = oldest
+            # A short page is the oldest available history.
+            if len(candles) < page_size:
+                break
+        return [by_ts[ts] for ts in sorted(by_ts)[-requested:]]
 
     def get_perp_ohlcv(self, symbol: str, interval: str = "1h", limit: int = 200) -> list:
         return self.get_ohlcv(f"{symbol}-USDT", interval, limit)

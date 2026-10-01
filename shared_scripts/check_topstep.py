@@ -14,10 +14,18 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'shared_tools')
 from atr import ensure_atr_indicator, latest_atr
 from regime import latest_regime, parse_regime_windows_spec_json, prepare_check_regime
 
-# Minimum LTF bars for ob_touch + HTF confirmation: the swing structure
-# (default lookback 50) needs ~500-600 bars to mature; shorter windows sit
-# at trend 0 and the swing filter blocks everything. Measured on BTC 5m.
-_OB_TOUCH_MIN_LTF_BARS = 600
+# Minimum LTF history measured against a deep reference: NQ needs about 2k
+# 5m bars and 1.2k 15m bars before the swing-50 filter produces stable state.
+# This is independent of the separately fetched HTF history.
+_OB_TOUCH_MIN_LTF_BARS = {"5m": 2000, "15m": 1200}
+
+
+def _ob_touch_ltf_limit(timeframe: str, requested: int) -> int:
+    floor = _OB_TOUCH_MIN_LTF_BARS.get(str(timeframe).lower(), 600)
+    try:
+        return max(int(requested or 0), floor)
+    except (TypeError, ValueError):
+        return floor
 
 
 def _make_dataframe(candles):
@@ -151,16 +159,11 @@ def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=
             }))
             return
 
-        # ob_touch needs a mature swing structure (lookback 50): measured
-        # trend stays 0 on 200-400 bar windows and matures at ~500-600 bars.
-        # Enforce the floor here (post-argparse) so a scheduler-appended
-        # --ohlcv-limit cannot shrink it again.
+        # Enforce the measured per-timeframe LTF history floor after argparse
+        # so a scheduler-appended --ohlcv-limit cannot shrink it again.
         eff_open_for_depth = (open_strategy or strategy_name or "").strip()
         if htf_timeframe and eff_open_for_depth == "ob_touch":
-            try:
-                ohlcv_limit = max(int(ohlcv_limit or 0), _OB_TOUCH_MIN_LTF_BARS)
-            except (TypeError, ValueError):
-                ohlcv_limit = _OB_TOUCH_MIN_LTF_BARS
+            ohlcv_limit = _ob_touch_ltf_limit(timeframe, ohlcv_limit)
 
         print(f"Fetching {symbol} {timeframe} from TopStepX ({mode})...", file=sys.stderr)
         candles = adapter.get_ohlcv(symbol, interval=timeframe, limit=ohlcv_limit)
