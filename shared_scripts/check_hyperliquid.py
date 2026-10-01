@@ -34,25 +34,34 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'shared_tools')
 
 
 def _hyperliquid_adapter():
-    """Load platforms/hyperliquid/adapter.py by file path.
+    """Resolve platforms/hyperliquid/adapter.py.
 
     Both Hyperliquid and BloFin ship a top-level ``adapter`` module, so under
     a shared pytest process the first import wins the ``sys.modules`` cache
-    and shadows the other platform. Loading by path (under a distinct module
-    name) keeps this script immune to that collision.
+    and can shadow the other platform. A plain import is tried first (it also
+    honors test doubles patching ``__import__``); when the cached module is
+    not ours, the file is loaded by path under a distinct module name.
     """
     mod = sys.modules.get("hyperliquid_platform_adapter")
     if mod is None:
-        import importlib.util
-        path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            "..", "platforms", "hyperliquid", "adapter.py",
-        )
-        spec = importlib.util.spec_from_file_location(
-            "hyperliquid_platform_adapter", path)
-        mod = importlib.util.module_from_spec(spec)
+        import importlib
+        try:
+            cand = importlib.import_module("adapter")
+        except ImportError:
+            cand = None
+        if cand is not None and hasattr(cand, "HyperliquidExchangeAdapter"):
+            mod = cand
+        else:
+            import importlib.util
+            path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "..", "platforms", "hyperliquid", "adapter.py",
+            )
+            spec = importlib.util.spec_from_file_location(
+                "hyperliquid_platform_adapter", path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
         sys.modules["hyperliquid_platform_adapter"] = mod
-        spec.loader.exec_module(mod)
     return mod
 
 from atr import ensure_atr_indicator, latest_atr

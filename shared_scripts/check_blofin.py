@@ -23,26 +23,35 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'shared_tools')
 
 
 def _blofin_adapter():
-    """Load platforms/blofin/adapter.py by file path.
+    """Resolve platforms/blofin/adapter.py.
 
     Both BloFin and Hyperliquid ship a top-level ``adapter`` module, so under
     a shared pytest process the first import wins the ``sys.modules`` cache
-    and shadows the other platform. Loading by path (under a distinct module
-    name) keeps this script immune to that collision.
+    and can shadow the other platform. A plain import is tried first; when
+    the cached module is not ours, the file is loaded by path under a
+    distinct module name.
     """
     import sys as _sys
     import os as _os
-    import importlib.util as _ilu
     mod = _sys.modules.get("blofin_platform_adapter")
     if mod is None:
-        path = _os.path.join(
-            _os.path.dirname(_os.path.abspath(__file__)),
-            "..", "platforms", "blofin", "adapter.py",
-        )
-        spec = _ilu.spec_from_file_location("blofin_platform_adapter", path)
-        mod = _ilu.module_from_spec(spec)
+        import importlib as _il
+        try:
+            cand = _il.import_module("adapter")
+        except ImportError:
+            cand = None
+        if cand is not None and hasattr(cand, "BloFinExchangeAdapter"):
+            mod = cand
+        else:
+            import importlib.util as _ilu
+            path = _os.path.join(
+                _os.path.dirname(_os.path.abspath(__file__)),
+                "..", "platforms", "blofin", "adapter.py",
+            )
+            spec = _ilu.spec_from_file_location("blofin_platform_adapter", path)
+            mod = _ilu.module_from_spec(spec)
+            spec.loader.exec_module(mod)
         _sys.modules["blofin_platform_adapter"] = mod
-        spec.loader.exec_module(mod)
     return mod
 
 from atr import ensure_atr_indicator, latest_atr
