@@ -953,7 +953,6 @@ func main() {
 			for _, alert := range report.Alerts {
 				fmt.Println("[feed] " + alert)
 				if notifier != nil && notifier.HasBackends() {
-					notifier.SendToAllChannels(alert)
 					notifier.SendOwnerDM(alert)
 				}
 			}

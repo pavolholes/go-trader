@@ -1419,7 +1419,6 @@ func runPostTPStopLossAdjustment(
 		}
 	}
 	if msg != "" && !clampTriggered && notifier != nil && notifier.HasBackends() {
-		notifier.SendToAllChannels(msg)
 		notifier.SendOwnerDM(msg)
 	}
 	return false, 0, ""

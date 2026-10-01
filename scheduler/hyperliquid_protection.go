@@ -1127,7 +1127,6 @@ func notifyHLOnChainTPUnplaceable(notifier *MultiNotifier, logger *StrategyLogge
 		logger.Warn("%s", msg)
 	}
 	if notifier != nil && notifier.HasBackends() {
-		notifier.SendToAllChannels(msg)
 		notifier.SendOwnerDM(msg)
 	}
 	return true

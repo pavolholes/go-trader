@@ -197,7 +197,6 @@ func hlStopReplaceNotifyOnce(key string, notifier *MultiNotifier, msg string) {
 	if notifier == nil || !notifier.HasBackends() {
 		return
 	}
-	notifier.SendToAllChannels(msg)
 	notifier.SendOwnerDM(msg)
 }
 

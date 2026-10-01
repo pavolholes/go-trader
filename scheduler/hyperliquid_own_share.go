@@ -439,7 +439,6 @@ func formatHLShareBooks(peers []hlShareBook) string {
 
 func hlSendShareCritical(notifier *MultiNotifier, msg string) {
 	if notifier != nil && notifier.HasBackends() {
-		notifier.SendToAllChannels(msg)
 		notifier.SendOwnerDM(msg)
 	}
 }
