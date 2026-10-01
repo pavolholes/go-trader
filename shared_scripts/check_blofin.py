@@ -64,6 +64,7 @@ def _blofin_adapter():
 
 from atr import ensure_atr_indicator, latest_atr
 from regime import latest_regime, parse_regime_windows_spec_json, prepare_check_regime
+from ob_touch_data import closed_ltf_frame
 
 # Minimum LTF history measured against a deep reference: NQ needs about 2k
 # 5m bars and 1.2k 15m bars before the swing-50 filter produces stable state.
@@ -215,11 +216,12 @@ def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=
             sys.exit(1)
 
         df = _make_dataframe(candles)
+        eff_open = (open_strategy or strategy_name or "").strip()
+        df = closed_ltf_frame(df, eff_open, htf_timeframe)
         # Deep HTF frame for strategies with in-chart HTF confirmation
         # (ob_touch): fetched separately because the LTF window is too short
         # to resample enough HTF history. Injected as htf_df; the core drops
         # the forming HTF candle. Fetch failure here is fatal (fail-closed).
-        eff_open = (open_strategy or strategy_name or "").strip()
         if htf_timeframe and eff_open == "ob_touch":
             print(f"Fetching {symbol} {htf_timeframe} HTF from BloFin ({mode})...", file=sys.stderr)
             try:
