@@ -272,10 +272,16 @@ class TopStepExchangeAdapter:
         last_error = None
         for attempt in (1, 2, 3):
             try:
-                yf_interval = interval
-                if "m" in interval:
-                    period = "5d"
-                elif interval in ("1h", "60m"):
+                yf_interval = str(interval).strip().lower()
+                if yf_interval == "1m":
+                    # Yahoo retains 1-minute candles for only the last week.
+                    period = "7d"
+                elif yf_interval in ("2m", "5m", "15m", "30m", "90m"):
+                    # 5d yielded only ~346 15m NQ bars, too few for ob_touch's
+                    # 50-bar swing pivots. Yahoo supports these intraday bars
+                    # for up to 60 days; return the requested trailing window.
+                    period = "60d"
+                elif yf_interval in ("1h", "60m"):
                     period = "30d"
                 else:
                     period = "1y"
