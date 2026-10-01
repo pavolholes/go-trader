@@ -46,36 +46,35 @@ def _install_fake_yfinance(monkeypatch, script, calls, history_calls=None):
     monkeypatch.setitem(sys.modules, "yfinance", fake)
 
 
-def test_retry_rides_out_four_transient_failures(monkeypatch):
+def test_retry_rides_out_seven_transient_failures(monkeypatch):
     mod = _load_adapter()
     calls = []
     sleeps = []
     monkeypatch.setattr(mod.time, "sleep", lambda s: sleeps.append(s))
     _install_fake_yfinance(
         monkeypatch,
-        [RuntimeError("boom"), RuntimeError("boom"), RuntimeError("boom"),
-         RuntimeError("boom"), _frame()],
+        [RuntimeError("boom")] * 7 + [_frame()],
         calls,
     )
     adapter = mod.TopStepExchangeAdapter(mode="paper")
     out = adapter._get_yahoo_ohlcv("NQ", "15m", 200)
     assert len(out) == 10
-    assert calls == ["NQ=F"] * 5
-    assert sleeps == [1, 2, 3, 3]
+    assert calls == ["NQ=F"] * 8
+    assert sleeps == [1, 2, 4, 6, 8, 10, 10]
 
 
-def test_persistent_outage_returns_empty_after_five_attempts(monkeypatch):
+def test_persistent_outage_returns_empty_after_eight_attempts(monkeypatch):
     mod = _load_adapter()
     sleeps = []
     monkeypatch.setattr(mod.time, "sleep", lambda s: sleeps.append(s))
     _install_fake_yfinance(
         monkeypatch,
-        [RuntimeError("down")] * 5,
+        [RuntimeError("down")] * 8,
         [],
     )
     adapter = mod.TopStepExchangeAdapter(mode="paper")
     assert adapter._get_yahoo_ohlcv("NQ", "15m", 200) == []
-    assert sleeps == [1, 2, 3, 3]
+    assert sleeps == [1, 2, 4, 6, 8, 10, 10]
 
 
 def test_unknown_symbol_short_circuits():
