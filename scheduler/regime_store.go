@@ -196,6 +196,14 @@ func strategyRegimeSymbolTimeframe(args []string, rc *RegimeConfig) (string, str
 }
 
 func strategyRegimeBundleRequest(sc StrategyConfig, rc *RegimeConfig) (regimeBundleRequest, bool) {
+	// TopStep paper already computes its regime inline in check_topstep.py
+	// from the same OHLCV frame used for signals. The parallel shared-store
+	// fetch duplicates Yahoo intraday traffic immediately before the signal
+	// check and has caused transient fc.yahoo.com failures for NQ/MNQ. Keep
+	// TopStep live on the shared store; paper is deliberately skipped here.
+	if sc.Platform == "topstep" && !isLiveArgs(sc.Args) {
+		return regimeBundleRequest{}, false
+	}
 	if sc.Type == "options" {
 		platform := strategyRegimeDataPlatform(sc)
 		if platform == "" || len(sc.Args) < 2 {
