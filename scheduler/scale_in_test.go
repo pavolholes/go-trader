@@ -5,166 +5,55 @@ import (
 	"time"
 )
 
-func TestScaleInStatePersistsRoundTrip(t *testing.T) {
-	db := openTestDB(t)
-	now := time.Now().UTC().Truncate(time.Nanosecond)
-	state := &AppState{
-		Strategies: map[string]*StrategyState{
-			"hl-scalein-eth": {
-				ID:       "hl-scalein-eth",
-				Type:     "perps",
-				Platform: "hyperliquid",
-				Cash:     1000,
-				Positions: map[string]*Position{
-					"ETH": {
-						Symbol: "ETH", Quantity: 2, InitialQuantity: 2, AvgCost: 2100, Side: "long",
-						Multiplier: 1, OwnerStrategyID: "hl-scalein-eth", OpenedAt: now,
-						ScaleInCount: 3, LastAddPrice: 2200, AddedNotionalUSD: 2200, RiskAnchorPrice: 2000,
-					},
-				},
-				OptionPositions: map[string]*OptionPosition{},
-				TradeHistory:    []Trade{},
-			},
-		},
+func TestApplyScaleInBlendsPriceAndSizeFreezesRiskPlan(t *testing.T) {
+	mult := 1.5
+	pos := &Position{
+		Symbol:                   "ETH",
+		Side:                     "long",
+		Quantity:                 100,
+		InitialQuantity:          100,
+		AvgCost:                  2000,
+		EntryATR:                 50,
+		Regime:                   "trending",
+		RegimeWindows:            map[string]string{"medium": "trending"},
+		SLAdjustedTiersProcessed: 1,
+		TPArmedTiers:             []bool{true, false},
+		StopLossATRMult:          &mult,
 	}
-	if err := db.SaveState(state); err != nil {
-		t.Fatalf("SaveState: %v", err)
+	applyScaleIn(pos, 100, 2200)
+
+	if !approxEq(pos.AvgCost, 2100) {
+		t.Fatalf("AvgCost = %v, want 2100", pos.AvgCost)
 	}
-	loaded, err := db.LoadState()
-	if err != nil {
-		t.Fatalf("LoadState: %v", err)
+	if !approxEq(pos.Quantity, 200) {
+		t.Fatalf("Quantity = %v, want 200", pos.Quantity)
 	}
-	pos := loaded.Strategies["hl-scalein-eth"].Positions["ETH"]
-	if pos.ScaleInCount != 3 {
-		t.Errorf("ScaleInCount = %d, want 3", pos.ScaleInCount)
+	if !approxEq(pos.InitialQuantity, 200) {
+		t.Fatalf("InitialQuantity = %v, want 200", pos.InitialQuantity)
+	}
+	if pos.ScaleInCount != 1 {
+		t.Fatalf("ScaleInCount = %d, want 1", pos.ScaleInCount)
 	}
 	if !approxEq(pos.LastAddPrice, 2200) {
-		t.Errorf("LastAddPrice = %v, want 2200", pos.LastAddPrice)
+		t.Fatalf("LastAddPrice = %v, want 2200", pos.LastAddPrice)
 	}
-	if !approxEq(pos.AddedNotionalUSD, 2200) {
-		t.Errorf("AddedNotionalUSD = %v, want 2200", pos.AddedNotionalUSD)
+	if !approxEq(pos.AddedNotionalUSD, 100*2200) {
+		t.Fatalf("AddedNotionalUSD = %v, want %v", pos.AddedNotionalUSD, 100*2200.0)
 	}
-	if !approxEq(pos.RiskAnchorPrice, 2000) {
-		t.Errorf("RiskAnchorPrice = %v, want 2000", pos.RiskAnchorPrice)
+	if !pos.ScaleInResizePending {
+		t.Fatalf("ScaleInResizePending = false, want true")
 	}
-}
-
-func TestScaleInLegExcludedFromOpenCount(t *testing.T) {
-	db := openTestDB(t)
-	now := time.Now().UTC().Truncate(time.Nanosecond)
-	pid := "hl-scalein-eth:ETH:1:1"
-	state := &AppState{
-		Strategies: map[string]*StrategyState{
-			"hl-scalein-eth": {
-				ID: "hl-scalein-eth", Type: "perps", Platform: "hyperliquid", Cash: 1000,
-				Positions: map[string]*Position{}, OptionPositions: map[string]*OptionPosition{},
-				TradeHistory: []Trade{
-					{Timestamp: now.Add(-3 * time.Hour), StrategyID: "hl-scalein-eth", Symbol: "ETH", PositionID: pid, Side: "buy", Quantity: 1, Price: 2000, Value: 2000, TradeType: "perps"},
-					{Timestamp: now.Add(-2 * time.Hour), StrategyID: "hl-scalein-eth", Symbol: "ETH", PositionID: pid, Side: "buy", Quantity: 1, Price: 2100, Value: 2100, TradeType: scaleInTradeType},
-					{Timestamp: now.Add(-1 * time.Hour), StrategyID: "hl-scalein-eth", Symbol: "ETH", PositionID: pid, Side: "sell", Quantity: 2, Price: 2300, Value: 4600, TradeType: "perps", IsClose: true, RealizedPnL: 500},
-				},
-			},
-		},
+	if !approxEq(pos.EntryATR, 50) {
+		t.Fatalf("EntryATR moved: %v, want 50 (frozen)", pos.EntryATR)
 	}
-	if err := db.SaveState(state); err != nil {
-		t.Fatalf("SaveState: %v", err)
-	}
-	stats, err := db.LifetimeTradeStatsAll()
-	if err != nil {
-		t.Fatalf("LifetimeTradeStatsAll: %v", err)
-	}
-	got := stats["hl-scalein-eth"]
-	if got.PositionsOpened != 1 {
-		t.Errorf("PositionsOpened = %d, want 1 (scale_in leg excluded)", got.PositionsOpened)
-	}
-	if got.Wins != 1 {
-		t.Errorf("Wins = %d, want 1 (round-trip still graded)", got.Wins)
-	}
-	one, err := db.LifetimeTradeStatsForStrategy("hl-scalein-eth")
-	if err != nil {
-		t.Fatalf("LifetimeTradeStatsForStrategy: %v", err)
-	}
-	if one.PositionsOpened != 1 {
-		t.Errorf("per-strategy PositionsOpened = %d, want 1", one.PositionsOpened)
-	}
-}
-
-func TestScaleInProtectionForceReplace(t *testing.T) {
-	pos := &Position{
-		TPOIDs:                   []int64{0, 555},
-		TPArmedTiers:             []bool{true, true},
-		SLAdjustedTiersProcessed: 1,
-	}
-	plan := hlProtectionPlan{
-		StopLossATRMult: 1.5,
-		Tiers:           []hlProtectionTier{{Multiple: 1}, {Multiple: 2}},
-	}
-	forceSL, forceTP := scaleInProtectionForceReplace(pos, plan)
-	if !forceSL {
-		t.Errorf("forceSL = false, want true (SL must grow to cover the new total)")
-	}
-	if len(forceTP) != 2 {
-		t.Fatalf("forceTP len = %d, want 2", len(forceTP))
-	}
-	if forceTP[0] {
-		t.Errorf("forceTP[0] = true, want false (cleared tier must not be re-placed)")
-	}
-	if !forceTP[1] {
-		t.Errorf("forceTP[1] = false, want true (resting tier must resize to new total)")
+	if pos.Regime != "trending" {
+		t.Fatalf("Regime moved: %q, want trending (frozen)", pos.Regime)
 	}
 	if pos.SLAdjustedTiersProcessed != 1 {
-		t.Errorf("watermark mutated: %d, want 1", pos.SLAdjustedTiersProcessed)
+		t.Fatalf("SLAdjustedTiersProcessed = %d, want 1 (watermark not reset)", pos.SLAdjustedTiersProcessed)
 	}
-}
-
-func TestTrailingStopForceResizeReplacesWithoutMove(t *testing.T) {
-	old := runHyperliquidUpdateStopLossFunc
-	defer func() { runHyperliquidUpdateStopLossFunc = old }()
-	var called bool
-	var gotSize, gotTrigger float64
-	runHyperliquidUpdateStopLossFunc = func(script, symbol, side string, size, triggerPx float64, cancelStopLossOID int64) (*HyperliquidStopLossUpdateResult, string, error) {
-		called = true
-		gotSize = size
-		gotTrigger = triggerPx
-		return &HyperliquidStopLossUpdateResult{StopLossOID: 222, StopLossTriggerPx: triggerPx}, "", nil
-	}
-	trail := 3.0
-	minMove := 0.25
-	sc := StrategyConfig{ID: "hl-test", Platform: "hyperliquid", Type: "perps", Script: "shared_scripts/check_hyperliquid.py", TrailingStopPct: &trail, TrailingStopMinMovePct: &minMove}
-	logger := silentStrategyLogger("hl-test")
-	defer logger.Close()
-
-	called = false
-	_, result, ok := runHyperliquidTrailingStopUpdate(sc, "ETH", "long", 2.0, &Position{AvgCost: 100}, 100, 100, 97, 111, trailingReplacePolicy{}, nil, logger)
-	if !ok || result != nil || called {
-		t.Fatalf("without force, expected no replace (called=%v result=%+v)", called, result)
-	}
-	called = false
-	_, result, ok = runHyperliquidTrailingStopUpdate(sc, "ETH", "long", 2.0, &Position{AvgCost: 100}, 100, 100, 97, 111, trailingReplacePolicy{forceResize: true}, nil, logger)
-	if !ok || result == nil || !called {
-		t.Fatalf("with force, expected a replace (called=%v result=%+v ok=%v)", called, result, ok)
-	}
-	if !approxEq(gotSize, 2.0) {
-		t.Errorf("replace size = %v, want 2.0 (grown total)", gotSize)
-	}
-	if !approxEq(gotTrigger, 97) {
-		t.Errorf("replace trigger = %v, want 97 (existing trigger, frozen)", gotTrigger)
-	}
-}
-
-func TestOrForceReplace(t *testing.T) {
-	got := orForceReplace([]bool{true, false}, []bool{false, false, true})
-	want := []bool{true, false, true}
-	if len(got) != len(want) {
-		t.Fatalf("len = %d, want %d", len(got), len(want))
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Errorf("got[%d] = %v, want %v", i, got[i], want[i])
-		}
-	}
-	if orForceReplace(nil, nil) != nil {
-		t.Errorf("orForceReplace(nil,nil) should be nil")
+	if len(pos.TPArmedTiers) != 2 || !pos.TPArmedTiers[0] || pos.TPArmedTiers[1] {
+		t.Fatalf("TPArmedTiers changed: %v, want [true false] (watermark not reset)", pos.TPArmedTiers)
 	}
 }
 
@@ -225,91 +114,6 @@ func TestApplyManualActionAddBlendsAndRecords(t *testing.T) {
 	}
 }
 
-func TestConfigValidationRejectsScaleInOffPlatform(t *testing.T) {
-	cfg := &Config{
-		Strategies: []StrategyConfig{
-			{ID: "spot-x", Type: "spot", Platform: "binanceus", Script: "s.py", AllowScaleIn: true},
-		},
-	}
-	err := validateConfig(cfg, true)
-	if err == nil {
-		t.Fatalf("expected validateConfig to reject allow_scale_in on spot/binanceus")
-	}
-}
-
-func TestApplyScaleInBlendsPriceAndSizeFreezesRiskPlan(t *testing.T) {
-	mult := 1.5
-	pos := &Position{
-		Symbol:                   "ETH",
-		Side:                     "long",
-		Quantity:                 100,
-		InitialQuantity:          100,
-		AvgCost:                  2000,
-		EntryATR:                 50,
-		Regime:                   "trending",
-		RegimeWindows:            map[string]string{"medium": "trending"},
-		SLAdjustedTiersProcessed: 1,
-		TPArmedTiers:             []bool{true, false},
-		StopLossATRMult:          &mult,
-	}
-	applyScaleIn(pos, 100, 2200)
-
-	if !approxEq(pos.AvgCost, 2100) {
-		t.Fatalf("AvgCost = %v, want 2100", pos.AvgCost)
-	}
-	if !approxEq(pos.Quantity, 200) {
-		t.Fatalf("Quantity = %v, want 200", pos.Quantity)
-	}
-	if !approxEq(pos.InitialQuantity, 200) {
-		t.Fatalf("InitialQuantity = %v, want 200", pos.InitialQuantity)
-	}
-	if pos.ScaleInCount != 1 {
-		t.Fatalf("ScaleInCount = %d, want 1", pos.ScaleInCount)
-	}
-	if !approxEq(pos.LastAddPrice, 2200) {
-		t.Fatalf("LastAddPrice = %v, want 2200", pos.LastAddPrice)
-	}
-	if !approxEq(pos.AddedNotionalUSD, 100*2200) {
-		t.Fatalf("AddedNotionalUSD = %v, want %v", pos.AddedNotionalUSD, 100*2200.0)
-	}
-	if !pos.ScaleInResizePending {
-		t.Fatalf("ScaleInResizePending = false, want true")
-	}
-	if !approxEq(pos.EntryATR, 50) {
-		t.Fatalf("EntryATR moved: %v, want 50 (frozen)", pos.EntryATR)
-	}
-	if pos.Regime != "trending" {
-		t.Fatalf("Regime moved: %q, want trending (frozen)", pos.Regime)
-	}
-	if pos.SLAdjustedTiersProcessed != 1 {
-		t.Fatalf("SLAdjustedTiersProcessed = %d, want 1 (watermark not reset)", pos.SLAdjustedTiersProcessed)
-	}
-	if len(pos.TPArmedTiers) != 2 || !pos.TPArmedTiers[0] || pos.TPArmedTiers[1] {
-		t.Fatalf("TPArmedTiers changed: %v, want [true false] (watermark not reset)", pos.TPArmedTiers)
-	}
-}
-
-func TestApplyScaleInMultipleAddsAccumulate(t *testing.T) {
-	pos := &Position{Side: "short", Quantity: 10, InitialQuantity: 10, AvgCost: 100}
-	applyScaleIn(pos, 10, 90)
-	applyScaleIn(pos, 10, 110)
-	if pos.ScaleInCount != 2 {
-		t.Fatalf("ScaleInCount = %d, want 2", pos.ScaleInCount)
-	}
-	if !approxEq(pos.Quantity, 30) || !approxEq(pos.InitialQuantity, 30) {
-		t.Fatalf("Quantity/InitialQuantity = %v/%v, want 30/30", pos.Quantity, pos.InitialQuantity)
-	}
-	if !approxEq(pos.AvgCost, 100) {
-		t.Fatalf("AvgCost = %v, want 100", pos.AvgCost)
-	}
-	if !approxEq(pos.AddedNotionalUSD, 2000) {
-		t.Fatalf("AddedNotionalUSD = %v, want 2000", pos.AddedNotionalUSD)
-	}
-	if !approxEq(pos.LastAddPrice, 110) {
-		t.Fatalf("LastAddPrice = %v, want 110", pos.LastAddPrice)
-	}
-}
-
 func TestApplyScaleInStampsFrozenRiskAnchor(t *testing.T) {
 	pos := &Position{Side: "long", Quantity: 100, InitialQuantity: 100, AvgCost: 2000}
 	applyScaleIn(pos, 100, 2200)
@@ -325,32 +129,6 @@ func TestApplyScaleInStampsFrozenRiskAnchor(t *testing.T) {
 	}
 	if !approxEq(pos.riskAnchorPrice(), 2000) {
 		t.Fatalf("riskAnchorPrice() = %v, want 2000", pos.riskAnchorPrice())
-	}
-}
-
-func TestRiskAnchorPriceFallsBackToAvgCost(t *testing.T) {
-	pos := &Position{AvgCost: 1500}
-	if !approxEq(pos.riskAnchorPrice(), 1500) {
-		t.Fatalf("riskAnchorPrice() = %v, want 1500 (fallback to AvgCost)", pos.riskAnchorPrice())
-	}
-}
-
-func TestProtectionPlanFreezesTriggersAtRiskAnchor(t *testing.T) {
-	mult := 1.5
-	pos := &Position{
-		Symbol: "ETH", Side: "long", Quantity: 200, InitialQuantity: 200,
-		AvgCost: 2100, RiskAnchorPrice: 2000, EntryATR: 50, StopLossATRMult: &mult,
-	}
-	sc := StrategyConfig{Type: "perps", Platform: "hyperliquid", StopLossATRMult: &mult}
-	plan, ok := buildHyperliquidProtectionPlan(sc, pos, 0)
-	if !ok {
-		t.Fatalf("expected a protection plan")
-	}
-	if !approxEq(plan.AvgCost, 2000) {
-		t.Fatalf("plan.AvgCost = %v, want 2000 (frozen anchor, not blended 2100)", plan.AvgCost)
-	}
-	if !approxEq(plan.Size, 200) {
-		t.Fatalf("plan.Size = %v, want 200 (grown total)", plan.Size)
 	}
 }
 

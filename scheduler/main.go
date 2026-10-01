@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"math"
 	"os"
 	"os/signal"
 	"strings"
@@ -30,6 +31,7 @@ var knownSubcommands = []string{
 	"storage-inspect",
 	"agent-info",
 	"diagnostics",
+	"feed-fetch",
 	"version",
 }
 
@@ -82,6 +84,8 @@ func main() {
 			os.Exit(runAgentInfo(os.Args[2:]))
 		case "diagnostics":
 			os.Exit(runDiagnostics(os.Args[2:]))
+		case "feed-fetch":
+			os.Exit(runFeedFetch(os.Args[2:]))
 		case "version", "--version", "-version":
 			fmt.Println(Version)
 			os.Exit(0)
@@ -100,6 +104,10 @@ func main() {
 		os.Exit(2)
 	}
 
+	if role, roleErr := peekConfigRole(*configPath); roleErr == nil && role == configRoleFeed {
+		os.Exit(runFeedRole(*configPath, *statusPortFlag, *once, *summary, *leaderboard))
+	}
+
 	cfg, err := LoadConfig(*configPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
@@ -109,11 +117,16 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Failed to apply alert throttle interval: %v\n", err)
 		os.Exit(1)
 	}
+	if err := applyLogLevelFromConfig(cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to apply log level: %v\n", err)
+		os.Exit(1)
+	}
 	if err := applyKillSwitchResetDMTimeoutFromConfig(cfg); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to apply kill-switch reset DM timeout: %v\n", err)
 		os.Exit(1)
 	}
 	fmt.Printf("Loaded config: %d strategies, interval=%ds\n", len(cfg.Strategies), cfg.IntervalSeconds)
+	fmt.Println(logLevelStartupLine())
 
 	setDirectionalCertStore(LoadDirectionalCertSetFailClosed(directionalCertPath(), func(f string, a ...interface{}) {
 		fmt.Fprintf(os.Stderr, f+"\n", a...)
@@ -650,10 +663,29 @@ func main() {
 	fmt.Println("Option pricers ready (deribit: live API, ibkr: Black-Scholes)")
 
 	websocketFeed := cfg.marketFeedWebsocketEnabled()
+	sharedFeed := cfg.marketFeedSharedEnabled()
+	deadlineFeed := cfg.marketFeedDeadlineScheduled()
 	fmt.Println(marketFeedStartupLine(cfg))
 	var feedOwner *marketFeedOwner
+	feedOwnerCtx := shutdownReadOnlyCtx
 	var feedReq feedRequirements
+	var sharedClient *sharedFeedClient
 	lastEvaluated := make(map[string]feedEvaluationMark)
+	sharedSkipLogged := make(map[int64]bool)
+	if sharedFeed {
+		derived, ferr := deriveFeedRequirements(cfg)
+		if ferr != nil {
+			fmt.Fprintf(os.Stderr, "[feed] CRITICAL: %v\n", ferr)
+			sendStartupRefusalDM(notifier, "Market feed", ferr.Error())
+			cleanupNotifier()
+			os.Exit(1)
+		}
+		feedReq = derived
+		sharedClient = newSharedFeedClient(cfg)
+		fmt.Printf("[feed-audit] event=start at=%d pid=%d\n", time.Now().Unix(), os.Getpid())
+		globalMarketFeedStatus.setShared(sharedClient)
+		checkSharedFeedCoverage(sharedClient, "startup", feedReq, feedConsumerCadences(cfg), notifier)
+	}
 	if websocketFeed {
 		derived, ferr := deriveFeedRequirements(cfg)
 		if ferr != nil {
@@ -664,9 +696,14 @@ func main() {
 		}
 		feedReq = derived
 		feedOwner = newMarketFeedOwner(nil, func(format string, a ...any) { fmt.Printf(format+"\n", a...) })
+		feedLedger := newFeedRequestLedger(nil, false, nil)
+		feedOwner.SetRequestLedger(feedLedger)
+		feedOwnerCtx = withFeedLedger(shutdownReadOnlyCtx, feedLedger)
+		fmt.Printf("[feed] closed-bar correction: re-read at close%s, counted as request reason correction\n",
+			formatFeedCorrectionOffsets(feedCorrectionOffsets))
 		globalMarketFeedStatus.setOwner(feedOwner)
-		ready := feedOwner.ApplyGeneration(shutdownReadOnlyCtx, feedReq)
-		go feedOwner.Run(shutdownReadOnlyCtx)
+		ready := feedOwner.ApplyGeneration(feedOwnerCtx, feedReq)
+		go feedOwner.Run(feedOwnerCtx)
 		select {
 		case <-ready:
 		case <-time.After(feedStartupBudget):
@@ -707,13 +744,23 @@ func main() {
 
 		diagWorker.UpdateStrategies(cfg.Strategies)
 
+		if sharedFeed && sharedClient != nil {
+			nextReq, reqErr := deriveFeedRequirements(cfg)
+			if reqErr != nil {
+				fmt.Fprintf(os.Stderr, "[reload] ERROR: market feed requirements rejected; keeping the previous requirements: %v\n", reqErr)
+			} else {
+				feedReq = nextReq
+				fmt.Printf("[reload] shared market feed requirements refreshed (%d keys); each seal is checked against them\n", len(nextReq.Order))
+				checkSharedFeedCoverage(sharedClient, "reload", feedReq, feedConsumerCadences(cfg), notifier)
+			}
+		}
 		if websocketFeed && feedOwner != nil {
 			nextReq, reqErr := deriveFeedRequirements(cfg)
 			if reqErr != nil {
 				fmt.Fprintf(os.Stderr, "[reload] ERROR: market feed requirements rejected; keeping the previous generation: %v\n", reqErr)
 			} else {
 				feedReq = nextReq
-				<-feedOwner.ApplyGeneration(shutdownReadOnlyCtx, nextReq)
+				<-feedOwner.ApplyGeneration(feedOwnerCtx, nextReq)
 				fmt.Printf("[reload] market feed generation %d published (%d keys)\n", feedOwner.Generation(), len(nextReq.Order))
 			}
 		}
@@ -760,6 +807,8 @@ func main() {
 	var resetGoroutineRunning atomic.Bool
 	sharedWalletRiskBalances := make(map[SharedWalletKey]sharedWalletRiskBalanceSnapshot)
 	sharedWalletRiskGeneration := 0
+	backfillMovedStopMarkers(cfg, state, &mu)
+	var pendingDrainReports []manualDrainReport
 
 	for {
 		if isDraining() {
@@ -782,10 +831,11 @@ func main() {
 		manualAlerts, manualCriticals := drainPendingManualActions(state, cfg, store)
 		mu.Unlock()
 		for _, ma := range manualAlerts {
-			sendTradeAlerts(ma.sc, ma.ss, ma.trades, &mu, notifier, cfg.Regime)
+			sendTradeAlertRows(ma.sc, ma.rows, notifier, cfg.Regime)
+			pendingDrainReports = append(pendingDrainReports, manualDrainReport{sc: ma.sc, rows: ma.rows})
 		}
 		for _, critical := range manualCriticals {
-			notifyManualCloseRearmFailure(notifier, critical)
+			notifyCloseRearm(notifier, critical)
 		}
 
 		limitAlerts := reconcilePendingLimitOrders(state, cfg, store, &mu, notifier, logMgr)
@@ -799,9 +849,27 @@ func main() {
 		intervals := effectiveStrategyIntervals(cfg.Strategies, state.Strategies, cfg.IntervalSeconds, drawdownWarnThresholdPct)
 		mu.RUnlock()
 
-		dueStrategies, evaluationMarks, zeroCapitalSkipped := computeDueSet(cycleStart, cfg, intervals, lastRun, lastEvaluated, websocketFeed)
+		dueAt := cycleStart
+		sharedSched := sharedFeedScheduleFor(cfg, sharedClient)
+		if sharedSched != nil {
+			dueAt = time.Now()
+			stale := sharedFeedStaleDeadlines(dueAt, cfg, intervals, lastEvaluated, sharedSched)
+			for _, line := range sharedFeedSkipLines(stale, sharedSkipLogged, dueAt, feedEffectiveCadences(cfg, intervals)) {
+				fmt.Println(line)
+			}
+		}
+		dueStrategies, evaluationMarks, zeroCapitalSkipped := computeDueSet(dueAt, cfg, intervals, lastRun, lastEvaluated, deadlineFeed, sharedSched)
 		for _, id := range zeroCapitalSkipped {
 			fmt.Printf("[ERROR] %s: capital_pct set but capital resolved to $0 — skipping\n", id)
+			globalRunEvidence.markZeroCapitalSkipped(id, time.Now())
+		}
+		var sharedDeadline time.Time
+		if sharedFeed {
+			var deferred int
+			dueStrategies, evaluationMarks, sharedDeadline, deferred = splitDueByDeadline(dueStrategies, evaluationMarks)
+			if deferred > 0 {
+				fmt.Printf("[feed] shared cycle key=%d: %d strategies on a later deadline run in their own cycle next\n", sharedDeadline.Unix(), deferred)
+			}
 		}
 		for _, line := range feedCycleEvaluationSummary(evaluationMarks) {
 			fmt.Println(line)
@@ -824,7 +892,7 @@ func main() {
 					offCycleAuditSaveDirty = flushOffCycleLiquidationAuditState(state, cfg, store, &mu, mutations, offCycleAuditSaveDirty, false)
 					continue
 				}
-				delay := cycleSchedulerDelay(cfg, intervals, lastRun, lastEvaluated, time.Now(), tickSeconds, websocketFeed)
+				delay := cycleSchedulerDelay(cfg, intervals, lastRun, lastEvaluated, time.Now(), tickSeconds, deadlineFeed, sharedFeedScheduleFor(cfg, sharedClient))
 				if wait := time.Until(lastLiquidationAudit.Add(time.Duration(audSec) * time.Second)); wait < delay {
 					delay = wait
 				}
@@ -846,7 +914,7 @@ func main() {
 					return
 				}
 			}
-			delay := cycleSchedulerDelay(cfg, intervals, lastRun, lastEvaluated, time.Now(), tickSeconds, websocketFeed)
+			delay := cycleSchedulerDelay(cfg, intervals, lastRun, lastEvaluated, time.Now(), tickSeconds, deadlineFeed, sharedFeedScheduleFor(cfg, sharedClient))
 			timer := time.NewTimer(delay)
 			select {
 			case <-timer.C:
@@ -863,7 +931,7 @@ func main() {
 			}
 		}
 
-		fmt.Printf("\n=== Cycle %d starting at %s (%d/%d strategies due) ===\n",
+		logDebugf("\n=== Cycle %d starting at %s (%d/%d strategies due) ===\n",
 			cycle, cycleStart.UTC().Format("2006-01-02 15:04:05 UTC"),
 			len(dueStrategies), len(cfg.Strategies))
 
@@ -872,14 +940,31 @@ func main() {
 		hlPerpsCoins, okxPerpsCoins := collectPerpsMarkSymbols(cfg.Strategies)
 		blofinPerpsCoins := collectBloFinPerpsMarkSymbols(cfg.Strategies)
 
-		feedCtx := &marketFeedContext{Enabled: websocketFeed, Requirements: feedReq, Interval: cfg.IntervalSeconds}
+		feedCtx := &marketFeedContext{Enabled: deadlineFeed, Requirements: feedReq, Interval: cfg.IntervalSeconds}
 		var cycleFeedReqs cycleMarketRequirements
+		if sharedFeed && sharedClient != nil && len(evaluationMarks) > 0 {
+			cycleFeedReqs = cycleRequirementsForDue(dueStrategies, feedReq)
+			sharedKey := sharedDeadline.Unix()
+			snap, report := sharedClient.Fetch(shutdownReadOnlyCtx, sharedKey, cycleFeedReqs)
+			feedCtx.Snapshot = snap
+			feedCtx.SharedKey = sharedKey
+			globalMarketFeedStatus.setSnapshotID(snap.EvaluationID)
+			fmt.Println(sharedFeedAuditLine(report, len(evaluationMarks), feedEffectiveCadences(cfg, intervals)))
+			for _, alert := range report.Alerts {
+				fmt.Println("[feed] " + alert)
+				if notifier != nil && notifier.HasBackends() {
+					notifier.SendOwnerDM(alert)
+				}
+			}
+		}
 		if websocketFeed && feedOwner != nil {
 			cycleFeedReqs = cycleRequirementsForDue(dueStrategies, feedReq)
 			evalID := cycleEvaluationID(evaluationMarks, cycle)
-			feedCtx.Snapshot = sealCycleMarketSnapshot(shutdownReadOnlyCtx, feedOwner, cycleFeedReqs, evalID, time.Now().UTC())
+			feedCtx.Snapshot = sealCycleMarketSnapshot(feedOwnerCtx, feedOwner, cycleFeedReqs, evalID, time.Now().UTC())
 			globalMarketFeedStatus.setSnapshotID(evalID)
-			fmt.Println(marketSnapshotLogLine(feedCtx.Snapshot, cycleFeedReqs))
+			if line := marketSnapshotLogLine(feedCtx.Snapshot, cycleFeedReqs); line != "" {
+				logOnChangef("feed-snapshot", marketSnapshotHealth(feedCtx.Snapshot, cycleFeedReqs), "%s\n", line)
+			}
 			for _, line := range formatFeedAlerts(feedOwner.DrainAlerts()) {
 				fmt.Println(line)
 			}
@@ -907,6 +992,9 @@ func main() {
 		if len(hlPerpsCoins) > 0 && feedCtx.active() {
 			feedMarks := feedCtx.Snapshot.freshMids()
 			mergePerpsMarks(prices, feedMarks)
+			if feedCtx.SharedKey != 0 {
+				feedCtx.SharedPrices = prices
+			}
 			missing := make([]string, 0, len(hlPerpsCoins))
 			for _, coin := range hlPerpsCoins {
 				if _, ok := prices[coin]; !ok {
@@ -919,6 +1007,9 @@ func main() {
 					fmt.Printf("[WARN] HL perps marks REST fallback failed for %v: %v — portfolio notional will use entry cost for those coins\n", missing, err)
 				} else {
 					mergePerpsMarks(prices, restMarks)
+					if feedCtx.SharedKey != 0 {
+						fmt.Println(sharedFeedMarkFallbackLine(feedCtx.SharedKey, missing, prices))
+					}
 				}
 				for _, coin := range missing {
 					if _, ok := prices[coin]; !ok {
@@ -982,12 +1073,8 @@ func main() {
 			}
 		}
 		maybeSendDailySummary(store, state, cfg, notifier, cycleStart, prices)
-		if len(prices) > 0 {
-			fmt.Printf("Prices: ")
-			for sym, price := range prices {
-				fmt.Printf("%s=$%.2f ", sym, price)
-			}
-			fmt.Println()
+		if len(prices) > 0 && debugLogging() {
+			fmt.Println(formatPricesLogLine(prices))
 		}
 
 		var totalPV float64
@@ -996,6 +1083,7 @@ func main() {
 
 		if allPartitionsSaveBlocked(store, cfg) {
 			fmt.Println("[CRITICAL] State save failed 3x, skipping trades this cycle")
+			recordHeldStrategies(dueStrategies, nil, store, time.Now())
 			globalRegimeStore.resetForCycle(time.Now().UTC())
 			mu.Lock()
 			for _, ss := range state.Strategies {
@@ -1091,7 +1179,9 @@ func main() {
 			var hlPositions []HLPosition
 			var hlStateFetched bool
 			var hlSnapshotAt time.Time
-			if hlAddr != "" && len(hlLiveAll) > 0 {
+			var hlCycle *hlCycleShare
+			hlShareSnap := hlCoinSubmitSnapshot()
+			if hlAddr != "" && len(hlReconcileAll) > 0 {
 				bal, pos, err := fetchHyperliquidState(hlAddr)
 				if err != nil {
 					fmt.Printf("[WARN] hyperliquid clearinghouseState fetch failed: %v — falling back to per-wallet max and skipping position sync this cycle\n", err)
@@ -1635,6 +1725,17 @@ func main() {
 
 			var hlReconcileFillHintsJSON []byte
 			hlOnChainAbsQty, hlLiquidationPx, hlNetSideByCoin := buildHLLiquidationMaps(hlPositions)
+			if len(hlReconcileAll) > 0 {
+				hlCycle = newHLCycleShare(
+					hlOnChainCoinView{Known: hlStateFetched, AbsQty: hlOnChainAbsQty, NetSide: hlNetSideByCoin},
+					hlShareSnap,
+					hlOnChainRefetcher(hlAddr),
+					state.Strategies,
+					hlReconcileAll,
+					notifier,
+				)
+				setHLActiveCycleShare(hlCycle)
+			}
 
 			if !liveCloseKillSwitchFired {
 				if len(hlLiveAll) > 0 {
@@ -1696,8 +1797,9 @@ func main() {
 					)
 				}
 				drainOperatorRequiredPendingCloses(state, notifier, &mu)
-				if len(hlReconcileDue) > 0 && hlStateFetched {
+				if len(hlReconcileAll) > 0 && hlStateFetched {
 					_, fillHints, orphanCloseJobs := reconcileHyperliquidAccountPositions(hlReconcileDue, hlReconcileAll, state, &mu, logMgr, cfg.Regime, hlPositions, prices, os.Getenv("HYPERLIQUID_ACCOUNT_ADDRESS"), notifier, cfg.NotifyTPSLFillsEnabled())
+					hlCycle.markReconciled(hlReconcileDue)
 					if len(orphanCloseJobs) > 0 {
 						runRegimeDirectionOrphanCloses(
 							shutdownSideEffectCtx,
@@ -1724,6 +1826,24 @@ func main() {
 				if hlStateFetched {
 					lastLiquidationAudit = time.Now().UTC()
 				}
+				if hlCycle != nil {
+					script := ""
+					for _, sc := range hlReconcileAll {
+						if sc.Script != "" {
+							script = sc.Script
+							break
+						}
+					}
+					var listed hlAllOpenOrders
+					listFailed := script == ""
+					if script != "" {
+						var listErr error
+						listed, listErr = runHyperliquidListAllOpenOrdersFn(script)
+						listFailed = listErr != nil || listed.ReadErr != ""
+					}
+					runHyperliquidShareResize(cfg.Strategies, state, hlCycle, listed, listFailed, store, &mu, notifier)
+					runHyperliquidShareRearm(cfg.Strategies, state, hlCycle, prices, hlLiquidationPx, hlNetSideByCoin, hlReconcileFillHintsJSON, store, &mu, notifier)
+				}
 				if auditRes.ImmediateFills > 0 {
 					fmt.Printf("[WARN] #1450 liquidation audit: %d position(s) exited on a clamped stop this cycle\n", auditRes.ImmediateFills)
 					for _, cd := range auditRes.CloseDetails {
@@ -1742,6 +1862,17 @@ func main() {
 
 			regimeStoreReady()
 			processRegimeTransitionAlerts(store.primary(), globalRegimeStore, cfg.Regime, notifier, time.Now().UTC())
+			reportLegacyUnifiedSLAfterGaps(cfg, state, &mu, notifier, func(id string) *StrategyLogger {
+				if logMgr == nil {
+					return nil
+				}
+				lg, err := logMgr.GetStrategyLogger(id)
+				if err != nil {
+					return nil
+				}
+				return lg
+			})
+			recordHeldStrategies(dueStrategies, scopeRisk, store, time.Now())
 			dueUnlatched := dueStrategiesPersistable(store, dueStrategiesNotLatched(dueStrategies, scopeRisk))
 			hlBatchResults := runHyperliquidBatchPrePass(dueUnlatched, state, &mu, cfg, prices, notifier, func(format string, a ...any) {
 				fmt.Printf(format+"\n", a...)
@@ -1815,6 +1946,9 @@ func main() {
 				var hlSharedCloseHoldUSD float64
 				var hlSharedCloseHoldReason string
 				var hlPeerVirtualQty float64
+				var hlPeerSameQty, hlPeerOppQty float64
+				var hlPeerSame []hlShareBook
+				var hlStopArmed bool
 				var hlPoolBalanceKnown bool
 				var hlProfileState *RegimeProfileState
 				if sc.Type == "perps" && sc.Platform == "hyperliquid" {
@@ -1858,6 +1992,9 @@ func main() {
 						}
 						if hlLiveStrategy {
 							hlPeerVirtualQty = hlPeerVirtualQtyOnCoin(snapshotHyperliquidVirtualQuantities(state.Strategies, hlReconcileAll), sym, sc.ID)
+							hlPeerSame, hlPeerOppQty = hlPeerBookListOnCoin(state.Strategies, hlReconcileAll, sym, sc.ID, hlPosSide)
+							hlPeerSameQty = hlShareBookSum(hlPeerSame)
+							hlStopArmed = hlStopLossOID > 0 || hlStopLossTriggerPx > 0
 						}
 					}
 				}
@@ -1998,7 +2135,7 @@ func main() {
 						logger.Info("Circuit breaker latched — suppressing new entries but continuing close-aware position management")
 					} else {
 						logger.Close()
-						markStrategyEvaluated(sc, websocketFeed, evaluationMarks, lastRun, lastEvaluated, time.Now())
+						markStrategyEvaluated(sc, deadlineFeed, evaluationMarks, lastRun, lastEvaluated, time.Now())
 						continue
 					}
 				}
@@ -2006,12 +2143,13 @@ func main() {
 				if notionalCapSkipsStrategyCycle(sr.NotionalBlocked) {
 					logger.Warn("Notional cap exceeded — skipping strategy cycle")
 					logger.Close()
-					markStrategyEvaluated(sc, websocketFeed, evaluationMarks, lastRun, lastEvaluated, time.Now())
+					markStrategyEvaluated(sc, deadlineFeed, evaluationMarks, lastRun, lastEvaluated, time.Now())
 					continue
 				}
 
 				trades := 0
 				var detail string
+				var hlStep *hlStepTradeAlerts
 				switch sc.Type {
 				case "spot":
 					if sc.Platform == "okx" {
@@ -2227,7 +2365,8 @@ func main() {
 						hlProfileActive, hlProfileNext = resolveRegimeProfile(sc.RegimeProfileAllocation, palLabel, palBarTime, hlProfileState, hlPosQty, hlPosCtx.Profile)
 						applyRegimeProfileParams(&sc, sc.RegimeProfileAllocation, hlProfileActive)
 						hlProfileResolved = true
-						logger.Info("Regime profile: window=%s label=%s active=%q (pending=%q seen=%d)",
+						logger.InfoOnChange("regime-profile", fmt.Sprintf("%s|%s|%s|%s|%d", sc.RegimeProfileAllocation.Window, palLabel, hlProfileActive, hlProfileNext.PendingProfile, hlProfileNext.PendingBarsSeen),
+							"Regime profile: window=%s label=%s active=%q (pending=%q seen=%d)",
 							sc.RegimeProfileAllocation.Window, palLabel, hlProfileActive, hlProfileNext.PendingProfile, hlProfileNext.PendingBarsSeen)
 					}
 					if sc.Platform == "okx" {
@@ -2364,8 +2503,19 @@ func main() {
 						}
 					} else if result, signalStr, price, ok := runHyperliquidCheck(&sc, prices, hlPosCtx, cfg.Regime, resolveATRMethod(sc, cfg), notifier, logger, hlBatchResults, feedCtx); ok {
 						prices[result.Symbol] = price
+						hlStep = beginHyperliquidStepTradeAlerts(sc, stratState, &mu)
+						guardSameSideClose(sc, result, hlPosSide, hlPosQty, notifier, logger)
 						if cbManageOnly {
 							result.Signal = 0
+						}
+						if !hyperliquidIsLive(sc.Args) && hlPosQty > 0 {
+							breachAt := hlStep.historyLen(&mu)
+							if paperStopTrades, paperStopDetail := applyPaperStopLossBreach(sc, stratState, result.Symbol, hlPosSide, price, &mu, logger); paperStopTrades > 0 {
+								hlStep.bindWindow(&mu, breachAt, paperStopDetail)
+								hlPosQty, hlPosSide, hlAvgCost, hlEntryATR = 0, "", 0, 0
+								hlStopLossTriggerPx, hlStopLossHighWaterPx, hlPosSnapshot = 0, 0, nil
+								hlScaleInCount, hlLastAddPrice, hlAddedNotionalUSD = 0, 0, 0
+							}
 						}
 						storeRegime := globalRegimeStore.PayloadForStrategy(sc, cfg.Regime)
 						result.Regime = &storeRegime
@@ -2450,9 +2600,12 @@ func main() {
 							mu.Lock()
 							if pos, ok3 := stratState.Positions[result.Symbol]; ok3 && pos.Quantity > 0 && pos.Side == hlPosSide {
 								if breach {
-									if recordPerpsStopLossClose(stratState, result.Symbol, breachPx, "trailing_stop_loss_paper", logger) {
-										trades++
-										detail = fmt.Sprintf("[%s] PAPER TRAILING SL %s @ $%.2f", sc.ID, result.Symbol, breachPx)
+									if newTrigger > 0 {
+										pos.StopLossTriggerPx = newTrigger
+									}
+									stopAt := hlStep.historyLenLocked()
+									if recordPerpsStopLossClose(stratState, result.Symbol, breachPx, paperStopReasonTrailing, logger) {
+										hlStep.bindWindowLocked(stopAt, fmt.Sprintf("[%s] PAPER TRAILING SL %s @ $%.2f", sc.ID, result.Symbol, breachPx))
 									}
 								} else {
 									if newHighWater > 0 {
@@ -2468,43 +2621,49 @@ func main() {
 							mu.Unlock()
 						}
 						if hyperliquidIsLive(sc.Args) && result.Signal == 0 && hlPosQty > 0 && effectiveTrailingStopPct(sc, hlPosSnapshot) > 0 {
-							slEffectiveQty, capped := hlSLEffectiveQty(result.Symbol, hlPosQty, hlOnChainAbsQty)
-							if capped {
-								logger.Warn("trailing SL arm: virtual qty %.6f > on-chain %.6f for %s; capping SL size to on-chain qty (#621)", hlPosQty, slEffectiveQty, result.Symbol)
+							q := hlStopQty{Qty: hlPosQty, Fresh: true}
+							if hlCycle != nil {
+								q = hlCycle.StopQty(sc, result.Symbol, hlPosSide, hlPosQty, hlStopArmed, hlPeerSame, hlPeerOppQty)
 							}
-							forceResize := hlScaleInResizePending && !capped
-							newHighWater, slUpdate, updateConfirmed := runHyperliquidTrailingStopUpdate(sc, result.Symbol, hlPosSide, slEffectiveQty, hlPosSnapshot, price, hlStopLossHighWaterPx, hlStopLossTriggerPx, hlStopLossOID, trailingReplacePolicy{forceResize: forceResize, ratchetTightened: manageRatchetTightened, liquidationPx: hlLiquidationPxForSide(hlLiquidationPx, hlNetSideByCoin, result.Symbol, hlPosSide)}, notifier, logger)
-							mu.Lock()
-							if immediateFill, fillPx := applyTrailingStopUpdateResult(stratState, result.Symbol, hlPosSide, hlStopLossOID, newHighWater, updateConfirmed, slUpdate, "trailing_stop_loss_immediate", logger, 0); immediateFill {
-								trades++
-								detail = fmt.Sprintf("[%s] LIVE TRAILING SL %s @ $%.2f", sc.ID, result.Symbol, fillPx)
-							}
-							if forceResize && updateConfirmed {
-								if p, ok := stratState.Positions[result.Symbol]; ok && p != nil {
-									p.ScaleInResizePending = false
+							slEffectiveQty, capped, place := hlReplaceQty(q, hlPosQty)
+							if place {
+								if capped {
+									logger.Warn("trailing SL arm: virtual qty %.6f > chain share %.6f for %s; capping", hlPosQty, slEffectiveQty, result.Symbol)
 								}
+								forceResize := hlScaleInResizePending && !capped
+								newHighWater, slUpdate, updateConfirmed := runHyperliquidTrailingStopUpdate(sc, result.Symbol, hlPosSide, slEffectiveQty, hlPosSnapshot, price, hlStopLossHighWaterPx, hlStopLossTriggerPx, hlStopLossOID, trailingReplacePolicy{forceResize: forceResize, ratchetTightened: manageRatchetTightened, liquidationPx: hlLiquidationPxForSide(hlLiquidationPx, hlNetSideByCoin, result.Symbol, hlPosSide)}, notifier, logger)
+								mu.Lock()
+								stopAt := hlStep.historyLenLocked()
+								if immediateFill, fillPx := applyTrailingStopUpdateResult(stratState, result.Symbol, hlPosSide, hlStopLossOID, newHighWater, updateConfirmed, slUpdate, "trailing_stop_loss_immediate", logger, slEffectiveQty); immediateFill {
+									hlStep.bindWindowLocked(stopAt, fmt.Sprintf("[%s] LIVE TRAILING SL %s @ $%.2f", sc.ID, result.Symbol, fillPx))
+								}
+								if forceResize && updateConfirmed {
+									if p, ok := stratState.Positions[result.Symbol]; ok && p != nil {
+										p.ScaleInResizePending = false
+									}
+								}
+								mu.Unlock()
 							}
-							mu.Unlock()
 						}
-						if !hyperliquidIsLive(sc.Args) && result.Signal == 0 && hlPosQty > 0 && sc.StopLossATRMult != nil && *sc.StopLossATRMult > 0 {
-							newTrigger, breach, breachPx := runHyperliquidFixedATRStopLossPaper(sc, hlPosSide, hlPosSnapshot, price, hlStopLossTriggerPx)
+						if !hyperliquidIsLive(sc.Args) && result.Signal == 0 && hlPosQty > 0 && effectiveTrailingStopPct(sc, hlPosSnapshot) <= 0 {
+							newTrigger, breach, breachPx, stopReason := runHyperliquidFixedStopLossPaper(sc, hlPosSide, hlPosSnapshot, price, hlStopLossTriggerPx)
 							mu.Lock()
 							if pos, ok3 := stratState.Positions[result.Symbol]; ok3 && pos.Quantity > 0 && pos.Side == hlPosSide {
-								if breach {
-									if recordPerpsStopLossClose(stratState, result.Symbol, breachPx, "stop_loss_atr_paper", logger) {
-										trades++
-										detail = fmt.Sprintf("[%s] PAPER FIXED ATR SL %s @ $%.2f", sc.ID, result.Symbol, breachPx)
-									}
-								} else if newTrigger > 0 && pos.StopLossTriggerPx == 0 {
+								if newTrigger > 0 && pos.StopLossTriggerPx == 0 {
 									pos.StopLossTriggerPx = newTrigger
 									stampOpenTradeWithProtectionSnapshot(stratState, stratDB, sc, result.Symbol, pos)
-									logger.Info("Paper fixed ATR SL armed @ $%.4f (%.2f%% from entry $%.4f)",
-										newTrigger, effectiveFixedStopLossATRPct(sc, hlPosSnapshot), pos.AvgCost)
+									logger.Info("Paper SL armed @ $%.4f (%s, anchor $%.4f)", newTrigger, stopReason, pos.riskAnchorPrice())
+								}
+								if breach {
+									stopAt := hlStep.historyLenLocked()
+									if recordPerpsStopLossClose(stratState, result.Symbol, breachPx, stopReason, logger) {
+										hlStep.bindWindowLocked(stopAt, fmt.Sprintf("[%s] %s %s @ $%.2f", sc.ID, paperStopLossDetailLabel(stopReason), result.Symbol, breachPx))
+									}
 								}
 							}
 							mu.Unlock()
 						}
-						if hyperliquidIsLive(sc.Args) && result.Signal == 0 && hlPosQty > 0 && sc.StopLossATRMult != nil && *sc.StopLossATRMult > 0 && hlStopLossOID == 0 && hlStopLossTriggerPx == 0 {
+						if hyperliquidIsLive(sc.Args) && result.Signal == 0 && hlPosQty > 0 && sc.StopLossATRMult != nil && *sc.StopLossATRMult > 0 && hlStopLossOID == 0 && hlStopLossTriggerPx == 0 && (hlPosSnapshot == nil || !hlPosSnapshot.SLAfterMoved) {
 							triggerPx := fixedStopLossATRTriggerPx(sc, hlPosSide, hlPosSnapshot)
 							clampOffendingPx := 0.0
 							clampedTriggerPx := 0.0
@@ -2518,32 +2677,41 @@ func main() {
 								triggerPx = clamped
 							}
 							if triggerPx > 0 {
-								slEffectiveQty, capped := hlSLEffectiveQty(result.Symbol, hlPosQty, hlOnChainAbsQty)
-								if capped {
-									logger.Warn("fixed ATR SL arm: virtual qty %.6f > on-chain %.6f for %s; capping SL size to on-chain qty (#621)", hlPosQty, slEffectiveQty, result.Symbol)
+								q := hlStopQty{Qty: hlPosQty, Fresh: true}
+								if hlCycle != nil {
+									q = hlCycle.StopQty(sc, result.Symbol, hlPosSide, hlPosQty, hlStopArmed, hlPeerSame, hlPeerOppQty)
 								}
-								slResult, ok2 := hyperliquidArmFixedATRStopLossLive(sc, result.Symbol, hlPosSide, slEffectiveQty, triggerPx, notifier, logger)
-								clampArmAction = hlLiquidationArmClampAction(slResult, ok2)
-								if ok2 && slResult != nil {
-									mu.Lock()
-									if pos, ok3 := stratState.Positions[result.Symbol]; ok3 && pos.Quantity > 0 && pos.Side == hlPosSide && pos.StopLossOID == 0 {
-										if slResult.StopLossFilledImmediately && slResult.StopLossTriggerPx > 0 {
-											if recordPerpsStopLossClose(stratState, result.Symbol, slResult.StopLossTriggerPx, "stop_loss_atr_immediate", logger) {
-												trades++
-												detail = fmt.Sprintf("[%s] LIVE FIXED ATR SL %s @ $%.2f", sc.ID, result.Symbol, slResult.StopLossTriggerPx)
+								slEffectiveQty, capped, place := hlReplaceQty(q, hlPosQty)
+								if !place {
+									slEffectiveQty = 0
+								}
+								if capped && place {
+									logger.Warn("fixed ATR SL arm: virtual qty %.6f > chain share %.6f for %s; capping", hlPosQty, slEffectiveQty, result.Symbol)
+								}
+								if place {
+									slResult, ok2 := hyperliquidArmFixedATRStopLossLive(sc, result.Symbol, hlPosSide, slEffectiveQty, triggerPx, notifier, logger)
+									clampArmAction = hlLiquidationArmClampAction(slResult, ok2)
+									if ok2 && slResult != nil {
+										mu.Lock()
+										if pos, ok3 := stratState.Positions[result.Symbol]; ok3 && pos.Quantity > 0 && pos.Side == hlPosSide && pos.StopLossOID == 0 {
+											if slResult.StopLossFilledImmediately && slResult.StopLossTriggerPx > 0 {
+												stopAt := hlStep.historyLenLocked()
+												if recordPerpsStopLossCloseQty(stratState, result.Symbol, hlPlacedStopQty(slEffectiveQty, slResult.StopLossSize), slResult.StopLossTriggerPx, "stop_loss_atr_immediate", logger) {
+													hlStep.bindWindowLocked(stopAt, fmt.Sprintf("[%s] LIVE FIXED ATR SL %s @ $%.2f", sc.ID, result.Symbol, slResult.StopLossTriggerPx))
+												}
+											} else if slResult.StopLossOID > 0 {
+												pos.StopLossOID = slResult.StopLossOID
+												pos.StopLossTriggerPx = slResult.StopLossTriggerPx
+												stampOpenTradeWithProtectionSnapshot(stratState, stratDB, sc, result.Symbol, pos)
+												logger.Info("Fixed ATR SL armed oid=%d @ $%.4f", slResult.StopLossOID, slResult.StopLossTriggerPx)
+											} else if slResult.StopLossOutcomeUnknown && slResult.StopLossTriggerPx > 0 {
+												pos.StopLossTriggerPx = slResult.StopLossTriggerPx
+												stampOpenTradeWithProtectionSnapshot(stratState, stratDB, sc, result.Symbol, pos)
+												logger.Warn("Fixed ATR SL outcome unreadable for %s: requested trigger $%.4f recorded (oid unknown)", result.Symbol, slResult.StopLossTriggerPx)
 											}
-										} else if slResult.StopLossOID > 0 {
-											pos.StopLossOID = slResult.StopLossOID
-											pos.StopLossTriggerPx = slResult.StopLossTriggerPx
-											stampOpenTradeWithProtectionSnapshot(stratState, stratDB, sc, result.Symbol, pos)
-											logger.Info("Fixed ATR SL armed oid=%d @ $%.4f", slResult.StopLossOID, slResult.StopLossTriggerPx)
-										} else if slResult.StopLossOutcomeUnknown && slResult.StopLossTriggerPx > 0 {
-											pos.StopLossTriggerPx = slResult.StopLossTriggerPx
-											stampOpenTradeWithProtectionSnapshot(stratState, stratDB, sc, result.Symbol, pos)
-											logger.Warn("Fixed ATR SL outcome unreadable for %s: requested trigger $%.4f recorded (oid unknown)", result.Symbol, slResult.StopLossTriggerPx)
 										}
+										mu.Unlock()
 									}
-									mu.Unlock()
 								}
 							}
 							if clampedTriggerPx > 0 {
@@ -2556,11 +2724,21 @@ func main() {
 							mu.Unlock()
 						}
 						if hyperliquidIsLive(sc.Args) && result.Signal == 0 && hlPosQty > 0 {
-							if _, fillPx := runHyperliquidProtectionSync(sc, stratState, stratDB, result.Symbol, &mu, notifier, logger, "HL protection synced", hlReconcileFillHintsJSON, hlLiquidationPx, hlNetSideByCoin, hlProtectionGuardFull); fillPx > 0 {
-								trades++
-								detail = fmt.Sprintf("[%s] LIVE PROTECTION SYNC SL %s @ $%.2f", sc.ID, result.Symbol, fillPx)
+							syncAt := hlStep.historyLen(&mu)
+							if _, fillPx := runHyperliquidProtectionSync(sc, stratState, stratDB, result.Symbol, &mu, notifier, logger, "HL protection synced", hlReconcileFillHintsJSON, hlLiquidationPx, hlNetSideByCoin, hlProtectionGuardFull, hlCycle); fillPx > 0 {
+								hlStep.bindWindow(&mu, syncAt, fmt.Sprintf("[%s] LIVE PROTECTION SYNC SL %s @ $%.2f", sc.ID, result.Symbol, fillPx))
 							}
-							runPostTPStopLossAdjustment(sc, stratState, result.Symbol, price, cfg, &mu, notifier, logger, hlOnChainAbsQty)
+							postTPAt := hlStep.historyLen(&mu)
+							if _, slFills, slDetail := runPostTPStopLossAdjustment(sc, stratState, result.Symbol, price, cfg, &mu, notifier, logger, hlCycle, hlLiquidationPx, hlNetSideByCoin); slFills > 0 {
+								hlStep.bindWindow(&mu, postTPAt, slDetail)
+							}
+						}
+						if !hyperliquidIsLive(sc.Args) && result.Signal == 0 && hlPosQty > 0 {
+							flipAt := hlStep.historyLen(&mu)
+							if flipTrades, flipDetail := advancePaperDynamicCloseRegime(sc, stratState, stratDB, result.Symbol, price, &mu, logger); flipTrades > 0 {
+								hlStep.bindWindow(&mu, flipAt, flipDetail)
+							}
+							runPaperPostTPStopLossAdjustment(sc, stratState, result.Symbol, price, cfg, &mu, notifier, logger)
 						}
 						scaleInAddQty := 0.0
 						if result.Signal != 0 && sc.Type == "perps" && sc.AllowScaleIn {
@@ -2572,6 +2750,7 @@ func main() {
 								logger.Info("Scale-in not taken for %s: %s", result.Symbol, reason)
 							}
 						}
+						var execRearm hlCloseRearmContext
 						if hyperliquidIsLive(sc.Args) && result.Signal != 0 {
 							walletSnapshot := hlExecuteSnapshotForCoin(hlPositions, result.Symbol)
 							if scaleInAddQty > 0 {
@@ -2581,7 +2760,9 @@ func main() {
 									liveExecFailed = true
 								}
 							} else {
-								er, ok2 := runHyperliquidExecuteOrder(sc, result, price, hlCash, hlPoolBalanceKnown, hlPosQty, hlPosSide, hlAvgCost, hlPosLeverage, hlStopLossOID, hlTPOIDs, hlReconcileAll, walletSnapshot, hurstDecision, notifier, logger)
+								closeCtx := hlCloseContext{PeerSameQty: hlPeerSameQty, PeerOppQty: hlPeerOppQty, OnChain: hlOnChainCoinView{Known: hlStateFetched, AbsQty: hlOnChainAbsQty, NetSide: hlNetSideByCoin}, Refetch: hlOnChainRefetcher(hlAddr)}
+								execRearm = hlCloseRearmContext{Price: price, PrevStopOID: hlStopLossOID, PrevTPOIDs: cloneInt64s(hlTPOIDs), PrevTriggerPx: hlStopLossTriggerPx, PrevHighWater: hlStopLossHighWaterPx, FillHintsJSON: hlReconcileFillHintsJSON, LiqPxByCoin: hlLiquidationPx, NetSideByCoin: hlNetSideByCoin, Backing: hlCloseBacking{PeerSameQty: hlPeerSameQty, PeerOppQty: hlPeerOppQty, PeerSame: hlPeerSame, Refetch: closeCtx.Refetch}}
+								er, ok2 := runHyperliquidExecuteOrder(sc, result, price, hlCash, hlPoolBalanceKnown, hlPosQty, hlPosSide, hlAvgCost, hlPosLeverage, hlStopLossOID, hlTPOIDs, hlReconcileAll, walletSnapshot, closeCtx, hurstDecision, notifier, logger)
 								switch {
 								case result.SharedCloseStrandedUSD > 0:
 									mu.Lock()
@@ -2628,10 +2809,12 @@ func main() {
 											mu.Unlock()
 										}
 									}
-									if hlPosQty > 0 && result.LiveOrderSubmitted && result.LiveOrderCancelRequested && (er == nil || len(canceledOIDs) > 0) {
-										if extraTrades, slDetail := rearmProtectionAfterFailedClose(sc, stratState, stratDB, result.Symbol, price, hlStopLossOID, hlStopLossTriggerPx, hlStopLossHighWaterPx, hlOnChainAbsQty, hlReconcileFillHintsJSON, hlLiquidationPx, hlNetSideByCoin, &mu, notifier, logger); extraTrades > 0 {
-											trades += extraTrades
-											detail = slDetail
+									unfilled := hlExecuteFillOutcome(er, nil, hlPosQty)
+									if hlPosQty > 0 && result.LiveOrderSubmitted && hlUnfilledCloseNeedsRearm(result.LiveOrderCancelRequested, unfilled, canceledOIDs) {
+										execRearm.Backing.PreSend = result.SizedClosePreSend
+										rearmAt := hlStep.historyLen(&mu)
+										if extraTrades, slDetail := rearmAfterSizedClose(sc, stratState, stratDB, result.Symbol, hlPosSide, hlPosQty, unfilled, execRearm, &mu, notifier, logger); extraTrades > 0 {
+											hlStep.bindWindow(&mu, rearmAt, slDetail)
 										}
 									}
 								}
@@ -2641,10 +2824,13 @@ func main() {
 							mu.Lock()
 							var openTrade *Trade
 							var ratchetAlert *RatchetTriggerAlert
+							var execTrades int
+							var execDetail string
+							execAt := hlStep.historyLenLocked()
 							if scaleInAddQty > 0 {
-								trades, detail, openTrade, ratchetAlert = executeHyperliquidScaleInDeferredOpen(sc, stratState, result, execResult, signalStr, price, scaleInAddQty, logger)
+								execTrades, execDetail, openTrade, ratchetAlert = executeHyperliquidScaleInDeferredOpen(sc, stratState, result, execResult, signalStr, price, scaleInAddQty, logger)
 							} else {
-								trades, detail, openTrade, ratchetAlert = executeHyperliquidResultDeferredOpen(sc, stratState, result, execResult, signalStr, price, cfg.Regime, cfg, hurstDecision, logger)
+								execTrades, execDetail, openTrade, ratchetAlert = executeHyperliquidResultDeferredOpen(sc, stratState, result, execResult, signalStr, price, cfg.Regime, cfg, hurstDecision, logger)
 							}
 							if openTrade != nil {
 								var pos *Position
@@ -2653,39 +2839,44 @@ func main() {
 								}
 								recordPositionOpen(stratState, sc, openTrade, pos)
 							}
+							hlStep.bindExecuteLocked(execAt, execDetail)
 							mu.Unlock()
 							notifyRatchetTrigger(notifier, sc.NotifyRatchetTriggersEnabled(cfg), ratchetAlert)
-							ratchetWalkerOwnedByScaleIn := scaleInAddQty > 0 && execResult != nil && trades > 0
+							ratchetWalkerOwnedByScaleIn := scaleInAddQty > 0 && execResult != nil && execTrades > 0
 							if ratchetAlert != nil && !ratchetWalkerOwnedByScaleIn {
-								if extraTrades, slDetail := runTrailingStopUpdateAfterRatchetTighten(sc, stratState, result.Symbol, price, hlOnChainAbsQty, hlLiquidationPx, hlNetSideByCoin, &mu, notifier, logger); extraTrades > 0 {
-									trades += extraTrades
-									detail = slDetail
+								walkerAt := hlStep.historyLen(&mu)
+								if extraTrades, slDetail := runTrailingStopUpdateAfterRatchetTighten(sc, stratState, result.Symbol, price, hlCycle, hlLiquidationPx, hlNetSideByCoin, &mu, notifier, logger); extraTrades > 0 {
+									hlStep.bindWindow(&mu, walkerAt, slDetail)
 								}
 							}
-							if execResult != nil && trades > 0 {
-								if _, fillPx := runHyperliquidProtectionSync(sc, stratState, stratDB, result.Symbol, &mu, notifier, logger, "HL protection synced after trade", hlReconcileFillHintsJSON, hlLiquidationPx, hlNetSideByCoin, hlProtectionGuardFull); fillPx > 0 {
-									trades++
-									detail = fmt.Sprintf("[%s] LIVE PROTECTION SYNC SL %s @ $%.2f", sc.ID, result.Symbol, fillPx)
+							sizedCloseShortFill := result.SizedCloseBookedQty > 0
+							if execResult != nil && execTrades > 0 {
+								syncAt := hlStep.historyLen(&mu)
+								if sizedCloseShortFill {
+									logger.Info("Sized close %s filled short; the remainder's protection is re-armed at the backed size instead of the post-trade sync", result.Symbol)
+								} else if _, fillPx := runHyperliquidProtectionSync(sc, stratState, stratDB, result.Symbol, &mu, notifier, logger, "HL protection synced after trade", hlReconcileFillHintsJSON, hlLiquidationPx, hlNetSideByCoin, hlProtectionGuardFull, hlCycle); fillPx > 0 {
+									hlStep.bindWindow(&mu, syncAt, fmt.Sprintf("[%s] LIVE PROTECTION SYNC SL %s @ $%.2f", sc.ID, result.Symbol, fillPx))
 								}
-								runPostTPStopLossAdjustment(sc, stratState, result.Symbol, price, cfg, &mu, notifier, logger, hlOnChainAbsQty)
+								postTPAt := hlStep.historyLen(&mu)
+								if _, slFills, slDetail := runPostTPStopLossAdjustment(sc, stratState, result.Symbol, price, cfg, &mu, notifier, logger, hlCycle, hlLiquidationPx, hlNetSideByCoin); slFills > 0 {
+									hlStep.bindWindow(&mu, postTPAt, slDetail)
+								}
 								if scaleInAddQty > 0 {
 									filledAddQty := scaleInAddQty
 									if execResult.Execution != nil && execResult.Execution.Fill != nil && execResult.Execution.Fill.TotalSz > 0 {
 										filledAddQty = execResult.Execution.Fill.TotalSz
 									}
 									hedgeFreshExposureQty = filledAddQty
-									if extraTrades, slDetail := scaleInResizeTrailingSLNow(sc, stratState, result.Symbol, price, hlOnChainAbsQty, hlLiquidationPx, hlNetSideByCoin, filledAddQty, ratchetAlert != nil, &mu, notifier, logger); extraTrades > 0 {
-										trades += extraTrades
-										detail = slDetail
+									resizeAt := hlStep.historyLen(&mu)
+									if extraTrades, slDetail := scaleInResizeTrailingSLNow(sc, stratState, result.Symbol, price, hlCycle, hlLiquidationPx, hlNetSideByCoin, ratchetAlert != nil, &mu, notifier, logger); extraTrades > 0 {
+										hlStep.bindWindow(&mu, resizeAt, slDetail)
 									}
 								} else {
-									filledQty := 0.0
-									if execResult.Execution != nil && execResult.Execution.Fill != nil && execResult.Execution.Fill.TotalSz > 0 {
-										filledQty = execResult.Execution.Fill.TotalSz
-									}
-									if extraTrades, slDetail := armTrailingStopAtOpenNow(sc, stratState, result.Symbol, price, hlOnChainAbsQty, filledQty, &mu, notifier, logger); extraTrades > 0 {
-										trades += extraTrades
-										detail = slDetail
+									if !sizedCloseShortFill {
+										armAt := hlStep.historyLen(&mu)
+										if extraTrades, slDetail := armTrailingStopAtOpenNow(sc, stratState, result.Symbol, price, hlCycle, &mu, notifier, logger); extraTrades > 0 {
+											hlStep.bindWindow(&mu, armAt, slDetail)
+										}
 									}
 								}
 								if openTrade != nil {
@@ -2698,6 +2889,16 @@ func main() {
 								if scaleInAddQty <= 0 && openTrade != nil && openTrade.Quantity > 0 {
 									hedgeFreshExposureQty = openTrade.Quantity
 								}
+							}
+							if sizedCloseShortFill {
+								execRearm.Backing.PreSend = result.SizedClosePreSend
+								rearmAt := hlStep.historyLen(&mu)
+								if extraTrades, slDetail := rearmAfterSizedClose(sc, stratState, stratDB, result.Symbol, hlPosSide, hlPosQty, hlCloseFillOutcome{Filled: result.SizedCloseBookedQty, Known: true}, execRearm, &mu, notifier, logger); extraTrades > 0 {
+									hlStep.bindWindow(&mu, rearmAt, slDetail)
+								}
+							}
+							if execResult == nil && !hyperliquidIsLive(sc.Args) && result.Signal != 0 && execTrades > 0 {
+								runPaperPostTPStopLossAdjustment(sc, stratState, result.Symbol, price, cfg, &mu, notifier, logger)
 							}
 						}
 						if hlProfileResolved {
@@ -2723,7 +2924,9 @@ func main() {
 								logger.Error("Replay mirror: failed to read decision log: %v — holding last replayed state (#1431)", perr)
 							case len(pending) > 0:
 								mu.Lock()
+								replayAt := hlStep.historyLenLocked()
 								appliedIDs, replayTrades, replayDetails, driftDMs := applyReplayedLiveDecisions(sc, stratState, pending, price, result, cfg, logger)
+								hlStep.bindWindowLocked(replayAt, replayDetails...)
 								var saveErr error
 								if len(appliedIDs) > 0 {
 									saveErr = store.SaveStrategyBook(stratState)
@@ -2731,8 +2934,7 @@ func main() {
 								mu.Unlock()
 								sendReplayDriftWarns(driftDMs)
 								if replayTrades > 0 {
-									trades += replayTrades
-									detail = mergeTradeDetails(detail, replayDetails...)
+									runPaperPostTPStopLossAdjustment(sc, stratState, result.Symbol, price, cfg, &mu, notifier, logger)
 								}
 								if len(appliedIDs) > 0 {
 									switch {
@@ -2752,9 +2954,11 @@ func main() {
 								HedgePx:           prices[hedgeCoin(sc)],
 								FreshExposureQty:  hedgeFreshExposureQty,
 								PrimaryCancelOIDs: hedgeUnwindCancelOIDs(stratState, &mu, result.Symbol),
+								PrimaryPeers:      hedgePrimaryPeersFor(state.Strategies, hlReconcileAll, stratState, &mu, sc.ID, result.Symbol),
 								Live:              hyperliquidIsLive(sc.Args),
 							}, notifier, logger)
 						}
+						trades, detail = hlStep.finish(&mu, notifier, cfg.Regime, logger)
 					}
 				case "futures":
 					if result, signalStr, price, ok := runTopStepCheck(sc, prices, tsPosCtx, cfg.Regime, resolveATRMethod(sc, cfg), notifier, logger); ok {
@@ -2805,6 +3009,7 @@ func main() {
 						}
 					}
 				case "manual":
+					hlStep = beginHyperliquidStepTradeAlerts(sc, stratState, &mu)
 					mu.RLock()
 					pos := stratState.Positions[sc.Symbol]
 					mu.RUnlock()
@@ -2813,9 +3018,9 @@ func main() {
 						break
 					}
 					if pos != nil && hyperliquidIsLive(sc.Args) {
-						if _, fillPx := runHyperliquidProtectionSync(sc, stratState, stratDB, sc.Symbol, &mu, notifier, logger, "HL manual protection synced", hlReconcileFillHintsJSON, hlLiquidationPx, hlNetSideByCoin, hlProtectionGuardFull); fillPx > 0 {
-							trades++
-							detail = fmt.Sprintf("[%s] LIVE PROTECTION SYNC SL %s @ $%.2f", sc.ID, sc.Symbol, fillPx)
+						syncAt := hlStep.historyLen(&mu)
+						if _, fillPx := runHyperliquidProtectionSync(sc, stratState, stratDB, sc.Symbol, &mu, notifier, logger, "HL manual protection synced", hlReconcileFillHintsJSON, hlLiquidationPx, hlNetSideByCoin, hlProtectionGuardFull, hlCycle); fillPx > 0 {
+							hlStep.bindWindow(&mu, syncAt, fmt.Sprintf("[%s] LIVE PROTECTION SYNC SL %s @ $%.2f", sc.ID, sc.Symbol, fillPx))
 						}
 					}
 					if feedHeld, feedWhy := feedCtx.feedHoldsSignal(sc); feedHeld {
@@ -2846,7 +3051,10 @@ func main() {
 						}
 					}
 					if pos != nil && hyperliquidIsLive(sc.Args) {
-						runPostTPStopLossAdjustment(sc, stratState, sc.Symbol, prices[sc.Symbol], cfg, &mu, notifier, logger, hlOnChainAbsQty)
+						postTPAt := hlStep.historyLen(&mu)
+						if _, slFills, slDetail := runPostTPStopLossAdjustment(sc, stratState, sc.Symbol, prices[sc.Symbol], cfg, &mu, notifier, logger, hlCycle, hlLiquidationPx, hlNetSideByCoin); slFills > 0 {
+							hlStep.bindWindow(&mu, postTPAt, slDetail)
+						}
 						mark := prices[sc.Symbol]
 						manualRatchetTightened := false
 						if mark > 0 && strategyUsesTrailingTPRatchetClose(sc) {
@@ -2854,27 +3062,9 @@ func main() {
 							notifyRatchetTrigger(notifier, sc.NotifyRatchetTriggersEnabled(cfg), ratchetAlert)
 							manualRatchetTightened = ratchetAlert != nil
 						}
-						mu.RLock()
-						pos = stratState.Positions[sc.Symbol]
-						mu.RUnlock()
-						if pos != nil && mark > 0 && strategyUsesTrailingTPRatchetClose(sc) && effectiveTrailingStopPct(sc, pos) > 0 {
-							slEffectiveQty, capped := hlSLEffectiveQty(sc.Symbol, pos.Quantity, hlOnChainAbsQty)
-							if capped {
-								logger.Warn("manual trailing SL: virtual qty %.6f > on-chain %.6f for %s; capping (#621)", pos.Quantity, slEffectiveQty, sc.Symbol)
-							}
-							prevSLOID := pos.StopLossOID
-							forceResize := pos.ScaleInResizePending && !capped
-							newHighWater, slUpdate, updateConfirmed := runHyperliquidTrailingStopUpdate(sc, sc.Symbol, pos.Side, slEffectiveQty, pos, mark, pos.StopLossHighWaterPx, pos.StopLossTriggerPx, pos.StopLossOID, trailingReplacePolicy{forceResize: forceResize, ratchetTightened: manualRatchetTightened, liquidationPx: hlLiquidationPxForSide(hlLiquidationPx, hlNetSideByCoin, sc.Symbol, pos.Side)}, notifier, logger)
-							mu.Lock()
-							if immediateFill, fillPx := applyTrailingStopUpdateResult(stratState, sc.Symbol, pos.Side, prevSLOID, newHighWater, updateConfirmed, slUpdate, "trailing_stop_loss_immediate", logger, 0); immediateFill {
-								logger.Info("[%s] manual trailing SL filled immediately %s @ $%.2f", sc.ID, sc.Symbol, fillPx)
-							}
-							if forceResize && updateConfirmed {
-								if p, ok := stratState.Positions[sc.Symbol]; ok && p != nil {
-									p.ScaleInResizePending = false
-								}
-							}
-							mu.Unlock()
+						trailAt := hlStep.historyLen(&mu)
+						if manualFills, manualDetail := runManualTrailingStopUpdate(sc, stratState, state.Strategies, hlReconcileAll, hlCycle, hlLiquidationPx, hlNetSideByCoin, mark, manualRatchetTightened, &mu, notifier, logger); manualFills > 0 {
+							hlStep.bindWindow(&mu, trailAt, manualDetail)
 						}
 					}
 					if manualOK && closeFraction > 0 {
@@ -2900,85 +3090,89 @@ func main() {
 							if intentFullClose {
 								closeFullPosition = shouldCloseFullPosition(1.0, sc.Symbol, hlReconcileAll)
 							}
+							closeMode := hlCloseModeNone
+							var peerSame, peerOpp float64
+							var peerBooks []hlShareBook
+							if hyperliquidIsLive(sc.Args) {
+								mu.RLock()
+								peerBooks, peerOpp = hlPeerBookListOnCoin(state.Strategies, hlReconcileAll, sc.Symbol, sc.ID, pos.Side)
+								peerSame = hlShareBookSum(peerBooks)
+								mu.RUnlock()
+							}
+							backing := hlCloseBacking{PeerSameQty: peerSame, PeerOppQty: peerOpp, PeerSame: peerBooks, Refetch: hlOnChainRefetcher(hlAddr)}
 							if closeFullPosition {
+								closeMode = hlCloseModeWhole
+								backing.PreSend = hlCloseViewOf(hlOnChainCoinView{Known: hlStateFetched, AbsQty: hlOnChainAbsQty, NetSide: hlNetSideByCoin}, sc.Symbol, hlCloseViewCycleStart)
 								logger.Info("Manual full close %s (close_fraction=1.0) — using market_close(sz=None)", sc.Symbol)
-							} else if intentFullClose {
-								logger.Info("Manual full close %s shares coin with HL peers — using sized close to preserve peer exposure", sc.Symbol)
+							} else if hyperliquidIsLive(sc.Args) {
+								if intentFullClose {
+									logger.Info("Manual full close %s shares coin with HL peers — using sized close to preserve peer exposure", sc.Symbol)
+								}
+								plan := resolveHLCloseOrder(sc.Symbol, pos.Side, pos.Quantity, closeQty, hlCloseContext{PeerSameQty: peerSame, PeerOppQty: peerOpp, OnChain: hlOnChainCoinView{Known: hlStateFetched, AbsQty: hlOnChainAbsQty, NetSide: hlNetSideByCoin}, Refetch: backing.Refetch})
+								manualAlertDirection := directionOpen
+								if closeSide == "sell" {
+									manualAlertDirection = directionClose
+								}
+								if plan.Action == hlCloseSkip {
+									logger.Error("CRITICAL: manual sized close %s not sent: %s", sc.Symbol, plan.Reason)
+									notifyLiveExecFailure(notifier, sc, manualAlertDirection, sc.Symbol, "sized close not sent: "+plan.Reason)
+									break
+								}
+								if plan.Action == hlCloseDefer {
+									logger.Warn("Manual sized close %s deferred to the next cycle: %s", sc.Symbol, plan.Reason)
+									break
+								}
+								if plan.Capped {
+									logger.Warn("Manual sized close %s capped from %.6f to %.6f by the on-chain position: %s", sc.Symbol, closeQty, plan.Size, plan.Reason)
+								}
+								closeQty = plan.Size
+								closeMode = plan.Mode
+								backing.PreSend = plan.PreSend
+								logger.Info("Manual sized close %s sent as %s: %s", sc.Symbol, closeMode, plan.Reason)
 							}
 							var extraCancelOIDs []int64
 							if intentFullClose {
 								extraCancelOIDs = cloneInt64s(pos.TPOIDs)
 							}
+							rearmCtx := hlCloseRearmContext{Price: prices[sc.Symbol], PrevStopOID: cancelOID, PrevTPOIDs: cloneInt64s(extraCancelOIDs), PrevTriggerPx: pos.StopLossTriggerPx, PrevHighWater: pos.StopLossHighWaterPx, FillHintsJSON: hlReconcileFillHintsJSON, LiqPxByCoin: hlLiquidationPx, NetSideByCoin: hlNetSideByCoin, Backing: backing}
 							execResult, execStderr, execErr := runHyperliquidExecuteFn(
 								sc.Script, sc.Symbol, closeSide, closeQty,
-								0, cancelOID, 0, "", 0, closeFullPosition, hlExecuteSnapshot{}, extraCancelOIDs...,
+								0, cancelOID, 0, "", 0, closeMode, hlExecuteSnapshot{}, extraCancelOIDs...,
 							)
 							if execStderr != "" {
 								logger.Info("HL manual close stderr: %s", execStderr)
 							}
 							requestedCancelOIDs := append([]int64{cancelOID}, extraCancelOIDs...)
-							execResult, execErr = confirmHyperliquidExecuteFill(execResult, execErr)
-							if execErr != nil {
-								logger.Error("manual close execute failed: %v", execErr)
-								canceledOIDs := hyperliquidExecuteSucceededCancelOIDs(execResult, requestedCancelOIDs)
-								if len(canceledOIDs) > 0 {
-									mu.Lock()
-									clearHyperliquidProtectionOIDsMatching(stratState.Positions[sc.Symbol], canceledOIDs)
-									mu.Unlock()
-								}
-								break
+							closeAt := hlStep.historyLen(&mu)
+							closeTrades, closeDetail, fillPx := settleManualCycleClose(sc, stratState, stratDB, pos, closeSide, closeQty, intentFullClose, execResult, execErr, requestedCancelOIDs, rearmCtx, &mu, notifier, logger)
+							if fillPx > 0 {
+								prices[sc.Symbol] = fillPx
 							}
-							if execResult.CancelStopLossError != "" {
-								logger.Warn("manual close cancel failed (non-fatal) for %s/%s: %s (sl_oid=%d tp_oids=%v) — verify HL on-chain triggers",
-									sc.ID, sc.Symbol, execResult.CancelStopLossError, cancelOID, extraCancelOIDs)
-							}
-							if execResult.Execution != nil && execResult.Execution.Fill != nil {
-								fill := execResult.Execution.Fill
-								var oid string
-								if fill.OID != 0 {
-									oid = fmt.Sprintf("%d", fill.OID)
-								}
-								var realizedPnL float64
-								if pos.Side == "long" {
-									realizedPnL = closeQty * (fill.AvgPx - pos.AvgCost)
-								} else {
-									realizedPnL = closeQty * (pos.AvgCost - fill.AvgPx)
-								}
-								realizedPnL -= fill.Fee
-								action := PendingManualAction{
-									StrategyID:      sc.ID,
-									Action:          "close",
-									Symbol:          sc.Symbol,
-									Side:            closeSide,
-									Quantity:        closeQty,
-									FillPrice:       fill.AvgPx,
-									FillFee:         fill.Fee,
-									ExchangeOrderID: oid,
-									RealizedPnL:     realizedPnL,
-									IsFullClose:     intentFullClose,
-									CreatedAt:       time.Now().UTC(),
-								}
-								if err := stratDB.InsertPendingManualAction(action); err != nil {
-									logger.Error("failed to queue manual close action: %v", err)
-								} else {
-									prices[sc.Symbol] = fill.AvgPx
-									trades = 1
-									detail = fmt.Sprintf("manual close %.4f %s @ $%.2f | PnL=$%.2f", closeQty, sc.Symbol, fill.AvgPx, realizedPnL)
-									logger.Info("Queued manual close: %s", detail)
-								}
+							if closeTrades > 0 {
+								hlStep.bindWindow(&mu, closeAt, closeDetail)
 							}
 						}
 					}
 				default:
 					logger.Error("Unknown strategy type: %s", sc.Type)
 				}
-				if trades > 0 && detail != "" {
+				var detailLines []string
+				if sc.Type == "manual" && hlStep != nil {
+					trades, detailLines = hlStep.finishLines(&mu, notifier, cfg.Regime, logger)
+				}
+				if trades > 0 && (detail != "" || len(detailLines) > 0) {
 					if chKey := notifier.resolveChannelKey(sc.Platform, sc.Type, isLiveArgs(sc.Args), sc.PaperSource); chKey != "" {
 						channelTrades[chKey] += trades
 						key := chKey + "|" + extractAsset(sc)
-						channelTradeDetails[key] = append(channelTradeDetails[key], detail)
+						if len(detailLines) > 0 {
+							channelTradeDetails[key] = append(channelTradeDetails[key], detailLines...)
+						} else {
+							channelTradeDetails[key] = append(channelTradeDetails[key], detail)
+						}
 					}
-					sendTradeAlerts(sc, stratState, trades, &mu, notifier, cfg.Regime)
+					if hlStep == nil {
+						sendTradeAlerts(sc, stratState, trades, &mu, notifier, cfg.Regime)
+					}
 				}
 
 				totalTrades += trades
@@ -3016,14 +3210,22 @@ func main() {
 				if cashReconcile {
 					statusLine += " | CASH RECONCILE REQUIRED"
 				}
-				if marker := hurstGateStatusMarkerForStrategy(sc, stratState, cfg.Regime, &mu); marker != "" {
+				marker := hurstGateStatusMarkerForStrategy(sc, stratState, cfg.Regime, &mu)
+				if marker != "" {
 					statusLine += " | " + marker
 				}
-				logger.Info("%s", statusLine)
+				statusChanged := logger.Changed("status", fmt.Sprintf("%d|%s|%t|%s", posCount, regimeLabel, cashReconcile, marker))
+				logger.InfoOrDebug(trades > 0 || statusChanged, "%s", statusLine)
 
 				logger.Close()
-				markStrategyEvaluated(sc, websocketFeed, evaluationMarks, lastRun, lastEvaluated, time.Now())
+				markStrategyEvaluated(sc, deadlineFeed, evaluationMarks, lastRun, lastEvaluated, time.Now())
 			}
+			if hlCycle != nil {
+				mu.RLock()
+				hlCycle.SweepClosed(state.Strategies)
+				mu.RUnlock()
+			}
+			setHLActiveCycleShare(nil)
 		}
 
 		mu.RLock()
@@ -3081,6 +3283,9 @@ func main() {
 		}
 		mu.RUnlock()
 
+		drainedChannels := foldManualDrainTrades(pendingDrainReports, notifier, &totalTrades, channelTrades, channelTradeDetails)
+		pendingDrainReports = nil
+
 		elapsed := time.Since(cycleStart)
 		logMgr.LogSummary(cycle, elapsed, len(dueStrategies), totalTrades, totalPV)
 
@@ -3093,14 +3298,7 @@ func main() {
 			summaryNow := time.Now().UTC()
 			mu.RLock()
 			for chKey, chStrats := range channelStrats {
-				chRan := false
-				for _, sc := range dueStrategies {
-					if notifier.resolveChannelKey(sc.Platform, sc.Type, isLiveArgs(sc.Args), sc.PaperSource) == chKey {
-						chRan = true
-						break
-					}
-				}
-				if !chRan {
+				if !summaryChannelActive(notifier, chKey, dueStrategies, drainedChannels) {
 					continue
 				}
 				chTrades := channelTrades[chKey]
@@ -3160,6 +3358,7 @@ func main() {
 		}
 		if savedAll {
 			offCycleAuditSaveDirty = false
+			globalRunEvidence.markStateSaved(time.Now())
 		}
 
 		var postLeaderboard bool
@@ -3229,7 +3428,7 @@ func main() {
 		mu.RLock()
 		endIntervals := effectiveStrategyIntervals(cfg.Strategies, state.Strategies, cfg.IntervalSeconds, drawdownWarnThresholdPct)
 		mu.RUnlock()
-		delay := cycleSchedulerDelay(cfg, endIntervals, lastRun, lastEvaluated, time.Now(), tickSeconds, websocketFeed)
+		delay := cycleSchedulerDelay(cfg, endIntervals, lastRun, lastEvaluated, time.Now(), tickSeconds, deadlineFeed, sharedFeedScheduleFor(cfg, sharedClient))
 		timer := time.NewTimer(delay)
 		select {
 		case <-timer.C:
@@ -3338,15 +3537,16 @@ func runSpotCheck(sc StrategyConfig, prices map[string]float64, posCtx PositionC
 	args = appendStrategyRegimeWindowArgs(args, sc, regime)
 	args = appendRegimePayloadArg(args, sc, regime)
 	args = appendATRMethodArg(args, atrMethod)
-	if refsArgs, err := buildStrategyRefsArg(sc); err != nil {
+	if refsArgs, err := buildStrategyRefsArg(sc, "", false); err != nil {
 		logger.Warn("Failed to marshal strategy refs: %v", err)
 	} else if len(refsArgs) > 0 {
 		args = append(args, refsArgs...)
 	}
-	logger.Info("Running: python3 %s %v", sc.Script, args)
+	logger.Running(sc.Script, args)
 
 	result, stderr, err := RunSpotCheck(sc.Script, args)
 	if err != nil {
+		logger.RunningOnFailure(sc.Script, args)
 		logger.Error("Script failed: %v", err)
 		if stderr != "" {
 			logger.Error("stderr: %s", stderr)
@@ -3354,11 +3554,10 @@ func runSpotCheck(sc StrategyConfig, prices map[string]float64, posCtx PositionC
 		notifyScriptFailure(notifier, sc, scriptFailureCrash, err.Error())
 		return nil, "", 0, false
 	}
-	if stderr != "" {
-		logger.Info("stderr: %s", stderr)
-	}
+	logger.ScriptStderr(stderr)
 
 	if result.Error != "" {
+		logger.RunningOnFailure(sc.Script, args)
 		logger.Error("Script returned error: %s", result.Error)
 		notifyScriptFailure(notifier, sc, scriptFailureError, result.Error)
 		return nil, "", 0, false
@@ -3371,7 +3570,7 @@ func runSpotCheck(sc StrategyConfig, prices map[string]float64, posCtx PositionC
 	} else if result.Signal == -1 {
 		signalStr = "SELL"
 	}
-	logger.Info("Signal: %s | %s @ $%.2f", signalStr, result.Symbol, result.Price)
+	logger.InfoOrDebug(result.Signal != 0 || result.CloseFraction > 0, "Signal: %s | %s @ $%.2f", signalStr, result.Symbol, result.Price)
 
 	price := result.Price
 	if price <= 0 {
@@ -3472,10 +3671,11 @@ func runOptionsCheck(sc StrategyConfig, posJSON string, notifier *MultiNotifier,
 	if raw, ok := globalRegimeStore.InjectionJSONForStrategy(sc, nil); ok {
 		args = append(args, "--regime-payload-json="+raw)
 	}
-	logger.Info("Running: python3 %s %v", sc.Script, args)
+	logger.Running(sc.Script, args)
 
 	result, stderr, err := RunOptionsCheckWithStdin(sc.Script, args, posJSON)
 	if err != nil {
+		logger.RunningOnFailure(sc.Script, args)
 		logger.Error("Script failed: %v", err)
 		if stderr != "" {
 			logger.Error("stderr: %s", stderr)
@@ -3483,11 +3683,10 @@ func runOptionsCheck(sc StrategyConfig, posJSON string, notifier *MultiNotifier,
 		notifyScriptFailure(notifier, sc, scriptFailureCrash, err.Error())
 		return nil, "", false
 	}
-	if stderr != "" {
-		logger.Info("stderr: %s", stderr)
-	}
+	logger.ScriptStderr(stderr)
 
 	if result.Error != "" {
+		logger.RunningOnFailure(sc.Script, args)
 		logger.Error("Script returned error: %s", result.Error)
 		notifyScriptFailure(notifier, sc, scriptFailureError, result.Error)
 		return nil, "", false
@@ -3500,7 +3699,7 @@ func runOptionsCheck(sc StrategyConfig, posJSON string, notifier *MultiNotifier,
 	} else if result.Signal == -1 {
 		signalStr = "BEARISH"
 	}
-	logger.Info("Signal: %s | %s spot=$%.2f | IV rank=%.1f | %d actions",
+	logger.InfoOrDebug(result.Signal != 0 || len(result.Actions) > 0, "Signal: %s | %s spot=$%.2f | IV rank=%.1f | %d actions",
 		signalStr, result.Underlying, result.SpotPrice, result.IVRank, len(result.Actions))
 
 	return result, signalStr, true
@@ -3640,6 +3839,15 @@ var runHyperliquidCheckFn = RunHyperliquidCheck
 var runHyperliquidCheckWithStdinFn = RunHyperliquidCheckWithStdin
 
 func runHyperliquidCheck(sc *StrategyConfig, prices map[string]float64, posCtx PositionCtx, regime *RegimeConfig, atrMethod string, notifier *MultiNotifier, logger *StrategyLogger, batch *hlBatchCycleResults, feed *marketFeedContext) (*HyperliquidResult, string, float64, bool) {
+	closeOwner := hlCloseOwnerForCheck(*sc, posCtx)
+	sentInvert := hlInvertOpenSignalForCheck(*sc, posCtx, regime)
+	if closeStrategySuppressedByOnChainProtection(*sc) {
+		if closeOwner == "" && posCtx.Quantity > 0 {
+			notifyHLOnChainTPUnplaceable(notifier, logger, *sc, hyperliquidSymbol(sc.Args), posCtx.OnChainTPBlocked)
+		} else {
+			clearHLOnChainTPUnplaceable(sc.ID, hyperliquidSymbol(sc.Args))
+		}
+	}
 	if outcome, ok := batch.lookup(sc.ID); ok {
 		fp, fpErr := hyperliquidBatchSlotFingerprint(*sc, posCtx, regime)
 		if fpErr == nil && fp == outcome.Fingerprint {
@@ -3648,7 +3856,7 @@ func runHyperliquidCheck(sc *StrategyConfig, prices map[string]float64, posCtx P
 				res := *result
 				if sym := hyperliquidSymbol(sc.Args); sym != "" {
 					if mid, ok := prices[sym]; ok && mid > 0 {
-						res.Price = hyperliquidBatchDisplayPrice(mid)
+						res.Price = mid
 					}
 				}
 				result = &res
@@ -3657,7 +3865,7 @@ func runHyperliquidCheck(sc *StrategyConfig, prices map[string]float64, posCtx P
 				feed.clearDegradedFor(notifier, sc.ID)
 			}
 			return finishHyperliquidCheck(sc, prices, posCtx, regime, notifier, logger,
-				result, outcome.Stderr, outcome.Err, outcome.Mode)
+				result, outcome.Stderr, outcome.Err, outcome.Mode, sentInvert)
 		}
 		logger.Warn("Batched check inputs changed since the pre-pass snapshot; running this strategy's own check (#1442)")
 	}
@@ -3668,6 +3876,8 @@ func runHyperliquidCheck(sc *StrategyConfig, prices map[string]float64, posCtx P
 		degradedKey := entry.Signal
 		if hold := feed.holdFor(*sc); hold.Held {
 			degradedReason, degradedKey = hold.Reason, hold.Key
+		} else if sym := hyperliquidSymbol(sc.Args); feed.sharedMarkMissing(prices, sym) {
+			degradedReason = fmt.Sprintf("no verified mark for %s: the sealed mid is older than %s and the REST mark fallback returned none", sym, feedMidStaleAfter)
 		} else if blob, err := feed.singleCheckPayload(*sc); err != nil {
 			degradedReason = err.Error()
 		} else {
@@ -3682,13 +3892,12 @@ func runHyperliquidCheck(sc *StrategyConfig, prices map[string]float64, posCtx P
 				return nil, "", 0, false
 			}
 			result := degradedHyperliquidResult(*sc, hyperliquidSymbol(sc.Args), hyperliquidModeFromArgs(sc.Args), degradedReason, price)
-			return finishHyperliquidCheck(sc, prices, posCtx, regime, notifier, logger, result, "", "", scriptFailureError)
+			return finishHyperliquidCheck(sc, prices, posCtx, regime, notifier, logger, result, "", "", scriptFailureError, sentInvert)
 		}
 		feed.clearDegradedFor(notifier, sc.ID)
 	}
 	args := append([]string{}, sc.Args...)
-	scForCheck := strategyConfigWithOnChainProtectionFilter(*sc)
-	args = appendOpenCloseArgs(args, scForCheck, posCtx)
+	args = appendOpenCloseArgs(args, *sc, posCtx)
 	if sc.HTFFilter {
 		args = append(args, "--htf-filter")
 	}
@@ -3696,7 +3905,7 @@ func runHyperliquidCheck(sc *StrategyConfig, prices map[string]float64, posCtx P
 	args = appendStrategyRegimeWindowArgs(args, *sc, regime)
 	args = appendRegimePayloadArg(args, *sc, regime)
 	args = appendATRMethodArg(args, atrMethod)
-	if refsArgs, err := buildStrategyRefsArg(scForCheck); err != nil {
+	if refsArgs, err := buildStrategyRefsArg(*sc, closeOwner, sentInvert); err != nil {
 		logger.Warn("Failed to marshal strategy refs: %v", err)
 	} else if len(refsArgs) > 0 {
 		args = append(args, refsArgs...)
@@ -3709,7 +3918,7 @@ func runHyperliquidCheck(sc *StrategyConfig, prices map[string]float64, posCtx P
 	if marketStdin != nil {
 		args = append(args, marketStdinFlag)
 	}
-	logger.Info("Running: python3 %s %v", sc.Script, args)
+	logger.Running(sc.Script, args)
 
 	var result *HyperliquidResult
 	var stderr string
@@ -3726,10 +3935,24 @@ func runHyperliquidCheck(sc *StrategyConfig, prices map[string]float64, posCtx P
 	case result.Error != "":
 		errMsg, mode, result = result.Error, scriptFailureError, nil
 	}
-	return finishHyperliquidCheck(sc, prices, posCtx, regime, notifier, logger, result, stderr, errMsg, mode)
+	if errMsg != "" {
+		logger.RunningOnFailure(sc.Script, args)
+	}
+	return finishHyperliquidCheck(sc, prices, posCtx, regime, notifier, logger, result, stderr, errMsg, mode, sentInvert)
 }
 
-func finishHyperliquidCheck(sc *StrategyConfig, prices map[string]float64, posCtx PositionCtx, regime *RegimeConfig, notifier *MultiNotifier, logger *StrategyLogger, result *HyperliquidResult, stderr, errMsg string, mode scriptFailureMode) (*HyperliquidResult, string, float64, bool) {
+func finishHyperliquidCheck(sc *StrategyConfig, prices map[string]float64, posCtx PositionCtx, regime *RegimeConfig, notifier *MultiNotifier, logger *StrategyLogger, result *HyperliquidResult, stderr, errMsg string, mode scriptFailureMode, sentInvert bool) (*HyperliquidResult, string, float64, bool) {
+	if result != nil && errMsg == "" && result.Degraded == "" {
+		if want := hlCloseOwnerForCheck(*sc, posCtx); want != "" && result.CloseOwner != want {
+			errMsg = fmt.Sprintf("close-owner contract mismatch: sent close_owner=%q but the check returned close_owner=%q; holding this signal because the check script may have evaluated a close the on-chain take-profit owns (redeploy with scripts/update.sh so Go and Python match)", want, result.CloseOwner)
+			mode = scriptFailureError
+			result = nil
+		} else if result.OpenSignalInverted != sentInvert {
+			errMsg = fmt.Sprintf("open-signal-inverted contract mismatch: sent invert_open_signal=%t but the check returned open_signal_inverted=%t; holding this signal because the check script may have inverted a side Go did not ask for (redeploy with scripts/update.sh so Go and Python match)", sentInvert, result.OpenSignalInverted)
+			mode = scriptFailureError
+			result = nil
+		}
+	}
 	if errMsg != "" {
 		switch {
 		case mode == scriptFailureCrash:
@@ -3747,51 +3970,49 @@ func finishHyperliquidCheck(sc *StrategyConfig, prices map[string]float64, posCt
 		}
 		return nil, "", 0, false
 	}
-	if stderr != "" {
-		logger.Info("stderr: %s", stderr)
-	}
+	logger.ScriptStderr(stderr)
 	if result.Degraded == "" {
 		clearScriptFailure(notifier, *sc)
 	}
-	currentDirRegime := regimeDirectionalLabel(*sc, regimePayloadValue(result.Regime), regime)
-	posDirRegime := posCtx.DirectionalRegime
-	var dirCertStates map[string]string
-	if sc.RegimeDirectionalPolicy.IsConfigured() {
-		if posCtx.Quantity > 0 {
-			dirCertStates = posCtx.DirectionCertifiedStatesAtOpen
-		} else {
-			dirCertStates, _ = strategyDirectionalCertified(*sc, regime, time.Now().UTC())
-		}
-	}
-	if entry, applied, legacyFallback := applyRegimeDirectionalPolicy(sc, currentDirRegime, posDirRegime, posCtx.Quantity, dirCertStates); applied {
-		regimeKey := effectiveRegimeForPolicy(currentDirRegime, posDirRegime, posCtx.Quantity)
-		logger.Info("Regime directional policy: regime=%s -> direction=%q invert_signal=%t",
-			regimeKey, entry.Direction, entry.InvertSignal)
-		if legacyFallback {
+	overrides := applyCheckDirectionalOverrides(sc, regimePayloadValue(result.Regime), posCtx, regime)
+	if overrides.PolicyApplied {
+		regimeKey := effectiveRegimeForPolicy(overrides.CurrentLabel, posCtx.DirectionalRegime, posCtx.Quantity)
+		logger.InfoOnChange("directional-policy", fmt.Sprintf("%s|%s|%t", regimeKey, overrides.PolicyEntry.Direction, overrides.PolicyEntry.InvertSignal),
+			"Regime directional policy: regime=%s -> direction=%q invert_signal=%t",
+			regimeKey, overrides.PolicyEntry.Direction, overrides.PolicyEntry.InvertSignal)
+		if overrides.LegacyFallback {
 			if _, loaded := regimeDirectionalLegacyWarned.LoadOrStore(sc.ID, struct{}{}); !loaded {
 				logger.Warn("Regime directional policy: open position has no stamped regime (legacy pre-#741); resolving against current regime=%q. Hold-on-transition not guaranteed for this position; self-heals on next entry.", regimeKey)
 			}
 		}
 	}
-	if sc.RegimeWindowDivergence.IsConfigured() {
-		payload := regimePayloadValue(result.Regime)
-		divResult := applyRegimeDivergenceOverride(sc, payload, regime, posCtx.Quantity)
+	if overrides.DivergenceConfigured {
+		divResult := overrides.Divergence
 		result.Divergence = divResult
 		if divResult.IsActive() && posCtx.Quantity <= 0 {
-			logger.Info("Regime divergence override: short=%s medium=%s -> direction=%q (was policy-resolved)",
+			logger.InfoOnChange("divergence", "override|"+divResult.ShortLabel+"|"+divResult.MediumLabel+"|"+divResult.OverrideDir,
+				"Regime divergence override: short=%s medium=%s -> direction=%q (was policy-resolved)",
 				divResult.ShortLabel, divResult.MediumLabel, divResult.OverrideDir)
 		} else if divResult.Kind == DivergenceHard {
-			logger.Info("Regime divergence: hard divergence short=%s medium=%s (position open, holding direction)",
+			logger.InfoOnChange("divergence", "hard|"+divResult.ShortLabel+"|"+divResult.MediumLabel,
+				"Regime divergence: hard divergence short=%s medium=%s (position open, holding direction)",
 				divResult.ShortLabel, divResult.MediumLabel)
 		} else if divResult.Kind == DivergenceSoft {
-			logger.Info("Regime divergence: soft divergence short=%s medium=%s (no override)",
+			logger.InfoOnChange("divergence", "soft|"+divResult.ShortLabel+"|"+divResult.MediumLabel,
+				"Regime divergence: soft divergence short=%s medium=%s (no override)",
 				divResult.ShortLabel, divResult.MediumLabel)
+		} else {
+			logger.Changed("divergence", "none")
 		}
 	}
-	applySignalInversion(*sc, result, logger)
+	if effective := sc.Type != "manual" && sc.InvertSignal; effective != sentInvert {
+		logger.Warn("invert_open_signal changed between the check and this result (sent %t, effective %t); holding this signal for one cycle", sentInvert, effective)
+		result.Signal = 0
+		result.CloseFraction = 0
+	}
 
 	signalStr := signalLabel(result.Signal)
-	logger.Info("Signal: %s | %s @ $%.2f [%s]", signalStr, result.Symbol, result.Price, result.Mode)
+	logger.InfoOrDebug(result.Signal != 0 || result.CloseFraction > 0, "Signal: %s | %s @ $%s [%s]", signalStr, result.Symbol, formatSignalPrice(result.Price), result.Mode)
 	if result.CloseGate != "" {
 		logger.Info("Venue close gate for %s: partial close rewritten to noop (%s); no order this cycle", result.Symbol, result.CloseGate)
 	}
@@ -3809,13 +4030,11 @@ func finishHyperliquidCheck(sc *StrategyConfig, prices map[string]float64, posCt
 	return result, signalStr, price, true
 }
 
-func applySignalInversion(sc StrategyConfig, result *HyperliquidResult, logger *StrategyLogger) {
-	if !sc.InvertSignal || result == nil || result.Signal == 0 {
-		return
+func formatSignalPrice(v float64) string {
+	if v > 0 && v < 1 {
+		return fmt.Sprintf("%.6g", v)
 	}
-	original := result.Signal
-	result.Signal = -result.Signal
-	logger.Info("Signal inversion enabled: %s -> %s", signalLabel(original), signalLabel(result.Signal))
+	return fmt.Sprintf("%.2f", v)
 }
 
 func signalLabel(signal int) string {
@@ -3836,7 +4055,7 @@ func shouldCloseFullPosition(closeFraction float64, symbol string, hlLiveAll []S
 	return len(hlLiveStrategiesForCoin(symbol, hlLiveAll)) <= 1
 }
 
-func runHyperliquidExecuteOrder(sc StrategyConfig, result *HyperliquidResult, price, cash float64, poolBalanceKnown bool, posQty float64, posSide string, avgCost, posLeverage float64, existingStopLossOID int64, existingTPOIDs []int64, hlLiveAll []StrategyConfig, walletSnapshot hlExecuteSnapshot, hurst HurstGateDecision, notifier *MultiNotifier, logger *StrategyLogger) (*HyperliquidExecuteResult, bool) {
+func runHyperliquidExecuteOrder(sc StrategyConfig, result *HyperliquidResult, price, cash float64, poolBalanceKnown bool, posQty float64, posSide string, avgCost, posLeverage float64, existingStopLossOID int64, existingTPOIDs []int64, hlLiveAll []StrategyConfig, walletSnapshot hlExecuteSnapshot, closeCtx hlCloseContext, hurst HurstGateDecision, notifier *MultiNotifier, logger *StrategyLogger) (*HyperliquidExecuteResult, bool) {
 	if result.Signal == 0 {
 		logger.Info("Skipping live order for %s: no signal", result.Symbol)
 		return nil, false
@@ -3856,7 +4075,7 @@ func runHyperliquidExecuteOrder(sc StrategyConfig, result *HyperliquidResult, pr
 		posLeverage,
 		poolBalanceKnown,
 	), hurst.OpenSizeMult())
-	size, ok, reason := perpsLiveOrderSize(result.Signal, price, cash, posQty, avgCost, sizing, posSide, directionEnum, result.CloseFraction)
+	size, orderKind, ok, reason := perpsLiveOrderSizeKind(result.Signal, price, cash, posQty, avgCost, sizing, posSide, directionEnum, result.CloseFraction)
 	if !ok {
 		logger.Info("%s for %s", reason, result.Symbol)
 		return nil, false
@@ -3897,31 +4116,50 @@ func runHyperliquidExecuteOrder(sc StrategyConfig, result *HyperliquidResult, pr
 		}
 	}
 
+	closeFullPosition := shouldCloseFullPosition(result.CloseFraction, result.Symbol, hlLiveAll)
+	if result.ForceFullClose && result.CloseFraction == 1.0 {
+		closeFullPosition = true
+	}
+	direction := directionOpen
+	if side == "sell" {
+		direction = directionClose
+	}
+	closeMode := hlCloseModeNone
+	if closeFullPosition {
+		closeMode = hlCloseModeWhole
+		result.SizedClosePreSend = hlCloseViewOf(closeCtx.OnChain, result.Symbol, hlCloseViewCycleStart)
+		logger.Info("Final-tier full close %s (close_fraction=1.0) — using market_close(sz=None)", result.Symbol)
+	} else if orderKind == perpsLiveOrderClose {
+		plan := resolveHLCloseOrder(result.Symbol, posSide, posQty, size, closeCtx)
+		switch plan.Action {
+		case hlCloseSkip:
+			logger.Error("CRITICAL: sized close %s not sent: %s", result.Symbol, plan.Reason)
+			notifyLiveExecFailure(notifier, sc, direction, result.Symbol, "sized close not sent: "+plan.Reason)
+			return nil, false
+		case hlCloseDefer:
+			logger.Warn("Sized close %s deferred to the next cycle: %s", result.Symbol, plan.Reason)
+			return nil, false
+		}
+		if plan.Capped {
+			logger.Warn("Sized close %s capped from %.6f to %.6f by the on-chain position: %s", result.Symbol, size, plan.Size, plan.Reason)
+		}
+		size = plan.Size
+		closeMode = plan.Mode
+		result.SizedClosePreSend = plan.PreSend
+		logger.Info("Sized close %s sent as %s: %s", result.Symbol, closeMode, plan.Reason)
+	}
+
 	if slPct > 0 || cancelOID > 0 || prevPosQty > 0 || marginMode != "" {
 		logger.Info("Placing live %s %s size=%.6f (sl_pct=%.2f cancel_oid=%d prev_pos_qty=%.6f margin_mode=%q leverage=%g)",
 			side, result.Symbol, size, slPct, cancelOID, prevPosQty, marginMode, leverageForOpen)
 	} else {
 		logger.Info("Placing live %s %s size=%.6f", side, result.Symbol, size)
 	}
-
-	closeFullPosition := shouldCloseFullPosition(result.CloseFraction, result.Symbol, hlLiveAll)
-	if result.ForceFullClose && result.CloseFraction == 1.0 {
-		closeFullPosition = true
-	}
-	if closeFullPosition {
-		logger.Info("Final-tier full close %s (close_fraction=1.0) — using market_close(sz=None)", result.Symbol)
-	} else if result.CloseFraction == 1.0 {
-		logger.Info("Final-tier close %s shares coin with HL perps peers — using sized close to preserve peer exposure", result.Symbol)
-	}
 	result.LiveOrderSubmitted = true
 	result.LiveOrderCancelRequested = cancelOID > 0 || len(extraCancelOIDs) > 0
-	execResult, stderr, err := runHyperliquidExecuteFn(sc.Script, result.Symbol, side, size, slPct, cancelOID, prevPosQty, marginMode, leverageForOpen, closeFullPosition, walletSnapshot, extraCancelOIDs...)
+	execResult, stderr, err := runHyperliquidExecuteFn(sc.Script, result.Symbol, side, size, slPct, cancelOID, prevPosQty, marginMode, leverageForOpen, closeMode, walletSnapshot, extraCancelOIDs...)
 	if stderr != "" {
 		logger.Info("execute stderr: %s", stderr)
-	}
-	direction := directionOpen
-	if side == "sell" {
-		direction = directionClose
 	}
 	execResult, err = confirmHyperliquidExecuteFill(execResult, err)
 	if err != nil {
@@ -3943,6 +4181,14 @@ func runHyperliquidExecuteOrder(sc StrategyConfig, result *HyperliquidResult, pr
 	clearLiveExecThrottle(sc, direction, result.Symbol)
 	if execResult.CancelStopLossError != "" {
 		logger.Warn("SL cancel failed (non-fatal): %s", execResult.CancelStopLossError)
+	}
+	if (closeMode == hlCloseModeReduceOnly || closeMode == hlCloseModeCross) && !partialClose {
+		if bookedQty, _, bookedFull := manualCloseFillAttribution(posQty, execResult.Execution.Fill); !bookedFull {
+			result.SizedCloseBookFraction = bookedQty / posQty
+			result.SizedCloseBookedQty = bookedQty
+			result.SizedCloseCanceledOIDs = hyperliquidExecuteSucceededCancelOIDs(execResult, append([]int64{cancelOID}, extraCancelOIDs...))
+			logger.Error("CRITICAL: sized close %s filled %.6f of the %.6f book (sent %.6f); booking the filled quantity and keeping the %.6f remainder on the book", result.Symbol, bookedQty, posQty, size, posQty-bookedQty)
+		}
 	}
 	if execResult.StopLossError != "" {
 		if isHLOpenOrderCapRejection(execResult.StopLossError) {
@@ -3984,6 +4230,30 @@ func executeHyperliquidResult(sc StrategyConfig, s *StrategyState, result *Hyper
 	return trades, detail
 }
 
+func paperTierFillPrice(sc StrategyConfig, result *HyperliquidResult, execResult *HyperliquidExecuteResult) float64 {
+	if execResult != nil || result == nil || sc.Platform != "hyperliquid" || hyperliquidIsLive(sc.Args) {
+		return 0
+	}
+	if result.ForceFullClose || result.CloseFraction <= 0 || result.Signal == 0 {
+		return 0
+	}
+	px := result.CloseTierFillPrice
+	if math.IsNaN(px) || math.IsInf(px, 0) || px <= 0 {
+		return 0
+	}
+	return px
+}
+
+func paperTierFillQty(pos *Position, closeFraction float64) float64 {
+	if pos == nil || pos.Quantity <= 0 || closeFraction <= 0 {
+		return 0
+	}
+	if closeFraction >= 1 {
+		return pos.Quantity
+	}
+	return pos.Quantity * closeFraction
+}
+
 func executeHyperliquidResultDeferredOpen(sc StrategyConfig, s *StrategyState, result *HyperliquidResult, execResult *HyperliquidExecuteResult, signalStr string, price float64, regime *RegimeConfig, cfg *Config, hurst HurstGateDecision, logger *StrategyLogger) (int, string, *Trade, *RatchetTriggerAlert) {
 	if execResult != nil {
 		if _, err := confirmHyperliquidExecuteFill(execResult, nil); err != nil {
@@ -4010,12 +4280,40 @@ func executeHyperliquidResultDeferredOpen(sc StrategyConfig, s *StrategyState, r
 		fillFee = fill.Fee
 	}
 
-	exec, err := ExecutePerpsSignalWithLeverageDeferredOpen(s, result.Signal, result.Symbol, fillPrice, sizing, fillQty, fillOID, fillFee, EffectiveDirection(sc), result.CloseFraction, logger)
+	bookCloseFraction := result.CloseFraction
+	if result.SizedCloseBookFraction > 0 && result.SizedCloseBookFraction < 1 {
+		bookCloseFraction = result.SizedCloseBookFraction
+	}
+	preCloseQty, preCloseInit := 0.0, 0.0
+	if prePos := s.Positions[result.Symbol]; prePos != nil {
+		preCloseQty = prePos.Quantity
+		preCloseInit = prePos.InitialQuantity
+	}
+	bookPrice := fillPrice
+	if tierPx := paperTierFillPrice(sc, result, execResult); tierPx > 0 {
+		if qty := paperTierFillQty(s.Positions[result.Symbol], result.CloseFraction); qty > 0 {
+			bookPrice = tierPx
+			fillQty = qty
+			logger.Info("Paper take-profit tier fill at tier price $%.4f qty=%.6f (mid was $%.4f)", tierPx, qty, price)
+		}
+	}
+
+	exec, err := ExecutePerpsSignalWithLeverageDeferredOpen(s, result.Signal, result.Symbol, bookPrice, sizing, fillQty, fillOID, fillFee, EffectiveDirection(sc), bookCloseFraction, logger)
 	if err != nil {
 		logger.Error("Trade execution failed: %v", err)
 		return 0, "", nil, nil
 	}
 	trades := exec.TradesExecuted
+	if trades > 0 && paperSignalCloseOwnsUnifiedTier(sc, result) {
+		if pos := s.Positions[result.Symbol]; pos != nil && pos.Quantity > 0 && preCloseQty > pos.Quantity+1e-9 {
+			recordPaperUnifiedTPConsumption(sc, pos, preCloseQty, preCloseInit)
+		}
+	}
+	if trades > 0 && len(result.SizedCloseCanceledOIDs) > 0 {
+		if pos, ok := s.Positions[result.Symbol]; ok && pos != nil {
+			clearHyperliquidProtectionOIDsMatching(pos, result.SizedCloseCanceledOIDs)
+		}
+	}
 	openTrade := exec.OpenTrade
 	stampEntryATRIfOpened(s, result.Symbol, result.Indicators)
 	stampPositionRegimeIfOpened(s, result.Symbol, regimePayloadValue(result.Regime), sc, regime)
@@ -4037,6 +4335,21 @@ func executeHyperliquidResultDeferredOpen(sc StrategyConfig, s *StrategyState, r
 	if trades > 0 {
 		if pos, ok := s.Positions[result.Symbol]; ok && effectiveTrailingStopPct(sc, pos) > 0 {
 			pos.StopLossHighWaterPx = fillPrice
+		}
+	}
+
+	if trades > 0 && openTrade != nil && execResult == nil && !hyperliquidIsLive(sc.Args) {
+		if breach, stopPx, stopReason := armPaperStopLossAtOpen(sc, s, result.Symbol, price, logger); breach {
+			var pos *Position
+			if p, ok := s.Positions[result.Symbol]; ok {
+				pos = p
+			}
+			if recordPositionOpen(s, sc, openTrade, pos) {
+				openTrade = nil
+			}
+			if recordPerpsStopLossClose(s, result.Symbol, stopPx, stopReason, logger) {
+				trades++
+			}
 		}
 	}
 
@@ -4073,7 +4386,7 @@ func executeHyperliquidResultDeferredOpen(sc StrategyConfig, s *StrategyState, r
 		if execResult != nil {
 			prefix = "LIVE "
 		}
-		detail = fmt.Sprintf("[%s] %s%s %s @ $%.2f", sc.ID, prefix, signalStr, result.Symbol, fillPrice)
+		detail = fmt.Sprintf("[%s] %s%s %s @ $%.2f", sc.ID, prefix, signalStr, result.Symbol, bookPrice)
 	}
 	if execResult == nil {
 		var pos *Position
@@ -4108,15 +4421,16 @@ func runTopStepCheck(sc StrategyConfig, prices map[string]float64, posCtx Positi
 	args = appendStrategyRegimeWindowArgs(args, sc, regime)
 	args = appendRegimePayloadArg(args, sc, regime)
 	args = appendATRMethodArg(args, atrMethod)
-	if refsArgs, err := buildStrategyRefsArg(sc); err != nil {
+	if refsArgs, err := buildStrategyRefsArg(sc, "", false); err != nil {
 		logger.Warn("Failed to marshal strategy refs: %v", err)
 	} else if len(refsArgs) > 0 {
 		args = append(args, refsArgs...)
 	}
-	logger.Info("Running: python3 %s %v", sc.Script, args)
+	logger.Running(sc.Script, args)
 
 	result, stderr, err := RunTopStepCheck(sc.Script, args)
 	if err != nil {
+		logger.RunningOnFailure(sc.Script, args)
 		logger.Error("Script failed: %v", err)
 		if stderr != "" {
 			logger.Error("stderr: %s", stderr)
@@ -4124,10 +4438,9 @@ func runTopStepCheck(sc StrategyConfig, prices map[string]float64, posCtx Positi
 		notifyScriptFailure(notifier, sc, scriptFailureCrash, err.Error())
 		return nil, "", 0, false
 	}
-	if stderr != "" {
-		logger.Info("stderr: %s", stderr)
-	}
+	logger.ScriptStderr(stderr)
 	if result.Error != "" {
+		logger.RunningOnFailure(sc.Script, args)
 		logger.Error("Script returned error: %s", result.Error)
 		notifyScriptFailure(notifier, sc, scriptFailureError, result.Error)
 		return nil, "", 0, false
@@ -4135,9 +4448,10 @@ func runTopStepCheck(sc StrategyConfig, prices map[string]float64, posCtx Positi
 	clearScriptFailure(notifier, sc)
 
 	if !result.MarketOpen {
-		logger.Info("Market closed for %s, skipping", result.Symbol)
+		logger.InfoOnChange("market", "closed", "Market closed for %s, skipping", result.Symbol)
 		return nil, "", 0, false
 	}
+	logger.Changed("market", "open")
 
 	signalStr := "HOLD"
 	if result.Signal == 1 {
@@ -4145,7 +4459,7 @@ func runTopStepCheck(sc StrategyConfig, prices map[string]float64, posCtx Positi
 	} else if result.Signal == -1 {
 		signalStr = "SELL"
 	}
-	logger.Info("Signal: %s | %s @ $%.2f [%s]", signalStr, result.Symbol, result.Price, result.Mode)
+	logger.InfoOrDebug(result.Signal != 0 || result.CloseFraction > 0, "Signal: %s | %s @ $%.2f [%s]", signalStr, result.Symbol, result.Price, result.Mode)
 
 	price := result.Price
 	if price <= 0 {
@@ -4299,15 +4613,16 @@ func runRobinhoodCheck(sc StrategyConfig, prices map[string]float64, posCtx Posi
 	args = appendStrategyRegimeWindowArgs(args, sc, regime)
 	args = appendRegimePayloadArg(args, sc, regime)
 	args = appendATRMethodArg(args, atrMethod)
-	if refsArgs, err := buildStrategyRefsArg(sc); err != nil {
+	if refsArgs, err := buildStrategyRefsArg(sc, "", false); err != nil {
 		logger.Warn("Failed to marshal strategy refs: %v", err)
 	} else if len(refsArgs) > 0 {
 		args = append(args, refsArgs...)
 	}
-	logger.Info("Running: python3 %s %v", sc.Script, args)
+	logger.Running(sc.Script, args)
 
 	result, stderr, err := RunRobinhoodCheck(sc.Script, args)
 	if err != nil {
+		logger.RunningOnFailure(sc.Script, args)
 		logger.Error("Script failed: %v", err)
 		if stderr != "" {
 			logger.Error("stderr: %s", stderr)
@@ -4315,10 +4630,9 @@ func runRobinhoodCheck(sc StrategyConfig, prices map[string]float64, posCtx Posi
 		notifyScriptFailure(notifier, sc, scriptFailureCrash, err.Error())
 		return nil, "", 0, false
 	}
-	if stderr != "" {
-		logger.Info("stderr: %s", stderr)
-	}
+	logger.ScriptStderr(stderr)
 	if result.Error != "" {
+		logger.RunningOnFailure(sc.Script, args)
 		logger.Error("Script returned error: %s", result.Error)
 		notifyScriptFailure(notifier, sc, scriptFailureError, result.Error)
 		return nil, "", 0, false
@@ -4331,7 +4645,7 @@ func runRobinhoodCheck(sc StrategyConfig, prices map[string]float64, posCtx Posi
 	} else if result.Signal == -1 {
 		signalStr = "SELL"
 	}
-	logger.Info("Signal: %s | %s @ $%.2f [%s]", signalStr, result.Symbol, result.Price, result.Mode)
+	logger.InfoOrDebug(result.Signal != 0 || result.CloseFraction > 0, "Signal: %s | %s @ $%.2f [%s]", signalStr, result.Symbol, result.Price, result.Mode)
 
 	price := result.Price
 	if price <= 0 {
@@ -4479,15 +4793,16 @@ func runOKXCheck(sc StrategyConfig, prices map[string]float64, posCtx PositionCt
 	args = appendStrategyRegimeWindowArgs(args, sc, regime)
 	args = appendRegimePayloadArg(args, sc, regime)
 	args = appendATRMethodArg(args, atrMethod)
-	if refsArgs, err := buildStrategyRefsArg(sc); err != nil {
+	if refsArgs, err := buildStrategyRefsArg(sc, "", false); err != nil {
 		logger.Warn("Failed to marshal strategy refs: %v", err)
 	} else if len(refsArgs) > 0 {
 		args = append(args, refsArgs...)
 	}
-	logger.Info("Running: python3 %s %v", sc.Script, args)
+	logger.Running(sc.Script, args)
 
 	result, stderr, err := RunOKXCheck(sc.Script, args)
 	if err != nil {
+		logger.RunningOnFailure(sc.Script, args)
 		logger.Error("Script failed: %v", err)
 		if stderr != "" {
 			logger.Error("stderr: %s", stderr)
@@ -4495,10 +4810,9 @@ func runOKXCheck(sc StrategyConfig, prices map[string]float64, posCtx PositionCt
 		notifyScriptFailure(notifier, sc, scriptFailureCrash, err.Error())
 		return nil, "", 0, false
 	}
-	if stderr != "" {
-		logger.Info("stderr: %s", stderr)
-	}
+	logger.ScriptStderr(stderr)
 	if result.Error != "" {
+		logger.RunningOnFailure(sc.Script, args)
 		logger.Error("Script returned error: %s", result.Error)
 		notifyScriptFailure(notifier, sc, scriptFailureError, result.Error)
 		return nil, "", 0, false
@@ -4511,7 +4825,7 @@ func runOKXCheck(sc StrategyConfig, prices map[string]float64, posCtx PositionCt
 	} else if result.Signal == -1 {
 		signalStr = "SELL"
 	}
-	logger.Info("Signal: %s | %s @ $%.2f [%s]", signalStr, result.Symbol, result.Price, result.Mode)
+	logger.InfoOrDebug(result.Signal != 0 || result.CloseFraction > 0, "Signal: %s | %s @ $%.2f [%s]", signalStr, result.Symbol, result.Price, result.Mode)
 
 	price := result.Price
 	if price <= 0 {

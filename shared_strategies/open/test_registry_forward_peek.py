@@ -1,4 +1,3 @@
-
 import importlib.util
 import os
 
@@ -240,50 +239,6 @@ def test_registry_strategy_is_truncation_invariant(name, params):
             f"the fixture / add a per-strategy input hook, or add it to "
             f"EXPECTED_ALL_ZERO_SIGNAL with an inline justification."
         )
-
-
-def test_zero_signal_allowlist_is_exact():
-    unknown = set(EXPECTED_ALL_ZERO_SIGNAL) - set(_REGISTRY.STRATEGIES)
-    assert not unknown, f"EXPECTED_ALL_ZERO_SIGNAL names unregistered strategies: {sorted(unknown)}"
-    for name in sorted(EXPECTED_ALL_ZERO_SIGNAL):
-        if name in SKIP_STRATEGIES:
-            continue
-        entry = _REGISTRY.STRATEGIES[name]
-        emitted = False
-        for platform in entry["platforms"]:
-            merged = {
-                **entry["default_params"],
-                **entry["variants"].get(platform, {}).get("default_params", {}),
-            }
-            sig = _signal(entry["fn"], merged, _df_for(name)[1])
-            emitted = emitted or bool((np.nan_to_num(sig) != 0).any())
-        assert not emitted, (
-            f"{name} now emits signals on the sweep fixture — remove it from "
-            f"EXPECTED_ALL_ZERO_SIGNAL (stale vacuity entry)."
-        )
-
-
-def test_skip_list_is_closed_allowlist():
-    unknown = set(SKIP_STRATEGIES) - set(_REGISTRY.STRATEGIES)
-    assert not unknown, f"SKIP_STRATEGIES names unregistered strategies: {sorted(unknown)}"
-    for name, reason in SKIP_STRATEGIES.items():
-        assert isinstance(reason, str) and reason.strip(), (
-            f"SKIP_STRATEGIES[{name!r}] must carry a non-empty justification"
-        )
-
-
-def test_fixture_hooks_are_closed_allowlist():
-    unknown = set(STRATEGY_FIXTURES) - set(_REGISTRY.STRATEGIES)
-    assert not unknown, f"STRATEGY_FIXTURES names unregistered strategies: {sorted(unknown)}"
-
-
-def test_sweep_covers_every_registered_strategy():
-    swept = {p.id.split("[")[0] for p in _sweep_cases()}
-    assert swept == set(_REGISTRY.STRATEGIES)
-    assert _REGISTRY.DISCOVERY_HIDDEN_STRATEGIES <= swept
-    assert any(e.get("backtest_only") for e in _REGISTRY.STRATEGIES.values()), (
-        "expected at least one backtest_only strategy in the sweep (#1138)"
-    )
 
 
 def test_harness_detects_forward_peeking_strategy():

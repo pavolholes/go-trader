@@ -42,6 +42,8 @@ const (
 	feedStatusRepairing     feedKeyStatus = "repairing"
 	feedStatusInvalid       feedKeyStatus = "invalid"
 	feedStatusFailed        feedKeyStatus = "failed"
+	feedStatusBudget        feedKeyStatus = "budget_exhausted"
+	feedStatusNotDue        feedKeyStatus = "not_due"
 )
 
 type marketFeedKey struct {
@@ -77,17 +79,18 @@ func sortMarketFeedKeys(keys []marketFeedKey) {
 }
 
 type feedBar struct {
-	OpenMs   int64
-	CloseMs  int64
-	HasClose bool
-	Open     float64
-	High     float64
-	Low      float64
-	Close    float64
-	Volume   float64
-	Seq      uint64
-	RecvAt   time.Time
-	Source   feedBarSource
+	OpenMs     int64
+	CloseMs    int64
+	HasClose   bool
+	Open       float64
+	High       float64
+	Low        float64
+	Close      float64
+	Volume     float64
+	Seq        uint64
+	RecvAt     time.Time
+	Source     feedBarSource
+	RestSeenAt time.Time
 }
 
 func (b feedBar) row() hlCandleRow {
@@ -170,6 +173,7 @@ type feedKeyState struct {
 	InvalidCount  int
 	LastInvalid   string
 	seq           uint64
+	corr          feedKeyCorrection
 }
 
 func newFeedKeyState(key marketFeedKey, intervalMs int64, required int) *feedKeyState {
@@ -241,9 +245,14 @@ func applySocketBar(s *feedKeyState, bar feedBar) error {
 func storeSocketBar(s *feedKeyState, bar feedBar) {
 	idx, found := s.indexOfOpen(bar.OpenMs)
 	if found {
-		if bar.CloseMs < s.Bars[idx].CloseMs {
+		stored := s.Bars[idx]
+		if bar.CloseMs < stored.CloseMs {
 			return
 		}
+		if stored.Source == feedBarSourceREST && bar.Volume < stored.Volume {
+			return
+		}
+		bar.RestSeenAt = stored.RestSeenAt
 		bar.Seq = s.nextSeq()
 		s.Bars[idx] = bar
 	} else {
@@ -284,11 +293,20 @@ func mergeRestRows(s *feedKeyState, raws []hlCandleRaw, requestedAt time.Time) m
 			out.Invalid++
 			continue
 		}
+		bar.RestSeenAt = requestedAt
 		idx, found := s.indexOfOpen(bar.OpenMs)
 		if found {
-			if s.Bars[idx].RecvAt.After(requestedAt) {
+			stored := s.Bars[idx]
+			replace, verified := feedRestBarDecision(stored, bar, requestedAt)
+			if !replace {
+				if verified && requestedAt.After(stored.RestSeenAt) {
+					s.Bars[idx].RestSeenAt = requestedAt
+				}
 				out.Kept++
 				continue
+			}
+			if stored.RestSeenAt.After(bar.RestSeenAt) {
+				bar.RestSeenAt = stored.RestSeenAt
 			}
 			bar.Seq = s.nextSeq()
 			s.Bars[idx] = bar
@@ -360,7 +378,7 @@ func keyReadiness(s *feedKeyState, now time.Time, connected bool) feedKeyReadine
 		out.LastOpenMs = s.Bars[len(s.Bars)-1].OpenMs
 		out.LastCloseMs = s.Bars[len(s.Bars)-1].CloseMs
 	}
-	if s.Status == feedStatusFailed {
+	if s.Status == feedStatusFailed || s.Status == feedStatusBudget {
 		return out
 	}
 	if s.Status == feedStatusRepairing {
@@ -434,6 +452,13 @@ const (
 	feedRestRepair    feedRestReason = "repair"
 	feedRestRecovery  feedRestReason = "recovery"
 	feedRestSteady    feedRestReason = "steady"
+	feedRestRefresh   feedRestReason = "refresh"
+	feedRestRetry     feedRestReason = "retry"
+	feedRestFunding   feedRestReason = "funding"
+	feedRestMids      feedRestReason = "mids"
+
+	feedRestCorrection      feedRestReason = "correction"
+	feedRestCorrectionRetry feedRestReason = "correction_retry"
 )
 
 type feedMetrics struct {
@@ -441,6 +466,7 @@ type feedMetrics struct {
 	RepairCalls       int
 	RecoveryCalls     int
 	SteadyCandleCalls int
+	CorrectionCalls   int
 }
 
 type feedAlert struct {
@@ -470,6 +496,13 @@ type marketFeedOwner struct {
 
 	metrics feedMetrics
 
+	corrOffsets    []time.Duration
+	correction     feedCorrectionStats
+	corrWindow     []time.Time
+	corrPauseUntil time.Time
+	corrRunning    bool
+	requestLedger  *feedRequestLedger
+
 	alerts chan feedAlert
 	clock  func() time.Time
 	logf   func(string, ...any)
@@ -495,10 +528,17 @@ func newMarketFeedOwner(clock func() time.Time, logf func(string, ...any)) *mark
 		midCoins:     make(map[string]bool),
 		funding:      make(map[string]*feedFunding),
 		fundingNeeds: make(map[string]feedFundingNeed),
+		corrOffsets:  append([]time.Duration(nil), feedCorrectionOffsets...),
 		alerts:       make(chan feedAlert, feedAlertChannelDepth),
 		clock:        clock,
 		logf:         logf,
 	}
+}
+
+func (o *marketFeedOwner) SetRequestLedger(l *feedRequestLedger) {
+	o.feedMu.Lock()
+	defer o.feedMu.Unlock()
+	o.requestLedger = l
 }
 
 func (o *marketFeedOwner) now() time.Time {
@@ -534,6 +574,8 @@ func (o *marketFeedOwner) countRestCall(reason feedRestReason) {
 		o.metrics.RepairCalls++
 	case feedRestRecovery:
 		o.metrics.RecoveryCalls++
+	case feedRestCorrection, feedRestCorrectionRetry:
+		o.metrics.CorrectionCalls++
 	default:
 		o.metrics.SteadyCandleCalls++
 	}
@@ -672,6 +714,7 @@ func (o *marketFeedOwner) fetchAndMerge(ctx context.Context, key marketFeedKey, 
 	if !ok {
 		return fmt.Errorf("feed key %s is not tracked", key)
 	}
+	ctx = withFeedReason(ctx, string(reason))
 	requestedAt := o.now()
 	var raws []hlCandleRaw
 	var err error
@@ -722,6 +765,15 @@ func (o *marketFeedOwner) fetchAndMerge(ctx context.Context, key marketFeedKey, 
 	return nil
 }
 
+func (o *marketFeedOwner) markKeyUnready(key marketFeedKey, status feedKeyStatus, detail string) {
+	o.feedMu.Lock()
+	defer o.feedMu.Unlock()
+	if st := o.keys[key]; st != nil {
+		st.Status = status
+		st.StatusDetail = detail
+	}
+}
+
 func (o *marketFeedOwner) Readiness() []feedKeyReadiness {
 	o.feedMu.Lock()
 	defer o.feedMu.Unlock()
@@ -752,18 +804,24 @@ type marketFeedHealth struct {
 	Metrics      feedMetrics           `json:"metrics"`
 	Keys         []marketFeedHealthKey `json:"keys"`
 	Mids         []marketFeedHealthMid `json:"mids,omitempty"`
+	Shared       *sharedFeedStatus     `json:"shared,omitempty"`
+	Correction   *feedCorrectionHealth `json:"correction,omitempty"`
+	Requests     *feedBudgetTotals     `json:"requests,omitempty"`
 }
 
 type marketFeedHealthKey struct {
-	Key           string `json:"key"`
-	Status        string `json:"status"`
-	Bars          int    `json:"bars"`
-	Required      int    `json:"required"`
-	Ready         bool   `json:"ready"`
-	Stale         bool   `json:"stale,omitempty"`
-	CoverageShort bool   `json:"coverage_short,omitempty"`
-	Detail        string `json:"detail,omitempty"`
-	LastCloseMs   int64  `json:"last_close_ms,omitempty"`
+	Key               string `json:"key"`
+	Status            string `json:"status"`
+	Bars              int    `json:"bars"`
+	Required          int    `json:"required"`
+	Ready             bool   `json:"ready"`
+	Stale             bool   `json:"stale,omitempty"`
+	CoverageShort     bool   `json:"coverage_short,omitempty"`
+	Detail            string `json:"detail,omitempty"`
+	LastCloseMs       int64  `json:"last_close_ms,omitempty"`
+	CorrectionPending int    `json:"correction_pending,omitempty"`
+	CorrectionOverdue int    `json:"correction_overdue,omitempty"`
+	CorrectionError   string `json:"correction_error,omitempty"`
 }
 
 type marketFeedHealthMid struct {
@@ -785,6 +843,15 @@ func (o *marketFeedOwner) Health(lastSnapshotID string) marketFeedHealth {
 		Generation:   o.gen,
 		LastSnapshot: lastSnapshotID,
 		Metrics:      o.metrics,
+		Correction:   o.correctionHealthLocked(),
+	}
+	if o.requestLedger != nil {
+		totals := o.requestLedger.snapshot()
+		health.Requests = &totals
+	}
+	perKey := make(map[marketFeedKey]feedKeyCorrection, len(o.keys))
+	for k, st := range o.keys {
+		perKey[k] = st.corr
 	}
 	coins := make([]string, 0, len(o.midCoins))
 	for c := range o.midCoins {
@@ -815,6 +882,10 @@ func (o *marketFeedOwner) Health(lastSnapshotID string) marketFeedHealth {
 			CoverageShort: r.CoverageShort,
 			Detail:        r.Detail,
 			LastCloseMs:   r.LastCloseMs,
+
+			CorrectionPending: perKey[r.Key].pendingBars,
+			CorrectionOverdue: perKey[r.Key].overdueBars,
+			CorrectionError:   perKey[r.Key].lastErr,
 		})
 	}
 	return health
@@ -823,7 +894,14 @@ func (o *marketFeedOwner) Health(lastSnapshotID string) marketFeedHealth {
 type marketFeedStatusHolder struct {
 	statusMu   sync.Mutex
 	owner      *marketFeedOwner
+	shared     *sharedFeedClient
 	snapshotID string
+}
+
+func (h *marketFeedStatusHolder) setShared(client *sharedFeedClient) {
+	h.statusMu.Lock()
+	defer h.statusMu.Unlock()
+	h.shared = client
 }
 
 var globalMarketFeedStatus = &marketFeedStatusHolder{}
@@ -847,6 +925,13 @@ func (h *marketFeedStatusHolder) read() (*marketFeedOwner, string) {
 }
 
 func marketFeedStatusBlock() *marketFeedHealth {
+	globalMarketFeedStatus.statusMu.Lock()
+	shared := globalMarketFeedStatus.shared
+	sharedID := globalMarketFeedStatus.snapshotID
+	globalMarketFeedStatus.statusMu.Unlock()
+	if shared != nil {
+		return &marketFeedHealth{Mode: marketFeedShared, LastSnapshot: sharedID, Keys: []marketFeedHealthKey{}, Shared: shared.status()}
+	}
 	owner, snapshotID := globalMarketFeedStatus.read()
 	if owner == nil {
 		return &marketFeedHealth{Mode: marketFeedREST}
@@ -856,8 +941,8 @@ func marketFeedStatusBlock() *marketFeedHealth {
 }
 
 func formatFeedMetrics(m feedMetrics) string {
-	return fmt.Sprintf("rest{bootstrap,repair,recovery}=%d,%d,%d steady_candle_rest=%d",
-		m.BootstrapCalls, m.RepairCalls, m.RecoveryCalls, m.SteadyCandleCalls)
+	return fmt.Sprintf("rest{bootstrap,repair,recovery,correction}=%d,%d,%d,%d steady_candle_rest=%d",
+		m.BootstrapCalls, m.RepairCalls, m.RecoveryCalls, m.CorrectionCalls, m.SteadyCandleCalls)
 }
 
 func feedKeySummary(readiness []feedKeyReadiness) string {

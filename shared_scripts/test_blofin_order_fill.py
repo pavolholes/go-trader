@@ -207,8 +207,6 @@ def test_execute_parser_forwards_close_flag_and_configured_leverage(monkeypatch)
 
 
 def test_execute_handles_object_shaped_copy_order_response(monkeypatch, capsys):
-    import adapter as adapter_module
-
     path = os.path.join(os.path.dirname(__file__), "check_blofin.py")
     spec = importlib.util.spec_from_file_location("check_blofin_object_response_test", path)
     module = importlib.util.module_from_spec(spec)
@@ -235,7 +233,10 @@ def test_execute_handles_object_shaped_copy_order_response(monkeypatch, capsys):
                 "oid": "16949003",
             }
 
-    monkeypatch.setattr(adapter_module, "BloFinExchangeAdapter", FakeAdapter)
+    class FakeNS:
+        BloFinExchangeAdapter = FakeAdapter
+
+    monkeypatch.setattr(module, "_blofin_adapter", lambda: FakeNS)
 
     module.run_execute("ETH", "sell", 11.16, "live", False, "long", True, 75)
 
@@ -254,8 +255,6 @@ def test_execute_handles_object_shaped_copy_order_response(monkeypatch, capsys):
 
 
 def test_copy_order_ack_without_history_fill_does_not_assume_requested_size(monkeypatch, capsys):
-    import adapter as adapter_module
-
     path = os.path.join(os.path.dirname(__file__), "check_blofin.py")
     spec = importlib.util.spec_from_file_location("check_blofin_unfilled_ack_test", path)
     module = importlib.util.module_from_spec(spec)
@@ -273,7 +272,10 @@ def test_copy_order_ack_without_history_fill_does_not_assume_requested_size(monk
                                 request_timeout=15, retry_delay=3):
             return {}
 
-    monkeypatch.setattr(adapter_module, "BloFinExchangeAdapter", FakeAdapter)
+    class FakeNS:
+        BloFinExchangeAdapter = FakeAdapter
+
+    monkeypatch.setattr(module, "_blofin_adapter", lambda: FakeNS)
 
     module.run_execute("ETH", "sell", 11.16, "live", False, "long", True, 75)
 

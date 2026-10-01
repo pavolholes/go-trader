@@ -21,6 +21,47 @@ from datetime import datetime, timezone
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'platforms', 'blofin'))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'shared_tools'))
 
+
+def _blofin_adapter():
+    """Resolve platforms/blofin/adapter.py.
+
+    Both BloFin and Hyperliquid ship a top-level ``adapter`` module, so under
+    a shared pytest process the first import wins the ``sys.modules`` cache
+    and can shadow the other platform. A plain import is tried first; when
+    the cached module is not ours, the file is loaded by path under a
+    distinct module name.
+    """
+    import sys as _sys
+    import os as _os
+    mod = _sys.modules.get("blofin_platform_adapter")
+    if mod is not None:
+        return mod
+    try:
+        # NOTE: plain __import__ (not importlib.import_module) so test
+        # doubles patching builtins.__import__ keep working.
+        cand = __import__("adapter", fromlist=["BloFinExchangeAdapter"])
+    except ImportError:
+        cand = None
+    cand_file = getattr(cand, "__file__", None)
+    if isinstance(cand_file, str):
+        if cand_file.replace(_os.sep, "/").endswith("platforms/blofin/adapter.py"):
+            _sys.modules["blofin_platform_adapter"] = cand
+            return cand
+    elif cand is not None and hasattr(cand, "BloFinExchangeAdapter"):
+        # Test double (no real __file__): use it but never cache it, so it
+        # cannot leak into other tests sharing this process.
+        return cand
+    import importlib.util as _ilu
+    path = _os.path.join(
+        _os.path.dirname(_os.path.abspath(__file__)),
+        "..", "platforms", "blofin", "adapter.py",
+    )
+    spec = _ilu.spec_from_file_location("blofin_platform_adapter", path)
+    mod = _ilu.module_from_spec(spec)
+    _sys.modules["blofin_platform_adapter"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
 from atr import ensure_atr_indicator, latest_atr
 from regime import latest_regime, parse_regime_windows_spec_json, prepare_check_regime
 
@@ -76,7 +117,7 @@ def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=
                      htf_timeframe="", htf_limit=300):
     """Run strategy signal check using BloFin OHLCV data."""
     try:
-        from adapter import BloFinExchangeAdapter
+        BloFinExchangeAdapter = _blofin_adapter().BloFinExchangeAdapter
         from strategies import apply_strategy, get_strategy, list_strategies
         from close_registry_loader import (
             evaluate as close_evaluate,
@@ -332,8 +373,7 @@ def run_execute(symbol, side, size, mode, size_in_contracts=False, pos_side_hint
         sys.exit(1)
 
     try:
-        from adapter import BloFinExchangeAdapter
-        adapter = BloFinExchangeAdapter()
+        adapter = _blofin_adapter().BloFinExchangeAdapter()
         is_buy = side.lower() == "buy"
         client_order_id = uuid.uuid4().hex if adapter.trade_account == "copy" else ""
         result = adapter.market_open(

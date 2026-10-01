@@ -30,6 +30,14 @@ tree_mutated=0
 unit_sync_source_path=""
 unit_sync_installed_path=""
 unit_sync_backup_path=""
+tree_owner=""
+tree_owner_snapshot=""
+owner_scope=""
+probe_owner=""
+uv_bin=""
+uv_env=()
+build_export_tree=""
+build_export_commit=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -105,10 +113,15 @@ while [[ $# -gt 0 ]]; do
             echo "  --rsync-from <dir>  rsync code from a source clone into this deployment (skips git pull;"
             echo "                      hardcoded exclusions protect .env, config, state DB, venv, binaries)."
             echo "  --all               update+restart every deployment. Batch = union of ACTIVE go-trader"
-            echo "                      systemd units' WorkingDirectory (layout-independent) and the"
-            echo "                      <root>/go-trader-*/ glob. Auto-discovery is active-only, so it never"
-            echo "                      starts a stopped/failed deployment; the glob still restarts anything"
-            echo "                      under <root>. --update-all-root pins the glob root (skips systemd)."
+            echo "                      systemd units' WorkingDirectory (layout-independent), ENABLED units whose"
+            echo "                      --config sets role=feed, and the <root>/go-trader-*/ glob. A stopped or"
+            echo "                      failed enabled feed is updated and started. Scheduler discovery is"
+            echo "                      active-only, so it never starts a stopped/failed scheduler; the glob"
+            echo "                      still restarts anything under <root>."
+            echo "                      Deployments whose config sets role=feed run first, then schedulers."
+            echo "                      A glob dir with no discovered unit maps to an active go-trader@<name>, or an"
+            echo "                      enabled role=feed one, whose WorkingDirectory is the dir."
+            echo "                      --update-all-root pins the glob root."
             echo "  With --all + systemd: each child resolves GO_TRADER_SERVICE from the active unit that owns"
             echo "                      that deployment's WorkingDirectory (per-dir systemd lookup). Parent"
             echo "                      --unit / --service / GO_TRADER_SERVICE is overridden when a per-dir"
@@ -384,8 +397,12 @@ run_rsync_from() {
     if [[ "$signal_log_excl" != "./go-trader-signal.log" && "$signal_log_excl" != "go-trader-signal.log" ]]; then
         rsync_excludes+=(--exclude="$signal_log_excl")
     fi
+    local -a rsync_owner=()
+    if [[ "$EUID" == "0" ]]; then
+        rsync_owner=(--no-owner --no-group)
+    fi
     echo "[update] rsync: $src/ -> $dest/ (excludes deployment .git, secrets, state DB, venv, binaries, signal log)"
-    rsync -a --delete "${rsync_excludes[@]}" "$src/" "$dest/"
+    rsync -a ${rsync_owner[@]+"${rsync_owner[@]}"} --delete "${rsync_excludes[@]}" "$src/" "$dest/"
 }
 
 warn_execstart_vs_swap() {
@@ -466,8 +483,8 @@ do_rollback() {
 
     if [[ "$tree_mutated" == "1" && -n "$pre_pull_sha" ]]; then
         echo "[update] rollback: reverting git tree to $pre_pull_sha" >&2
-        if git reset --hard "$pre_pull_sha" >&2; then
-            if ! uv sync >&2; then
+        if update_git "$repo_root" reset --hard "$pre_pull_sha" >&2; then
+            if ! env ${uv_env[@]+"${uv_env[@]}"} "$uv_bin" sync >&2; then
                 echo "[update] rollback: uv sync FAILED — Python tree may be inconsistent with .prev binary" >&2
             fi
         else
@@ -518,6 +535,15 @@ do_rollback() {
     echo "[update] rollback: previous binary did not reach active within ${active_timeout}s" >&2
 }
 
+restore_tree_owner_on_exit() {
+    local rc=$?
+    if ! update_restore_tree_owner "$owner_scope" "$tree_owner" "$tree_owner_snapshot"; then
+        echo "[update] WARNING: files this update wrote under $owner_scope may still be owned by root; check with: find $owner_scope -xdev -user root" >&2
+    fi
+    rm -f "$tree_owner_snapshot"
+    exit "$rc"
+}
+
 verify_cur_restart_pid() {
     if restart_uses_signal_pid; then
         signal_read_pidfile "$go_trader_pidfile" || true
@@ -535,7 +561,7 @@ verify_cur_restart_pid() {
 
 begin_phase preflight
 
-repo_root=$(git rev-parse --show-toplevel)
+repo_root=$(update_git "$PWD" rev-parse --show-toplevel) || fail "$PWD is not inside a git checkout that git can read (see the git error above)"
 cd "$repo_root"
 
 if [[ "$update_all" == "1" ]]; then
@@ -600,7 +626,7 @@ if [[ "$update_all" == "1" ]]; then
     declare -a all_dirs=()
     while IFS= read -r line; do
         [[ -n "$line" ]] && all_dirs+=("$line")
-    done < <(printf '%s\n' "${canon[@]}" | sort -u)
+    done < <(printf '%s\n' "${canon[@]}" | sort -u | order_deployments_feeds_first)
     discovery_source=$(IFS='+'; printf '%s' "${discovery_sources[*]}")
     echo "[update] --all: ${#all_dirs[@]} deployment dir(s) via ${discovery_source} discovery"
     declare -A unit_for_dir=()
@@ -638,6 +664,10 @@ if [[ "$update_all" == "1" ]]; then
         fi
         update_count=$((update_count + 1))
         mapped_unit="${unit_for_dir[$d]:-}"
+        if [[ -z "$mapped_unit" ]]; then
+            mapped_unit=$(update_convention_unit_for_dir "$d")
+        fi
+        echo "[update] --all: $(cd "$d" && pwd) role=$(update_deployment_role "$d")"
         # resolve_child_unit_override is the tested helper that decides the
         # child's effective unit + argv. Production runs must share that
         # single decision so tests cover the real branch.
@@ -672,20 +702,54 @@ if [[ "$update_all" == "1" ]]; then
     exit 0
 fi
 
-if ! command -v uv >/dev/null 2>&1; then
-    fail "uv not on PATH — install uv first (see CLAUDE.md → Setup)"
+refuse_unconfined_tree() {
+    local tree="$1" role="$2" issues owners
+    owners="top $(update_path_owner_name "$tree"), .git $(update_path_owner_name "${tree%/}/.git")"
+    if ! issues=$(update_foreign_tree_check "$tree"); then
+        printf '%s\n' "$issues" >&2
+        if [[ -n "${SUDO_UID:-}" ]] && grep -qx "$SUDO_UID" <<<"$(update_tree_foreign_accounts "$tree")"; then
+            echo "[update] you ran this through sudo, and your account owns $tree: run the update as your account without sudo (it calls sudo itself only for systemd steps)" >&2
+        fi
+        fail "$role $tree ($owners) belongs in part to an account other than root, and root would build and run code from it, but the listed units or owners let that account change files in it outside scheduler/ and logs/ (or run without ProtectSystem=strict). Run those units from the go-trader@.service template, whose sandbox keeps the rest of the tree read-only, or give the tree to root"
+    fi
+}
+
+give_back_tree_owner() {
+    [[ -n "$tree_owner" ]] || return 0
+    update_restore_tree_owner "$owner_scope" "$tree_owner" "$tree_owner_snapshot" && return 0
+    rm -f ./go-trader.new
+    fail "could not give the root-written files under $owner_scope back to $(update_path_owner_name "$owner_scope") $1; the binary and the running service are unchanged"
+}
+
+if [[ -n "$(update_tree_foreign_accounts "$repo_root")" ]]; then
+    refuse_unconfined_tree "$repo_root" "the deployment"
+    tree_owner=$(update_tree_foreign_owner "$repo_root")
+    owner_scope="$repo_root"
+    if [[ -z "$tree_owner" && -d "$repo_root/.git" && ! -L "$repo_root/.git" ]]; then
+        tree_owner=$(update_tree_foreign_owner "$repo_root/.git")
+        owner_scope="$repo_root/.git"
+    fi
+    probe_owner=$(update_tree_foreign_owner "$repo_root")
+    [[ -n "$probe_owner" ]] || probe_owner=$(update_tree_foreign_owner "$repo_root/.git")
+fi
+if [[ -n "$tree_owner" ]]; then
+    echo "[update] $owner_scope belongs to $(update_path_owner_name "$owner_scope"); git trusts only this tree for each command, and files this update writes there are given back to that owner"
+    tree_owner_snapshot=$(mktemp "${TMPDIR:-/tmp}/go-trader-owner.XXXXXX") || fail "could not create a temporary file for the ownership list"
+    if ! update_owner_snapshot "$owner_scope" "$tree_owner_snapshot"; then
+        rm -f "$tree_owner_snapshot"
+        fail "could not list the root-owned paths under $owner_scope before the update; nothing changed"
+    fi
+    trap restore_tree_owner_on_exit EXIT
 fi
 
-go_bin=""
-if command -v go >/dev/null 2>&1; then
-    go_bin=$(command -v go)
-elif [[ -x /opt/homebrew/bin/go ]]; then
-    go_bin=/opt/homebrew/bin/go
-elif [[ -x /usr/local/go/bin/go ]]; then
-    go_bin=/usr/local/go/bin/go
-else
-    fail "go not on PATH and not found at /opt/homebrew/bin/go or /usr/local/go/bin/go"
+uv_bin=$(update_resolve_tool uv) \
+    || fail "uv not on PATH and not at $(update_tool_fixed_text uv) — install uv system-wide so every account finds it (SKILL.md → Prerequisites)"
+if [[ "$EUID" == "0" ]]; then
+    uv_env=(UV_LINK_MODE=copy)
 fi
+
+go_bin=$(update_resolve_tool go) \
+    || fail "go not on PATH and not found at $(update_tool_fixed_text go)"
 
 if [[ ! -f scheduler/config.json ]]; then
     cat >&2 <<EOF
@@ -696,7 +760,7 @@ exists). scheduler/config.json is gitignored, so a bare source clone has none
 and the probe phase would later fail without it.
 
 If this IS your deployment directory, copy scheduler/config.example.json to
-scheduler/config.json and fill in API keys (see CLAUDE.md → Setup).
+scheduler/config.json and fill in API keys (see SKILL.md → Configure).
 
 If you moved config out of the tree (#1056), scheduler/config.json should be a
 symlink to e.g. /var/lib/go-trader/<instance>/config.json — recreate it with
@@ -713,9 +777,31 @@ if [[ -n "$rsync_from" ]]; then
     if [[ "$(pwd)" == "$rsync_from" ]]; then
         fail "--rsync-from cannot be the deployment directory ($(pwd))"
     fi
+    rsync_src_top=$(update_git_top "$rsync_from" 2>/dev/null || printf '%s' "$rsync_from")
+    rsync_src_owner=$(update_tree_foreign_accounts "$rsync_src_top")
+    if [[ -n "$rsync_src_owner" ]]; then
+        refuse_unconfined_tree "$rsync_src_top" "the --rsync-from source"
+    fi
+    if update_git_top "$rsync_from" >/dev/null; then
+        ver=$(update_git_version "$rsync_from") \
+            || fail "could not read the version of the --rsync-from source $rsync_from, a git checkout (see the git error above); refusing to stamp the build as dev"
+        if [[ "$ver" != *-mod ]]; then
+            build_export_tree="$rsync_from"
+            build_export_commit=$(update_git "$rsync_from" rev-parse HEAD) \
+                || fail "could not read HEAD of the --rsync-from source $rsync_from (see the git error above)"
+        elif [[ -n "$rsync_src_owner" ]]; then
+            fail "the --rsync-from source $rsync_from belongs to $(update_path_owner_name "$rsync_from") and has tracked changes against its HEAD ($ver); root builds only committed code from a tree another account owns. Commit or revert the changes, or when the files already match a release, move HEAD to it without touching files (git reset <release>)"
+        fi
+    else
+        ver=dev
+        if [[ -n "$rsync_src_owner" ]]; then
+            fail "the --rsync-from source $rsync_from belongs to $(update_path_owner_name "$rsync_from") and is not a git checkout; root builds only committed code from a tree another account owns"
+        fi
+        echo "[update] --rsync-from source $rsync_from is not a git checkout; the build is stamped dev"
+    fi
 fi
 
-pre_pull_sha=$(git rev-parse HEAD 2>/dev/null || echo "")
+pre_pull_sha=$(update_git "$repo_root" rev-parse HEAD 2>/dev/null || echo "")
 
 if [[ "$restart" == "1" && "$restart_mode" == "signal" ]]; then
     if systemd_unit_manages_this_instance "$service_unit"; then
@@ -753,20 +839,20 @@ if [[ -z "$rsync_from" ]]; then
         uv.lock
     )
 
-    if ! git diff --quiet -- "${build_paths[@]}" || ! git diff --cached --quiet -- "${build_paths[@]}"; then
-        git status --short -- "${build_paths[@]}" >&2
+    if ! update_git "$repo_root" diff --quiet -- "${build_paths[@]}" || ! update_git "$repo_root" diff --cached --quiet -- "${build_paths[@]}"; then
+        update_git "$repo_root" status --short -- "${build_paths[@]}" >&2
         fail "working tree has uncommitted changes in build-input paths; commit, stash, or revert first"
     fi
-    if ! git diff --quiet || ! git diff --cached --quiet; then
+    if ! update_git "$repo_root" diff --quiet || ! update_git "$repo_root" diff --cached --quiet; then
         echo "[update] warning: uncommitted changes outside build-input paths (will survive git pull):" >&2
-        git status --short >&2
+        update_git "$repo_root" status --short >&2
     fi
 
-    untracked=$(git ls-files --others --exclude-standard \
+    untracked=$(update_git "$repo_root" ls-files --others --exclude-standard \
         scheduler shared_scripts shared_strategies shared_tools platforms backtest 2>/dev/null || true)
-    untracked_root=$(git ls-files --others --exclude-standard 2>/dev/null | grep -v '/' || true)
+    untracked_root=$(update_git "$repo_root" ls-files --others --exclude-standard 2>/dev/null | grep -v '/' || true)
     if [[ -n "$untracked" || -n "$untracked_root" ]]; then
-        echo "[update] warning: untracked files (will not affect the build):" >&2
+        echo "[update] warning: untracked files (the Go build uses only committed sources; they stay in the tree):" >&2
         [[ -n "$untracked" ]] && echo "$untracked" >&2
         [[ -n "$untracked_root" ]] && echo "$untracked_root" >&2
     fi
@@ -809,8 +895,8 @@ if [[ -n "$rsync_from" ]]; then
     end_phase
 else
     begin_phase pull
-    git pull --ff-only
-    post_pull_sha=$(git rev-parse HEAD 2>/dev/null || echo "")
+    update_git "$repo_root" pull --ff-only || fail "git pull --ff-only failed in $repo_root (see the git error above)"
+    post_pull_sha=$(update_git "$repo_root" rev-parse HEAD 2>/dev/null || echo "")
     if [[ -n "$pre_pull_sha" && -n "$post_pull_sha" && "$pre_pull_sha" != "$post_pull_sha" ]]; then
         tree_mutated=1
     fi
@@ -818,17 +904,31 @@ else
 fi
 
 begin_phase sync
-uv sync
+env ${uv_env[@]+"${uv_env[@]}"} "$uv_bin" sync
+give_back_tree_owner "after uv sync"
+if [[ "$owner_scope" == "$repo_root" && -n "$tree_owner" ]] && ! update_owner_runs_venv "$repo_root"; then
+    fail "after uv sync, $(update_path_owner_name "$repo_root") cannot run $repo_root/.venv/bin/python3 ($(readlink -f .venv/bin/python3 2>/dev/null || echo unresolved)); the service runs as that account. Install a Python every account can read, then rebuild the venv"
+fi
 end_phase
 
 begin_phase build
-if [[ -n "$rsync_from" ]]; then
-    ver=$(git -C "$rsync_from" describe --tags --always --dirty=-mod 2>/dev/null || echo dev)
-else
-    ver=$(git describe --tags --always --dirty=-mod 2>/dev/null || echo dev)
+if [[ -z "$rsync_from" ]]; then
+    ver=$(update_git_version "$repo_root") \
+        || fail "could not read the version of $repo_root (see the git error above); refusing to stamp the build as dev"
+    build_export_tree="$repo_root"
+    build_export_commit=$(update_git "$repo_root" rev-parse HEAD) \
+        || fail "could not read HEAD of $repo_root (see the git error above)"
 fi
 rm -f ./go-trader.new
-"$go_bin" -C scheduler build -ldflags "-X main.Version=$ver" -o ../go-trader.new .
+if [[ -n "$build_export_tree" ]]; then
+    echo "[update] build: Go sources of $build_export_commit exported from $build_export_tree (untracked files are never built)"
+    update_build_go_export "$build_export_tree" "$build_export_commit" "$go_bin" "$ver" "$repo_root/go-trader.new" \
+        || fail "go build of the exported sources failed"
+else
+    echo "[update] build: Go sources of the root-owned --rsync-from source $rsync_from/scheduler (never the deployment's scheduler/, which its service can write)"
+    GOWORK=off GOFLAGS=-mod=readonly "$go_bin" -C "$rsync_from/scheduler" build -buildvcs=false -ldflags "-X main.Version=$ver" -o "$repo_root/go-trader.new" . \
+        || fail "go build of $rsync_from/scheduler failed"
+fi
 if [[ ! -s ./go-trader.new ]]; then
     fail "go build produced empty go-trader.new"
 fi
@@ -839,11 +939,38 @@ echo "[update] built ${ver}: $(stat -c '%s' ./go-trader.new 2>/dev/null || stat 
 end_phase
 
 begin_phase probe
-if ! ./go-trader.new probe; then
+give_back_tree_owner "before the probe"
+if [[ -n "$probe_owner" ]]; then
+    echo "[update] probe: runs as $(id -nu "${probe_owner%%:*}" 2>/dev/null || printf 'uid %s' "${probe_owner%%:*}") under the unit sandbox, on a private copy of scheduler/config.json, because that account can change the config and the scripts it names"
+    probe_ok=0
+    update_probe_as_owner "$repo_root" "$probe_owner" "$repo_root/go-trader.new" scheduler/config.json && probe_ok=1
+else
+    probe_ok=0
+    ./go-trader.new probe && probe_ok=1
+fi
+if [[ "$probe_ok" != 1 ]]; then
     rm -f ./go-trader.new
     fail "go-trader.new probe rejected the freshly synced Python — refusing to swap"
 fi
 end_phase
+
+if [[ -n "$tree_owner" ]]; then
+    begin_phase ownership
+    if ! update_restore_tree_owner "$owner_scope" "$tree_owner" "$tree_owner_snapshot"; then
+        rm -f ./go-trader.new
+        fail "could not give the root-written files under $owner_scope back to $(update_path_owner_name "$owner_scope"); the binary and the running service are unchanged"
+    fi
+    end_phase
+fi
+
+if [[ "$restart" == "1" && "$restart_mode" == "systemd" && -n "$unit_sync_source_path" && -n "$unit_sync_installed_path" ]]; then
+    begin_phase journal
+    if ! update_sync_journal_namespace "$repo_root" "$unit_sync_source_path"; then
+        rm -f ./go-trader.new
+        fail "journald namespace config for $unit_sync_source_path could not be installed; the go-trader binary, the unit and the running service were left unchanged"
+    fi
+    end_phase
+fi
 
 begin_phase swap
 rm -f ./go-trader.prev

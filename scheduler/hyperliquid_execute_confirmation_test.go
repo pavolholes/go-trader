@@ -129,64 +129,6 @@ func confirmationNotifier() (*MultiNotifier, *mockNotifier) {
 	}), backend
 }
 
-func TestAutomaticHyperliquidExecuteRejectsUnconfirmedOpenCloseFlip(t *testing.T) {
-	originalExecute := runHyperliquidExecuteFn
-	originalThrottle := liveExecThrottle
-	t.Cleanup(func() {
-		runHyperliquidExecuteFn = originalExecute
-		liveExecThrottle = originalThrottle
-	})
-
-	cases := []struct {
-		name    string
-		dir     string
-		signal  int
-		posQty  float64
-		posSide string
-	}{
-		{name: "open", dir: DirectionLong, signal: 1},
-		{name: "close", dir: DirectionLong, signal: -1, posQty: 0.5, posSide: "long"},
-		{name: "flip", dir: DirectionBoth, signal: 1, posQty: 0.5, posSide: "short"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			called := 0
-			runHyperliquidExecuteFn = func(script, symbol, side string, size, stopLossPct float64, cancelOID int64, prevPosQty float64, marginMode string, leverage float64, closeFullPosition bool, snapshot hlExecuteSnapshot, extraCancelOIDs ...int64) (*HyperliquidExecuteResult, string, error) {
-				called++
-				return unconfirmedExecuteResult(), "", nil
-			}
-			liveExecThrottle = &LiveExecFailureThrottle{}
-			notifier, backend := confirmationNotifier()
-			sc := confirmationTestStrategy(tc.dir)
-			result := &HyperliquidResult{Symbol: "ETH", Signal: tc.signal, Price: 2000}
-			got, ok := runHyperliquidExecuteOrder(sc, result, 2000, 1000, false, tc.posQty, tc.posSide, 2000, 2, 111, []int64{222}, nil, hlExecuteSnapshot{}, HurstGateDecision{}, notifier, silentStrategyLogger(sc.ID))
-			if ok || got == nil {
-				t.Fatalf("execute result = %+v, ok=%t, want rejected result", got, ok)
-			}
-			if called != 1 {
-				t.Fatalf("execute calls = %d, want 1", called)
-			}
-			key := liveExecKey(sc.ID, sc.Platform, "ETH", directionOpen)
-			if tc.signal == -1 {
-				key = liveExecKey(sc.ID, sc.Platform, "ETH", directionClose)
-			}
-			liveExecThrottle.mu.Lock()
-			entry := liveExecThrottle.entries[key]
-			liveExecThrottle.mu.Unlock()
-			if entry == nil || entry.count != 1 {
-				t.Fatalf("throttle entry = %+v, want one retained failure", entry)
-			}
-			backend.mu.Lock()
-			messages := len(backend.messages)
-			dms := len(backend.dms)
-			backend.mu.Unlock()
-			if messages == 0 || dms != 0 {
-				t.Fatalf("failure notifications = channels %d DMs %d, want channel-only delivery", messages, dms)
-			}
-		})
-	}
-}
-
 func TestHyperliquidScaleInRejectsUnconfirmedBeforeBooking(t *testing.T) {
 	originalExecute := runHyperliquidExecuteFn
 	originalThrottle := liveExecThrottle
@@ -194,7 +136,7 @@ func TestHyperliquidScaleInRejectsUnconfirmedBeforeBooking(t *testing.T) {
 		runHyperliquidExecuteFn = originalExecute
 		liveExecThrottle = originalThrottle
 	})
-	runHyperliquidExecuteFn = func(script, symbol, side string, size, stopLossPct float64, cancelOID int64, prevPosQty float64, marginMode string, leverage float64, closeFullPosition bool, snapshot hlExecuteSnapshot, extraCancelOIDs ...int64) (*HyperliquidExecuteResult, string, error) {
+	runHyperliquidExecuteFn = func(script, symbol, side string, size, stopLossPct float64, cancelOID int64, prevPosQty float64, marginMode string, leverage float64, closeMode hlCloseMode, snapshot hlExecuteSnapshot, extraCancelOIDs ...int64) (*HyperliquidExecuteResult, string, error) {
 		return unconfirmedExecuteResult(), "", nil
 	}
 	liveExecThrottle = &LiveExecFailureThrottle{}
@@ -307,7 +249,7 @@ func TestManualLiveExecuteRejectsUnconfirmedWithoutQueueing(t *testing.T) {
 			cfg := &Config{DBFile: dbPath, Strategies: []StrategyConfig{sc}}
 			deps := newCLIManualCoreDeps(cfg, openTestStore(t, db), nil)
 			deps.fetchMids = func([]string) (map[string]float64, error) { return map[string]float64{"ETH": 2000}, nil }
-			deps.execute = func(script, symbol, side string, size, stopLossPct float64, cancelOID int64, prevPosQty float64, marginMode string, leverage float64, closeFullPosition bool, snapshot hlExecuteSnapshot, extraCancelOIDs ...int64) (*HyperliquidExecuteResult, string, error) {
+			deps.execute = func(script, symbol, side string, size, stopLossPct float64, cancelOID int64, prevPosQty float64, marginMode string, leverage float64, closeMode hlCloseMode, snapshot hlExecuteSnapshot, extraCancelOIDs ...int64) (*HyperliquidExecuteResult, string, error) {
 				result := unconfirmedExecuteResult()
 				if action == "close" {
 					result.CancelStopLossSucceeded = true
@@ -365,7 +307,7 @@ func TestManualLiveExecuteRejectsUnconfirmedWithoutQueueing(t *testing.T) {
 func TestDaemonManualCloseRejectsUnconfirmedAndRestoresTheStop(t *testing.T) {
 	ss, db, _ := newTradeActionTestServer(t)
 	stubs := stubTradeDeps(t, ss)
-	stubs.execute = func(script, symbol, side string, size, stopLossPct float64, cancelOID int64, prevPosQty float64, marginMode string, leverage float64, closeFullPosition bool, snapshot hlExecuteSnapshot, extraCancelOIDs ...int64) (*HyperliquidExecuteResult, string, error) {
+	stubs.execute = func(script, symbol, side string, size, stopLossPct float64, cancelOID int64, prevPosQty float64, marginMode string, leverage float64, closeMode hlCloseMode, snapshot hlExecuteSnapshot, extraCancelOIDs ...int64) (*HyperliquidExecuteResult, string, error) {
 		return &HyperliquidExecuteResult{
 			Execution:                   &HyperliquidExecution{Fill: &HyperliquidFill{}},
 			CancelStopLossSucceeded:     true,

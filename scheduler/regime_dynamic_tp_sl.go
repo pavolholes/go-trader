@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"sync"
 )
 
 const (
@@ -101,6 +102,76 @@ func advanceDynamicCloseRegime(pos *Position, stratState *StrategyState, sc Stra
 	return old != current
 }
 
+func advancePaperDynamicCloseRegime(sc StrategyConfig, stratState *StrategyState, db *StateDB, symbol string, mark float64, mu *sync.RWMutex, logger *StrategyLogger) (int, string) {
+	if sc.Platform != "hyperliquid" || hyperliquidIsLive(sc.Args) || !strategyUsesDynamicRegimeClose(sc) {
+		return 0, ""
+	}
+	if stratState == nil || mu == nil || symbol == "" {
+		return 0, ""
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	pos, ok := stratState.Positions[symbol]
+	if !ok || pos == nil || pos.Quantity <= 0 {
+		return 0, ""
+	}
+	if tpConsumptionHoldsRegime(pos) {
+		if logger != nil {
+			logger.InfoOnChange("tp-consumption-hold", symbol, "Paper dynamic close regime held for %s: confirmed take-profit consumption is still unprocessed", symbol)
+		}
+		return 0, ""
+	}
+	oldLabel := pos.RegimeAppliedLabel
+	if !advanceDynamicCloseRegime(pos, stratState, sc) {
+		return 0, ""
+	}
+	if logger != nil {
+		logger.Info("Paper dynamic close regime confirmed for %s: %s -> %s", symbol, oldLabel, pos.RegimeAppliedLabel)
+	}
+	newTrigger, move := paperDynamicFlipStopTrigger(sc, pos)
+	if !move {
+		return 0, ""
+	}
+	oldTrigger := pos.StopLossTriggerPx
+	pos.StopLossTriggerPx = newTrigger
+	stampOpenTradeWithProtectionSnapshot(stratState, db, sc, symbol, pos)
+	if logger != nil {
+		logger.Info("Paper SL re-armed for the confirmed regime %s: $%.4f -> $%.4f", pos.RegimeAppliedLabel, oldTrigger, newTrigger)
+	}
+	if !trailingStopBreached(pos.Side, mark, newTrigger) {
+		return 0, ""
+	}
+	fillPx := paperStopFillPx(pos.Side, mark, newTrigger)
+	if !recordPerpsStopLossClose(stratState, symbol, fillPx, paperStopReasonATR, logger) {
+		return 0, ""
+	}
+	return 1, fmt.Sprintf("[%s] %s %s @ $%.2f", sc.ID, paperStopLossDetailLabel(paperStopReasonATR), symbol, fillPx)
+}
+
+func dynamicRegimeStopMoves(sc StrategyConfig, pos *Position, currentPx, candidatePx float64) bool {
+	if pos == nil || candidatePx <= 0 || math.IsNaN(candidatePx) || math.IsInf(candidatePx, 0) {
+		return false
+	}
+	if effectiveTrailingStopPct(sc, pos) > 0 || strategyUsesTrailingTPRatchetClose(sc) {
+		return false
+	}
+	if pos.SLAfterMoved && !hlTriggerStrictlyTighter(pos.Side, candidatePx, currentPx) {
+		return false
+	}
+	return triggerPxMoveExceedsMinPct(currentPx, candidatePx, effectiveTrailingStopMinMovePct(sc))
+}
+
+func paperDynamicFlipStopTrigger(sc StrategyConfig, pos *Position) (float64, bool) {
+	if pos == nil || pos.StopLossTriggerPx <= 0 {
+		return 0, false
+	}
+	newPx := fixedStopLossATRTriggerPx(sc, pos.Side, pos)
+	if !dynamicRegimeStopMoves(sc, pos, pos.StopLossTriggerPx, newPx) {
+		return 0, false
+	}
+	return newPx, true
+}
+
 func protectionATRRegimeLabel(pos *Position, sc StrategyConfig) string {
 	if strategyUsesDynamicRegimeClose(sc) {
 		return dynamicCloseATRRegimeLabel(pos, sc)
@@ -174,21 +245,25 @@ func dynamicProtectionForceReplace(
 	if !regimeChanged || pos == nil {
 		return false, nil
 	}
-	minMove := effectiveTrailingStopMinMovePct(sc)
-
-	if plan.StopLossATRMult > 0 {
-		oldSL := 0.0
-		if v, ok := unifiedCloseStopLossATR(sc, oldRegime); ok {
-			oldSL = atrStopLossTriggerPx(plan.Side, plan.AvgCost, plan.EntryATR, v)
+	label := protectionATRRegimeLabel(pos, sc)
+	newMult := 0.0
+	if v, ok := unifiedCloseStopLossATR(sc, label); ok {
+		newMult = v
+	} else if plan.StopLossATRMult > 0 {
+		newMult = plan.StopLossATRMult
+	}
+	if newMult > 0 {
+		newSL := atrStopLossTriggerPx(plan.Side, plan.AvgCost, plan.EntryATR, newMult)
+		current := pos.StopLossTriggerPx
+		if current <= 0 {
+			if v, ok := unifiedCloseStopLossATR(sc, oldRegime); ok {
+				current = atrStopLossTriggerPx(plan.Side, plan.AvgCost, plan.EntryATR, v)
+			}
 		}
-		newSL := atrStopLossTriggerPx(plan.Side, plan.AvgCost, plan.EntryATR, plan.StopLossATRMult)
-		cur := pos.StopLossTriggerPx
-		if cur > 0 {
-			oldSL = cur
-		}
-		forceSL = triggerPxMoveExceedsMinPct(oldSL, newSL, minMove)
+		forceSL = dynamicRegimeStopMoves(sc, pos, current, newSL)
 	}
 
+	minMove := effectiveTrailingStopMinMovePct(sc)
 	oldTiers := strategyTPTiersForRegime(sc, oldRegime)
 	if len(plan.Tiers) == 0 {
 		return forceSL, nil
@@ -220,16 +295,11 @@ func validateDynamicRegimeClose(params map[string]interface{}, labels []string, 
 		errs = append(errs, fmt.Sprintf("%s: params required", ctxLabel))
 		return errs
 	}
-	for k := range params {
-		if k != regimeClassifierKey && k != "atr_source" && k != dynamicCloseParamConfirmCycles {
-			errs = append(errs, fmt.Sprintf("%s: unknown param %q (allowed: trend_regime, atr_source, regime_confirm_cycles)", ctxLabel, k))
-		}
-	}
 	if v, ok := params[dynamicCloseParamConfirmCycles]; ok {
-		if f, err := floatFromAnyChecked(v); err != nil || f < 1 {
-			errs = append(errs, fmt.Sprintf("%s.%s: must be >= 1", ctxLabel, dynamicCloseParamConfirmCycles))
+		if f, err := floatFromAnyChecked(v); err != nil || f < 1 || f != math.Trunc(f) || f >= float64(math.MaxInt64) {
+			errs = append(errs, fmt.Sprintf("%s.%s: must be a whole number >= 1, got %#v", ctxLabel, dynamicCloseParamConfirmCycles, v))
 		}
 	}
-	errs = append(errs, validateUnifiedRegimeClose(params, labels, ctxLabel)...)
+	errs = append(errs, validateUnifiedRegimeClose(params, labels, ctxLabel, dynamicCloseParamConfirmCycles)...)
 	return errs
 }

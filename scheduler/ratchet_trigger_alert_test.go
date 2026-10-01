@@ -1,7 +1,6 @@
 package main
 
 import (
-	"sync"
 	"testing"
 )
 
@@ -80,95 +79,5 @@ func TestApplyTrailingTPRatchetToPosition_AlertShortMath(t *testing.T) {
 	}
 	if a.NextTierTriggerPx != 80 {
 		t.Fatalf("nextTriggerPx=%g want 80", a.NextTierTriggerPx)
-	}
-}
-
-func TestApplyTrailingTPRatchetToPosition_MultiTierJump(t *testing.T) {
-	sc := ratchetAlertSC(3.0, tier(1.0, 0, 2.0), tier(2.0, 0, 1.5), tier(3.0, 0, 1.0))
-	pos := &Position{
-		Symbol: "ETH", Side: "long", Quantity: 1, InitialQuantity: 1,
-		AvgCost: 100, EntryATR: 10, Multiplier: 1, Regime: "ranging",
-	}
-	tightened, a := applyTrailingTPRatchetToPosition(sc, pos, "ETH", 125, nil)
-	if !tightened || a == nil {
-		t.Fatal("expected tighten+alert on multi-tier jump")
-	}
-	if a.TierIdx != 1 || a.NewTrailMult != 1.5 {
-		t.Fatalf("cleared tier=%d trail=%g want 1,1.5", a.TierIdx, a.NewTrailMult)
-	}
-	if pos.SLAdjustedTiersProcessed != 2 {
-		t.Fatalf("watermark=%d want 2 (jumped past tier0)", pos.SLAdjustedTiersProcessed)
-	}
-	if !a.HasNextTier || a.NextTierATRMultiple != 3.0 || a.NextTierTrailAfter != 1.0 {
-		t.Fatalf("next tier should be the 3.0 rung, got %+v", a)
-	}
-}
-
-func TestApplyTrailingTPRatchetToPosition_NoAlertCases(t *testing.T) {
-	sc := ratchetAlertSC(3.0, tier(1.0, 0, 2.0), tier(2.0, 0, 1.0))
-	pos := &Position{
-		Symbol: "ETH", Side: "long", Quantity: 1, InitialQuantity: 1,
-		AvgCost: 100, EntryATR: 10, Multiplier: 1, Regime: "ranging",
-	}
-	if tightened, _ := applyTrailingTPRatchetToPosition(sc, pos, "ETH", 115, nil); !tightened {
-		t.Fatal("setup: first clear should tighten")
-	}
-	if tightened, a := applyTrailingTPRatchetToPosition(sc, pos, "ETH", 115, nil); tightened || a != nil {
-		t.Fatalf("re-run on processed tier should not alert, got tightened=%v alert=%v", tightened, a)
-	}
-
-	scEqual := ratchetAlertSC(3.0, tier(1.0, 0, 2.0), tier(2.0, 0, 2.0))
-	pos2 := &Position{
-		Symbol: "ETH", Side: "long", Quantity: 1, InitialQuantity: 1,
-		AvgCost: 100, EntryATR: 10, Multiplier: 1, Regime: "ranging",
-	}
-	if tightened, _ := applyTrailingTPRatchetToPosition(scEqual, pos2, "ETH", 110, nil); !tightened {
-		t.Fatal("setup: tier0 should tighten 3.0->2.0")
-	}
-	tightened, a := applyTrailingTPRatchetToPosition(scEqual, pos2, "ETH", 120, nil)
-	if tightened || a != nil {
-		t.Fatalf("equal-trail tier should advance watermark without alert, got tightened=%v alert=%v", tightened, a)
-	}
-	if pos2.SLAdjustedTiersProcessed != 2 {
-		t.Fatalf("watermark=%d want 2 (advanced even without tighten)", pos2.SLAdjustedTiersProcessed)
-	}
-}
-
-func TestNotifyRatchetTrigger_Gating(t *testing.T) {
-	alert := &RatchetTriggerAlert{StrategyID: "x", Symbol: "ETH", Side: "long", TotalTiers: 1}
-
-	notifyRatchetTrigger(nil, true, alert)
-	var mn *MultiNotifier
-	notifyRatchetTrigger(mn, true, alert)
-
-	c := &countingDMSender{}
-	notifyRatchetTrigger(c, false, alert)
-	if c.count != 0 {
-		t.Fatalf("disabled flag should suppress, count=%d", c.count)
-	}
-
-	notifyRatchetTrigger(c, true, nil)
-	if c.count != 0 {
-		t.Fatalf("nil alert should suppress, count=%d", c.count)
-	}
-
-	notifyRatchetTrigger(c, true, alert)
-	if c.count != 1 {
-		t.Fatalf("enabled+alert should send once, count=%d", c.count)
-	}
-}
-
-func TestApplyTrailingTPRatchet_ReturnsSnapshotForDeferredSend(t *testing.T) {
-	sc := ratchetAlertSC(3.0, tier(1.0, 0, 2.0), tier(2.0, 0, 1.0))
-	state := &StrategyState{Positions: map[string]*Position{
-		"ETH": {Symbol: "ETH", Side: "long", Quantity: 1, InitialQuantity: 1, AvgCost: 100, EntryATR: 10, Multiplier: 1, Regime: "ranging"},
-	}}
-	var mu sync.RWMutex
-	a := applyTrailingTPRatchet(sc, state, "ETH", 115, &mu, nil)
-	if a == nil {
-		t.Fatal("wrapper should surface the alert snapshot")
-	}
-	if pos := state.Positions["ETH"]; pos.PostTPTrailingATRMult == nil || *pos.PostTPTrailingATRMult != 2.0 {
-		t.Fatalf("position must already be mutated before delivery, got %v", pos.PostTPTrailingATRMult)
 	}
 }

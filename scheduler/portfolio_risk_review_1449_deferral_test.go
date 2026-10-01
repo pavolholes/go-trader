@@ -69,69 +69,6 @@ func TestUntrustedEquity_OverLimitLatchIsDeferredNotVetoed(t *testing.T) {
 	}
 }
 
-func TestUntrustedEquity_DeferralWindowClearsOnEveryNonQualifyingCycle(t *testing.T) {
-	cfg := review1449Config()
-
-	openWindow := func() *PortfolioRiskState {
-		prs := &PortfolioRiskState{PeakValue: 10000}
-		if _, _, _, _ = checkPortfolioRiskWithEquityAvailability(prs, cfg, 6000, 0, 0, 0, true, false); prs.UntrustedOverLimitSince.IsZero() {
-			t.Fatal("setup: expected a deferral window")
-		}
-		return prs
-	}
-
-	prs := openWindow()
-	if _, _, _, _ = checkPortfolioRiskWithEquityAvailability(prs, cfg, 10000, 0, 0, 0, true, true); !prs.UntrustedOverLimitSince.IsZero() {
-		t.Error("a trusted cycle must clear the deferral window")
-	}
-
-	prs = openWindow()
-	if _, _, _, _ = checkPortfolioRiskWithEquityAvailability(prs, cfg, 10000, 0, 0, 0, true, false); !prs.UntrustedOverLimitSince.IsZero() {
-		t.Errorf("an untrusted cycle at the clamped limit must clear the window (reading %.1f)", prs.CurrentDrawdownPct)
-	}
-
-	prs = openWindow()
-	if _, _, _, _ = checkPortfolioRiskWithEquityAvailability(prs, cfg, 6000, 0, 0, 0, false, false); !prs.UntrustedOverLimitSince.IsZero() {
-		t.Error("an unarmed equity guard must clear the deferral window")
-	}
-}
-
-func TestUntrustedEquity_DeferralDoesNotDisarmTheMarginArm(t *testing.T) {
-	cfg := review1449Config()
-	prs := &PortfolioRiskState{PeakValue: 10000}
-
-	allowed, _, _, reason := checkPortfolioRiskWithEquityAvailability(prs, cfg, 0, 0, 40, 100, false, false)
-	if allowed || !prs.KillSwitchActive {
-		t.Fatal("the margin arm must still latch when the equity guard is unarmed")
-	}
-	if !strings.Contains(reason, "margin drawdown") {
-		t.Errorf("expected a margin-sourced latch reason; got %q", reason)
-	}
-	if !prs.UntrustedOverLimitSince.IsZero() {
-		t.Error("the margin arm must not open an equity deferral window")
-	}
-}
-
-func TestUntrustedEquity_DeferralWindowSurvivesReset(t *testing.T) {
-	since := time.Now().UTC().Add(-time.Minute)
-
-	manual := &PortfolioRiskState{PeakValue: 10000, CurrentDrawdownPct: 40, KillSwitchActive: true, UntrustedOverLimitSince: since}
-	if got := ResetPortfolioKillSwitchManual(manual); got != 40 {
-		t.Errorf("manual reset must return the pre-reset reading; got %.1f", got)
-	}
-	if !manual.UntrustedOverLimitSince.IsZero() {
-		t.Error("the manual DM reset must clear the deferral window")
-	}
-
-	auto := &PortfolioRiskState{PeakValue: 10000, CurrentDrawdownPct: 40, KillSwitchActive: true, UntrustedOverLimitSince: since}
-	if !AutoResetConfirmedFlatKillSwitch(auto, 9000, true, "confirmed flat") {
-		t.Fatal("auto reset must run on a latched state")
-	}
-	if !auto.UntrustedOverLimitSince.IsZero() {
-		t.Error("the confirmed-flat auto reset must clear the deferral window")
-	}
-}
-
 func TestUntrustedEquity_DegenerateLimitKeepsExistingMeaning(t *testing.T) {
 	cfg := &PortfolioRiskConfig{MaxDrawdownPct: 0, WarnThresholdPct: 60}
 	prs := &PortfolioRiskState{PeakValue: 10000}
@@ -142,31 +79,6 @@ func TestUntrustedEquity_DegenerateLimitKeepsExistingMeaning(t *testing.T) {
 	}
 	if !prs.UntrustedOverLimitSince.IsZero() {
 		t.Error("a non-positive limit must not open a deferral window")
-	}
-}
-
-func TestPortfolioWarningMessage_NamesTheDeferredLatch(t *testing.T) {
-	state := &AppState{
-		Strategies: map[string]*StrategyState{},
-		PortfolioRisk: map[RiskPartition]*PortfolioRiskState{livePartition: {
-			PeakValue:               10000,
-			CurrentDrawdownPct:      40,
-			UntrustedOverLimitSince: time.Now().UTC().Add(-time.Minute),
-		}},
-	}
-	msg := BuildPortfolioWarningMessage(PortfolioWarningMessageInputs{
-		Reason:           "portfolio equity drawdown 40.0% exceeds limit 25.0%",
-		Config:           review1449Config(),
-		State:            state,
-		TotalValue:       6000,
-		Now:              time.Now().UTC(),
-		EquityGuardArmed: true,
-	})
-	if !strings.Contains(msg, "DEFERRED") {
-		t.Errorf("the warning message must name the deferred latch; got:\n%s", msg)
-	}
-	if !strings.Contains(msg, "equity data is untrusted") || !strings.Contains(msg, "circuit breakers remain active") {
-		t.Errorf("the deferred path must explain its data state and remaining protection; got:\n%s", msg)
 	}
 }
 

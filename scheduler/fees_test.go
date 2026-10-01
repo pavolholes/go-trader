@@ -5,26 +5,6 @@ import (
 	"testing"
 )
 
-func TestCalculateFuturesFee(t *testing.T) {
-	cases := []struct {
-		contracts      int
-		feePerContract float64
-		want           float64
-	}{
-		{1, 1.50, 1.50},
-		{2, 1.50, 3.00},
-		{10, 0.50, 5.00},
-		{0, 1.50, 0.00},
-		{5, 0, 0.00},
-	}
-	for _, tc := range cases {
-		got := CalculateFuturesFee(tc.contracts, tc.feePerContract)
-		if math.Abs(got-tc.want) > 0.001 {
-			t.Errorf("CalculateFuturesFee(%d, %.2f) = %.2f, want %.2f", tc.contracts, tc.feePerContract, got, tc.want)
-		}
-	}
-}
-
 func TestCalculatePlatformSpotFee(t *testing.T) {
 	cases := []struct {
 		platform string

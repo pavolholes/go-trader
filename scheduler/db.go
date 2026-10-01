@@ -105,6 +105,9 @@ CREATE TABLE IF NOT EXISTS positions (
     hurst_at_open REAL NOT NULL DEFAULT 0,
     hurst_size_mult REAL NOT NULL DEFAULT 0,
     realized_pnl_accum REAL NOT NULL DEFAULT 0,
+    sl_after_moved INTEGER NOT NULL DEFAULT 0,
+    tp_consumptions_json TEXT NOT NULL DEFAULT '',
+    sl_after_trigger_px REAL NOT NULL DEFAULT 0,
     PRIMARY KEY (strategy_id, symbol)
 );
 
@@ -308,7 +311,10 @@ CREATE TABLE IF NOT EXISTS wallet_transfers (
 -- correctly priced. amount_usd is the SIGNED settled-cash effect on accountValue:
 --   fill            = closed_pnl_gross - fee_usd  (closed_pnl is GROSS of fees;
 --                     the gross value is retained for attribution/display and is
---                     NEVER summed into equity on its own — #698 / #954 invariant)
+--                     NEVER summed into equity on its own — #698 / #954 invariant).
+--                     Rows keep this frontend closedPnl figure. The HL drift
+--                     alarm subtracts the gap versus fill-price realized PnL
+--                     and does not rewrite the stored amounts (#1570).
 --   funding         = signed funding usdc
 --   <transfer kind> = signedPerpFlowUSD (deposits / withdrawals / transfers / ...)
 -- This is the LIVE total-drift-alarm basis for HL wallets (the drift alarm is
@@ -324,9 +330,38 @@ CREATE TABLE IF NOT EXISTS cashflow_journal (
     coin TEXT NOT NULL DEFAULT '',
     closed_pnl_gross REAL NOT NULL DEFAULT 0,
     fee_usd REAL NOT NULL DEFAULT 0,
+    hl_basis_error REAL NOT NULL DEFAULT 0,
+    hl_basis_resolved INTEGER NOT NULL DEFAULT 0,
     dedup_id TEXT NOT NULL UNIQUE
 );
 CREATE INDEX IF NOT EXISTS idx_cashflow_journal_account ON cashflow_journal(platform, account);
+
+CREATE TABLE IF NOT EXISTS cashflow_hl_basis_state (
+    platform TEXT NOT NULL,
+    account TEXT NOT NULL,
+    scan_since_ms INTEGER NOT NULL DEFAULT 0,
+    target_ms INTEGER NOT NULL DEFAULT 0,
+    ready INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (platform, account)
+);
+
+CREATE TABLE IF NOT EXISTS cashflow_hl_basis_book (
+    platform TEXT NOT NULL,
+    account TEXT NOT NULL,
+    coin TEXT NOT NULL,
+    position_size TEXT NOT NULL DEFAULT '0',
+    entry_notional TEXT NOT NULL DEFAULT '0',
+    has_position INTEGER NOT NULL DEFAULT 0,
+    entry_known INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (platform, account, coin)
+);
+
+CREATE TABLE IF NOT EXISTS cashflow_hl_basis_seen (
+    platform TEXT NOT NULL,
+    account TEXT NOT NULL,
+    dedup_id TEXT NOT NULL,
+    PRIMARY KEY (platform, account, dedup_id)
+);
 
 -- #1100: per-wallet journal cursors + adoption baseline. fills/funding/transfers
 -- watermarks bound the three incremental fetches; baseline_account_value /
@@ -618,6 +653,11 @@ func (sdb *StateDB) migrateSchema() error {
 		"ALTER TABLE pending_manual_actions ADD COLUMN tp_armed_tiers_json TEXT NOT NULL DEFAULT ''",
 		"ALTER TABLE pending_manual_actions ADD COLUMN position_id TEXT NOT NULL DEFAULT ''",
 		"ALTER TABLE positions ADD COLUMN realized_pnl_accum REAL NOT NULL DEFAULT 0",
+		"ALTER TABLE cashflow_journal ADD COLUMN hl_basis_error REAL NOT NULL DEFAULT 0",
+		"ALTER TABLE cashflow_journal ADD COLUMN hl_basis_resolved INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE positions ADD COLUMN sl_after_moved INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE positions ADD COLUMN tp_consumptions_json TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE positions ADD COLUMN sl_after_trigger_px REAL NOT NULL DEFAULT 0",
 	}
 	for _, ddl := range migrations {
 		if _, err := sdb.db.Exec(ddl); err != nil {
@@ -1462,8 +1502,8 @@ func (sdb *StateDB) saveStateSubset(state *AppState, req scopeSaveRequest) error
 	}
 	defer stmtStrat.Close()
 
-	stmtPos, err := tx.Prepare(`INSERT INTO positions (strategy_id, symbol, position_id, quantity, initial_quantity, avg_cost, entry_atr, side, multiplier, owner_strategy_id, opened_at, stop_loss_oid, stop_loss_trigger_px, stop_loss_high_water_px, tp1_oid, tp2_oid, tp_oids_json, tp_armed_tiers_json, stop_loss_atr_mult, tp_tiers_json, sl_adjusted_tiers_processed, post_tp_trailing_atr_mult, regime, regime_windows_json, regime_pending_label, regime_pending_count, regime_applied_label, scale_in_count, last_add_price, added_notional_usd, risk_anchor_price, scale_in_resize_pending, ratchet_fallback_normalize_pending, open_profile, direction_certified_at_open, direction_certified_states_json, llm_analysis_requested, llm_verdict, atr_method_at_open, hedge_for, hedge_primary_qty_basis, hurst_at_open, hurst_size_mult, shared_close_hold_usd, shared_close_hold_reason, realized_pnl_accum)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	stmtPos, err := tx.Prepare(`INSERT INTO positions (strategy_id, symbol, position_id, quantity, initial_quantity, avg_cost, entry_atr, side, multiplier, owner_strategy_id, opened_at, stop_loss_oid, stop_loss_trigger_px, stop_loss_high_water_px, tp1_oid, tp2_oid, tp_oids_json, tp_armed_tiers_json, stop_loss_atr_mult, tp_tiers_json, sl_adjusted_tiers_processed, post_tp_trailing_atr_mult, regime, regime_windows_json, regime_pending_label, regime_pending_count, regime_applied_label, scale_in_count, last_add_price, added_notional_usd, risk_anchor_price, scale_in_resize_pending, ratchet_fallback_normalize_pending, open_profile, direction_certified_at_open, direction_certified_states_json, llm_analysis_requested, llm_verdict, atr_method_at_open, hedge_for, hedge_primary_qty_basis, hurst_at_open, hurst_size_mult, shared_close_hold_usd, shared_close_hold_reason, realized_pnl_accum, sl_after_moved, tp_consumptions_json, sl_after_trigger_px)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		return fmt.Errorf("prepare position insert: %w", err)
 	}
@@ -1532,7 +1572,7 @@ func (sdb *StateDB) saveStateSubset(state *AppState, req scopeSaveRequest) error
 			if pos.LLMAnalysisRequested {
 				llmAnalysisRequested = 1
 			}
-			if _, err := stmtPos.Exec(sid, pos.Symbol, positionID, pos.Quantity, pos.InitialQuantity, pos.AvgCost, pos.EntryATR, pos.Side, pos.Multiplier, sdb.toStorageOwnerID(pos.OwnerStrategyID), formatTime(pos.OpenedAt), pos.StopLossOID, pos.StopLossTriggerPx, pos.StopLossHighWaterPx, tp1OID, tp2OID, marshalTPOIDsJSON(pos.TPOIDs), marshalTPArmedTiersJSON(pos.TPArmedTiers), nullableFloat64(pos.StopLossATRMult), pos.TPTiersJSON, pos.SLAdjustedTiersProcessed, nullableFloat64(pos.PostTPTrailingATRMult), pos.Regime, marshalRegimeWindowsJSON(pos.RegimeWindows), pos.RegimePendingLabel, pos.RegimePendingCount, pos.RegimeAppliedLabel, pos.ScaleInCount, pos.LastAddPrice, pos.AddedNotionalUSD, pos.RiskAnchorPrice, scaleInResizePending, ratchetFallbackNormalizePending, pos.OpenProfile, directionCertifiedAtOpen, marshalStringMapJSON(pos.DirectionCertifiedStatesAtOpen), llmAnalysisRequested, pos.LLMVerdict, pos.ATRMethodAtOpen, pos.HedgeFor, pos.HedgePrimaryQtyBasis, pos.HurstAtOpen, pos.HurstSizeMult, pos.SharedCloseHoldUSD, pos.SharedCloseHoldReason, pos.RealizedPnLAccum); err != nil {
+			if _, err := stmtPos.Exec(sid, pos.Symbol, positionID, pos.Quantity, pos.InitialQuantity, pos.AvgCost, pos.EntryATR, pos.Side, pos.Multiplier, sdb.toStorageOwnerID(pos.OwnerStrategyID), formatTime(pos.OpenedAt), pos.StopLossOID, pos.StopLossTriggerPx, pos.StopLossHighWaterPx, tp1OID, tp2OID, marshalTPOIDsJSON(pos.TPOIDs), marshalTPArmedTiersJSON(pos.TPArmedTiers), nullableFloat64(pos.StopLossATRMult), pos.TPTiersJSON, pos.SLAdjustedTiersProcessed, nullableFloat64(pos.PostTPTrailingATRMult), pos.Regime, marshalRegimeWindowsJSON(pos.RegimeWindows), pos.RegimePendingLabel, pos.RegimePendingCount, pos.RegimeAppliedLabel, pos.ScaleInCount, pos.LastAddPrice, pos.AddedNotionalUSD, pos.RiskAnchorPrice, scaleInResizePending, ratchetFallbackNormalizePending, pos.OpenProfile, directionCertifiedAtOpen, marshalStringMapJSON(pos.DirectionCertifiedStatesAtOpen), llmAnalysisRequested, pos.LLMVerdict, pos.ATRMethodAtOpen, pos.HedgeFor, pos.HedgePrimaryQtyBasis, pos.HurstAtOpen, pos.HurstSizeMult, pos.SharedCloseHoldUSD, pos.SharedCloseHoldReason, pos.RealizedPnLAccum, boolToInt(pos.SLAfterMoved), marshalTPConsumptionsJSON(pos.TPConsumptions), pos.SLAfterTriggerPx); err != nil {
 				return fmt.Errorf("insert position %s/%s: %w", s.ID, pos.Symbol, err)
 			}
 		}
@@ -1915,8 +1955,8 @@ func (sdb *StateDB) saveStrategyBookWithAcks(s *StrategyState, scope PortfolioSc
 		return fmt.Errorf("delete option_positions for %s: %w", s.ID, err)
 	}
 
-	stmtPos, err := tx.Prepare(`INSERT INTO positions (strategy_id, symbol, position_id, quantity, initial_quantity, avg_cost, entry_atr, side, multiplier, owner_strategy_id, opened_at, stop_loss_oid, stop_loss_trigger_px, stop_loss_high_water_px, tp1_oid, tp2_oid, tp_oids_json, tp_armed_tiers_json, stop_loss_atr_mult, tp_tiers_json, sl_adjusted_tiers_processed, post_tp_trailing_atr_mult, regime, regime_windows_json, regime_pending_label, regime_pending_count, regime_applied_label, scale_in_count, last_add_price, added_notional_usd, risk_anchor_price, scale_in_resize_pending, ratchet_fallback_normalize_pending, open_profile, direction_certified_at_open, direction_certified_states_json, llm_analysis_requested, llm_verdict, atr_method_at_open, hedge_for, hedge_primary_qty_basis, hurst_at_open, hurst_size_mult, shared_close_hold_usd, shared_close_hold_reason, realized_pnl_accum)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	stmtPos, err := tx.Prepare(`INSERT INTO positions (strategy_id, symbol, position_id, quantity, initial_quantity, avg_cost, entry_atr, side, multiplier, owner_strategy_id, opened_at, stop_loss_oid, stop_loss_trigger_px, stop_loss_high_water_px, tp1_oid, tp2_oid, tp_oids_json, tp_armed_tiers_json, stop_loss_atr_mult, tp_tiers_json, sl_adjusted_tiers_processed, post_tp_trailing_atr_mult, regime, regime_windows_json, regime_pending_label, regime_pending_count, regime_applied_label, scale_in_count, last_add_price, added_notional_usd, risk_anchor_price, scale_in_resize_pending, ratchet_fallback_normalize_pending, open_profile, direction_certified_at_open, direction_certified_states_json, llm_analysis_requested, llm_verdict, atr_method_at_open, hedge_for, hedge_primary_qty_basis, hurst_at_open, hurst_size_mult, shared_close_hold_usd, shared_close_hold_reason, realized_pnl_accum, sl_after_moved, tp_consumptions_json, sl_after_trigger_px)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		return fmt.Errorf("prepare position insert: %w", err)
 	}
@@ -1941,7 +1981,7 @@ func (sdb *StateDB) saveStrategyBookWithAcks(s *StrategyState, scope PortfolioSc
 		if pos.LLMAnalysisRequested {
 			llmAnalysisRequested = 1
 		}
-		if _, err := stmtPos.Exec(sid, pos.Symbol, positionID, pos.Quantity, pos.InitialQuantity, pos.AvgCost, pos.EntryATR, pos.Side, pos.Multiplier, sdb.toStorageOwnerID(pos.OwnerStrategyID), formatTime(pos.OpenedAt), pos.StopLossOID, pos.StopLossTriggerPx, pos.StopLossHighWaterPx, tp1OID, tp2OID, marshalTPOIDsJSON(pos.TPOIDs), marshalTPArmedTiersJSON(pos.TPArmedTiers), nullableFloat64(pos.StopLossATRMult), pos.TPTiersJSON, pos.SLAdjustedTiersProcessed, nullableFloat64(pos.PostTPTrailingATRMult), pos.Regime, marshalRegimeWindowsJSON(pos.RegimeWindows), pos.RegimePendingLabel, pos.RegimePendingCount, pos.RegimeAppliedLabel, pos.ScaleInCount, pos.LastAddPrice, pos.AddedNotionalUSD, pos.RiskAnchorPrice, scaleInResizePending, ratchetFallbackNormalizePending, pos.OpenProfile, directionCertifiedAtOpen, marshalStringMapJSON(pos.DirectionCertifiedStatesAtOpen), llmAnalysisRequested, pos.LLMVerdict, pos.ATRMethodAtOpen, pos.HedgeFor, pos.HedgePrimaryQtyBasis, pos.HurstAtOpen, pos.HurstSizeMult, pos.SharedCloseHoldUSD, pos.SharedCloseHoldReason, pos.RealizedPnLAccum); err != nil {
+		if _, err := stmtPos.Exec(sid, pos.Symbol, positionID, pos.Quantity, pos.InitialQuantity, pos.AvgCost, pos.EntryATR, pos.Side, pos.Multiplier, sdb.toStorageOwnerID(pos.OwnerStrategyID), formatTime(pos.OpenedAt), pos.StopLossOID, pos.StopLossTriggerPx, pos.StopLossHighWaterPx, tp1OID, tp2OID, marshalTPOIDsJSON(pos.TPOIDs), marshalTPArmedTiersJSON(pos.TPArmedTiers), nullableFloat64(pos.StopLossATRMult), pos.TPTiersJSON, pos.SLAdjustedTiersProcessed, nullableFloat64(pos.PostTPTrailingATRMult), pos.Regime, marshalRegimeWindowsJSON(pos.RegimeWindows), pos.RegimePendingLabel, pos.RegimePendingCount, pos.RegimeAppliedLabel, pos.ScaleInCount, pos.LastAddPrice, pos.AddedNotionalUSD, pos.RiskAnchorPrice, scaleInResizePending, ratchetFallbackNormalizePending, pos.OpenProfile, directionCertifiedAtOpen, marshalStringMapJSON(pos.DirectionCertifiedStatesAtOpen), llmAnalysisRequested, pos.LLMVerdict, pos.ATRMethodAtOpen, pos.HedgeFor, pos.HedgePrimaryQtyBasis, pos.HurstAtOpen, pos.HurstSizeMult, pos.SharedCloseHoldUSD, pos.SharedCloseHoldReason, pos.RealizedPnLAccum, boolToInt(pos.SLAfterMoved), marshalTPConsumptionsJSON(pos.TPConsumptions), pos.SLAfterTriggerPx); err != nil {
 			return fmt.Errorf("insert position %s/%s: %w", s.ID, pos.Symbol, err)
 		}
 	}
@@ -2366,7 +2406,7 @@ func (sdb *StateDB) loadScopeBooks(scopes []PortfolioScope) (*scopeLoad, error) 
 		return nil, fmt.Errorf("iterate strategies: %w", err)
 	}
 
-	posRows, err := sdb.db.Query("SELECT strategy_id, symbol, COALESCE(position_id, '') AS position_id, quantity, initial_quantity, avg_cost, entry_atr, side, multiplier, owner_strategy_id, opened_at, stop_loss_oid, stop_loss_trigger_px, stop_loss_high_water_px, COALESCE(tp1_oid, 0) AS tp1_oid, COALESCE(tp2_oid, 0) AS tp2_oid, COALESCE(tp_oids_json, '') AS tp_oids_json, COALESCE(tp_armed_tiers_json, '') AS tp_armed_tiers_json, stop_loss_atr_mult, COALESCE(tp_tiers_json, '') AS tp_tiers_json, COALESCE(sl_adjusted_tiers_processed, 0) AS sl_adjusted_tiers_processed, post_tp_trailing_atr_mult, COALESCE(regime, '') AS regime, COALESCE(regime_windows_json, '') AS regime_windows_json, COALESCE(regime_pending_label, '') AS regime_pending_label, COALESCE(regime_pending_count, 0) AS regime_pending_count, COALESCE(regime_applied_label, '') AS regime_applied_label, COALESCE(scale_in_count, 0) AS scale_in_count, COALESCE(last_add_price, 0) AS last_add_price, COALESCE(added_notional_usd, 0) AS added_notional_usd, COALESCE(risk_anchor_price, 0) AS risk_anchor_price, COALESCE(scale_in_resize_pending, 0) AS scale_in_resize_pending, COALESCE(ratchet_fallback_normalize_pending, 0) AS ratchet_fallback_normalize_pending, COALESCE(open_profile, '') AS open_profile, COALESCE(direction_certified_at_open, 0) AS direction_certified_at_open, COALESCE(direction_certified_states_json, '') AS direction_certified_states_json, COALESCE(llm_analysis_requested, 0) AS llm_analysis_requested, COALESCE(llm_verdict, '') AS llm_verdict, COALESCE(atr_method_at_open, '') AS atr_method_at_open, COALESCE(hedge_for, '') AS hedge_for, COALESCE(hedge_primary_qty_basis, 0) AS hedge_primary_qty_basis, COALESCE(hurst_at_open, 0) AS hurst_at_open, COALESCE(hurst_size_mult, 0) AS hurst_size_mult, COALESCE(shared_close_hold_usd, 0) AS shared_close_hold_usd, COALESCE(shared_close_hold_reason, '') AS shared_close_hold_reason, COALESCE(realized_pnl_accum, 0) AS realized_pnl_accum FROM positions")
+	posRows, err := sdb.db.Query("SELECT strategy_id, symbol, COALESCE(position_id, '') AS position_id, quantity, initial_quantity, avg_cost, entry_atr, side, multiplier, owner_strategy_id, opened_at, stop_loss_oid, stop_loss_trigger_px, stop_loss_high_water_px, COALESCE(tp1_oid, 0) AS tp1_oid, COALESCE(tp2_oid, 0) AS tp2_oid, COALESCE(tp_oids_json, '') AS tp_oids_json, COALESCE(tp_armed_tiers_json, '') AS tp_armed_tiers_json, stop_loss_atr_mult, COALESCE(tp_tiers_json, '') AS tp_tiers_json, COALESCE(sl_adjusted_tiers_processed, 0) AS sl_adjusted_tiers_processed, post_tp_trailing_atr_mult, COALESCE(regime, '') AS regime, COALESCE(regime_windows_json, '') AS regime_windows_json, COALESCE(regime_pending_label, '') AS regime_pending_label, COALESCE(regime_pending_count, 0) AS regime_pending_count, COALESCE(regime_applied_label, '') AS regime_applied_label, COALESCE(scale_in_count, 0) AS scale_in_count, COALESCE(last_add_price, 0) AS last_add_price, COALESCE(added_notional_usd, 0) AS added_notional_usd, COALESCE(risk_anchor_price, 0) AS risk_anchor_price, COALESCE(scale_in_resize_pending, 0) AS scale_in_resize_pending, COALESCE(ratchet_fallback_normalize_pending, 0) AS ratchet_fallback_normalize_pending, COALESCE(open_profile, '') AS open_profile, COALESCE(direction_certified_at_open, 0) AS direction_certified_at_open, COALESCE(direction_certified_states_json, '') AS direction_certified_states_json, COALESCE(llm_analysis_requested, 0) AS llm_analysis_requested, COALESCE(llm_verdict, '') AS llm_verdict, COALESCE(atr_method_at_open, '') AS atr_method_at_open, COALESCE(hedge_for, '') AS hedge_for, COALESCE(hedge_primary_qty_basis, 0) AS hedge_primary_qty_basis, COALESCE(hurst_at_open, 0) AS hurst_at_open, COALESCE(hurst_size_mult, 0) AS hurst_size_mult, COALESCE(shared_close_hold_usd, 0) AS shared_close_hold_usd, COALESCE(shared_close_hold_reason, '') AS shared_close_hold_reason, COALESCE(realized_pnl_accum, 0) AS realized_pnl_accum, COALESCE(sl_after_moved, 0) AS sl_after_moved, COALESCE(tp_consumptions_json, '') AS tp_consumptions_json, COALESCE(sl_after_trigger_px, 0) AS sl_after_trigger_px FROM positions")
 	if err != nil {
 		return nil, fmt.Errorf("load positions: %w", err)
 	}
@@ -2386,7 +2426,9 @@ func (sdb *StateDB) loadScopeBooks(scopes []PortfolioScope) (*scopeLoad, error) 
 		var directionCertifiedAtOpen int
 		var directionCertifiedStatesJSON string
 		var llmAnalysisRequested int
-		if err := posRows.Scan(&storedID, &pos.Symbol, &pos.TradePositionID, &pos.Quantity, &pos.InitialQuantity, &pos.AvgCost, &pos.EntryATR, &pos.Side, &pos.Multiplier, &pos.OwnerStrategyID, &openedAtStr, &pos.StopLossOID, &pos.StopLossTriggerPx, &pos.StopLossHighWaterPx, &tp1OID, &tp2OID, &tpOIDsJSON, &tpArmedTiersJSON, &slATRMult, &pos.TPTiersJSON, &pos.SLAdjustedTiersProcessed, &postTPTrailingMult, &pos.Regime, &regimeWindowsJSON, &pos.RegimePendingLabel, &pos.RegimePendingCount, &pos.RegimeAppliedLabel, &pos.ScaleInCount, &pos.LastAddPrice, &pos.AddedNotionalUSD, &pos.RiskAnchorPrice, &scaleInResizePending, &ratchetFallbackNormalizePending, &pos.OpenProfile, &directionCertifiedAtOpen, &directionCertifiedStatesJSON, &llmAnalysisRequested, &pos.LLMVerdict, &pos.ATRMethodAtOpen, &pos.HedgeFor, &pos.HedgePrimaryQtyBasis, &pos.HurstAtOpen, &pos.HurstSizeMult, &pos.SharedCloseHoldUSD, &pos.SharedCloseHoldReason, &pos.RealizedPnLAccum); err != nil {
+		var slAfterMoved int
+		var tpConsumptionsJSON string
+		if err := posRows.Scan(&storedID, &pos.Symbol, &pos.TradePositionID, &pos.Quantity, &pos.InitialQuantity, &pos.AvgCost, &pos.EntryATR, &pos.Side, &pos.Multiplier, &pos.OwnerStrategyID, &openedAtStr, &pos.StopLossOID, &pos.StopLossTriggerPx, &pos.StopLossHighWaterPx, &tp1OID, &tp2OID, &tpOIDsJSON, &tpArmedTiersJSON, &slATRMult, &pos.TPTiersJSON, &pos.SLAdjustedTiersProcessed, &postTPTrailingMult, &pos.Regime, &regimeWindowsJSON, &pos.RegimePendingLabel, &pos.RegimePendingCount, &pos.RegimeAppliedLabel, &pos.ScaleInCount, &pos.LastAddPrice, &pos.AddedNotionalUSD, &pos.RiskAnchorPrice, &scaleInResizePending, &ratchetFallbackNormalizePending, &pos.OpenProfile, &directionCertifiedAtOpen, &directionCertifiedStatesJSON, &llmAnalysisRequested, &pos.LLMVerdict, &pos.ATRMethodAtOpen, &pos.HedgeFor, &pos.HedgePrimaryQtyBasis, &pos.HurstAtOpen, &pos.HurstSizeMult, &pos.SharedCloseHoldUSD, &pos.SharedCloseHoldReason, &pos.RealizedPnLAccum, &slAfterMoved, &tpConsumptionsJSON, &pos.SLAfterTriggerPx); err != nil {
 			return nil, fmt.Errorf("scan position: %w", err)
 		}
 		procID, mapped := loaded[storedID]
@@ -2405,6 +2447,8 @@ func (sdb *StateDB) loadScopeBooks(scopes []PortfolioScope) (*scopeLoad, error) 
 		pos.OpenedAt = parseTime(openedAtStr)
 		pos.TPOIDs = parseTPOIDsJSON(tpOIDsJSON, tp1OID, tp2OID)
 		pos.TPArmedTiers = parseTPArmedTiersJSON(tpArmedTiersJSON)
+		pos.SLAfterMoved = slAfterMoved != 0
+		pos.TPConsumptions = parseTPConsumptionsJSON(tpConsumptionsJSON)
 		pos.RegimeWindows = parseRegimeWindowsJSON(regimeWindowsJSON)
 		backfillTPArmedTiers(&pos)
 		if slATRMult.Valid {

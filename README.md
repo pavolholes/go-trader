@@ -74,7 +74,7 @@ Walks asset/strategy/platform/capital/risk/Discord choices and writes `scheduler
 
 ```bash
 git clone https://github.com/richkuo/go-trader.git && cd go-trader
-curl -LsSf https://astral.sh/uv/install.sh | sh    # install uv if needed
+curl -LsSf https://astral.sh/uv/install.sh | sudo env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh    # uv for every account (SKILL.md Prerequisites)
 uv sync                                             # Python deps from lockfile
 
 VER=$(git describe --tags --always --dirty 2>/dev/null || echo dev)
@@ -103,11 +103,13 @@ sudo bash scripts/install-service.sh systemd/go-trader@.service paper-testing
 
 Existing in-tree deploy: **stop the service**, then `scripts/migrate-config-out-of-tree.sh --instance <name>` (refuses while daemon is live). `NO_START=1` enables without starting. Detail: [SKILL.md](SKILL.md).
 
-**Folding paper deployments into the live process.** Stop every unit named in the run, then `bash scripts/merge-paper-instance.sh --live <live> --paper <paper>` (dry run) and, once it prints `VERDICT: READY`, the same command with `--apply`. Every state file stays where it is: the live config gains `paper_db_file`, every paper id gets a `-paper` suffix (numbered on a name clash) with `storage_strategy_id` keeping the stored identity, and a systemd drop-in grants each folded database directory.
+Hand-made unit (for example `go-trader-live.service` run as root from a workspace): `sudo python3 scripts/migrate-service-layout.py plan --unit <unit> --instance <name>` checks a move to this layout, and `apply` makes it with state transfer, proofs and automatic recovery; `rollback` returns it. Updates never run it. Detail: [SKILL.md](SKILL.md) § Run And Install Service.
 
-`--source <id>=<instance>` folds a deployment into its **own** partition `paper:<id>` instead of the shared paper one: it adds a `paper_sources` entry with that id and the deployment's database, aliases each strategy as `<base>-paper-<id>` and stamps `paper_source=<id>`. `--paper` and `--source` may be combined and `--source` may repeat, so several deployments fold in one run, each keeping its own risk limits, latch and state file. `--diff` previews the whole plan from the config files alone, with no unit stopped.
+**Folding paper deployments into one paper service.** Paper and live never share a service: the fold refuses any target that runs a `--mode=live` strategy. To build a new combined paper service, stop every unit named in the run, then `bash scripts/merge-paper-instance.sh --new-target <name> --status-port <n> --source <id>=<instance>...` (dry run) and, once it prints `VERDICT: READY`, the same command with `--apply`; it creates `go-trader@<name>` and enables nothing. `--live <instance>` instead names an existing paper-only service (the flag name is historical). Every state file stays where it is: the target config gains `paper_db_file` for `--paper`, every paper id gets a `-paper` suffix (numbered on a name clash) with `storage_strategy_id` keeping the stored identity, and a systemd drop-in grants each folded database directory.
 
-The script holds every database's locks for the run, verifies the merged config with the live binary's own `inspect --all --json` and `storage-inspect --json`, and never opens a database for writing. Back up every state file first, then `daemon-reload`, disable each folded unit, start the live unit, verify the boot `[storage]` lines and the first cycle, and only then retire the folded status ports. `--rollback` takes the same `--paper` and `--source` arguments as the apply it undoes, restores the config and drop-ins, never touches a database, and must run newest merge first. See `scheduler/config.live-paper.example.json` and SKILL.md § Storage Ownership, whose cutover checklist names the exact recovery boundary.
+`--source <id>=<instance>` folds a deployment into its **own** partition `paper:<id>` instead of the shared paper one: it adds a `paper_sources` entry with that id and the deployment's database, aliases each strategy as `<base>-paper-<id>` and stamps `paper_source=<id>`. `--paper` and `--source` may be combined and `--source` may repeat, so several deployments fold in one run, each keeping its own risk limits, latch and state file. `--diff` previews the whole plan from the config files alone, with no unit stopped. Every folded deployment's `leaderboard_summaries` entries are kept.
+
+The script holds every database's locks for the run, verifies the merged config with one release's own `inspect --all --json` and `storage-inspect --json`, and never opens a database for writing. Back up every state file first, then `daemon-reload`, disable each folded unit, start the target unit, verify the boot `[storage]` lines and the first cycle, and only then retire the folded status ports. `--rollback` takes the same `--paper` and `--source` arguments as the apply it undoes, restores the config and drop-ins, never touches a database, and must run newest merge first. See `scheduler/config.live-paper.example.json` and SKILL.md § Storage Ownership, whose cutover checklist names the exact recovery boundary.
 
 ---
 
@@ -137,7 +139,7 @@ flowchart TB
             PROT["Protection<br/>on-chain SL/TP, trailing,<br/>liquidation clamp"]
             RECON["Reconciliation<br/>shared wallet, cashflow, fills"]
             MIRROR["Replay mirror<br/>live decisions to paper"]
-            FEED["Market feed (market_feed=websocket)<br/>one HL websocket, history repair,<br/>sealed per-evaluation snapshot"]
+            FEED["Market feed (market_feed=websocket, or shared from role=feed services over Unix sockets:<br/>websocket primary, REST backup with a request budget)<br/>one HL websocket, history repair,<br/>sealed per-evaluation snapshot"]
             OPS["Operator surfaces<br/>Discord bot, loopback dashboard,<br/>owner DMs"]
         end
         subgraph Py["One-shot Python subprocesses (per cycle)"]
@@ -441,6 +443,10 @@ bash scripts/update.sh --rsync-from /path/to/staged-build --restart
 bash scripts/update.sh --all --restart                             # batch all instances
 ```
 
+When your own account owns the deployment tree, run `bash scripts/update.sh --restart` without `sudo`; the script calls `sudo` itself only for the systemd steps. As root, the update refuses a tree whose owning account runs any unit without the `go-trader@.service` sandbox (SKILL.md § Auto-Update, "Root on a tree another account owns").
+
+Optional: `sudo bash scripts/shared-feed-convert.sh plan --consumer <unit>` starts a checked, reversible conversion to the shared market feed. Updates never run it. See SKILL.md § Shared market feed.
+
 | Change | Action |
 |--------|--------|
 | Go or Python source | `sudo bash scripts/update.sh --restart` |
@@ -460,11 +466,13 @@ curl -s localhost:8099/status            # live prices + P&L
 curl -s localhost:8099/health
 open http://localhost:8099/dashboard     # charts, trades, equity, regime badge, tuner, reports
 open http://localhost:8099/tuning        # research-run tuning page (suggest-only)
-journalctl -u go-trader -n 50
+journalctl --namespace=+go-trader -u go-trader -n 50
 ./go-trader inspect <strategy-id>        # resolved config + SL/TP provenance
 ./go-trader inspect --all --json
 ./go-trader agent-info                   # capabilities, schema, env vars, live state
 ```
+
+**Logs live in their own journal namespace.** Both shipped units set `LogNamespace=go-trader`, so every go-trader unit logs to a separate journal with its own size cap, and none of its lines go to `/var/log/syslog`. A plain `journalctl -u go-trader` shows only systemd's start and stop lines. Add `--namespace=go-trader` for the go-trader output alone, or `--namespace=+go-trader` to merge it with the default journal (systemd's own lines for the unit and anything logged before the move). `scripts/install-service.sh` and `scripts/update.sh --restart` install `systemd/journald@go-trader.conf` as `/etc/systemd/journald@go-trader.conf`: `SystemMaxUse=2G`, `ForwardToSyslog=no`, persistent storage. That file is managed by go-trader and replaced on a difference (the old copy is kept as `.prev`). Put local settings in `/etc/systemd/journald@go-trader.conf.d/*.conf` and apply them with `sudo systemctl restart systemd-journald@go-trader.service`. Journal namespaces need systemd 245 or newer; on an older systemd the installers warn, skip the config, and systemd ignores the unit line, so logs stay in the default journal.
 
 Loopback-only status server (`localhost:<port>`). Dashboard includes candle charts, trade history, equity sparklines, strategy tuner, and `/reports`. A separate `/tuning` page launches persistent research retunes across one or more strategies and diffs the ranked results against live config — suggestions are never auto-applied. Set `status_token` for mutating API calls from the browser. Prefer VPN or reverse proxy over binding `0.0.0.0`.
 
@@ -535,7 +543,8 @@ Python 3.12+ via [uv](https://github.com/astral-sh/uv); Go 1.26.2; systemd.
 | Problem | Solution |
 |---|---|
 | No Discord messages | Check `DISCORD_BOT_TOKEN`, channel IDs, bot permissions |
-| Service won't start | `journalctl -u go-trader -n 50` |
+| Service won't start | `journalctl --namespace=+go-trader -u go-trader -n 50` (the `+` merges systemd's start and exit lines with the go-trader output) |
+| Need the per-check detail (script argv, HOLD signals, prices) | Set `"log_level": "debug"` and `sudo systemctl kill -s HUP go-trader`; set it back to `"info"` after. See `SKILL.md` § Adjustable Settings |
 | Didn't come back after reboot | Re-run `sudo bash scripts/install-service.sh` |
 | Strategy not trading | Circuit breaker in `/status`, verify params |
 | Reset positions | `rm scheduler/state.db && systemctl restart go-trader` (remove **every** configured state file: `db_file`, `paper_db_file` and each `paper_sources[].db_file`) |
@@ -543,7 +552,7 @@ Python 3.12+ via [uv](https://github.com/astral-sh/uv); Go 1.26.2; systemd.
 | Live mode fails | Set env vars from Platforms table |
 | "state DB missing but live strategies configured" | Restore `scheduler/state.db` from backup, or `GO_TRADER_ALLOW_MISSING_STATE=1` for first-run. With `paper_db_file` or `paper_sources` set, restore every file together with its `-wal` / `-shm` sidecars, in the order primary, paper, then sources by id |
 | Which files does a backup need? | `./go-trader storage-inspect --json --config <path>` names the canonical path and the partitions of every state file; `update_resolve_db_exclude` in `scripts/update_helpers.sh` enumerates the same list for the updater |
-| A unit exits 79 after a fold | Two processes cannot own one state file. Whichever scheduler starts **second** fails to take the ownership lock and refuses to start with exit 79; the process already holding the lock keeps trading, so read `journalctl` for the unit that exited and leave the running one alone. Usually a folded paper unit was restarted or came back after a reboot: disable every folded unit (`systemctl disable go-trader@<instance>.service`) and start only the merged live unit |
+| A unit exits 79 after a fold | Two processes cannot own one state file. Whichever scheduler starts **second** fails to take the ownership lock and refuses to start with exit 79; the process already holding the lock keeps trading, so read `journalctl --namespace=+go-trader -u <unit>` for the unit that exited and leave the running one alone. Usually a folded paper unit was restarted or came back after a reboot: disable every folded unit (`systemctl disable go-trader@<instance>.service`) and start only the merged live unit |
 | Exit code 80 on startup | The storage layout was rejected (aliased files, a book in the wrong file, an ambiguous legacy risk row). Run `./go-trader storage-inspect` — it names the file and the identifier |
 
 ---

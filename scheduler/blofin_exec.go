@@ -25,7 +25,7 @@ func runBloFinCheck(sc StrategyConfig, prices map[string]float64, posCtx Positio
 	args = appendRegimeArgs(args, regime)
 	args = appendStrategyRegimeWindowArgs(args, sc, regime)
 	args = appendRegimePayloadArg(args, sc, regime)
-	if refsArgs, err := buildStrategyRefsArg(sc); err != nil {
+	if refsArgs, err := buildStrategyRefsArg(sc, "", false); err != nil {
 		logger.Warn("Failed to marshal strategy refs: %v", err)
 	} else if len(refsArgs) > 0 {
 		args = append(args, refsArgs...)

@@ -68,12 +68,15 @@ type marketSnapshotKey struct {
 }
 
 type marketSnapshot struct {
-	Version          int
-	EvaluationID     string
-	ConfigGeneration uint64
-	SealedAt         time.Time
-	Connected        bool
-	Metrics          feedMetrics
+	Version           int
+	EvaluationID      string
+	ConfigGeneration  uint64
+	SealedAt          time.Time
+	Connected         bool
+	Metrics           feedMetrics
+	Deadline          time.Time
+	MarksAgeFromNow   bool
+	CorrectionUnknown bool
 
 	keys    map[marketFeedKey]*marketSnapshotKey
 	mids    map[string]feedMid
@@ -171,6 +174,11 @@ func sealCycleMarketSnapshot(ctx context.Context, o *marketFeedOwner, reqs cycle
 	if o == nil {
 		return nil
 	}
+	prepareMarketSnapshot(ctx, o, reqs)
+	return freezeMarketSnapshot(o, reqs, evaluationID, now)
+}
+
+func prepareMarketSnapshot(ctx context.Context, o *marketFeedOwner, reqs cycleMarketRequirements) {
 	for _, cr := range reqs.Keys {
 		readiness, tracked := o.readinessFor(cr.Key)
 		if !tracked {
@@ -185,7 +193,9 @@ func sealCycleMarketSnapshot(ctx context.Context, o *marketFeedOwner, reqs cycle
 		}
 	}
 	o.EnsureFunding(ctx, o.earliestFrameBarMs(reqs))
+}
 
+func freezeMarketSnapshot(o *marketFeedOwner, reqs cycleMarketRequirements, evaluationID string, now time.Time) *marketSnapshot {
 	o.feedMu.Lock()
 	defer o.feedMu.Unlock()
 	snap := &marketSnapshot{
@@ -246,7 +256,13 @@ func (s *marketSnapshot) age(now time.Time) time.Duration {
 	if s == nil {
 		return 0
 	}
-	return now.UTC().Sub(s.SealedAt)
+	age := now.UTC().Sub(s.SealedAt)
+	if !s.Deadline.IsZero() {
+		if sinceDeadline := now.UTC().Sub(s.Deadline); sinceDeadline > age {
+			age = sinceDeadline
+		}
+	}
+	return age
 }
 
 func feedDecisionAgeLimit(intervalSeconds int) time.Duration {
@@ -315,7 +331,13 @@ func (s *marketSnapshot) midFor(coin string) (float64, bool) {
 	if !ok || mid.Px <= 0 {
 		return 0, false
 	}
-	if s.SealedAt.Sub(mid.RecvAt) > feedMidStaleAfter {
+	ref := s.SealedAt
+	if s.MarksAgeFromNow {
+		if now := time.Now().UTC(); now.After(ref) {
+			ref = now
+		}
+	}
+	if ref.Sub(mid.RecvAt) > feedMidStaleAfter {
 		return 0, false
 	}
 	return mid.Px, true
@@ -449,7 +471,7 @@ func marketPayloadJSON(payload *marketPayload) ([]byte, error) {
 	return blob, nil
 }
 
-func marketSnapshotLogLine(s *marketSnapshot, reqs cycleMarketRequirements) string {
+func marketSnapshotHealth(s *marketSnapshot, reqs cycleMarketRequirements) string {
 	if s == nil {
 		return ""
 	}
@@ -462,6 +484,18 @@ func marketSnapshotLogLine(s *marketSnapshot, reqs cycleMarketRequirements) stri
 			stale++
 		}
 	}
-	return fmt.Sprintf("[feed] snapshot=%s/%d keys=%d ready=%d stale=%d %s",
-		s.EvaluationID, s.ConfigGeneration, len(reqs.Keys), ready, stale, formatFeedMetrics(s.Metrics))
+	return fmt.Sprintf("keys=%d ready=%d stale=%d", len(reqs.Keys), ready, stale)
+}
+
+func marketSnapshotLogLine(s *marketSnapshot, reqs cycleMarketRequirements) string {
+	if s == nil {
+		return ""
+	}
+	metrics := formatFeedMetrics(s.Metrics)
+	if s.CorrectionUnknown {
+		metrics = fmt.Sprintf("rest{bootstrap,repair,recovery}=%d,%d,%d correction=n/a steady_candle_rest=%d",
+			s.Metrics.BootstrapCalls, s.Metrics.RepairCalls, s.Metrics.RecoveryCalls, s.Metrics.SteadyCandleCalls)
+	}
+	return fmt.Sprintf("[feed] snapshot=%s/%d %s %s",
+		s.EvaluationID, s.ConfigGeneration, marketSnapshotHealth(s, reqs), metrics)
 }

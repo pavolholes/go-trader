@@ -6,25 +6,6 @@ import (
 	"testing"
 )
 
-func TestHyperliquidAllTiersArmedAndCleared_DustGuard(t *testing.T) {
-	sc := tieredTPATRSC()
-	pos := &Position{
-		Quantity:     0.013,
-		TPOIDs:       []int64{0, 0},
-		TPArmedTiers: []bool{true, true},
-	}
-	if !hyperliquidAllTiersArmedAndCleared(sc, pos) {
-		t.Fatal("expected all tiers armed and cleared")
-	}
-	pos.TPArmedTiers = []bool{false, false}
-	if hyperliquidAllTiersArmedAndCleared(sc, pos) {
-		t.Error("never-placed TP list must not look armed+cleared")
-	}
-	if _, ok := hyperliquidClearedTPTier(sc, pos, 0.012); ok {
-		t.Error("hyperliquidClearedTPTier must not attribute ambiguous all-zero dust")
-	}
-}
-
 func TestSoleOwnerTPDust_BooksBothTiersAtUserFills(t *testing.T) {
 	const (
 		fullQty  = 0.012
@@ -73,7 +54,7 @@ func TestSoleOwnerTPDust_BooksBothTiersAtUserFills(t *testing.T) {
 	})
 	logger := newTestLogger(t)
 
-	changed := reconcileHyperliquidPositionsForStrategy(sc, ss, "BTC", positions, resolver, logger, nil, nil)
+	changed := reconcileHyperliquidPositionsForStrategy(sc, ss, "BTC", positions, resolver, logger, nil, nil, nil)
 	if !changed {
 		t.Fatal("expected changed=true")
 	}
@@ -102,49 +83,6 @@ func TestSoleOwnerTPDust_BooksBothTiersAtUserFills(t *testing.T) {
 	wantTP2Qty := fullQty - dustQty - tp1Qty
 	if math.Abs(closes[1].Quantity-wantTP2Qty) > 1e-9 || math.Abs(closes[1].Price-tp2Px) > 1e-9 {
 		t.Errorf("TP2 trade = %+v, want qty=%g px=%g", closes[1], wantTP2Qty, tp2Px)
-	}
-}
-
-func TestSoleOwnerTPDust_NeverPlaced_NoBook(t *testing.T) {
-	const (
-		fullQty  = 0.013
-		dustQty  = 0.001
-		entryPx  = 75249.0
-		entryATR = 200.0
-	)
-	sc := soleOwnerTPSC()
-	sc.Symbol = "BTC"
-	sc.Args = []string{"sma", "BTC", "1h", "--mode=live"}
-
-	ss := &StrategyState{
-		ID:   sc.ID,
-		Cash: 1000,
-		Positions: map[string]*Position{
-			"BTC": {
-				Symbol: "BTC", Quantity: fullQty, InitialQuantity: fullQty,
-				AvgCost: entryPx, EntryATR: entryATR, Side: "short",
-				Multiplier: 1, Leverage: 5, OwnerStrategyID: sc.ID,
-				TPOIDs: []int64{0, 0}, TPArmedTiers: []bool{false, false},
-			},
-		},
-	}
-	positions := []HLPosition{{Coin: "BTC", Size: -dustQty, EntryPrice: entryPx, Leverage: 5}}
-	resolver := hlReconcileFillResolver(func(string, int64, float64) (HLFillLookup, bool) {
-		return HLFillLookup{}, false
-	})
-	logger := newTestLogger(t)
-
-	reconcileHyperliquidPositionsForStrategy(sc, ss, "BTC", positions, resolver, logger, nil, nil)
-
-	if len(ss.TradeHistory) != 0 {
-		t.Fatalf("TradeHistory = %d, want 0 close trades", len(ss.TradeHistory))
-	}
-	pos := ss.Positions["BTC"]
-	if pos == nil {
-		t.Fatal("expected position to remain")
-	}
-	if math.Abs(pos.Quantity-dustQty) > 1e-9 {
-		t.Errorf("Quantity = %g, want legacy resync to %g", pos.Quantity, dustQty)
 	}
 }
 

@@ -48,6 +48,13 @@ func applyHotReloadConfig(cfg, next *Config, state *AppState, notifier *MultiNot
 			return nil, fmt.Errorf("alert_throttle_interval: %w", err)
 		}
 	}
+	if cfg.LogLevel != next.LogLevel {
+		addChange("log_level: %q -> %q", cfg.LogLevel, next.LogLevel)
+		cfg.LogLevel = next.LogLevel
+		if err := applyLogLevelFromConfig(cfg); err != nil {
+			return nil, fmt.Errorf("log_level: %w", err)
+		}
+	}
 	if cfg.KillSwitchResetDMTimeout != next.KillSwitchResetDMTimeout {
 		addChange("kill_switch_reset_dm_timeout: %q -> %q", cfg.KillSwitchResetDMTimeout, next.KillSwitchResetDMTimeout)
 		cfg.KillSwitchResetDMTimeout = next.KillSwitchResetDMTimeout
@@ -438,6 +445,17 @@ func validateHotReloadCompatible(cfg, next *Config) error {
 	errs = append(errs, storageIdentityReloadErrors(cfg, next)...)
 	if cfg.marketFeedMode() != next.marketFeedMode() {
 		errs = append(errs, fmt.Sprintf("market_feed changed (%q -> %q; restart required)", cfg.marketFeedMode(), next.marketFeedMode()))
+	}
+	if strings.TrimSpace(cfg.Role) != strings.TrimSpace(next.Role) {
+		errs = append(errs, fmt.Sprintf("role changed (%q -> %q; restart required)", cfg.Role, next.Role))
+	}
+	curPrimary, curBackup := cfg.sharedMarketFeedSockets()
+	nextPrimary, nextBackup := next.sharedMarketFeedSockets()
+	if curPrimary != nextPrimary {
+		errs = append(errs, fmt.Sprintf("shared_market_feed.primary_socket changed (%q -> %q; restart required)", curPrimary, nextPrimary))
+	}
+	if curBackup != nextBackup {
+		errs = append(errs, fmt.Sprintf("shared_market_feed.backup_socket changed (%q -> %q; restart required)", curBackup, nextBackup))
 	}
 	if cfg.ReplayLogPath != next.ReplayLogPath {
 		errs = append(errs, fmt.Sprintf("replay_log_path changed (%q -> %q; restart required)", cfg.ReplayLogPath, next.ReplayLogPath))

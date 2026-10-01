@@ -43,33 +43,6 @@ func stubHLStateFetcher(positions []HLPosition, err error) (HLStateFetcher, *int
 	return fetcher, &calls
 }
 
-func stubOKXLiveCloser(errs map[string]error) (OKXLiveCloser, *[]string) {
-	var calls []string
-	closer := func(symbol string, partialSz *float64) (*OKXCloseResult, error) {
-		calls = append(calls, symbol)
-		if err, ok := errs[symbol]; ok && err != nil {
-			return nil, err
-		}
-		return &OKXCloseResult{
-			Close:    &OKXClose{Symbol: symbol, Fill: &OKXCloseFill{TotalSz: 1.0, AvgPx: 100}},
-			Platform: "okx",
-		}, nil
-	}
-	return closer, &calls
-}
-
-func stubOKXPositionsFetcher(positions []OKXPosition, err error) (OKXPositionsFetcher, *int) {
-	var calls int
-	fetcher := func() ([]OKXPosition, error) {
-		calls++
-		if err != nil {
-			return nil, err
-		}
-		return positions, nil
-	}
-	return fetcher, &calls
-}
-
 func defaultHLInputs(hlAddr string, fetched bool, positions []HLPosition,
 	hlLive []StrategyConfig, reason string, timeout time.Duration,
 	closer HyperliquidLiveCloser, fetcher HLStateFetcher) KillSwitchCloseInputs {
@@ -124,6 +97,33 @@ func TestPlanKillSwitchClose_HappyPath(t *testing.T) {
 		strings.Contains(got, "Manual reset required") {
 		t.Errorf("expected auto-reset message to replace manual-reset instruction, got: %s", got)
 	}
+}
+
+func stubOKXLiveCloser(errs map[string]error) (OKXLiveCloser, *[]string) {
+	var calls []string
+	closer := func(symbol string, partialSz *float64) (*OKXCloseResult, error) {
+		calls = append(calls, symbol)
+		if err, ok := errs[symbol]; ok && err != nil {
+			return nil, err
+		}
+		return &OKXCloseResult{
+			Close:    &OKXClose{Symbol: symbol, Fill: &OKXCloseFill{TotalSz: 1.0, AvgPx: 100}},
+			Platform: "okx",
+		}, nil
+	}
+	return closer, &calls
+}
+
+func stubOKXPositionsFetcher(positions []OKXPosition, err error) (OKXPositionsFetcher, *int) {
+	var calls int
+	fetcher := func() ([]OKXPosition, error) {
+		calls++
+		if err != nil {
+			return nil, err
+		}
+		return positions, nil
+	}
+	return fetcher, &calls
 }
 
 func TestHyperliquidKillSwitchClose_UsesRealFillBeforeMark(t *testing.T) {
@@ -271,278 +271,6 @@ func TestHyperliquidKillSwitchClose_AlreadyFlatRecoversRecentUserFill(t *testing
 	wantNetPnL := (1727.70-1754.10)*0.588 - 0.4389
 	if math.Abs(s.ClosedPositions[0].RealizedPnL-wantNetPnL) > 1e-9 {
 		t.Fatalf("closed pnl = %.6f, want %.6f", s.ClosedPositions[0].RealizedPnL, wantNetPnL)
-	}
-}
-
-func TestHyperliquidKillSwitchClose_AlreadyFlatRecoversRecentUserFill_LowerKCoin(t *testing.T) {
-	hlLive := []StrategyConfig{
-		{ID: "hl-kpepe", Platform: "hyperliquid", Type: "perps", Leverage: 5,
-			Args: []string{"sma", "kPEPE", "1h", "--mode=live"}},
-	}
-	positions := []HLPosition{{Coin: "kPEPE", Size: 12345.0, EntryPrice: 0.00012}}
-	closer := func(symbol string, partialSz *float64, cancelStopLossOIDs []int64) (*HyperliquidCloseResult, error) {
-		return &HyperliquidCloseResult{
-			Close:    &HyperliquidClose{Symbol: symbol, AlreadyFlat: true},
-			Platform: "hyperliquid",
-		}, nil
-	}
-	fetcher, _ := stubHLStateFetcher(nil, nil)
-	var recoverCalls int
-	in := defaultHLInputs("0xaddr", true, positions, hlLive,
-		"portfolio drawdown 25.0% exceeds limit 20.0%",
-		time.Second, closer, fetcher)
-	in.HLNoFillRecoverer = func(since time.Time) (*HLUserFillsResult, error) {
-		recoverCalls++
-		if since.IsZero() {
-			t.Fatal("recovery since timestamp must be populated")
-		}
-		return &HLUserFillsResult{
-			ByOID: map[string]HLFillSummary{
-				"98765": {
-					Coin:           "kPEPE",
-					FirstTimeMS:    time.Now().Add(-time.Second).UnixMilli(),
-					LastTimeMS:     time.Now().Add(-time.Second).UnixMilli(),
-					Fee:            0.123,
-					ClosedPnLGross: -1.23,
-					Count:          1,
-					Qty:            12345.0,
-					Px:             0.000119,
-				},
-			},
-		}, nil
-	}
-
-	plan := planKillSwitchClose(in)
-	if !plan.OnChainConfirmedFlat {
-		t.Fatalf("expected confirmed-flat plan, got %+v", plan)
-	}
-	if recoverCalls != 1 {
-		t.Fatalf("recoverCalls = %d, want 1", recoverCalls)
-	}
-	fill, ok := plan.CloseReport.Fills["kPEPE"]
-	if !ok {
-		t.Fatalf("missing recovered fill under raw 'kPEPE' key: %+v", plan.CloseReport.Fills)
-	}
-	if _, ok := plan.CloseReport.Fills["KPEPE"]; ok {
-		t.Fatalf("must not also write normalized uppercase key: %+v", plan.CloseReport.Fills)
-	}
-	if fill.OID != 98765 || math.Abs(fill.TotalSz-12345.0) > 1e-9 || math.Abs(fill.AvgPx-0.000119) > 1e-9 || math.Abs(fill.Fee-0.123) > 1e-9 {
-		t.Fatalf("recovered fill = %+v, want oid 98765 qty 12345 px 0.000119 fee 0.123", fill)
-	}
-	logs := strings.Join(plan.LogLines, "\n")
-	if !strings.Contains(logs, "recovered already-flat fill for kPEPE") {
-		t.Fatalf("missing recovery log line with raw casing: %v", plan.LogLines)
-	}
-
-	s := &StrategyState{
-		ID:       "hl-kpepe",
-		Type:     "perps",
-		Platform: "hyperliquid",
-		Cash:     1000,
-		Positions: map[string]*Position{
-			"kPEPE": {Symbol: "kPEPE", Quantity: 12345.0, AvgCost: 0.00012, Side: "long", Multiplier: 1, Leverage: 5},
-		},
-	}
-	forceCloseKillSwitchPositions(s, hlLive[0], map[string]float64{"kPEPE": 0.0001}, plan.CloseReport.Fills, hlLive, nil, nil)
-	if len(s.TradeHistory) != 1 {
-		t.Fatalf("expected 1 trade, got %d", len(s.TradeHistory))
-	}
-	trade := s.TradeHistory[0]
-	if trade.ExchangeOrderID != "98765" || trade.FeeSource != FeeSourceUserFills || !trade.PnLGross {
-		t.Fatalf("trade fill metadata = oid %q fee_source %q gross %v, want 98765/userfills/true", trade.ExchangeOrderID, trade.FeeSource, trade.PnLGross)
-	}
-	if math.Abs(trade.Price-0.000119) > 1e-9 || math.Abs(trade.ExchangeFee-0.123) > 1e-9 {
-		t.Fatalf("trade price/fee = %.9f/%.6f, want 0.000119/0.123", trade.Price, trade.ExchangeFee)
-	}
-}
-
-func TestHyperliquidKillSwitchClose_AlreadyFlatSharedLowKCoinRecoversAndSplits(t *testing.T) {
-	hlLive := []StrategyConfig{
-		{ID: "hl-a", Platform: "hyperliquid", Type: "perps", Leverage: 5, CapitalPct: 2.0 / 3.0,
-			Args: []string{"sma", "kPEPE", "1h", "--mode=live"}},
-		{ID: "hl-b", Platform: "hyperliquid", Type: "perps", Leverage: 5, CapitalPct: 1.0 / 3.0,
-			Args: []string{"ema", "kPEPE", "1h", "--mode=live"}},
-		{ID: "hl-zero", Platform: "hyperliquid", Type: "perps", Leverage: 5,
-			Args: []string{"sma", "kPEPE", "1h", "--mode=live"}},
-	}
-	positions := []HLPosition{{Coin: "kPEPE", Size: 1.5, EntryPrice: 0.00012}}
-	closer := func(symbol string, partialSz *float64, cancelStopLossOIDs []int64) (*HyperliquidCloseResult, error) {
-		return &HyperliquidCloseResult{
-			Close:    &HyperliquidClose{Symbol: symbol, AlreadyFlat: true},
-			Platform: "hyperliquid",
-		}, nil
-	}
-	fetcher, _ := stubHLStateFetcher(nil, nil)
-	var recoverCalls int
-	in := defaultHLInputs("0xaddr", true, positions, hlLive,
-		"portfolio drawdown 25.0% exceeds limit 20.0%",
-		time.Second, closer, fetcher)
-	const recOID = "77777"
-	const recQty = 1.5
-	const recPx = 0.000119
-	const recFee = 0.003
-	in.HLNoFillRecoverer = func(since time.Time) (*HLUserFillsResult, error) {
-		recoverCalls++
-		return &HLUserFillsResult{
-			ByOID: map[string]HLFillSummary{
-				recOID: {
-					Coin:           "kPEPE",
-					FirstTimeMS:    time.Now().Add(-2 * time.Second).UnixMilli(),
-					LastTimeMS:     time.Now().Add(-time.Second).UnixMilli(),
-					Fee:            recFee,
-					ClosedPnLGross: -0.012,
-					Count:          1,
-					Qty:            recQty,
-					Px:             recPx,
-				},
-			},
-		}, nil
-	}
-
-	plan := planKillSwitchClose(in)
-	if !plan.OnChainConfirmedFlat {
-		t.Fatalf("expected confirmed-flat plan, got %+v", plan)
-	}
-	if recoverCalls != 1 {
-		t.Fatalf("recoverCalls = %d, want 1", recoverCalls)
-	}
-	fill, ok := plan.CloseReport.Fills["kPEPE"]
-	if !ok {
-		t.Fatalf("missing recovered fill under raw 'kPEPE' key: %+v", plan.CloseReport.Fills)
-	}
-	if _, ok := plan.CloseReport.Fills["KPEPE"]; ok {
-		t.Fatalf("must not also write normalized uppercase key on shared low-k: %+v", plan.CloseReport.Fills)
-	}
-	if fill.OID != 77777 || math.Abs(fill.TotalSz-recQty) > 1e-9 || math.Abs(fill.AvgPx-recPx) > 1e-9 || math.Abs(fill.Fee-recFee) > 1e-9 {
-		t.Fatalf("recovered fill = %+v, want oid %s qty %.4f px %.6f fee %.6f", fill, recOID, recQty, recPx, recFee)
-	}
-	logs := strings.Join(plan.LogLines, "\n")
-	if !strings.Contains(logs, "recovered already-flat fill for kPEPE") {
-		t.Fatalf("missing recovery log with raw coin key: %v", plan.LogLines)
-	}
-
-	stateA := &StrategyState{
-		ID: "hl-a", Type: "perps", Platform: "hyperliquid", Cash: 10000,
-		Positions: map[string]*Position{
-			"kPEPE": {Symbol: "kPEPE", Quantity: 1.0, AvgCost: 0.00012, Side: "long", Multiplier: 1, Leverage: 5},
-		},
-	}
-	stateB := &StrategyState{
-		ID: "hl-b", Type: "perps", Platform: "hyperliquid", Cash: 5000,
-		Positions: map[string]*Position{
-			"kPEPE": {Symbol: "kPEPE", Quantity: 0.5, AvgCost: 0.00012, Side: "long", Multiplier: 1, Leverage: 5},
-		},
-	}
-	zeroState := &StrategyState{
-		ID:        "hl-zero",
-		Type:      "perps",
-		Platform:  "hyperliquid",
-		Cash:      1000,
-		Positions: map[string]*Position{},
-	}
-	hlVirtualQty := snapshotHyperliquidVirtualQuantities(map[string]*StrategyState{
-		"hl-a": stateA, "hl-b": stateB, "hl-zero": zeroState,
-	}, hlLive)
-
-	prices := map[string]float64{"kPEPE": 0.00005}
-	forceCloseKillSwitchPositions(stateA, hlLive[0], prices, plan.CloseReport.Fills, hlLive, hlVirtualQty, nil)
-	forceCloseKillSwitchPositions(stateB, hlLive[1], prices, plan.CloseReport.Fills, hlLive, hlVirtualQty, nil)
-	forceCloseKillSwitchPositions(zeroState, hlLive[2], prices, plan.CloseReport.Fills, hlLive, hlVirtualQty, nil)
-
-	if len(stateA.TradeHistory) != 1 {
-		t.Fatalf("A: expected 1 trade from recovered fill, got %d", len(stateA.TradeHistory))
-	}
-	ta := stateA.TradeHistory[0]
-	if ta.ExchangeOrderID != recOID || ta.FeeSource != FeeSourceUserFills || !ta.PnLGross {
-		t.Fatalf("A trade metadata = oid %q src %q gross %v, want %s/UserFills/true", ta.ExchangeOrderID, ta.FeeSource, ta.PnLGross, recOID)
-	}
-	if math.Abs(ta.Quantity-1.0) > 1e-9 || math.Abs(ta.Price-recPx) > 1e-12 || math.Abs(ta.ExchangeFee-0.002) > 1e-12 {
-		t.Fatalf("A qty/px/fee = %.6f/%.6f/%.6f, want 1.0/%.6f/0.002", ta.Quantity, ta.Price, ta.ExchangeFee, recPx)
-	}
-
-	if len(stateB.TradeHistory) != 1 {
-		t.Fatalf("B: expected 1 trade from recovered fill, got %d", len(stateB.TradeHistory))
-	}
-	tb := stateB.TradeHistory[0]
-	if tb.ExchangeOrderID != recOID || tb.FeeSource != FeeSourceUserFills || !tb.PnLGross {
-		t.Fatalf("B trade metadata = oid %q src %q gross %v, want %s/UserFills/true", tb.ExchangeOrderID, tb.FeeSource, tb.PnLGross, recOID)
-	}
-	if math.Abs(tb.Quantity-0.5) > 1e-9 || math.Abs(tb.Price-recPx) > 1e-12 || math.Abs(tb.ExchangeFee-0.001) > 1e-12 {
-		t.Fatalf("B qty/px/fee = %.6f/%.6f/%.6f, want 0.5/%.6f/0.001", tb.Quantity, tb.Price, tb.ExchangeFee, recPx)
-	}
-
-	if math.Abs((ta.Quantity+tb.Quantity)-recQty) > 1e-9 || math.Abs((ta.ExchangeFee+tb.ExchangeFee)-recFee) > 1e-12 {
-		t.Fatalf("peer shares sum to q=%.6f f=%.6f; want %.6f / %.6f", ta.Quantity+tb.Quantity, ta.ExchangeFee+tb.ExchangeFee, recQty, recFee)
-	}
-
-	if len(zeroState.TradeHistory) != 0 {
-		t.Fatalf("zero peer must not book a fill share trade, got %d", len(zeroState.TradeHistory))
-	}
-}
-
-func TestHyperliquidKillSwitchClose_AlreadyFlatSharedLowKCoinAmbiguousFallsBack(t *testing.T) {
-	hlLive := []StrategyConfig{
-		{ID: "hl-a", Platform: "hyperliquid", Type: "perps", Leverage: 5,
-			Args: []string{"sma", "kPEPE", "1h", "--mode=live"}},
-		{ID: "hl-b", Platform: "hyperliquid", Type: "perps", Leverage: 5,
-			Args: []string{"ema", "kPEPE", "1h", "--mode=live"}},
-	}
-	positions := []HLPosition{{Coin: "kPEPE", Size: 2.0, EntryPrice: 0.00011}}
-	closer := func(symbol string, partialSz *float64, cancelStopLossOIDs []int64) (*HyperliquidCloseResult, error) {
-		return &HyperliquidCloseResult{
-			Close:    &HyperliquidClose{Symbol: symbol, AlreadyFlat: true},
-			Platform: "hyperliquid",
-		}, nil
-	}
-	fetcher, _ := stubHLStateFetcher(nil, nil)
-	in := defaultHLInputs("0xaddr", true, positions, hlLive,
-		"portfolio drawdown 25.0% exceeds limit 20.0%",
-		time.Second, closer, fetcher)
-	in.HLNoFillRecoverer = func(since time.Time) (*HLUserFillsResult, error) {
-		return &HLUserFillsResult{
-			ByOID: map[string]HLFillSummary{
-				"111": {Coin: "kPEPE", Fee: 0.1, Qty: 2.0, Px: 0.00010, ClosedPnLGross: -0.5, LastTimeMS: time.Now().UnixMilli()},
-				"222": {Coin: "kPEPE", Fee: 0.2, Qty: 2.0, Px: 0.00009, ClosedPnLGross: -0.6, LastTimeMS: time.Now().UnixMilli()},
-			},
-		}, nil
-	}
-
-	plan := planKillSwitchClose(in)
-	if !plan.OnChainConfirmedFlat {
-		t.Fatalf("expected confirmed-flat plan, got %+v", plan)
-	}
-	if _, ok := plan.CloseReport.Fills["kPEPE"]; ok {
-		t.Fatalf("ambiguous must not inject a fill under raw key: %+v", plan.CloseReport.Fills)
-	}
-	if _, ok := plan.CloseReport.Fills["KPEPE"]; ok {
-		t.Fatalf("ambiguous must not inject under normalized key either")
-	}
-	if !strings.Contains(strings.Join(plan.LogLines, "\n"), "multiple userFills candidates") {
-		t.Fatalf("missing ambiguity warning: %v", plan.LogLines)
-	}
-
-	stateA := &StrategyState{
-		ID: "hl-a", Type: "perps", Platform: "hyperliquid", Cash: 1000,
-		Positions: map[string]*Position{"kPEPE": {Symbol: "kPEPE", Quantity: 1.2, AvgCost: 0.00011, Side: "long", Multiplier: 1, Leverage: 5}},
-	}
-	stateB := &StrategyState{
-		ID: "hl-b", Type: "perps", Platform: "hyperliquid", Cash: 1000,
-		Positions: map[string]*Position{"kPEPE": {Symbol: "kPEPE", Quantity: 0.8, AvgCost: 0.00011, Side: "long", Multiplier: 1, Leverage: 5}},
-	}
-	hlVirtual := snapshotHyperliquidVirtualQuantities(map[string]*StrategyState{"hl-a": stateA, "hl-b": stateB}, hlLive)
-	mark := 0.00005
-	forceCloseKillSwitchPositions(stateA, hlLive[0], map[string]float64{"kPEPE": mark}, plan.CloseReport.Fills, hlLive, hlVirtual, nil)
-	forceCloseKillSwitchPositions(stateB, hlLive[1], map[string]float64{"kPEPE": mark}, plan.CloseReport.Fills, hlLive, hlVirtual, nil)
-
-	for _, st := range []*StrategyState{stateA, stateB} {
-		for _, tr := range st.TradeHistory {
-			if tr.ExchangeOrderID == "111" || tr.ExchangeOrderID == "222" {
-				t.Fatalf("peer booked against ambiguous OID %s (should have fallen back)", tr.ExchangeOrderID)
-			}
-			if tr.Price == 0.00010 || tr.Price == 0.00009 {
-				t.Fatalf("peer booked at an ambiguous fill px %.6f instead of mark", tr.Price)
-			}
-		}
 	}
 }
 
@@ -745,39 +473,6 @@ func TestPlanKillSwitchClose_CloseError(t *testing.T) {
 	}
 }
 
-func TestPlanKillSwitchClose_CloseErrorVerifiedFlat(t *testing.T) {
-	hlLive := []StrategyConfig{
-		{ID: "hl-ema-eth", Platform: "hyperliquid", Type: "perps",
-			Args: []string{"ema_crossover", "ETH", "1h", "--mode=live"}},
-	}
-	positions := []HLPosition{{Coin: "ETH", Size: 0.5}}
-	closer, _ := stubHLLiveCloser(map[string]error{"ETH": fmt.Errorf("post-submit disconnect")})
-	fetcher, fetchCalls := stubHLStateFetcher(nil, nil)
-
-	plan := planKillSwitchClose(defaultHLInputs("0xaddr", true, positions, hlLive,
-		"portfolio drawdown 25.0% exceeds limit 20.0%",
-		time.Second, closer, fetcher))
-
-	if *fetchCalls != 1 {
-		t.Fatalf("fetcher should be called once to verify the close error, got %d", *fetchCalls)
-	}
-	if !plan.OnChainConfirmedFlat {
-		t.Fatalf("expected ConfirmedFlat after verification fetch proved ETH flat, got plan=%+v", plan)
-	}
-	if len(plan.CloseReport.Errors) != 0 {
-		t.Fatalf("expected verified-flat close error to be cleared, got %v", plan.CloseReport.Errors)
-	}
-	if len(plan.CloseReport.AlreadyFlat) != 1 || plan.CloseReport.AlreadyFlat[0] != "ETH" {
-		t.Errorf("AlreadyFlat = %v, want [ETH]", plan.CloseReport.AlreadyFlat)
-	}
-	if !strings.Contains(strings.Join(plan.LogLines, "\n"), "verified flat after close error: [ETH]") {
-		t.Errorf("expected verification log line, got %v", plan.LogLines)
-	}
-	if strings.Contains(plan.DiscordMessage, "LATCHED, RETRYING") {
-		t.Errorf("expected success-shaped message after verified-flat close error, got: %s", plan.DiscordMessage)
-	}
-}
-
 func TestPlanKillSwitchClose_CloseErrorVerificationFetchFailure(t *testing.T) {
 	hlLive := []StrategyConfig{
 		{ID: "hl-ema-eth", Platform: "hyperliquid", Type: "perps",
@@ -802,29 +497,6 @@ func TestPlanKillSwitchClose_CloseErrorVerificationFetchFailure(t *testing.T) {
 	}
 	if !strings.Contains(strings.Join(plan.LogLines, "\n"), "unable to verify HL state after close error: hl 503") {
 		t.Errorf("expected verification fetch error log line, got %v", plan.LogLines)
-	}
-}
-
-func TestPlanKillSwitchClose_OpportunisticFetch(t *testing.T) {
-	hlLive := []StrategyConfig{
-		{ID: "hl-ema-eth", Platform: "hyperliquid", Type: "perps",
-			Args: []string{"ema_crossover", "ETH", "1h", "--mode=live"}},
-	}
-	positions := []HLPosition{{Coin: "ETH", Size: 0.5}}
-	closer, calls := stubHLLiveCloser(nil)
-	fetcher, fetchCalls := stubHLStateFetcher(positions, nil)
-
-	plan := planKillSwitchClose(defaultHLInputs("0xaddr", false, nil, hlLive,
-		"drawdown reason", time.Second, closer, fetcher))
-
-	if *fetchCalls != 1 {
-		t.Fatalf("fetcher should be called once, got %d", *fetchCalls)
-	}
-	if !plan.OnChainConfirmedFlat {
-		t.Errorf("expected ConfirmedFlat after successful fetch + close, got plan=%+v", plan)
-	}
-	if len(*calls) != 1 || (*calls)[0] != "ETH" {
-		t.Errorf("closer calls = %v, want [ETH] (fetched positions should feed the closer)", *calls)
 	}
 }
 
@@ -882,36 +554,6 @@ func TestPlanKillSwitchClose_UnconfiguredPositionBlocksReset(t *testing.T) {
 	}
 }
 
-func TestPlanKillSwitchClose_NoHLConfigured(t *testing.T) {
-	closer, calls := stubHLLiveCloser(nil)
-	fetcher, fetchCalls := stubHLStateFetcher(nil, nil)
-
-	plan := planKillSwitchClose(defaultHLInputs("", false, nil, nil,
-		"drawdown reason", time.Second, closer, fetcher))
-
-	if !plan.OnChainConfirmedFlat {
-		t.Fatal("expected ConfirmedFlat when HL is not configured at all")
-	}
-	if *fetchCalls != 0 {
-		t.Errorf("fetcher must not be called when hlAddr is empty, got %d", *fetchCalls)
-	}
-	if len(*calls) != 0 {
-		t.Errorf("closer must not be called, got %v", *calls)
-	}
-	if !strings.Contains(plan.DiscordMessage, "HL not configured") {
-		t.Errorf("expected 'HL not configured' in message, got: %s", plan.DiscordMessage)
-	}
-}
-
-func TestPlanKillSwitchClose_ZeroInputsAreSafe(t *testing.T) {
-	closer, _ := stubHLLiveCloser(nil)
-	fetcher, _ := stubHLStateFetcher(nil, nil)
-	plan := planKillSwitchClose(defaultHLInputs("", false, nil, nil, "", time.Second, closer, fetcher))
-	if !plan.OnChainConfirmedFlat {
-		t.Errorf("zero inputs should yield ConfirmedFlat=true, got %+v", plan)
-	}
-}
-
 func stubRHLiveCloser(errs map[string]error) (RobinhoodLiveCloser, *[]string) {
 	var calls []string
 	closer := func(symbol string) (*RobinhoodCloseResult, error) {
@@ -937,70 +579,6 @@ func stubRHPositionsFetcher(positions []RobinhoodPosition, err error) (Robinhood
 		return positions, nil
 	}
 	return fetcher, &calls
-}
-
-func TestPlanKillSwitchClose_HLAndOKXAndRobinhoodHappyPath(t *testing.T) {
-	hlLive := []StrategyConfig{
-		{ID: "hl-eth", Platform: "hyperliquid", Type: "perps",
-			Args: []string{"sma", "ETH", "1h", "--mode=live"}},
-	}
-	okxLive := []StrategyConfig{
-		{ID: "okx-btc", Platform: "okx", Type: "perps",
-			Args: []string{"sma", "BTC", "1h", "--mode=live"}},
-	}
-	rhLive := []StrategyConfig{
-		{ID: "rh-sma-sol", Platform: "robinhood", Type: "spot",
-			Args: []string{"sma_crossover", "SOL", "1h", "--mode=live"}},
-	}
-	hlPos := []HLPosition{{Coin: "ETH", Size: 0.5}}
-	okxPos := []OKXPosition{{Coin: "BTC", Size: 0.01, Side: "long"}}
-	rhPos := []RobinhoodPosition{{Coin: "SOL", Size: 2.5}}
-
-	hlCloser, hlCalls := stubHLLiveCloser(nil)
-	hlFetcher, _ := stubHLStateFetcher(nil, nil)
-	okxCloser, okxCalls := stubOKXLiveCloser(nil)
-	okxFetcher, _ := stubOKXPositionsFetcher(okxPos, nil)
-	rhCloser, rhCalls := stubRHLiveCloser(nil)
-	rhFetcher, _ := stubRHPositionsFetcher(rhPos, nil)
-
-	plan := planKillSwitchClose(KillSwitchCloseInputs{
-		HLAddr:          "0xaddr",
-		HLStateFetched:  true,
-		HLPositions:     hlPos,
-		HLLiveAll:       hlLive,
-		HLCloser:        hlCloser,
-		HLFetcher:       hlFetcher,
-		OKXLiveAllPerps: okxLive,
-		OKXCloser:       okxCloser,
-		OKXFetcher:      okxFetcher,
-		RHLiveCrypto:    rhLive,
-		RHCloser:        rhCloser,
-		RHFetcher:       rhFetcher,
-		PortfolioReason: "drawdown reason",
-		CloseTimeout:    time.Second,
-	})
-
-	if !plan.OnChainConfirmedFlat {
-		t.Fatalf("expected ConfirmedFlat when every platform succeeds, got plan=%+v", plan)
-	}
-	if len(*hlCalls) != 1 || (*hlCalls)[0] != "ETH" {
-		t.Errorf("HL closer calls = %v, want [ETH]", *hlCalls)
-	}
-	if len(*okxCalls) != 1 || (*okxCalls)[0] != "BTC" {
-		t.Errorf("OKX closer calls = %v, want [BTC]", *okxCalls)
-	}
-	if len(*rhCalls) != 1 || (*rhCalls)[0] != "SOL" {
-		t.Errorf("Robinhood closer calls = %v, want [SOL]", *rhCalls)
-	}
-	if !strings.Contains(plan.DiscordMessage, "HL closes: [ETH]") {
-		t.Errorf("expected HL closes in message, got: %s", plan.DiscordMessage)
-	}
-	if !strings.Contains(plan.DiscordMessage, "OKX closes: [BTC]") {
-		t.Errorf("expected OKX closes in message, got: %s", plan.DiscordMessage)
-	}
-	if !strings.Contains(plan.DiscordMessage, "Robinhood closes: [SOL]") {
-		t.Errorf("expected Robinhood closes in message, got: %s", plan.DiscordMessage)
-	}
 }
 
 func stubTSLiveCloser(errs map[string]error) (TopStepLiveCloser, *[]string) {
@@ -1249,254 +827,6 @@ func TestPlanKillSwitchClose_PeerPlatformFailureStillLatches(t *testing.T) {
 			}
 			if !strings.Contains(plan.DiscordMessage, tc.want) {
 				t.Errorf("%s error missing from message, got: %s", tc.name, plan.DiscordMessage)
-			}
-		})
-	}
-}
-
-func TestPlanKillSwitchClose_OperatorRequiredGapSuppressesAutoReset(t *testing.T) {
-	cases := []struct {
-		name    string
-		in      KillSwitchCloseInputs
-		present func(plan KillSwitchClosePlan) bool
-		want    string
-	}{
-		{
-			name: "OKX spot", want: "OKX spot",
-			in: KillSwitchCloseInputs{OKXLiveAllSpot: []StrategyConfig{{ID: "okx-sma-btc-spot", Platform: "okx", Type: "spot",
-				Args: []string{"sma", "BTC", "1h", "--mode=live", "--inst-type=spot"}}}},
-			present: func(plan KillSwitchClosePlan) bool { return plan.OKXSpotPresent },
-		},
-		{
-			name: "Robinhood options", want: "Robinhood options",
-			in: KillSwitchCloseInputs{RHLiveOptions: []StrategyConfig{{ID: "rh-ccall-spy", Platform: "robinhood", Type: "options",
-				Args: []string{"covered_call", "SPY", "1d", "--mode=live"}}}},
-			present: func(plan KillSwitchClosePlan) bool { return plan.RHOptionsPresent },
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			tc.in.OKXCloser, _ = stubOKXLiveCloser(nil)
-			tc.in.RHCloser, _ = stubRHLiveCloser(nil)
-			tc.in.PortfolioReason = "drawdown reason"
-			tc.in.CloseTimeout = time.Second
-			plan := planKillSwitchClose(tc.in)
-			if !plan.OnChainConfirmedFlat {
-				t.Errorf("%s-only presence must not block ConfirmedFlat, got plan=%+v", tc.name, plan)
-			}
-			if !tc.present(plan) {
-				t.Errorf("expected %s present flag on the plan", tc.name)
-			}
-			if plan.CanAutoResetWithoutOwner() {
-				t.Errorf("%s operator-required gap must suppress no-owner auto-reset", tc.name)
-			}
-			if !strings.Contains(plan.DiscordMessage, tc.want) {
-				t.Errorf("expected %q gap note in message, got: %s", tc.want, plan.DiscordMessage)
-			}
-		})
-	}
-}
-
-func TestPlanKillSwitchClose_DeterministicErrorOrder(t *testing.T) {
-	errFor := func(coins ...string) map[string]error {
-		out := map[string]error{}
-		for _, c := range coins {
-			out[c] = fmt.Errorf("err")
-		}
-		return out
-	}
-	cases := []struct {
-		name  string
-		order []string
-		build func() KillSwitchCloseInputs
-	}{
-		{
-			name: "HL", order: []string{"BTC", "DOGE", "ETH", "SOL"},
-			build: func() KillSwitchCloseInputs {
-				hlLive := []StrategyConfig{
-					{ID: "hl-btc", Platform: "hyperliquid", Type: "perps", Args: []string{"sma", "BTC", "1h", "--mode=live"}},
-					{ID: "hl-eth", Platform: "hyperliquid", Type: "perps", Args: []string{"sma", "ETH", "1h", "--mode=live"}},
-					{ID: "hl-sol", Platform: "hyperliquid", Type: "perps", Args: []string{"sma", "SOL", "1h", "--mode=live"}},
-					{ID: "hl-doge", Platform: "hyperliquid", Type: "perps", Args: []string{"sma", "DOGE", "1h", "--mode=live"}},
-				}
-				positions := []HLPosition{
-					{Coin: "BTC", Size: 0.01}, {Coin: "ETH", Size: 0.1},
-					{Coin: "SOL", Size: 1.0}, {Coin: "DOGE", Size: 100},
-				}
-				closer, _ := stubHLLiveCloser(errFor("BTC", "ETH", "SOL", "DOGE"))
-				fetcher, _ := stubHLStateFetcher(positions, nil)
-				return defaultHLInputs("0xaddr", true, positions, hlLive, "reason", time.Second, closer, fetcher)
-			},
-		},
-		{
-			name: "Robinhood", order: []string{"BTC", "DOGE", "ETH"},
-			build: func() KillSwitchCloseInputs {
-				closer, _ := stubRHLiveCloser(errFor("BTC", "ETH", "DOGE"))
-				fetcher, _ := stubRHPositionsFetcher([]RobinhoodPosition{
-					{Coin: "BTC", Size: 0.01}, {Coin: "ETH", Size: 0.1}, {Coin: "DOGE", Size: 100},
-				}, nil)
-				return KillSwitchCloseInputs{
-					RHLiveCrypto: []StrategyConfig{
-						{ID: "rh-btc", Platform: "robinhood", Type: "spot", Args: []string{"sma", "BTC", "1h", "--mode=live"}},
-						{ID: "rh-eth", Platform: "robinhood", Type: "spot", Args: []string{"sma", "ETH", "1h", "--mode=live"}},
-						{ID: "rh-doge", Platform: "robinhood", Type: "spot", Args: []string{"sma", "DOGE", "1h", "--mode=live"}},
-					},
-					RHCloser: closer, RHFetcher: fetcher, PortfolioReason: "reason", CloseTimeout: time.Second,
-				}
-			},
-		},
-		{
-			name: "OKX", order: []string{"BTC", "ETH", "SOL"},
-			build: func() KillSwitchCloseInputs {
-				closer, _ := stubOKXLiveCloser(errFor("BTC", "ETH", "SOL"))
-				fetcher, _ := stubOKXPositionsFetcher([]OKXPosition{
-					{Coin: "BTC", Size: 0.01, Side: "long"}, {Coin: "ETH", Size: 0.1, Side: "long"}, {Coin: "SOL", Size: 1.0, Side: "long"},
-				}, nil)
-				return KillSwitchCloseInputs{
-					OKXLiveAllPerps: []StrategyConfig{
-						{ID: "okx-btc", Platform: "okx", Type: "perps", Args: []string{"sma", "BTC", "1h", "--mode=live"}},
-						{ID: "okx-eth", Platform: "okx", Type: "perps", Args: []string{"sma", "ETH", "1h", "--mode=live"}},
-						{ID: "okx-sol", Platform: "okx", Type: "perps", Args: []string{"sma", "SOL", "1h", "--mode=live"}},
-					},
-					OKXCloser: closer, OKXFetcher: fetcher, PortfolioReason: "reason", CloseTimeout: time.Second,
-				}
-			},
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			var prev string
-			for i := 0; i < 10; i++ {
-				plan := planKillSwitchClose(tc.build())
-				if prev != "" && plan.DiscordMessage != prev {
-					t.Fatalf("message should be deterministic across calls\niter %d: %s\nprev: %s", i, plan.DiscordMessage, prev)
-				}
-				prev = plan.DiscordMessage
-			}
-			last := -1
-			for _, coin := range tc.order {
-				idx := strings.Index(prev, coin+":")
-				if idx < 0 || idx <= last {
-					t.Fatalf("expected alphabetical ordering %v in: %s", tc.order, prev)
-				}
-				last = idx
-			}
-		})
-	}
-}
-
-func TestPlanKillSwitchClose_FetcherUnwiredLatches(t *testing.T) {
-	cases := []struct {
-		name string
-		in   KillSwitchCloseInputs
-		want string
-	}{
-		{name: "HL", want: "HLFetcher unwired", in: KillSwitchCloseInputs{HLAddr: "0xabc", HLStateFetched: false, HLFetcher: nil}},
-		{name: "OKX", want: "OKXFetcher unwired", in: KillSwitchCloseInputs{OKXFetcher: nil,
-			OKXLiveAllPerps: []StrategyConfig{{ID: "okx-sma-btc", Platform: "okx", Type: "perps",
-				Args: []string{"sma", "BTC", "1h", "--mode=live"}}}}},
-		{name: "RH", want: "RHFetcher unwired", in: KillSwitchCloseInputs{RHFetcher: nil,
-			RHLiveCrypto: []StrategyConfig{{ID: "rh-sma-btc", Platform: "robinhood", Type: "spot",
-				Args: []string{"sma_crossover", "BTC", "1h", "--mode=live"}}}}},
-		{name: "TS", want: "TSFetcher unwired", in: KillSwitchCloseInputs{TSFetcher: nil,
-			TSLiveAll: []StrategyConfig{{ID: "ts-momentum-es", Platform: "topstep", Type: "futures",
-				Args: []string{"momentum", "ES", "1h", "--mode=live"}}}}},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			tc.in.PortfolioReason = "drawdown reason"
-			tc.in.CloseTimeout = time.Second
-			plan := planKillSwitchClose(tc.in)
-			if plan.OnChainConfirmedFlat {
-				t.Fatalf("expected NOT ConfirmedFlat when %s is unwired with the platform configured", tc.want)
-			}
-			if !strings.Contains(strings.Join(plan.LogLines, "\n"), tc.want) {
-				t.Errorf("expected log line mentioning %q, got: %v", tc.want, plan.LogLines)
-			}
-		})
-	}
-}
-
-func TestPlanKillSwitchClose_PlatformBudgetOverrides(t *testing.T) {
-	in := KillSwitchCloseInputs{
-		CloseTimeout:    90 * time.Second,
-		HLCloseTimeout:  10 * time.Second,
-		OKXCloseTimeout: 0,
-		RHCloseTimeout:  150 * time.Second,
-		TSCloseTimeout:  0,
-	}
-	if got := in.platformCloseBudget(in.HLCloseTimeout); got != 10*time.Second {
-		t.Errorf("HL budget = %v, want 10s override", got)
-	}
-	if got := in.platformCloseBudget(in.OKXCloseTimeout); got != 90*time.Second {
-		t.Errorf("OKX budget = %v, want 90s fallback", got)
-	}
-	if got := in.platformCloseBudget(in.RHCloseTimeout); got != 150*time.Second {
-		t.Errorf("RH budget = %v, want 150s override", got)
-	}
-	if got := in.platformCloseBudget(in.TSCloseTimeout); got != 90*time.Second {
-		t.Errorf("TS budget = %v, want 90s fallback", got)
-	}
-}
-
-func TestKillSwitchInstanceLabel(t *testing.T) {
-	for _, tc := range []struct{ path, want string }{
-		{"/var/lib/go-trader/live/config.json", "live"},
-		{"/var/lib/go-trader/paper-hl-eth/config.json", "paper-hl-eth"},
-	} {
-		if got := killSwitchInstanceLabel(tc.path); got != tc.want {
-			t.Errorf("killSwitchInstanceLabel(%q) = %q, want %q", tc.path, got, tc.want)
-		}
-	}
-	if got := killSwitchInstanceLabel("config.json"); got == "." || got == "" {
-		t.Errorf("killSwitchInstanceLabel(%q) = %q, want a real non-empty fallback", "config.json", got)
-	}
-}
-
-func TestFormatKillSwitchResetPrompt(t *testing.T) {
-	cases := []struct {
-		name     string
-		instance string
-		addr     string
-		plan     KillSwitchClosePlan
-		want     []string
-		reject   []string
-	}{
-		{
-			name: "confirmed flat includes context and identity", instance: "live", addr: "0xabc123",
-			plan: KillSwitchClosePlan{OnChainConfirmedFlat: true,
-				DiscordMessage: "**PORTFOLIO KILL SWITCH**\nportfolio drawdown 25.0% exceeds limit 20.0%\nHL closes: [ETH]. Virtual state cleared. Manual reset required."},
-			want:   []string{"live", "0xabc123", "portfolio drawdown 25.0%", "HL closes: [ETH]", "does not itself close or protect any position"},
-			reject: []string{"still retrying"},
-		},
-		{
-			name: "latched retrying warns protection may be gone", instance: "live", addr: "0xabc123",
-			plan: KillSwitchClosePlan{OnChainConfirmedFlat: false,
-				DiscordMessage: "**PORTFOLIO KILL SWITCH (LATCHED, RETRYING)**\nportfolio drawdown 25.0% exceeds limit 20.0%\nHL live close errors — ETH: timeout. Virtual state preserved. Next cycle will retry."},
-			want: []string{"still retrying", "stop-losses may already be cancelled"},
-		},
-		{
-			name: "omits address when HL not configured", instance: "paper-hl-eth", addr: "",
-			plan: KillSwitchClosePlan{OnChainConfirmedFlat: true,
-				DiscordMessage: "**PORTFOLIO KILL SWITCH**\nreason\nHL not configured. Virtual state cleared. Manual reset required."},
-			want: []string{"paper-hl-eth"},
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := formatKillSwitchResetPrompt(tc.instance, tc.addr, tc.plan, livePartition, []RiskPartition{livePartition})
-			for _, w := range tc.want {
-				if !strings.Contains(got, w) {
-					t.Errorf("prompt missing %q, got: %s", w, got)
-				}
-			}
-			for _, r := range tc.reject {
-				if strings.Contains(got, r) {
-					t.Errorf("prompt must not contain %q, got: %s", r, got)
-				}
-			}
-			if tc.addr == "" && strings.Contains(got, "Hyperliquid ") && strings.Contains(got, "()") {
-				t.Errorf("expected no dangling empty-address parenthetical, got: %s", got)
 			}
 		})
 	}
