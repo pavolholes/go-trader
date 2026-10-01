@@ -522,6 +522,7 @@ def main():
         parser.add_argument("--position-qty", type=float, default=None)
         parser.add_argument("--position-initial-qty", type=float, default=None)
         parser.add_argument("--position-entry-atr", type=float, default=None)
+        parser.add_argument("--position-risk-anchor-price", type=float, default=None)
         parser.add_argument("--position-regime", default="")
         parser.add_argument("--mark-price", type=float, default=0.0)
         parser.add_argument("--probe-only", action="store_true")
