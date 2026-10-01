@@ -28,7 +28,7 @@ symlink to it).
 | `scheduler/blofin_exec.go` | `blofinIsLive`, `blofinSymbol`, `runBloFinCheck`, `executeBloFinResult`, copy-trading dispatch |
 | `scheduler/blofin_close.go` | Force-close / circuit-breaker close via `close_blofin_position.py` |
 | `scheduler/blofin_marks.go` | `fetchBloFinPerpsMids` via `/api/v1/market/tickers?instType=SWAP` |
-| `shared_scripts/check_blofin.py` | `--inst-type {swap,spot}` (default `swap`); spot branch uses `spot_adapter`; `--atr-method`; regime/HTF passthrough; `--htf-timeframe/--htf-limit` (deep HTF fetch injected as `htf_df` for `ob_touch`, fail-closed); `_detect_inst_type` accepts `--inst-type spot` and `--inst-type=swap`; LTF floor 600 bars for `ob_touch`+HTF (swing-50 needs ~500+ bars to mature) |
+| `shared_scripts/check_blofin.py` | `--inst-type {swap,spot}` (default `swap`); spot branch uses `spot_adapter`; `--atr-method`; regime/HTF passthrough; `--htf-timeframe/--htf-limit` (deep HTF fetch injected as `htf_df` for `ob_touch`, fail-closed); `_detect_inst_type` accepts `--inst-type spot` and `--inst-type=swap`; LTF floor 600 bars for `ob_touch`+HTF (swing-50 needs ~500+ bars to mature) | Accepts `--position-risk-anchor-price` (upstream probe parity, ignored like Topstep) |
 | `shared_scripts/check_topstep.py` | `--htf-timeframe/--htf-limit` (same HTF injection; paper serves yfinance NQ=F); yahoo fetch has bounded retry (3x/5s) for flaky `fc.yahoo.com`; same LTF floor 600 |
 | `shared_scripts/close_blofin_position.py` | Emergency close via `adapter.market_close()` (swap only) |
 | `shared_scripts/fetch_blofin_positions.py` | Open positions fetch (swap) |
