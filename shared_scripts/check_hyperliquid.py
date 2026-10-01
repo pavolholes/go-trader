@@ -43,26 +43,33 @@ def _hyperliquid_adapter():
     not ours, the file is loaded by path under a distinct module name.
     """
     mod = sys.modules.get("hyperliquid_platform_adapter")
-    if mod is None:
-        try:
-            # NOTE: plain __import__ (not importlib.import_module) so test
-            # doubles patching builtins.__import__ keep working.
-            cand = __import__("adapter", fromlist=["HyperliquidExchangeAdapter"])
-        except ImportError:
-            cand = None
-        if cand is not None and hasattr(cand, "HyperliquidExchangeAdapter"):
-            mod = cand
-        else:
-            import importlib.util
-            path = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)),
-                "..", "platforms", "hyperliquid", "adapter.py",
-            )
-            spec = importlib.util.spec_from_file_location(
-                "hyperliquid_platform_adapter", path)
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-        sys.modules["hyperliquid_platform_adapter"] = mod
+    if mod is not None:
+        return mod
+    try:
+        # NOTE: plain __import__ (not importlib.import_module) so test
+        # doubles patching builtins.__import__ keep working.
+        cand = __import__("adapter", fromlist=["HyperliquidExchangeAdapter"])
+    except ImportError:
+        cand = None
+    cand_file = getattr(cand, "__file__", None)
+    if isinstance(cand_file, str):
+        if cand_file.replace(os.sep, "/").endswith("platforms/hyperliquid/adapter.py"):
+            sys.modules["hyperliquid_platform_adapter"] = cand
+            return cand
+    elif cand is not None and hasattr(cand, "HyperliquidExchangeAdapter"):
+        # Test double (no real __file__): use it but never cache it, so it
+        # cannot leak into other tests sharing this process.
+        return cand
+    import importlib.util
+    path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "..", "platforms", "hyperliquid", "adapter.py",
+    )
+    spec = importlib.util.spec_from_file_location(
+        "hyperliquid_platform_adapter", path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["hyperliquid_platform_adapter"] = mod
+    spec.loader.exec_module(mod)
     return mod
 
 from atr import ensure_atr_indicator, latest_atr

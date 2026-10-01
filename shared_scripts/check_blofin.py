@@ -34,25 +34,32 @@ def _blofin_adapter():
     import sys as _sys
     import os as _os
     mod = _sys.modules.get("blofin_platform_adapter")
-    if mod is None:
-        try:
-            # NOTE: plain __import__ (not importlib.import_module) so test
-            # doubles patching builtins.__import__ keep working.
-            cand = __import__("adapter", fromlist=["BloFinExchangeAdapter"])
-        except ImportError:
-            cand = None
-        if cand is not None and hasattr(cand, "BloFinExchangeAdapter"):
-            mod = cand
-        else:
-            import importlib.util as _ilu
-            path = _os.path.join(
-                _os.path.dirname(_os.path.abspath(__file__)),
-                "..", "platforms", "blofin", "adapter.py",
-            )
-            spec = _ilu.spec_from_file_location("blofin_platform_adapter", path)
-            mod = _ilu.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-        _sys.modules["blofin_platform_adapter"] = mod
+    if mod is not None:
+        return mod
+    try:
+        # NOTE: plain __import__ (not importlib.import_module) so test
+        # doubles patching builtins.__import__ keep working.
+        cand = __import__("adapter", fromlist=["BloFinExchangeAdapter"])
+    except ImportError:
+        cand = None
+    cand_file = getattr(cand, "__file__", None)
+    if isinstance(cand_file, str):
+        if cand_file.replace(_os.sep, "/").endswith("platforms/blofin/adapter.py"):
+            _sys.modules["blofin_platform_adapter"] = cand
+            return cand
+    elif cand is not None and hasattr(cand, "BloFinExchangeAdapter"):
+        # Test double (no real __file__): use it but never cache it, so it
+        # cannot leak into other tests sharing this process.
+        return cand
+    import importlib.util as _ilu
+    path = _os.path.join(
+        _os.path.dirname(_os.path.abspath(__file__)),
+        "..", "platforms", "blofin", "adapter.py",
+    )
+    spec = _ilu.spec_from_file_location("blofin_platform_adapter", path)
+    mod = _ilu.module_from_spec(spec)
+    _sys.modules["blofin_platform_adapter"] = mod
+    spec.loader.exec_module(mod)
     return mod
 
 from atr import ensure_atr_indicator, latest_atr
