@@ -15,6 +15,10 @@ symlink to it).
 | `docs/GO-TRADER_OVERRIDES_PAVOL.md` | This file |
 | `shared_strategies/open/ob_touch.py` | `ob_touch_core` SMC order-block touch entries with 1H overlap confirmation (TradingView Institutional Level entry port; section 10) |
 | `shared_strategies/open/test_ob_touch.py` | 21 behavior tests for `ob_touch` (zone math, first-touch, mitigation, HTF gate, no-lookahead) |
+| `platforms/blofin/test_ohlcv_pagination.py` | Perps/spot multi-page history tests (1440 response cap, cursor overlap dedupe) |
+| `platforms/topstep/test_yahoo_retry.py` | Yahoo transient retry, outage fail-closed, and 60d/7d interval period policy tests |
+| `shared_scripts/test_check_blofin_inst_type.py` | Regression tests for equals- and space-separated spot/swap registry selection |
+| `shared_scripts/test_check_ob_touch_history_floor.py` | Regression tests for 5m=2000 and 15m=1200 LTF fetch floors in BloFin/TopStep checks |
 | `scheduler/config_pavol_test.go` | Fork config tests (perps leverage, spot rejection, Discord channel env) — upstream #1597 deleted the original file content, ours live here |
 | `scheduler/risk_pavol_test.go` | Fork risk tests (BloFin force-close, concise warning, spot multiplier) — same reason |
 | `scheduler/portfolio_pavol_test.go` | Fork spot valuation test — same reason |
