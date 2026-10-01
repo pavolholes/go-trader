@@ -65,11 +65,26 @@ def _blofin_adapter():
 from atr import ensure_atr_indicator, latest_atr
 from regime import latest_regime, parse_regime_windows_spec_json, prepare_check_regime
 
-_inst_type = "swap"
-for _arg in sys.argv:
-    if _arg.startswith("--inst-type="):
-        _inst_type = _arg.split("=", 1)[1]
-        break
+# Minimum LTF bars for ob_touch + HTF confirmation: the swing structure
+# (default lookback 50) needs ~500-600 bars to mature; shorter windows sit
+# at trend 0 and the swing filter blocks everything. Measured on BTC 5m.
+_OB_TOUCH_MIN_LTF_BARS = 600
+
+def _detect_inst_type(argv) -> str:
+    """Pick 'swap' vs 'spot' from raw argv.
+
+    Accepts both ``--inst-type=swap`` and ``--inst-type swap`` because demo
+    configs use the space-separated form.
+    """
+    for idx, arg in enumerate(argv):
+        if arg.startswith("--inst-type="):
+            return arg.split("=", 1)[1]
+        if arg == "--inst-type" and idx + 1 < len(argv):
+            return argv[idx + 1]
+    return "swap"
+
+
+_inst_type = _detect_inst_type(sys.argv)
 
 if _inst_type == "spot":
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'shared_strategies', 'open', 'spot'))
@@ -159,6 +174,17 @@ def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=
                 print(f"Funding rate {symbol}: current={current_rate:.6f} avg7d={avg_rate:.6f}", file=sys.stderr)
             except Exception as e:
                 print(f"Warning: failed to fetch funding rate: {e}", file=sys.stderr)
+
+        # ob_touch needs a mature swing structure (lookback 50): measured
+        # trend stays 0 on 200-400 bar windows and matures at ~500-600 bars.
+        # Enforce the floor here (post-argparse) so a scheduler-appended
+        # --ohlcv-limit cannot shrink it again.
+        eff_open_for_depth = (open_strategy or strategy_name or "").strip()
+        if htf_timeframe and eff_open_for_depth == "ob_touch":
+            try:
+                ohlcv_limit = max(int(ohlcv_limit or 0), _OB_TOUCH_MIN_LTF_BARS)
+            except (TypeError, ValueError):
+                ohlcv_limit = _OB_TOUCH_MIN_LTF_BARS
 
         print(f"Fetching {symbol} {timeframe} from BloFin ({mode})...", file=sys.stderr)
         if inst_type == "spot":

@@ -8,6 +8,7 @@ _OB_TOUCH = load_module("_ob_touch_test", __file__.replace("test_ob_touch.py", "
 ob_touch_core = _OB_TOUCH.ob_touch_core
 _zones_overlap = _OB_TOUCH._zones_overlap
 _bar_in_overlap = _OB_TOUCH._bar_in_overlap
+_confirmed_pivots = _OB_TOUCH._confirmed_pivots
 
 
 def _scenario():
@@ -67,6 +68,24 @@ class TestEntry:
         out = _run(_mirror(_scenario()))
         assert out["signal"].iloc[10] == -1
         assert (out["signal"] != 0).sum() == 1
+
+    def test_reentry_after_exit_fires_again(self):
+        # Pine parity: obtouch is a fresh crossunder on every re-entry.
+        # Touch bar 10, leave bar 11 (low back above the top), re-enter
+        # bar 12 (fires again), stay inside bar 13 (no repeat).
+        closes = [100, 101, 102, 100, 99, 100, 99, 99, 101, 103,
+                  100, 100.5, 100, 100]
+        highs = [100.3, 101.3, 102.3, 100.3, 99.3, 100.3, 99.3, 99.5,
+                 101.3, 103.3, 100.5, 101, 101, 100.5]
+        lows = [99.7, 100.7, 101.7, 99.3, 98.3, 99.3, 98.5, 98.0,
+                100.5, 102.5, 98.2, 99.0, 98.3, 98.4]
+        df = make_ohlcv(closes, opens=closes, highs=highs, lows=lows)
+        out = _run(df)
+        assert out["signal"].iloc[10] == 1
+        assert out["signal"].iloc[11] == 0
+        assert out["signal"].iloc[12] == 1
+        assert out["signal"].iloc[13] == 0
+        assert (out["signal"] != 0).sum() == 2
 
     def test_close_touch_mode_ignores_wick(self):
         out = _run(_scenario(), touch_mode="close")
@@ -164,6 +183,20 @@ class TestHelpers:
         assert _bar_in_overlap(10.0, 8.0, 7.5, 7.0, 7.2, "wick") is False
         assert _bar_in_overlap(10.0, 8.0, 11.0, 7.0, 8.5, "close") is True
         assert _bar_in_overlap(10.0, 8.0, 11.0, 7.0, 10.5, "close") is False
+
+
+class TestDepth:
+    def test_pivots_need_full_window(self):
+        high = np.linspace(100.0, 110.0, 10)
+        low = np.linspace(99.0, 109.0, 10)
+        ch, cl = _confirmed_pivots(high, low, 5)
+        assert not ch.any() and not cl.any()
+
+    def test_pivots_confirm_with_enough_history(self):
+        high = np.array([10.0, 11, 12, 20, 12, 11, 10, 9, 8, 7, 6.0])
+        low = np.linspace(5.0, 4.0, 11)
+        ch, _ = _confirmed_pivots(high, low, 2)
+        assert ch[5] and ch.sum() == 1
 
 
 class TestRobustness:

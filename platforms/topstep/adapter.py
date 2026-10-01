@@ -262,35 +262,47 @@ class TopStepExchangeAdapter:
             return []
         try:
             import yfinance as yf
-            yf_interval = interval
-            if "m" in interval:
-                period = "5d"
-            elif interval in ("1h", "60m"):
-                period = "30d"
-            else:
-                period = "1y"
-            ticker = yf.Ticker(yahoo_sym)
-            hist = ticker.history(period=period, interval=yf_interval)
-            if hist.empty:
-                return []
-            result = []
-            for idx, row in hist.iterrows():
-                ts_ms = int(idx.timestamp() * 1000)
-                result.append([
-                    ts_ms,
-                    float(row["Open"]),
-                    float(row["High"]),
-                    float(row["Low"]),
-                    float(row["Close"]),
-                    float(row.get("Volume", 0)),
-                ])
-            return result[-limit:]
         except ImportError:
             print("[topstep] yfinance not installed — paper mode has no OHLCV data. Run: uv add yfinance", file=sys.stderr)
             return []
-        except Exception as e:
-            print(f"[topstep] yahoo ohlcv error for {symbol}: {e}", file=sys.stderr)
-            return []
+        # Yahoo's cookie/auth endpoint is flaky from datacenter networks:
+        # a single failed burst used to fail-closed the whole check.
+        # Bounded retry (3 attempts) rides out transient failures; a
+        # persistent outage still returns [] and fail-closes downstream.
+        last_error = None
+        for attempt in (1, 2, 3):
+            try:
+                yf_interval = interval
+                if "m" in interval:
+                    period = "5d"
+                elif interval in ("1h", "60m"):
+                    period = "30d"
+                else:
+                    period = "1y"
+                ticker = yf.Ticker(yahoo_sym)
+                hist = ticker.history(period=period, interval=yf_interval)
+                if hist.empty:
+                    last_error = "empty history"
+                    raise ValueError("empty history")
+                result = []
+                for idx, row in hist.iterrows():
+                    ts_ms = int(idx.timestamp() * 1000)
+                    result.append([
+                        ts_ms,
+                        float(row["Open"]),
+                        float(row["High"]),
+                        float(row["Low"]),
+                        float(row["Close"]),
+                        float(row.get("Volume", 0)),
+                    ])
+                return result[-limit:]
+            except Exception as e:
+                last_error = e
+                print(f"[topstep] yahoo ohlcv error for {symbol} (attempt {attempt}/3): {e}", file=sys.stderr)
+                if attempt < 3:
+                    time.sleep(5)
+        print(f"[topstep] yahoo ohlcv error for {symbol}: {last_error}", file=sys.stderr)
+        return []
 
 
     def market_open(self, symbol: str, is_buy: bool, contracts: int) -> dict:

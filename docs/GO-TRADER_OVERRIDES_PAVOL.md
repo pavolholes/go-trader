@@ -28,8 +28,8 @@ symlink to it).
 | `scheduler/blofin_exec.go` | `blofinIsLive`, `blofinSymbol`, `runBloFinCheck`, `executeBloFinResult`, copy-trading dispatch |
 | `scheduler/blofin_close.go` | Force-close / circuit-breaker close via `close_blofin_position.py` |
 | `scheduler/blofin_marks.go` | `fetchBloFinPerpsMids` via `/api/v1/market/tickers?instType=SWAP` |
-| `shared_scripts/check_blofin.py` | `--inst-type {swap,spot}` (default `swap`); spot branch uses `spot_adapter`; `--atr-method`; regime/HTF passthrough; `--htf-timeframe/--htf-limit` (deep HTF fetch injected as `htf_df` for `ob_touch`, fail-closed) |
-| `shared_scripts/check_topstep.py` | `--htf-timeframe/--htf-limit` (same HTF injection; paper serves yfinance NQ=F) |
+| `shared_scripts/check_blofin.py` | `--inst-type {swap,spot}` (default `swap`); spot branch uses `spot_adapter`; `--atr-method`; regime/HTF passthrough; `--htf-timeframe/--htf-limit` (deep HTF fetch injected as `htf_df` for `ob_touch`, fail-closed); `_detect_inst_type` accepts `--inst-type spot` and `--inst-type=swap`; LTF floor 600 bars for `ob_touch`+HTF (swing-50 needs ~500+ bars to mature) |
+| `shared_scripts/check_topstep.py` | `--htf-timeframe/--htf-limit` (same HTF injection; paper serves yfinance NQ=F); yahoo fetch has bounded retry (3x/5s) for flaky `fc.yahoo.com`; same LTF floor 600 |
 | `shared_scripts/close_blofin_position.py` | Emergency close via `adapter.market_close()` (swap only) |
 | `shared_scripts/fetch_blofin_positions.py` | Open positions fetch (swap) |
 | `shared_scripts/fetch_blofin_balance.py` | USDT equity fetch (futures) |
@@ -107,5 +107,6 @@ Lavy stlpec (zoznam strategii + search + sparklines) je odstraneny z Table aj Su
 | `backtest/optimizer.py` | `DEFAULT_PARAM_RANGES["ob_touch"]` (CI param-ranges test fails without it) |
 | `scheduler/init.go` | `knownShortNames["ob_touch"]="obt"` (`"ob"` is taken); `bidirectionalPerpsStrategies["ob_touch"]=true` |
 | `shared_scripts/check_blofin.py`, `check_topstep.py` | `--htf-timeframe/--htf-limit` + `htf_df` injection gated on the effective open strategy being `ob_touch` |
+| first-touch semantics | Pine parity kept: every fresh wick entry into the same zone fires again (crossunder semantics); pinned by `test_reentry_after_exit_fires_again`, no consumed-zone tracking |
 
 Demo-side (outside this repo, survives merges by location): `dockge/go-trader-demo/compose.yaml` installs `yfinance` (Topstep paper); `go-trader-demo/config/config.json` paper set = 64x perps (`bl-ob_touch-*`, incl. `QQQ` Nasdaq proxy, per-symbol max leverage, `direction: both`) + 24x spot (`bls-ob_touch-*`, long-only) + 4x Topstep (`ts-ob_touch-{nq,mnq}-{5m,15m}`, capital 25000/3000, `maxContracts: 1`); 5m entries carry `--params {"htf_factor": 12}`, 15m use default 4. Backup: `config.json.bak-ob_touch-20260930`. `direction` is INVALID on `type: futures` (config load fails) never add it there.
