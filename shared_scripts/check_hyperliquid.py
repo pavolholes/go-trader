@@ -32,6 +32,29 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'platforms', 'h
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'shared_strategies', 'open', 'futures'))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'shared_tools'))
 
+
+def _hyperliquid_adapter():
+    """Load platforms/hyperliquid/adapter.py by file path.
+
+    Both Hyperliquid and BloFin ship a top-level ``adapter`` module, so under
+    a shared pytest process the first import wins the ``sys.modules`` cache
+    and shadows the other platform. Loading by path (under a distinct module
+    name) keeps this script immune to that collision.
+    """
+    mod = sys.modules.get("hyperliquid_platform_adapter")
+    if mod is None:
+        import importlib.util
+        path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "..", "platforms", "hyperliquid", "adapter.py",
+        )
+        spec = importlib.util.spec_from_file_location(
+            "hyperliquid_platform_adapter", path)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["hyperliquid_platform_adapter"] = mod
+        spec.loader.exec_module(mod)
+    return mod
+
 from atr import ensure_atr_indicator, latest_atr
 from hl_user_fills import apply_user_fills_lookup
 from market_payload import (
@@ -159,25 +182,19 @@ def _signal_check_deps():
 
 
 def _offline_sz_decimals(symbol):
-    from adapter import sz_decimals_from_meta_cache
-
-    return sz_decimals_from_meta_cache(symbol)
+    return _hyperliquid_adapter().sz_decimals_from_meta_cache(symbol)
 
 
 def _venue_min_order_notional_usd():
     try:
-        from adapter import MIN_ORDER_NOTIONAL_USD
-
-        return float(MIN_ORDER_NOTIONAL_USD)
+        return float(_hyperliquid_adapter().MIN_ORDER_NOTIONAL_USD)
     except Exception:
         return 10.0
 
 
 def _venue_min_order_notional_margin():
     try:
-        from adapter import MIN_ORDER_NOTIONAL_SAFETY_MARGIN
-
-        return max(float(MIN_ORDER_NOTIONAL_SAFETY_MARGIN), 0.0)
+        return max(float(_hyperliquid_adapter().MIN_ORDER_NOTIONAL_SAFETY_MARGIN), 0.0)
     except Exception:
         return 0.03
 
@@ -216,10 +233,8 @@ def apply_venue_close_gate(decision, position_ctx, price, lot_decimals, min_noti
         return decision
     if current_qty <= 0:
         return decision
-    from adapter import floor_lot_size
-
     requested_qty = current_qty * close_fraction
-    floored_qty = floor_lot_size(requested_qty, lot_decimals)
+    floored_qty = _hyperliquid_adapter().floor_lot_size(requested_qty, lot_decimals)
     try:
         px = float(price or 0.0)
     except (TypeError, ValueError):
@@ -564,9 +579,7 @@ def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=
 
         adapter = None
         if market is None:
-            from adapter import HyperliquidExchangeAdapter
-
-            adapter = HyperliquidExchangeAdapter()
+            adapter = _hyperliquid_adapter().HyperliquidExchangeAdapter()
 
         shared = build_shared_signal_state(
             symbol, timeframe,
@@ -731,8 +744,7 @@ def run_batch_signal_check(symbol, timeframe, slots, *, ohlcv_limit=200, atr_met
             adapter = None
             df = None
         elif adapter is None and df is None:
-            from adapter import HyperliquidExchangeAdapter
-            adapter = HyperliquidExchangeAdapter()
+            adapter = _hyperliquid_adapter().HyperliquidExchangeAdapter()
         shared = build_shared_signal_state(
             symbol, timeframe,
             adapter=adapter,
@@ -1069,8 +1081,7 @@ def run_sync_protection(
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
     try:
-        from adapter import HyperliquidExchangeAdapter
-        adapter = HyperliquidExchangeAdapter()
+        adapter = _hyperliquid_adapter().HyperliquidExchangeAdapter()
 
         fill_hints = None
         if reconcile_fill_hints_json:
@@ -1446,8 +1457,7 @@ def run_execute(symbol, side, size, mode, stop_loss_pct=0.0, cancel_oid=0, prev_
     cancel_failed_oids = []
 
     try:
-        from adapter import HyperliquidExchangeAdapter
-        adapter = HyperliquidExchangeAdapter()
+        adapter = _hyperliquid_adapter().HyperliquidExchangeAdapter()
 
         is_buy = side.lower() == "buy"
 
@@ -1658,8 +1668,7 @@ def run_execute(symbol, side, size, mode, stop_loss_pct=0.0, cancel_oid=0, prev_
 
 def run_list_open_order_oids(symbol=None):
     try:
-        from adapter import HyperliquidExchangeAdapter
-        adapter = HyperliquidExchangeAdapter()
+        adapter = _hyperliquid_adapter().HyperliquidExchangeAdapter()
         listed = []
         decimals = {}
         for order in adapter.frontend_open_orders(symbol or None):
@@ -1812,8 +1821,7 @@ def run_update_stop_loss(symbol, side, size, trigger_px, mode, cancel_oid=0):
     open_order_check_error = ""
 
     try:
-        from adapter import HyperliquidExchangeAdapter
-        adapter = HyperliquidExchangeAdapter()
+        adapter = _hyperliquid_adapter().HyperliquidExchangeAdapter()
 
         side = side.lower()
         if side not in ("long", "short"):
@@ -1995,8 +2003,7 @@ def run_update_stop_loss(symbol, side, size, trigger_px, mode, cancel_oid=0):
 
 def run_fetch_atr(symbol: str, timeframe: str, period: int, atr_method: str = "simple"):
     try:
-        from adapter import HyperliquidExchangeAdapter
-        adapter = HyperliquidExchangeAdapter()
+        adapter = _hyperliquid_adapter().HyperliquidExchangeAdapter()
         candles = adapter.get_ohlcv(symbol, interval=timeframe, limit=200)
         if not candles or len(candles) < period + 1:
             print(json.dumps({
@@ -2026,8 +2033,7 @@ def run_limit_open(symbol, side, size, limit_px, mode, tif="Alo",
         sys.exit(1)
 
     try:
-        from adapter import HyperliquidExchangeAdapter
-        adapter = HyperliquidExchangeAdapter()
+        adapter = _hyperliquid_adapter().HyperliquidExchangeAdapter()
 
         side = side.lower()
         if side not in ("buy", "sell"):
@@ -2129,8 +2135,7 @@ def run_limit_status(symbol, oids, mode, since_ms=0):
         print(json.dumps({"error": "--limit-status requires --mode=live"}, cls=SafeEncoder))
         sys.exit(1)
     try:
-        from adapter import HyperliquidExchangeAdapter
-        adapter = HyperliquidExchangeAdapter()
+        adapter = _hyperliquid_adapter().HyperliquidExchangeAdapter()
 
         if since_ms <= 0:
             since_ms = int(time.time() * 1000) - 7 * 24 * 60 * 60 * 1000
@@ -2186,8 +2191,7 @@ def run_cancel_order(symbol, oid, mode):
         print(json.dumps({"error": "--cancel-order requires --mode=live"}, cls=SafeEncoder))
         sys.exit(1)
     try:
-        from adapter import HyperliquidExchangeAdapter
-        adapter = HyperliquidExchangeAdapter()
+        adapter = _hyperliquid_adapter().HyperliquidExchangeAdapter()
         out = {
             "platform": "hyperliquid",
             "timestamp": datetime.now(timezone.utc).isoformat(),
