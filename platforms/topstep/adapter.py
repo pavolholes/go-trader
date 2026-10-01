@@ -267,10 +267,10 @@ class TopStepExchangeAdapter:
             return []
         # Yahoo's cookie/auth endpoint is flaky from datacenter networks:
         # a single failed burst used to fail-closed the whole check.
-        # Bounded retry (3 attempts) rides out transient failures; a
+        # Bounded retry (5 attempts) rides out transient failures; a
         # persistent outage still returns [] and fail-closes downstream.
         last_error = None
-        for attempt in (1, 2, 3):
+        for attempt in range(1, 6):
             try:
                 yf_interval = str(interval).strip().lower()
                 if yf_interval == "1m":
@@ -304,9 +304,9 @@ class TopStepExchangeAdapter:
                 return result[-limit:]
             except Exception as e:
                 last_error = e
-                print(f"[topstep] yahoo ohlcv error for {symbol} (attempt {attempt}/3): {e}", file=sys.stderr)
-                if attempt < 3:
-                    time.sleep(5)
+                print(f"[topstep] yahoo ohlcv error for {symbol} (attempt {attempt}/5): {e}", file=sys.stderr)
+                if attempt < 5:
+                    time.sleep(min(attempt, 3))
         print(f"[topstep] yahoo ohlcv error for {symbol}: {last_error}", file=sys.stderr)
         return []
 
