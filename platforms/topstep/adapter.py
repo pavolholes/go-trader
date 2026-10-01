@@ -267,11 +267,11 @@ class TopStepExchangeAdapter:
             return []
         # Yahoo's cookie/auth endpoint is flaky from datacenter networks:
         # a single failed burst used to fail-closed the whole check.
-        # Bounded retry (8 attempts, ~41s total backoff) rides out transient
-        # Yahoo egress failures seen in scheduled paper cycles; a
+        # Bounded retry (5 attempts, 9s total backoff) rides out transient
+        # Yahoo egress failures while staying inside the Go script timeout; a
         # persistent outage still returns [] and fail-closes downstream.
         last_error = None
-        retry_delays = (1, 2, 4, 6, 8, 10, 10)
+        retry_delays = (1, 2, 3, 3)
         for attempt in range(1, len(retry_delays) + 2):
             try:
                 yf_interval = str(interval).strip().lower()
@@ -306,7 +306,7 @@ class TopStepExchangeAdapter:
                 return result[-limit:]
             except Exception as e:
                 last_error = e
-                print(f"[topstep] yahoo ohlcv error for {symbol} (attempt {attempt}/8): {e}", file=sys.stderr)
+                print(f"[topstep] yahoo ohlcv error for {symbol} (attempt {attempt}/5): {e}", file=sys.stderr)
                 if attempt <= len(retry_delays):
                     time.sleep(retry_delays[attempt - 1])
         print(f"[topstep] yahoo ohlcv error for {symbol}: {last_error}", file=sys.stderr)
