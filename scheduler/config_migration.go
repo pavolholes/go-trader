@@ -163,7 +163,18 @@ func MigrateConfig(configPath string, fieldValues map[string]string, cfg *Config
 	if err := os.WriteFile(tmpPath, newData, 0600); err != nil {
 		return fmt.Errorf("write tmp: %w", err)
 	}
-	return os.Rename(tmpPath, configPath)
+	if err := os.Rename(tmpPath, configPath); err != nil {
+		// The config file is commonly bind-mounted into the container,
+		// where rename over the mount fails (EBUSY). Fall back to
+		// overwriting the file in place so the migrated version persists
+		// instead of re-migrating on every start.
+		if werr := os.WriteFile(configPath, newData, 0600); werr != nil {
+			os.Remove(tmpPath)
+			return fmt.Errorf("rename config: %v (in-place rewrite: %v)", err, werr)
+		}
+		os.Remove(tmpPath)
+	}
+	return nil
 }
 
 func migrateConfigData(data []byte, fieldValues map[string]string) ([]byte, error) {
