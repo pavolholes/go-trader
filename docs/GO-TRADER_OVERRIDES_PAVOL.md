@@ -35,7 +35,7 @@ symlink to it).
 | `scheduler/blofin_close.go` | Force-close / circuit-breaker close via `close_blofin_position.py` |
 | `scheduler/blofin_marks.go` | `fetchBloFinPerpsMids` via `/api/v1/market/tickers?instType=SWAP` |
 | `shared_scripts/check_blofin.py` | `--inst-type {swap,spot}` (default `swap`); spot branch uses `spot_adapter`; `--atr-method`; regime/HTF passthrough; `--htf-timeframe/--htf-limit` (deep HTF fetch injected as `htf_df` for `ob_touch`, fail-closed); `_detect_inst_type` accepts `--inst-type spot` and `--inst-type=swap`; `ob_touch` LTF floor 2000 bars on 5m / 1200 on 15m; trims trailing possibly-forming LTF candle; accepts `--position-risk-anchor-price` (upstream probe parity, ignored like Topstep) |
-| `shared_scripts/check_topstep.py` | `--htf-timeframe/--htf-limit` (same HTF injection; paper serves yfinance NQ=F); yahoo fetch has bounded retry (5 attempts, 1/2/3/3s backoff; within the Go runner timeout) for flaky `fc.yahoo.com`; 5m/15m queries use 60d Yahoo history (1m stays 7d); `ob_touch` LTF floors 2000/1200; trims trailing possibly-forming LTF candle |
+| `shared_scripts/check_topstep.py` | `--htf-timeframe/--htf-limit` (same HTF injection; paper serves NQ=F); adapter uses Yahoo Chart API with browser headers first (bypasses flaky `fc.yahoo.com` cookie host), then bounded yfinance fallback (5 attempts, 1/2/3/3s; within Go runner timeout); 5m/15m queries use 60d history (1m stays 7d); `ob_touch` LTF floors 2000/1200; trims trailing possibly-forming LTF candle |
 | `shared_scripts/close_blofin_position.py` | Emergency close via `adapter.market_close()` (swap only) |
 | `shared_scripts/fetch_blofin_positions.py` | Open positions fetch (swap) |
 | `shared_scripts/fetch_blofin_balance.py` | USDT equity fetch (futures) |

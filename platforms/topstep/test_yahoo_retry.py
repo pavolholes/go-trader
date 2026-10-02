@@ -46,8 +46,41 @@ def _install_fake_yfinance(monkeypatch, script, calls, history_calls=None):
     monkeypatch.setitem(sys.modules, "yfinance", fake)
 
 
+def _install_chart_error(monkeypatch):
+    fake = types.ModuleType("requests")
+
+    def get(*args, **kwargs):
+        raise RuntimeError("chart endpoint unavailable")
+
+    fake.get = get
+    monkeypatch.setitem(sys.modules, "requests", fake)
+
+
+class _ChartResponse:
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return {
+            "chart": {
+                "result": [{
+                    "timestamp": [1_700_000_000, 1_700_000_900, 1_700_001_800],
+                    "indicators": {"quote": [{
+                        "open": [100.0, None, 102.0],
+                        "high": [101.0, None, 103.0],
+                        "low": [99.0, None, 101.0],
+                        "close": [100.5, None, 102.5],
+                        "volume": [1000.0, None, 1200.0],
+                    }]},
+                }],
+                "error": None,
+            }
+        }
+
+
 def test_retry_rides_out_four_transient_failures(monkeypatch):
     mod = _load_adapter()
+    _install_chart_error(monkeypatch)
     calls = []
     sleeps = []
     monkeypatch.setattr(mod.time, "sleep", lambda s: sleeps.append(s))
@@ -65,6 +98,7 @@ def test_retry_rides_out_four_transient_failures(monkeypatch):
 
 def test_persistent_outage_returns_empty_after_five_attempts(monkeypatch):
     mod = _load_adapter()
+    _install_chart_error(monkeypatch)
     sleeps = []
     monkeypatch.setattr(mod.time, "sleep", lambda s: sleeps.append(s))
     _install_fake_yfinance(
@@ -85,6 +119,7 @@ def test_unknown_symbol_short_circuits():
 
 def test_supported_intraday_periods_fetch_enough_swing_history(monkeypatch):
     mod = _load_adapter()
+    _install_chart_error(monkeypatch)
     periods = []
     adapter = mod.TopStepExchangeAdapter(mode="paper")
     for interval, expected in (("5m", "60d"), ("15m", "60d"), ("1m", "7d")):
@@ -97,3 +132,23 @@ def test_supported_intraday_periods_fetch_enough_swing_history(monkeypatch):
         assert history_calls[0][0] == expected
         monkeypatch.delitem(sys.modules, "yfinance")
     assert periods == [("60d", "5m"), ("60d", "15m"), ("7d", "1m")]
+
+
+def test_public_yahoo_chart_fallback_maps_rows_without_cookie_client(monkeypatch):
+    mod = _load_adapter()
+    request_calls = []
+    fake = types.ModuleType("requests")
+    fake.get = lambda *args, **kwargs: (request_calls.append((args, kwargs)), _ChartResponse())[1]
+    monkeypatch.setitem(sys.modules, "requests", fake)
+
+    adapter = mod.TopStepExchangeAdapter(mode="paper")
+    rows = adapter._get_yahoo_ohlcv("NQ", "15m", 10)
+
+    assert rows == [
+        [1_700_000_000_000, 100.0, 101.0, 99.0, 100.5, 1000.0],
+        [1_700_001_800_000, 102.0, 103.0, 101.0, 102.5, 1200.0],
+    ]
+    args, kwargs = request_calls[0]
+    assert args[0].endswith("/NQ=F")
+    assert kwargs["params"]["interval"] == "15m"
+    assert kwargs["headers"]["Origin"] == "https://finance.yahoo.com"

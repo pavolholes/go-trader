@@ -243,6 +243,12 @@ class TopStepExchangeAdapter:
         if not yahoo_sym:
             return 0.0
         try:
+            candles = self._get_yahoo_chart_ohlcv(symbol, "1d", 1)
+            if candles:
+                return float(candles[-1][4])
+        except Exception as e:
+            print(f"[topstep] Yahoo Chart price fetch failed for {symbol}: {e}", file=sys.stderr)
+        try:
             import yfinance as yf
             ticker = yf.Ticker(yahoo_sym)
             hist = ticker.history(period="1d")
@@ -256,10 +262,109 @@ class TopStepExchangeAdapter:
             print(f"[topstep] yahoo price error for {symbol}: {e}", file=sys.stderr)
             return 0.0
 
+    def _get_yahoo_chart_ohlcv(self, symbol: str, interval: str, limit: int) -> list:
+        """Fetch public Yahoo chart JSON directly, without fc.yahoo cookie auth.
+
+        Yahoo's ``fc.yahoo.com`` cookie endpoint is intermittently unreachable
+        from the demo network. The public chart endpoint works with browser
+        headers and gives the same timestamp/OHLCV series; yfinance remains a
+        caller-side fallback if this endpoint is unavailable.
+        """
+        yahoo_sym = YAHOO_SYMBOL_MAP.get(symbol)
+        if not yahoo_sym or int(limit) <= 0:
+            return []
+        try:
+            import re
+            import requests
+        except ImportError as e:
+            raise RuntimeError(f"requests unavailable for Yahoo Chart API: {e}") from e
+
+        normalized = str(interval).strip().lower()
+        match = re.fullmatch(r"(\d+)(m|h|d)", normalized)
+        if not match:
+            raise ValueError(f"unsupported Yahoo interval {interval!r}")
+        count = int(match.group(1))
+        unit_seconds = {"m": 60, "h": 3600, "d": 86400}[match.group(2)]
+        seconds_per_bar = count * unit_seconds
+
+        # Ask for a safety margin over the requested trailing bar count to
+        # cover weekends/maintenance gaps. Yahoo intraday chart data is capped
+        # at 60d (1m at 7d); daily data has no such short cap.
+        lookback_seconds = int(max(int(limit), 1) * seconds_per_bar * 2.2)
+        max_days = 7 if normalized == "1m" else (
+            60 if match.group(2) == "m" else None
+        )
+        if max_days is not None:
+            lookback_seconds = min(lookback_seconds, max_days * 86400)
+        now_s = int(time.time())
+        params = {
+            "period1": str(now_s - lookback_seconds),
+            "period2": str(now_s),
+            "interval": normalized,
+            "includePrePost": "true",
+            "events": "div,splits",
+        }
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 Chrome/131 Safari/537.36"
+            ),
+            "Accept": "application/json,text/plain,*/*",
+            "Origin": "https://finance.yahoo.com",
+            "Referer": "https://finance.yahoo.com/",
+        }
+        response = requests.get(
+            f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_sym}",
+            params=params,
+            headers=headers,
+            timeout=15,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        chart = payload.get("chart") or {}
+        if chart.get("error"):
+            raise RuntimeError(f"Yahoo Chart API error: {chart['error']}")
+        results = chart.get("result") or []
+        if not results:
+            return []
+        result = results[0]
+        timestamps = result.get("timestamp") or []
+        indicators = result.get("indicators") or {}
+        quotes = indicators.get("quote") or []
+        if not quotes:
+            return []
+        quote = quotes[0]
+        opens = quote.get("open") or []
+        highs = quote.get("high") or []
+        lows = quote.get("low") or []
+        closes = quote.get("close") or []
+        volumes = quote.get("volume") or []
+        rows = []
+        for idx, ts in enumerate(timestamps):
+            try:
+                o, h, low, close = opens[idx], highs[idx], lows[idx], closes[idx]
+                if o is None or h is None or low is None or close is None:
+                    continue
+                volume = volumes[idx] if idx < len(volumes) and volumes[idx] is not None else 0
+                rows.append([
+                    int(ts * 1000), float(o), float(h), float(low),
+                    float(close), float(volume),
+                ])
+            except (IndexError, TypeError, ValueError, OverflowError):
+                continue
+        rows.sort(key=lambda row: row[0])
+        return rows[-int(limit):]
+
     def _get_yahoo_ohlcv(self, symbol: str, interval: str = "1h", limit: int = 200) -> list:
         yahoo_sym = YAHOO_SYMBOL_MAP.get(symbol)
         if not yahoo_sym:
             return []
+        try:
+            chart_rows = self._get_yahoo_chart_ohlcv(symbol, interval, limit)
+            if chart_rows:
+                return chart_rows
+        except Exception as e:
+            print(f"[topstep] Yahoo Chart OHLCV fetch failed for {symbol}: {e}; falling back to yfinance", file=sys.stderr)
         try:
             import yfinance as yf
         except ImportError:
