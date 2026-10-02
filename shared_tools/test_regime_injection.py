@@ -55,3 +55,17 @@ def test_bundle_roundtrip_through_injection():
         df, regime_enabled=True, windows_spec=_SPEC_MULTI, atr_window="short"
     )
     assert injected == inline
+
+
+def test_empty_shared_payload_falls_back_to_local_regime():
+    df = _make_uptrend()
+    empty_injection = prepare_check_regime(
+        df, regime_enabled=True, windows_spec=_SPEC_MULTI,
+        atr_window="medium", injected_payload_json="",
+    )
+    inline = prepare_check_regime(
+        df, regime_enabled=True, windows_spec=_SPEC_MULTI,
+        atr_window="medium",
+    )
+    assert empty_injection == inline
+    assert empty_injection[1] != ""

@@ -138,7 +138,7 @@ func appendRegimeArgs(args []string, regime *RegimeConfig) []string {
 
 func appendRegimePayloadArg(args []string, sc StrategyConfig, regime *RegimeConfig) []string {
 	raw, ok := globalRegimeStore.InjectionJSONForStrategy(sc, regime)
-	if !ok {
+	if !ok || strings.TrimSpace(raw) == "" {
 		return args
 	}
 	return append(args, "--regime-payload-json", raw)

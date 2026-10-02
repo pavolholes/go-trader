@@ -571,7 +571,11 @@ def prepare_check_regime(
     disabled = {"regime": "", "score": 0.0, "metrics": dict(_DEFAULT_METRICS)}
     if not regime_enabled:
         return "", "", disabled
-    if injected_payload_json is not None:
+    # An empty shared-store payload means the bundle was unavailable this
+    # cycle, not that regime evaluation is disabled. Fall back to the local
+    # OHLCV frame so directional entry filters and regime-aware closes still
+    # receive a fresh classification. A non-empty payload remains authoritative.
+    if injected_payload_json is not None and str(injected_payload_json).strip():
         return regime_from_injected_payload(injected_payload_json, atr_window=atr_window)
 
     spec_map = windows_spec if windows_spec is not None else windows
