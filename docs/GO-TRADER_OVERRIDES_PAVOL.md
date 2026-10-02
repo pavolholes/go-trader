@@ -14,7 +14,7 @@ symlink to it).
 | `scheduler/blofin_spot_test.go` | `TestSpotEffectiveDirectionIsLongOnly` — spot is long-only |
 | `docs/GO-TRADER_OVERRIDES_PAVOL.md` | This file |
 | `shared_strategies/open/ob_touch.py` | `ob_touch_core` SMC order-block touch entries with 1H overlap confirmation (TradingView Institutional Level entry port; section 10) |
-| `shared_strategies/open/test_ob_touch.py` | 21 behavior tests for `ob_touch` (zone math, first-touch, mitigation, HTF gate, no-lookahead) |
+| `shared_strategies/open/test_ob_touch.py` | 24 behavior tests for `ob_touch` (zone math, first-touch, mitigation, HTF gate, no-lookahead) |
 | `shared_tools/ob_touch_data.py` | Conservative LTF forming-candle trim for `ob_touch` MTF signal checks; backtests unchanged |
 | `shared_tools/test_ob_touch_data.py` | Closed-LTF-frame behavior tests |
 | `platforms/blofin/test_ohlcv_pagination.py` | Perps/spot multi-page history tests (1440 response cap, cursor overlap dedupe) |
@@ -109,7 +109,7 @@ Lavy stlpec (zoznam strategii + search + sparklines) je odstraneny z Table aj Su
 | File | Override |
 |---|---|
 | `shared_strategies/open/ob_touch.py`, `test_ob_touch.py` | New files (section 1) keep on merge |
-| `shared_strategies/open/registry.py` | `@register("ob_touch", ...)` block after `mtf_confluence_strategy`; `PLATFORM_ORDER` spot+futures entries before `"hold"`; defaults mirror the TradingView screenshot (internal 5, swing 50, 7 levels, Absolute/Precise/Previous, touch `wick`, spot `allow_short: False`, futures `True`); description documents the HTF factor guide (5m x 12 = 1H, 15m x 4 = 1H, 5m x 3 = 15m, 1 = single-TF) |
+| `shared_strategies/open/registry.py` | `@register("ob_touch", ...)` block after `mtf_confluence_strategy`; `PLATFORM_ORDER` spot+futures entries before `"hold"`; defaults mirror the TradingView screenshot (internal 5, swing 50, 7 levels, Absolute/Precise/Previous, touch `wick`, spot `allow_short: False`, futures `True`); description documents the HTF factor guide (5m x 12 = 1H, 15m x 4 = 1H, 5m x 3 = 15m, 1 = single-TF); default `regime_direction_filter=true` blocks long entries in bearish directional regime labels and short entries in bullish labels (neutral/unknown labels remain ungated) |
 | `backtest/optimizer.py` | `DEFAULT_PARAM_RANGES["ob_touch"]` (CI param-ranges test fails without it) |
 | `scheduler/init.go` | `knownShortNames["ob_touch"]="obt"` (`"ob"` is taken); `bidirectionalPerpsStrategies["ob_touch"]=true` |
 | `shared_scripts/check_blofin.py`, `check_topstep.py` | `--htf-timeframe/--htf-limit` + `htf_df` injection gated on the effective open strategy being `ob_touch` |

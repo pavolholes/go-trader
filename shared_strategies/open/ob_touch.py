@@ -375,6 +375,33 @@ def _bar_in_overlap(top: float, btm: float, bar_high: float, bar_low: float,
     return bar_low <= top and bar_high >= btm
 
 
+def _regime_label(value) -> str:
+    """Normalize the injected regime snapshot or a backtest label to text."""
+    if isinstance(value, dict):
+        if "regime" in value:
+            value = value.get("regime")
+        else:
+            # Defensive support for a multi-window snapshot. The framework
+            # normally injects the primary (medium) snapshot directly.
+            candidate = value.get("medium") or value.get("default")
+            value = candidate.get("regime") if isinstance(candidate, dict) else ""
+    return str(value or "").strip().lower()
+
+
+def _regime_blocks_side(value, side: str) -> bool:
+    """Veto only clearly opposing directional states; neutral stays neutral."""
+    label = _regime_label(value)
+    up = label in {
+        "trending_up", "trending_up_clean", "trending_up_choppy",
+        "ranging_directional_up",
+    }
+    down = label in {
+        "trending_down", "trending_down_clean", "trending_down_choppy",
+        "ranging_directional_down",
+    }
+    return down if side == "long" else up
+
+
 def ob_touch_core(
     df: pd.DataFrame,
     internal_lookback: int = 5,
@@ -385,6 +412,8 @@ def ob_touch_core(
     htf_factor: int = 4,
     touch_mode: str = "wick",
     allow_short: bool = True,
+    regime_direction_filter: bool = True,
+    regime=None,
     htf_df: pd.DataFrame = None,
 ) -> pd.DataFrame:
     """Entry signals for INL institutional-zone touches with HTF overlap.
@@ -394,6 +423,11 @@ def ob_touch_core(
     (last) candle is always discarded so only completed HTF candles gate
     entries. When omitted, the HTF frame is resampled in-frame from ``df``
     (backtest path).
+
+    When the framework supplies a directional composite/ADX regime, the
+    default direction veto suppresses longs in clearly bearish labels and
+    shorts in clearly bullish labels. Neutral/unknown labels are left to the
+    existing swing filter and HTF zone-overlap rules.
     """
     _ = inl_num  # display cap in Pine; books here are mitigation-bounded
     if touch_mode not in _VALID_TOUCH_MODES:
@@ -425,6 +459,11 @@ def ob_touch_core(
     h = result["high"].to_numpy(dtype=float)
     l = result["low"].to_numpy(dtype=float)
     c = result["close"].to_numpy(dtype=float)
+
+    if regime is None and "regime" in result.columns:
+        regime_values = result["regime"].to_numpy(dtype=object)
+    else:
+        regime_values = np.full(n, regime, dtype=object)
 
     ciH, ciL = _confirmed_pivots(h, l, internal_lookback)
     csH, csL = _confirmed_pivots(h, l, swing_lookback)
@@ -504,9 +543,18 @@ def ob_touch_core(
 
         l_bull = eng.books["bull"] + eng.books["swing_bull"]
         l_bear = eng.books["bear"] + eng.books["swing_bear"]
+        bar_regime = regime_values[i]
+        regime_long_ok = (
+            not regime_direction_filter
+            or not _regime_blocks_side(bar_regime, "long")
+        )
+        regime_short_ok = (
+            not regime_direction_filter
+            or not _regime_blocks_side(bar_regime, "short")
+        )
 
         fired_long = False
-        if not use_swing_filter or eng.trend == 1:
+        if regime_long_ok and (not use_swing_filter or eng.trend == 1):
             for z in l_bull:
                 peers = [z] if not use_htf else h_bull
                 for hz in peers:
@@ -522,7 +570,7 @@ def ob_touch_core(
                 if fired_long:
                     break
         fired_short = False
-        if allow_short and (not use_swing_filter or eng.trend == -1):
+        if allow_short and regime_short_ok and (not use_swing_filter or eng.trend == -1):
             for z in l_bear:
                 peers = [z] if not use_htf else h_bear
                 for hz in peers:

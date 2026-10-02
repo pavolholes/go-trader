@@ -105,6 +105,31 @@ class TestFilters:
         out_long = _run(_scenario(), allow_short=False)
         assert out_long["signal"].iloc[10] == 1
 
+    def test_regime_veto_blocks_long_in_bear_regime_and_short_in_bull(self):
+        long_bear = _run(
+            _scenario(), regime={"regime": "trending_down_clean"}
+        )
+        short_bull = _run(
+            _mirror(_scenario()), regime={"regime": "trending_up_choppy"}
+        )
+        assert (long_bear["signal"] != 0).sum() == 0
+        assert (short_bull["signal"] != 0).sum() == 0
+
+    def test_regime_veto_allows_neutral_regimes_and_can_be_disabled(self):
+        neutral = _run(_scenario(), regime={"regime": "ranging_volatile"})
+        disabled = _run(
+            _scenario(), regime={"regime": "trending_down_clean"},
+            regime_direction_filter=False,
+        )
+        assert neutral["signal"].iloc[10] == 1
+        assert disabled["signal"].iloc[10] == 1
+
+    def test_backtest_regime_column_vetoes_opposing_signal(self):
+        df = _scenario()
+        df["regime"] = "trending_down_clean"
+        out = _run(df)
+        assert (out["signal"] != 0).sum() == 0
+
     def test_invalid_touch_mode_rejected(self):
         try:
             _run(_scenario(), touch_mode="mid")
@@ -224,6 +249,8 @@ class TestRobustness:
     def test_registry_defaults_per_platform(self):
         import os
         import importlib.util
+        from shared_tools.strategy_composition import strip_unsupported_position_context
+
         here = os.path.dirname(os.path.abspath(__file__))
         spec = importlib.util.spec_from_file_location(
             "_ob_touch_registry_test", os.path.join(here, "registry.py"))
@@ -235,3 +262,15 @@ class TestRobustness:
         assert fut["default_params"]["allow_short"] is True
         assert spot["default_params"]["htf_factor"] == 4
         assert spot["default_params"]["inl_num"] == 7
+        assert spot["default_params"]["regime_direction_filter"] is True
+
+        fn = mod.STRATEGIES["ob_touch"]["fn"]
+        injected = strip_unsupported_position_context(
+            fn, {"regime": {"regime": "trending_down_clean"}}
+        )
+        assert "regime" in injected
+        out = fn(
+            _scenario(), internal_lookback=2, swing_lookback=6,
+            use_swing_filter=False, htf_factor=1, **injected,
+        )
+        assert (out["signal"] != 0).sum() == 0

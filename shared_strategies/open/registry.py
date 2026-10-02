@@ -1508,11 +1508,13 @@ def mtf_confluence_strategy(df: pd.DataFrame, **params) -> pd.DataFrame:
     "the first wick into the overlap of an active LTF institutional zone and "
     "an active 1H zone (short mirrors). HTF factor guide: 5m native x12 = 1H, "
     "15m native x4 = 1H, 5m native x3 = 15m, 1 = single-TF (no gate). "
-    "Zones use Absolute mitigation and Previous overlap handling.",
+    "Zones use Absolute mitigation and Previous overlap handling. The default "
+    "regime direction veto blocks longs in bearish labels and shorts in bullish labels; neutral/unknown labels are not vetoed.",
     {
         "internal_lookback": 5, "swing_lookback": 50, "inl_num": 7,
         "use_swing_levels": True, "use_swing_filter": True,
         "htf_factor": 4, "touch_mode": "wick", "allow_short": False,
+        "regime_direction_filter": True,
     },
     variants={
         "futures": {
@@ -1529,8 +1531,8 @@ def mtf_confluence_strategy(df: pd.DataFrame, **params) -> pd.DataFrame:
         "internal_lookback < swing_lookback",
     ],
 )
-def ob_touch_strategy(df: pd.DataFrame, **params) -> pd.DataFrame:
-    return ob_touch_core(df, **params)
+def ob_touch_strategy(df: pd.DataFrame, regime=None, **params) -> pd.DataFrame:
+    return ob_touch_core(df, regime=regime, **params)
 
 
 @register(
