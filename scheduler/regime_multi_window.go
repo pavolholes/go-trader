@@ -488,6 +488,18 @@ func regimePayloadValue(p *RegimePayload) RegimePayload {
 	return *p
 }
 
+// regimePayloadForPosition preserves the shared sealed payload when present,
+// but uses the check script's inline classification when the shared regime
+// bundle was unavailable. Entry gates and Hurst/directional evidence gates
+// must continue reading the shared store separately so their configured
+// fail-open/fail-closed behavior is unchanged.
+func regimePayloadForPosition(shared, check RegimePayload) RegimePayload {
+	if !shared.IsEmpty() {
+		return shared
+	}
+	return check
+}
+
 func regimeGateLabel(sc StrategyConfig, payload RegimePayload, rc *RegimeConfig) string {
 	return payload.Label(resolveStrategyRegimeWindow(sc, "gate", rc), rc)
 }

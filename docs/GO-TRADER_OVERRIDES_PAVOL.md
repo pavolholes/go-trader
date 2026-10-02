@@ -21,7 +21,7 @@ symlink to it).
 | `platforms/topstep/test_yahoo_retry.py` | Yahoo transient retry, outage fail-closed, and 60d/7d interval period policy tests |
 | `shared_scripts/test_check_blofin_inst_type.py` | Regression tests for equals- and space-separated spot/swap registry selection |
 | `shared_scripts/test_check_ob_touch_history_floor.py` | Regression tests for 5m=2000 and 15m=1200 LTF fetch floors in BloFin/TopStep checks |
-| `scheduler/strategy_composition.go`, `strategy_composition_regime_payload_test.go` | Do not append empty shared regime payloads to check scripts; missing bundle triggers local regime compute instead of disabling regime |
+| `scheduler/strategy_composition.go`, `strategy_composition_regime_payload_test.go` | Do not append empty shared regime payloads; check scripts locally compute regime if payload is absent/empty, and Go stamps that inline label for position TP/SL. Entry gate, Hurst, and evidence-gated directional policy still use shared-store fail-open/closed semantics |
 | `shared_tools/regime.py`, `test_regime_injection.py` | Empty injected payload falls back to local OHLCV regime calculation; non-empty payload remains authoritative |
 | `scheduler/config_pavol_test.go` | Fork config tests (perps leverage, spot rejection, Discord channel env) — upstream #1597 deleted the original file content, ours live here |
 | `scheduler/risk_pavol_test.go` | Fork risk tests (BloFin force-close, concise warning, spot multiplier) — same reason |

@@ -37,3 +37,24 @@ func TestAppendRegimePayloadArgFallsBackWhenSharedBundleMissing(t *testing.T) {
 		t.Fatalf("available shared bundle argv = %v, want %v", got, want)
 	}
 }
+
+func TestRegimePayloadForPositionKeepsInlineFallbackWhenSharedBundleEmpty(t *testing.T) {
+	inline := RegimePayload{
+		MultiMode: true,
+		Windows: map[string]RegimeSnapshot{
+			"medium": {Regime: "trending_down_clean"},
+		},
+	}
+	got := regimePayloadForPosition(RegimePayload{}, inline)
+	if label := got.PrimaryLabel(&RegimeConfig{Enabled: true, Windows: RegimeWindowsMap{
+		"medium": RegimeWindowSpec{Classifier: regimeClassifierComposite, Period: 14},
+	}}); label != "trending_down_clean" {
+		t.Fatalf("inline regime fallback label = %q", label)
+	}
+
+	shared := RegimePayload{Legacy: "ranging"}
+	got = regimePayloadForPosition(shared, inline)
+	if label := got.PrimaryLabel(nil); label != "ranging" {
+		t.Fatalf("non-empty shared regime must win, got %q", label)
+	}
+}

@@ -2274,7 +2274,8 @@ func main() {
 						}
 					} else if result, signalStr, price, ok := runSpotCheck(sc, prices, spotPosCtx, cfg.Regime, resolveATRMethod(sc, cfg), notifier, logger); ok {
 						storeRegime := globalRegimeStore.PayloadForStrategy(sc, cfg.Regime)
-						result.Regime = &storeRegime
+						positionRegime := regimePayloadForPosition(storeRegime, regimePayloadValue(result.Regime))
+						result.Regime = &positionRegime
 						if gateRegime, regimeBlocked := applyRegimeGate(sc, storeRegime, cfg.Regime, spotPosCtx.Quantity); regimeBlocked {
 							logger.Info("Regime gate: open signal blocked (%s)", regimeGateBlockDetail(gateRegime))
 							result.Signal = 0
@@ -2305,7 +2306,7 @@ func main() {
 							result.Signal = 0
 						}
 						mu.Lock()
-						syncStrategyRegimeState(stratState, storeRegime, cfg.Regime)
+						syncStrategyRegimeState(stratState, positionRegime, cfg.Regime)
 						trades, detail = executeSpotResult(sc, stratState, stratDB, result, signalStr, price, cfg.Regime, cfg, hurstDecision, logger)
 						mu.Unlock()
 					}
@@ -2436,7 +2437,8 @@ func main() {
 							}
 							prices[result.Symbol] = price
 							storeRegime := globalRegimeStore.PayloadForStrategy(sc, cfg.Regime)
-							result.Regime = &storeRegime
+							positionRegime := regimePayloadForPosition(storeRegime, regimePayloadValue(result.Regime))
+							result.Regime = &positionRegime
 							if gateRegime, regimeBlocked := applyRegimeGate(sc, storeRegime, cfg.Regime, blofinPosQty); regimeBlocked {
 								logger.Info("Regime gate: open signal blocked (%s)", regimeGateBlockDetail(gateRegime))
 								result.Signal = 0
@@ -2467,9 +2469,9 @@ func main() {
 								result.Signal = 0
 							}
 							mu.Lock()
-							syncStrategyRegimeState(stratState, storeRegime, cfg.Regime)
+							syncStrategyRegimeState(stratState, positionRegime, cfg.Regime)
 							mu.Unlock()
-							currentDirRegime := regimeDirectionalLabel(sc, regimePayloadValue(result.Regime), cfg.Regime)
+							currentDirRegime := regimeDirectionalLabel(sc, storeRegime, cfg.Regime)
 							posDirRegime := blofinPosCtx.DirectionalRegime
 							var dirCertStates map[string]string
 							if blofinPosQty > 0 {
@@ -2964,7 +2966,8 @@ func main() {
 					if result, signalStr, price, ok := runTopStepCheck(sc, prices, tsPosCtx, cfg.Regime, resolveATRMethod(sc, cfg), notifier, logger); ok {
 						prices[result.Symbol] = price
 						storeRegime := globalRegimeStore.PayloadForStrategy(sc, cfg.Regime)
-						result.Regime = &storeRegime
+						positionRegime := regimePayloadForPosition(storeRegime, regimePayloadValue(result.Regime))
+						result.Regime = &positionRegime
 						if gateRegime, regimeBlocked := applyRegimeGate(sc, storeRegime, cfg.Regime, tsContracts); regimeBlocked {
 							logger.Info("Regime gate: open signal blocked (%s)", regimeGateBlockDetail(gateRegime))
 							result.Signal = 0
@@ -2991,7 +2994,7 @@ func main() {
 							result.Signal = 0
 						}
 						mu.Lock()
-						syncStrategyRegimeState(stratState, storeRegime, cfg.Regime)
+						syncStrategyRegimeState(stratState, positionRegime, cfg.Regime)
 						mu.Unlock()
 						var execResult *TopStepExecuteResult
 						liveExecFailed := false
