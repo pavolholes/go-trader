@@ -2005,9 +2005,7 @@ class Backtester:
                  max_drawdown_pct: Optional[float] = None,
                  trailing_stop_min_move_pct: Optional[float] = None,
                  capability_context: Optional[CapabilityContext] = None,
-                 stop_platform: Optional[str] = None,
-                 circuit_breaker_max_drawdown_pct: Optional[float] = None,
-                 margin_per_trade_usd: Optional[float] = None):
+                 stop_platform: Optional[str] = None):
         """
         Args:
             initial_capital: Starting portfolio value.
