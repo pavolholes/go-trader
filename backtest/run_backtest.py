@@ -1384,6 +1384,30 @@ def run_single_backtest(
             cr_params = cr.setdefault("params", {})
             cr_params.setdefault("tp_enabled", False)
 
+    window_spec = None
+    execution_spec = None
+    observation_params = {}
+    if manifest is not None:
+        import offline_manifest as om
+        try:
+            df, window_spec, candle_cov = om.window_frame(
+                manifest, manifest_dataset_entry, manifest_window)
+            df, funding_cov = om.attach_funding_cost(
+                df, manifest_dataset_entry, window_spec)
+            if strategy_name in OBSERVATION_INPUT_STRATEGIES:
+                oi_obs, oi_cov = om.attach_open_interest(
+                    manifest, manifest_dataset_entry, window_spec)
+                observation_params = {"open_interest_observations": oi_obs}
+                print(f"  Open-interest coverage: {oi_cov}")
+        except om.ManifestError as exc:
+            raise SystemExit(f"manifest error: {exc}")
+        execution_spec = om.execution_spec(manifest, manifest_dataset_entry, cost_multiplier)
+        print(f"  Manifest: {manifest['study']} ({manifest['provenance']['kind']}: "
+              f"{manifest['provenance']['label']}) window {manifest_window} "
+              f"[{window_spec['start']}, {window_spec['end']})")
+        print(f"  Candle coverage: {candle_cov}")
+        print(f"  Funding coverage: {funding_cov}")
+        print(f"  Execution spec: {execution_spec}")
     else:
         df = load_cached_data(symbol, timeframe, exchange_id=platform, start_date=since)
         if df.empty:
