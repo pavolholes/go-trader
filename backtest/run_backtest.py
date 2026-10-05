@@ -24,6 +24,8 @@ from directional_certification import (
 
 FUNDING_COLUMN_STRATEGIES = {"funding_skew", "delta_neutral_funding"}
 
+OBSERVATION_INPUT_STRATEGIES = {"open_interest_breakout"}
+
 FUNDING_ACCRUAL_STRATEGIES = {"delta_neutral_funding"}
 
 
@@ -68,7 +70,14 @@ def _attach_funding_if_needed(df, strategy_name, symbol, since):
     return out
 from htf_filter import get_default_htf, apply_htf_filter
 from registry_loader import load_registry
-from backtester import Backtester, format_results
+from backtester import (Backtester, CapabilityContext, CloseCapabilityError,
+                        STOP_FIELD_KEYS, STOP_GEOMETRY_INPUT_KEYS,
+                        STOP_PERCENT_FIELD_KEYS, STOP_REGIME_FIELD_KEYS,
+                        STOP_SCALAR_FIELD_KEYS, STOP_UNITS_LIVE_CONFIG,
+                        STOP_UNITS_PREVIEW, _finite_number, _unified_close_params,
+                        aggregate_close_validations, build_stop_capability_context,
+                        format_close_validation, format_results, leverage_evidence,
+                        stop_raw_fields, validate_close_capabilities)
 from optimizer import (walk_forward_optimize, DEFAULT_PARAM_RANGES,
                        DEFAULT_CLOSE_STACK_SPECS, generate_close_stack_grid)
 from reporter import (
@@ -682,9 +691,258 @@ def _capture_promotion_baseline(cfg: dict, sc: dict) -> dict:
     }
 
 
+_PLATFORM_ID_PREFIXES = (
+    ("ibkr-", "ibkr"),
+    ("deribit-", "deribit"),
+    ("hl-", "hyperliquid"),
+    ("ts-", "topstep"),
+    ("rh-", "robinhood"),
+    ("luno-", "luno"),
+    ("okx-", "okx"),
+)
+_LIVE_DRAWDOWN_DEFAULT_PCT = {"options": 40.0, "perps": 50.0, "futures": 45.0}
+_LIVE_DEFAULT_STOP_LOSS_ATR_MULT = 1.0
+
+
+LIVE_STOP_KWARG_KEYS = STOP_FIELD_KEYS + STOP_GEOMETRY_INPUT_KEYS + (
+    "stop_platform", "capability_context")
+
+
+def live_stop_kwargs(loaded: dict) -> dict:
+    return {k: loaded[k] for k in LIVE_STOP_KWARG_KEYS if k in loaded}
+
+
+def stop_context_to_json(loaded: dict) -> dict:
+    out = {k: deepcopy(loaded[k]) for k in STOP_FIELD_KEYS + STOP_GEOMETRY_INPUT_KEYS
+           + ("stop_platform", "strategy_type") if loaded.get(k) is not None}
+    context = loaded.get("capability_context")
+    if context is not None:
+        out["capability_context"] = context.to_dict()
+    out["stop_units"] = "engine_fraction"
+    return out
+
+
+def stop_kwargs_from_json(payload) -> dict:
+    if not isinstance(payload, dict):
+        raise ValueError(f"stop_context must be an object, got {type(payload).__name__}")
+    if payload.get("stop_units") != "engine_fraction":
+        raise ValueError(
+            "stop_context.stop_units must be 'engine_fraction' (the translator already "
+            f"converted live percent units once), got {payload.get('stop_units')!r}")
+    allowed = set(STOP_FIELD_KEYS + STOP_GEOMETRY_INPUT_KEYS) | {
+        "stop_platform", "strategy_type", "capability_context", "stop_units"}
+    unknown = sorted(set(payload) - allowed)
+    if unknown:
+        raise ValueError(f"stop_context has unknown key(s) {unknown}")
+    out = {k: deepcopy(v) for k, v in payload.items()
+           if k not in ("capability_context", "stop_units")}
+    context = payload.get("capability_context")
+    if context is not None:
+        if not isinstance(context, dict) or set(context) != {
+                "raw_fields", "resolved_stop_owner", "input_evidence"}:
+            raise ValueError("stop_context.capability_context must be a serialized "
+                             "CapabilityContext")
+        out["capability_context"] = CapabilityContext(**context)
+    return out
+
+
+def live_strategy_platform(sc: dict) -> str:
+    raw = str(sc.get("platform") or "").strip()
+    if raw:
+        return raw.lower()
+    sid = str(sc.get("id") or "")
+    for prefix, name in _PLATFORM_ID_PREFIXES:
+        if sid.startswith(prefix):
+            return name
+    return "deribit" if str(sc.get("type") or "") == "options" else "binanceus"
+
+
+def _live_max_drawdown_pct(cfg: dict, sc: dict, platform: str, strategy_type: str) -> float:
+    explicit = _finite_number(sc.get("max_drawdown_pct"))
+    if explicit is not None and explicit != 0:
+        return explicit
+    platform_cfg = (cfg.get("platforms") or {}).get(platform)
+    risk = platform_cfg.get("risk") if isinstance(platform_cfg, dict) else None
+    if isinstance(risk, dict) and (_finite_number(risk.get("max_drawdown_pct")) or 0) > 0:
+        return float(risk["max_drawdown_pct"])
+    return _LIVE_DRAWDOWN_DEFAULT_PCT.get(strategy_type, 60.0)
+
+
+def apply_live_scalar_stop_default(cfg: dict, sc: dict, platform: str, strategy_type: str,
+                                   close_refs: list) -> None:
+    default = cfg.get("default_stop_loss_atr_mult")
+    default = _LIVE_DEFAULT_STOP_LOSS_ATR_MULT if default is None else _finite_number(default)
+    if default is None or default < 0:
+        raise ValueError(
+            f"default_stop_loss_atr_mult must be >= 0, got {cfg.get('default_stop_loss_atr_mult')!r}")
+    if default == 0 or strategy_type != "perps" or platform != "hyperliquid":
+        return
+    if any(sc.get(k) is not None for k in STOP_SCALAR_FIELD_KEYS):
+        return
+    if any(isinstance(sc.get(k), dict) and sc.get(k) for k in STOP_REGIME_FIELD_KEYS):
+        return
+    if _unified_close_params(close_refs) is not None:
+        return
+    sc["stop_loss_atr_mult"] = default
+
+
+def _atr_window_evidence(sc: dict, regime_cfg: dict) -> dict:
+    window = str(sc.get("regime_atr_window") or "").strip().lower()
+    if window in ("", "default"):
+        return {"status": "verified", "source": "regime_atr_window", "value": window or None}
+    windows = regime_cfg.get("windows") if regime_cfg.get("enabled") else None
+    names = sorted(str(k).strip().lower() for k in (windows or {}))
+    primary = "medium" if "medium" in names else (names[0] if names else "")
+    status = "verified" if window == primary else "missing"
+    return {"status": status, "source": "regime_atr_window", "value": window}
+
+
+def _jsonable_live_value(value):
+    if isinstance(value, dict):
+        return deepcopy(value)
+    number = _finite_number(value)
+    return number if number is not None else value
+
+
+def live_stop_engine_inputs(resolved: dict, *, raw_fields: dict, source: str,
+                            leverage: dict, extra_evidence: Optional[dict] = None):
+    if source not in (STOP_UNITS_LIVE_CONFIG, STOP_UNITS_PREVIEW):
+        raise ValueError(f"unknown live stop unit source {source!r}")
+    kwargs: dict = {}
+    for key in STOP_FIELD_KEYS + STOP_GEOMETRY_INPUT_KEYS:
+        value = resolved.get(key)
+        if key in STOP_PERCENT_FIELD_KEYS and value is not None:
+            number = _finite_number(value)
+            if number is None:
+                raise ValueError(f"{key} must be a finite number in live percent units, "
+                                 f"got {value!r}")
+            value = number / 100.0
+        kwargs[key] = deepcopy(value)
+    evidence = {
+        "stop_units": {"status": "verified", "source": source,
+                       "value": "live_percent_to_engine_fraction"},
+        "leverage": leverage,
+        "resolved_live_units": {
+            "status": "verified", "source": source,
+            "value": {k: _jsonable_live_value(resolved.get(k))
+                      for k in STOP_FIELD_KEYS + STOP_GEOMETRY_INPUT_KEYS}},
+    }
+    evidence.update(extra_evidence or {})
+    return kwargs, CapabilityContext(raw_fields=raw_fields, input_evidence=evidence)
+
+
+def live_stop_resolution(cfg: dict, sc: dict, raw_fields: dict, *, platform: str,
+                         strategy_type: str, close_refs: list, regime_cfg: dict):
+    apply_live_scalar_stop_default(cfg, sc, platform, strategy_type, close_refs)
+    resolved = {k: sc.get(k) for k in STOP_FIELD_KEYS}
+    resolved["max_drawdown_pct"] = _live_max_drawdown_pct(cfg, sc, platform, strategy_type)
+    resolved["trailing_stop_min_move_pct"] = sc.get("trailing_stop_min_move_pct")
+    raw_leverage = sc.get("leverage")
+    if strategy_type == "perps" and not ((_finite_number(raw_leverage) or 0) > 0):
+        resolved["leverage"] = 1.0
+        lev = {"status": "unverified", "source": "default", "value": 1.0}
+    else:
+        resolved["leverage"] = raw_leverage
+        lev = leverage_evidence(raw_leverage, "config", True)
+    kwargs, context = live_stop_engine_inputs(
+        resolved, raw_fields=raw_fields, source=STOP_UNITS_LIVE_CONFIG, leverage=lev,
+        extra_evidence={"atr_regime_window": _atr_window_evidence(sc, regime_cfg)})
+    kwargs["stop_platform"] = platform
+    return kwargs, context
+
+
+def live_stop_preflight(kwargs: dict, context, *, platform: str, strategy_type: str,
+                        close_refs: list, regime_windows_spec, risk_per_trade_pct,
+                        comparison_mode=None, consumer: str = "engine",
+                        phase: str = "preflight"):
+    preflight = build_stop_capability_context(
+        platform=platform, strategy_type=strategy_type, close_refs=close_refs,
+        fields=kwargs, regime_windows_spec=regime_windows_spec,
+        risk_per_trade_pct=risk_per_trade_pct, capability_context=context)
+    return validate_close_capabilities(
+        close_refs=close_refs, comparison_mode=comparison_mode, platform=platform,
+        strategy_type=strategy_type, consumer=consumer, phase=phase,
+        capability_context=preflight)
+
+
+def translate_live_stop_config(cfg: dict, sc: dict, raw_fields: dict, *, platform: str,
+                               strategy_type: str, close_refs: list, regime_cfg: dict,
+                               regime_windows_spec, risk_per_trade_pct,
+                               comparison_mode=None, consumer: str = "engine",
+                               phase: str = "preflight"):
+    kwargs, context = live_stop_resolution(
+        cfg, sc, raw_fields, platform=platform, strategy_type=strategy_type,
+        close_refs=close_refs, regime_cfg=regime_cfg)
+    validation = live_stop_preflight(
+        kwargs, context, platform=platform, strategy_type=strategy_type,
+        close_refs=close_refs, regime_windows_spec=regime_windows_spec,
+        risk_per_trade_pct=risk_per_trade_pct, comparison_mode=comparison_mode,
+        consumer=consumer, phase=phase)
+    return kwargs, context, validation
+
+
+def strategy_close_refs(sc: dict, label: str) -> list:
+    close_refs = []
+    single = sc.get("close_strategy")
+    if isinstance(single, dict) and single.get("name"):
+        close_refs.append({"name": single["name"], "params": dict(single.get("params") or {})})
+        return close_refs
+    legacy = sc.get("close_strategies", []) or []
+    if len(legacy) > 1:
+        raise ValueError(
+            f"{label} has "
+            f"{len(legacy)} close_strategies; the array model was "
+            f"collapsed to a single close_strategy (#842). Keep one "
+            f"profit-taking close and move risk backstops to "
+            f"strategy-level stop fields."
+        )
+    for ref in legacy:
+        if isinstance(ref, dict) and ref.get("name"):
+            close_refs.append({"name": ref["name"], "params": dict(ref.get("params") or {})})
+    return close_refs
+
+
+def resolve_live_strategy_stops(cfg: dict, sc: dict, user_defaults: Optional[dict], *,
+                                inject_user_defaults: bool, label: str) -> dict:
+    raw_stop_fields = stop_raw_fields(sc)
+    close_refs = strategy_close_refs(sc, label)
+    if inject_user_defaults:
+        _apply_user_close_defaults(close_refs, user_defaults, sc)
+    regime_cfg = cfg.get("regime") or {}
+    if not isinstance(regime_cfg, dict):
+        regime_cfg = {}
+    platform = live_strategy_platform(sc)
+    strategy_type = str(sc.get("type") or "perps")
+    kwargs, context = live_stop_resolution(
+        cfg, sc, raw_stop_fields, platform=platform, strategy_type=strategy_type,
+        close_refs=close_refs, regime_cfg=regime_cfg)
+    return {
+        "raw_stop_fields": raw_stop_fields,
+        "close_refs": close_refs,
+        "regime_cfg": regime_cfg,
+        "regime_windows_spec": _resolve_regime_windows_spec(regime_cfg),
+        "platform": platform,
+        "strategy_type": strategy_type,
+        "stop_kwargs": kwargs,
+        "stop_context": context,
+    }
+
+
+def resolve_raw_config_stops(cfg: dict, strategy_id: str, label: str) -> dict:
+    cfg = _normalize_atr_regime_keys(cfg)
+    user_defaults = _effective_user_close_defaults(cfg)
+    _validate_user_close_defaults_regime_atr(user_defaults)
+    for sc in cfg.get("strategies", []) or []:
+        if sc.get("id") == strategy_id:
+            return resolve_live_strategy_stops(
+                cfg, sc, user_defaults, inject_user_defaults=True, label=label)
+    raise ValueError(f"{label}: no strategy with id={strategy_id!r}")
+
+
 def load_strategy_config(config_path: str, strategy_id: str,
                          inject_user_defaults: bool = False,
-                         include_promotion_baseline: bool = False) -> dict:
+                         include_promotion_baseline: bool = False,
+                         comparison_mode: Optional[str] = None) -> dict:
     import json as _json
     with open(config_path) as fh:
         cfg = _normalize_atr_regime_keys(_json.load(fh))
@@ -751,35 +1009,28 @@ def load_strategy_config(config_path: str, strategy_id: str,
                 f"strategy. Set hedge.enabled=false (or remove the block) to "
                 f"backtest the primary leg alone."
             )
-        close_refs = []
-        single = sc.get("close_strategy")
-        if isinstance(single, dict) and single.get("name"):
-            close_refs.append({"name": single["name"], "params": dict(single.get("params") or {})})
-        else:
-            legacy = sc.get("close_strategies", []) or []
-            if len(legacy) > 1:
-                raise ValueError(
-                    f"{config_path}: strategy {strategy_id!r} has "
-                    f"{len(legacy)} close_strategies; the array model was "
-                    f"collapsed to a single close_strategy (#842). Keep one "
-                    f"profit-taking close and move risk backstops to "
-                    f"strategy-level stop fields."
-                )
-            for ref in legacy:
-                if isinstance(ref, dict) and ref.get("name"):
-                    close_refs.append({"name": ref["name"], "params": dict(ref.get("params") or {})})
-        for ref in close_refs:
-            if ref.get("name") == "tiered_tp_atr_live_regime_dynamic":
-                raise ValueError(
-                    f"{config_path}: strategy {strategy_id!r} uses "
-                    f"tiered_tp_atr_live_regime_dynamic, which is HL-live-only "
-                    f"in this release (backtester parity deferred — see #843)."
-                )
-        if inject_user_defaults:
-            _apply_user_close_defaults(close_refs, user_defaults, sc)
+        stops = resolve_live_strategy_stops(
+            cfg, sc, user_defaults, inject_user_defaults=inject_user_defaults,
+            label=f"{config_path}: strategy {strategy_id!r}")
+        close_refs = stops["close_refs"]
+        stop_kwargs = stops["stop_kwargs"]
+        stop_context = stops["stop_context"]
         direction = _effective_direction(sc)
         invert_signal = bool(sc.get("invert_signal"))
-        strategy_type = str(sc.get("type") or "perps")
+        strategy_type = stops["strategy_type"]
+        try:
+            close_validation = live_stop_preflight(
+                stop_kwargs, stop_context,
+                platform=stops["platform"],
+                strategy_type=strategy_type,
+                close_refs=close_refs,
+                regime_windows_spec=stops["regime_windows_spec"],
+                risk_per_trade_pct=sc.get("risk_per_trade_pct"),
+                comparison_mode=comparison_mode,
+            )
+        except CloseCapabilityError as exc:
+            raise exc.with_context(
+                f"{config_path}: strategy {strategy_id!r}") from exc
         if invert_signal and strategy_type not in ("perps", "manual"):
             raise ValueError(
                 f"{config_path}: strategy {strategy_id!r} sets invert_signal "
@@ -901,30 +1152,6 @@ def load_strategy_config(config_path: str, strategy_id: str,
                     f"re-size off frozen SL geometry, breaking the "
                     f"constant-dollar-risk invariant)."
                 )
-            for _pk in ("stop_loss_pct", "trailing_stop_pct", "stop_loss_margin_pct"):
-                if (sc.get(_pk) or 0) > 0:
-                    raise ValueError(
-                        f"{config_path}: strategy {strategy_id!r} sizes "
-                        f"risk_per_trade_pct from {_pk}, but the backtester's "
-                        f"pct-stop fields are fraction-denominated (live is "
-                        f"percent), so the risk formula would skew 100×. Use "
-                        f"an ATR-mult stop owner (stop_loss_atr_mult / "
-                        f"trailing_stop_atr_mult) for risk-sizing backtests."
-                    )
-            if not any(sc.get(k) is not None for k in _STOP_OWNER_KEYS):
-                _default_mult = cfg.get("default_stop_loss_atr_mult")
-                if _default_mult is None:
-                    _default_mult = 1.0
-                _default_mult = float(_default_mult or 0)
-                if _default_mult <= 0:
-                    raise ValueError(
-                        f"{config_path}: strategy {strategy_id!r} sets "
-                        f"risk_per_trade_pct with no stop owner and "
-                        f"default_stop_loss_atr_mult=0 (auto-default opted "
-                        f"out) — no stop distance to size risk from (the "
-                        f"live daemon rejects this config at startup; #1268)."
-                    )
-                sc["stop_loss_atr_mult"] = _default_mult
         cfg_args = sc.get("args") or []
         allow_scale_in = bool(sc.get("allow_scale_in"))
         scale_in_cfg = sc.get("scale_in")
@@ -1000,13 +1227,8 @@ def load_strategy_config(config_path: str, strategy_id: str,
                 "params": dict(open_ref.get("params") or {}),
             },
             "close_strategies": close_refs,
-            "stop_loss_atr_mult": sc.get("stop_loss_atr_mult"),
-            "stop_loss_pct": sc.get("stop_loss_pct"),
-            "stop_loss_margin_pct": sc.get("stop_loss_margin_pct"),
-            "trailing_stop_atr_mult": sc.get("trailing_stop_atr_mult"),
-            "trailing_stop_pct": sc.get("trailing_stop_pct"),
-            "stop_loss_atr_mult_regime": sc.get(_V19_STOP_LOSS_KEY),
-            "trailing_stop_atr_mult_regime": sc.get(_V19_TRAIL_STOP_KEY),
+            **stop_kwargs,
+            "capability_context": stop_context,
             "strategy_type": strategy_type,
             "platform": str(sc.get("platform") or "").strip().lower(),
             "direction": direction,
@@ -1027,7 +1249,8 @@ def load_strategy_config(config_path: str, strategy_id: str,
             "allow_scale_in": allow_scale_in,
             "scale_in": dict(scale_in_cfg) if scale_in_cfg else None,
             "atr_method": atr_method,
-            "platform": str(sc.get("platform") or "").strip().lower(),
+            "platform": live_strategy_platform(sc),
+            "comparison_mode": close_validation.mode,
         }
         if include_promotion_baseline:
             out["promotion_baseline"] = promotion_baseline
@@ -1077,26 +1300,66 @@ def run_single_backtest(
     allow_scale_in: bool = False,
     scale_in: Optional[dict] = None,
     atr_method: str = "simple",
+    stop_platform: Optional[str] = None,
+    capability_context: Optional[CapabilityContext] = None,
     circuit_breaker_max_drawdown_pct: Optional[float] = None,
     save: bool = False,
     margin_per_trade_usd: Optional[float] = None,
-    leverage: Optional[float] = None,
 ) -> Optional[dict]:
     """Run a single backtest and print results.
 
-    ``registry`` selects the strategy registry (``"spot"`` or ``"futures"``).
     ``platform`` selects the exchange fee model (``"binanceus"``,
     ``"hyperliquid"``, ``"blofin"``, ``"robinhood"``, ``"luno"``, ``"okx"``,
     ``"okx-perps"``), matching ``scheduler/fees.go:CalculatePlatformSpotFee``.
-    ``close_strategies`` is an optional list of co-located close-evaluator
-    refs (``[{"name": str, "params": dict}, ...]``) from the close registry
-    (#511, #641); each runs per-bar against the simulated position.
-    ``intrabar_resolution`` selects the SL race resolution (#1271):
-    ``"ohlc_walk"`` (default) stops out on any bar whose range touches the
-    armed trigger, priced at the trigger (or the open on a gap-through);
-    ``"bar_close"`` restores the legacy bar-level convention for reproducing
-    pre-#1271 baselines.
     """
+    manifest = None
+    manifest_dataset_entry = None
+    if manifest_path:
+        import offline_manifest as om
+        unsupported = [
+            label for label, active in (
+                ("--htf-filter", htf_filter),
+                ("a regime timeframe override", bool(regime_timeframe)),
+                ("profile allocation", bool(profile_allocation)),
+                ("funding-input strategies", strategy_name in FUNDING_COLUMN_STRATEGIES),
+                ("scale-in", allow_scale_in),
+                ("no close strategy (the execution spec needs the open/close engine)",
+                 not close_strategies),
+            ) if active
+        ]
+        if unsupported:
+            raise SystemExit(f"--manifest does not support: {', '.join(unsupported)}")
+        if not manifest_dataset or not manifest_window:
+            raise SystemExit("--manifest needs --manifest-dataset and --manifest-window")
+        try:
+            manifest = om.load_manifest(manifest_path)
+            manifest_dataset_entry = om.dataset_by_key(manifest, manifest_dataset)
+        except om.ManifestError as exc:
+            raise SystemExit(f"manifest error: {exc}")
+        if strategy_name in OBSERVATION_INPUT_STRATEGIES and manifest_dataset_entry.get("open_interest") is None:
+            raise SystemExit(f"--manifest: {strategy_name} reads open interest as an entry input; dataset "
+                             f"{manifest_dataset} attaches no open_interest series (schema {om.SCHEMA_V2})")
+        if manifest_window not in manifest["windows"]:
+            raise SystemExit(f"manifest error: unknown window {manifest_window!r}; "
+                             f"known: {sorted(manifest['windows'])}")
+        symbol = manifest_dataset_entry["symbol"]
+        timeframe = manifest["interval"]
+        platform = manifest["venue"]
+        since = manifest["windows"][manifest_window]["start"]
+    elif strategy_name in OBSERVATION_INPUT_STRATEGIES:
+        raise SystemExit(f"{strategy_name} reads recorded open interest; run it only with --manifest "
+                         f"(schema {'offline_candle_manifest/v2'}) on a dataset that attaches an open_interest series")
+    elif manifest_dataset or manifest_window:
+        raise SystemExit("--manifest-dataset and --manifest-window need --manifest")
+    elif cost_multiplier != 1.0:
+        raise SystemExit("--cost-multiplier needs --manifest")
+    validate_close_capabilities(
+        close_refs=close_strategies,
+        comparison_mode=comparison_mode,
+        platform=platform,
+        strategy_type=strategy_type,
+        phase="preflight",
+    )
     reg = load_registry(registry)
     strat = reg.STRATEGY_REGISTRY.get(strategy_name)
     if not strat:
@@ -1116,11 +1379,12 @@ def run_single_backtest(
             cr_params = cr.setdefault("params", {})
             cr_params.setdefault("tp_enabled", False)
 
-    df = load_cached_data(symbol, timeframe, exchange_id=platform, start_date=since)
-    if df.empty:
-        print("No data available!")
-        return None
-    df = _attach_funding_if_needed(df, strategy_name, symbol, since)
+    else:
+        df = load_cached_data(symbol, timeframe, exchange_id=platform, start_date=since)
+        if df.empty:
+            print("No data available!")
+            return None
+        df = _attach_funding_if_needed(df, strategy_name, symbol, since)
 
     print(f"  Data: {len(df)} candles from {df.index[0]} to {df.index[-1]}")
 
@@ -1152,7 +1416,8 @@ def run_single_backtest(
         print(f"  Profile allocation: window={profile_allocation['window']} "
               f"profiles={names} confirm_bars={profile_allocation['confirm_bars']}")
     else:
-        df_signals = reg.apply_strategy(strategy_name, df, strat_params)
+        df_signals = reg.apply_strategy(strategy_name, df, {**(strat_params or {}), **observation_params}
+                                        if observation_params else strat_params)
 
         if close_strategies:
             df_signals = ensure_atr_indicator(df_signals, method=atr_method)
@@ -1174,6 +1439,21 @@ def run_single_backtest(
         )
         if df_signals is None:
             return None
+
+    indicator_frame = None
+    if window_spec is not None:
+        import offline_manifest as om
+        if regime_enabled and "regime" not in df_signals.columns:
+            ensure_regime_columns(
+                df_signals,
+                period=regime_period,
+                adx_threshold=regime_adx_threshold,
+                windows_spec=regime_windows_spec,
+            )
+        indicator_frame = df_signals
+        df_signals = om.slice_window(df_signals, window_spec)
+        print(f"  Scored window: {len(df_signals)} candles from {df_signals.index[0]} "
+              f"to {df_signals.index[-1]} (warm-up bars excluded)")
 
     if (regime_directional_policy and regime_directional_certified_states is None
             and regime_directional_certified is None):
@@ -1211,6 +1491,11 @@ def run_single_backtest(
         trailing_stop_pct=trailing_stop_pct,
         stop_loss_atr_mult_regime=stop_loss_atr_mult_regime,
         trailing_stop_atr_mult_regime=trailing_stop_atr_mult_regime,
+        leverage=leverage,
+        max_drawdown_pct=max_drawdown_pct,
+        trailing_stop_min_move_pct=trailing_stop_min_move_pct,
+        stop_platform=stop_platform,
+        capability_context=capability_context,
         strategy_type=strategy_type,
         direction=direction,
         invert_signal=invert_signal,
@@ -1226,6 +1511,8 @@ def run_single_backtest(
         circuit_breaker_max_drawdown_pct=circuit_breaker_max_drawdown_pct,
         margin_per_trade_usd=resolved_margin,
         leverage=resolved_leverage,
+        execution_spec=execution_spec,
+        comparison_mode=comparison_mode,
     )
     results = bt.run(
         df_signals,
@@ -1234,6 +1521,7 @@ def run_single_backtest(
         timeframe=timeframe,
         params=strat_params,
         save=save,
+        indicator_frame=indicator_frame,
     )
 
     print(format_single_report(results))
@@ -1260,7 +1548,11 @@ def run_all_strategies(
     circuit_breaker_max_drawdown_pct: Optional[float] = None,
     margin_per_trade_usd: Optional[float] = None,
     leverage: Optional[float] = None,
+    comparison_mode: Optional[str] = None,
 ) -> list:
+    validate_close_capabilities(close_refs=close_strategies,
+                                comparison_mode=comparison_mode,
+                                platform=platform, phase="preflight")
     reg = load_registry(registry)
     strat_list = strategies or reg.list_strategies()
     print(f"\n{'#'*60}")
@@ -1283,12 +1575,15 @@ def run_all_strategies(
             circuit_breaker_max_drawdown_pct=circuit_breaker_max_drawdown_pct,
             margin_per_trade_usd=margin_per_trade_usd,
             leverage=leverage,
+            comparison_mode=comparison_mode,
         )
         if result:
             all_results.append(result)
 
     if all_results:
         print(format_comparison_report(all_results))
+        print("  " + format_close_validation(aggregate_close_validations(
+            r.get("close_validation") for r in all_results)))
 
     return all_results
 
@@ -1310,7 +1605,11 @@ def run_multi_asset(
     direction: Optional[str] = None,
     intrabar_resolution: str = "ohlc_walk",
     atr_method: str = "simple",
+    comparison_mode: Optional[str] = None,
 ) -> dict:
+    validate_close_capabilities(close_refs=close_strategies,
+                                comparison_mode=comparison_mode,
+                                platform=platform, phase="preflight")
     reg = load_registry(registry)
     strat_list = strategies or reg.list_strategies()
     sym_list = symbols or DEFAULT_SYMBOLS
@@ -1338,11 +1637,15 @@ def run_multi_asset(
                 direction=direction,
                 intrabar_resolution=intrabar_resolution,
                 atr_method=atr_method,
+                comparison_mode=comparison_mode,
             )
             if result:
                 results_by_asset[symbol].append(result)
 
     print(format_multi_asset_report(results_by_asset))
+    print("  " + format_close_validation(aggregate_close_validations(
+        r.get("close_validation")
+        for results in results_by_asset.values() for r in results)))
     return results_by_asset
 
 
@@ -1365,7 +1668,12 @@ def run_walk_forward(
     close_stack_grid: Optional[List[dict]] = None,
     optimize_metric: str = "sharpe_ratio",
     direction: Optional[str] = None,
+    comparison_mode: Optional[str] = None,
 ) -> Optional[dict]:
+    for stack in (close_stack_grid or [{"close_strategies": close_strategies}]):
+        validate_close_capabilities(close_refs=stack.get("close_strategies"),
+                                    comparison_mode=comparison_mode,
+                                    platform=platform, phase="preflight")
     reg = load_registry(registry)
     strat = reg.STRATEGY_REGISTRY.get(strategy_name)
     if not strat:
@@ -1408,6 +1716,7 @@ def run_walk_forward(
         close_stack_grid=close_stack_grid,
         optimize_metric=optimize_metric,
         direction=direction,
+        comparison_mode=comparison_mode,
     )
 
     print(format_walk_forward_report(result))
@@ -1531,6 +1840,20 @@ def _build_parser() -> argparse.ArgumentParser:
                              "alongside --config (the live config's atr_method "
                              "owns it). Regime classification stays pinned to "
                              "simple either way.")
+    parser.add_argument("--manifest", default=None, metavar="PATH",
+                        help="#1649 frozen offline manifest (offline_manifest.py). "
+                             "Single mode only: replays one manifest dataset and "
+                             "window from hash-verified venue candles with warm-up "
+                             "excluded from scoring, funding attached as a cost, "
+                             "and the manifest's fee/spread/slippage/lot/minimum "
+                             "execution spec. Needs a close strategy. No network "
+                             "fetch and no results-DB write. Default: off.")
+    parser.add_argument("--manifest-dataset", default=None,
+                        help="Manifest dataset key, e.g. 'BTC 4h'")
+    parser.add_argument("--manifest-window", default=None,
+                        help="Manifest window name, e.g. 'train'")
+    parser.add_argument("--cost-multiplier", type=float, default=1.0,
+                        help="With --manifest: scale spread and slippage")
     parser.add_argument("--intrabar-resolution", dest="intrabar_resolution",
                         choices=["ohlc_walk", "bar_close"],
                         default="ohlc_walk",
@@ -1543,6 +1866,16 @@ def _build_parser() -> argparse.ArgumentParser:
                              "detected on the close only, filled at the next "
                              "bar's open) for reproducing documented "
                              "baselines. Single mode only.")
+    parser.add_argument("--comparison-mode", dest="comparison_mode", default=None,
+                        metavar="MODE",
+                        help="#1683 close comparison mode, every --mode. Omitted = "
+                             "strict on every platform: refuses closes that need "
+                             "inputs no live close context supplies (time_stop "
+                             "bars_held, zscore_target zscore) and always refuses "
+                             "HL-live-only closes. 'approximate' opts research into "
+                             "those simulator-only exits; results carry "
+                             "close_validation with incomplete parity. Any other "
+                             "value is an error.")
     return parser
 
 
@@ -1574,12 +1907,40 @@ def _resolve_defaults_mode(args) -> str:
 
 
 def main(argv=None):
+    try:
+        _main(argv)
+    except CloseCapabilityError as exc:
+        print(str(exc))
+        print(json.dumps(exc.to_dict(), sort_keys=True))
+        sys.exit(1)
+
+
+def _main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     platform_explicit = any(
         a == "--platform" or str(a).startswith("--platform=") for a in argv
     )
     args = _build_parser().parse_args(argv)
     args.defaults = _resolve_defaults_mode(args)
+
+    if args.mode != "single":
+        manifest_flags = [
+            flag for flag, active in (
+                ("--manifest", args.manifest is not None),
+                ("--manifest-dataset", args.manifest_dataset is not None),
+                ("--manifest-window", args.manifest_window is not None),
+                ("--cost-multiplier", args.cost_multiplier != 1.0),
+            ) if active
+        ]
+        if manifest_flags:
+            print(f"--mode {args.mode} does not support {', '.join(manifest_flags)} "
+                  "(manifest replay is single mode only); use --mode single or "
+                  "eval_windows.py --manifest")
+            sys.exit(1)
+        if args.strategy in OBSERVATION_INPUT_STRATEGIES:
+            print(f"--mode {args.mode} cannot run {args.strategy}: it reads recorded open interest, "
+                  "which only --mode single --manifest (or eval_windows.py --manifest) attaches")
+            sys.exit(1)
 
     close_refs = None
     if args.close_strategies:
@@ -1609,7 +1970,8 @@ def main(argv=None):
             print("--config is only valid with --mode single (loads one strategy by --strategy <id>)")
             sys.exit(1)
         live_kwargs = load_strategy_config(args.config, args.strategy,
-                                           inject_user_defaults=(args.defaults == "user"))
+                                           inject_user_defaults=(args.defaults == "user"),
+                                           comparison_mode=args.comparison_mode)
         if not platform_explicit:
             live_platform = str(live_kwargs.get("platform") or "").strip().lower()
             if live_platform:
@@ -1666,6 +2028,11 @@ def main(argv=None):
             "scale_in",
             "atr_method",
             "hurst_gate",
+            "leverage",
+            "max_drawdown_pct",
+            "trailing_stop_min_move_pct",
+            "stop_platform",
+            "capability_context",
         )
         live_stop_kwargs = {k: live_kwargs[k] for k in stop_keys if k in live_kwargs}
         args.regime_enabled = live_kwargs.get("regime_enabled", args.regime_enabled)
@@ -1737,6 +2104,11 @@ def main(argv=None):
                             regime_period=args.regime_period,
                             regime_adx_threshold=args.regime_adx_threshold,
                             allowed_regimes=args.allowed_regimes,
+                            manifest_path=args.manifest,
+                            manifest_dataset=args.manifest_dataset,
+                            manifest_window=args.manifest_window,
+                            cost_multiplier=args.cost_multiplier,
+                            comparison_mode=args.comparison_mode,
                             **live_stop_kwargs)
 
     elif args.mode == "compare":
@@ -1752,7 +2124,8 @@ def main(argv=None):
                            allowed_regimes=args.allowed_regimes,
                            direction=args.direction,
                            intrabar_resolution=args.intrabar_resolution,
-                           atr_method=args.atr_method or "simple")
+                           atr_method=args.atr_method or "simple",
+                           comparison_mode=args.comparison_mode)
 
     elif args.mode == "multi":
         strategies = None if args.strategy == "all" else [args.strategy]
@@ -1768,7 +2141,8 @@ def main(argv=None):
                         allowed_regimes=args.allowed_regimes,
                         direction=args.direction,
                         intrabar_resolution=args.intrabar_resolution,
-                        atr_method=args.atr_method or "simple")
+                        atr_method=args.atr_method or "simple",
+                        comparison_mode=args.comparison_mode)
 
     elif args.mode == "optimize":
         close_stack_grid = None
@@ -1813,7 +2187,8 @@ def main(argv=None):
                                  close_strategies=close_refs,
                                  close_stack_grid=close_stack_grid,
                                  optimize_metric=args.optimize_metric,
-                                 direction=args.direction)
+                                 direction=args.direction,
+                                 comparison_mode=args.comparison_mode)
         else:
             run_walk_forward(args.strategy, args.symbol, args.timeframe,
                              args.since, args.splits, args.capital,
@@ -1827,7 +2202,8 @@ def main(argv=None):
                              close_strategies=close_refs,
                              close_stack_grid=close_stack_grid,
                              optimize_metric=args.optimize_metric,
-                             direction=args.direction)
+                             direction=args.direction,
+                             comparison_mode=args.comparison_mode)
 
 
 if __name__ == "__main__":

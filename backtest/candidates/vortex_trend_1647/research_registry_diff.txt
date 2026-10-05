@@ -1,0 +1,24 @@
+--- research_registry_before
++++ research_registry_after
+@@ -873,6 +873,21 @@
+   "RESEARCH, backtest-only (#1645) \u2014 Connors RSI pullback: composite of a bounded Wilder RSI of closes (price_period), a bounded Wilder RSI of the consecutive up/down streak (streak_period, streak capped at 20 bars) and the mid-rank percentile of the latest one-bar return among the previous rank_window returns; long when the composite recovers to or above oversold from strictly below, short when it falls to or below overbought from strictly above. Every decision reads a fixed trailing span (at most 153 bars). Entry-only; pair with one explicit close strategy and one stop owner. Refused by every live check script; promotion requires a separate reviewed decision"
+  ],
+  [
++  "vortex_trend",
++  {
++   "period": 14,
++   "min_separation": 0.0
++  },
++  true,
++  [
++   "period >= 2",
++   "period <= 100",
++   "min_separation >= 0",
++   "min_separation < 1"
++  ],
++  "RESEARCH, backtest-only (#1647) \u2014 Vortex trend crossover: VI+ and VI- are the period sums of |high - previous low| and |low - previous high| divided by the period sum of true range; long when VI+ minus VI- rises strictly above min_separation from at or below it on the previous bar, short on the mirror below -min_separation. Entry-only; pair with one explicit close strategy and one stop owner. Refused by every live check script; promotion requires a separate reviewed decision"
++ ],
++ [
+   "hold",
+   {},
+   false,

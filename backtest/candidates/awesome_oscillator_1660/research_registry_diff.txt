@@ -1,0 +1,23 @@
+--- research_registry_before
++++ research_registry_after
+@@ -899,6 +899,20 @@
+    "period <= 100"
+   ],
+   "RESEARCH, backtest-only (#1666) \u2014 Relative Vigor Index crossover: the period-bar mean of 1-2-2-1 smoothed close-minus-open over the mean of smoothed high-minus-low, with a 1-2-2-1 smoothed signal line; long on a strict upward cross of the signal line while the index is above zero, short on the mirror below zero (zero_line_filter). Any bad candle, timestamp defect or cadence gap inside the window holds. Entry-only; pair with one explicit close strategy and one stop owner. Refused by every live check script; promotion requires a separate reviewed decision"
++ ],
++ [
++  "awesome_oscillator",
++  {
++   "fast_period": 5,
++   "slow_period": 34
++  },
++  true,
++  [
++   "fast_period >= 1",
++   "fast_period < slow_period",
++   "slow_period <= 100"
++  ],
++  "RESEARCH, backtest-only (#1660) \u2014 Awesome Oscillator zero cross: the mean candle midpoint over fast_period bars minus the mean over slow_period bars; long when it turns positive after a negative value, short when it turns negative after a positive value, crossing at most 7 exact-zero bars (8-bar predecessor horizon). Entry-only; pair with one explicit close strategy and one stop owner. Refused by every live check script; promotion requires a separate reviewed decision"
+  ],
+  [
+   "hold",

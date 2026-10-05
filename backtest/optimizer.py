@@ -10,7 +10,8 @@ import numpy as np
 import pandas as pd
 
 from registry_loader import load_registry
-from backtester import Backtester
+from backtester import (STOP_OWNERS_NEEDING_ATR, Backtester, CloseCapabilityError,
+                        aggregate_close_validations)
 from atr import ensure_atr_indicator
 
 
@@ -228,6 +229,8 @@ def walk_forward_optimize(
     close_strategies: Optional[List[dict]] = None,
     close_stack_grid: Optional[List[dict]] = None,
     direction: Optional[str] = None,
+    comparison_mode: Optional[str] = None,
+    stop_kwargs: Optional[dict] = None,
 ) -> dict:
     total_len = len(df)
     window_size = total_len // n_splits
@@ -235,11 +238,21 @@ def walk_forward_optimize(
         raise ValueError(f"Not enough data: {total_len} rows / {n_splits} splits = {window_size} rows per window. Need >= 50.")
 
     if close_stack_grid and (close_strategies or stop_loss_atr_mult
-                             or trailing_stop_atr_mult):
+                             or trailing_stop_atr_mult or stop_kwargs):
         raise ValueError(
             "close_stack_grid is mutually exclusive with the fixed "
-            "close_strategies / stop_loss_atr_mult / trailing_stop_atr_mult "
-            "kwargs — the grid owns the close stack")
+            "close_strategies / stop_loss_atr_mult / trailing_stop_atr_mult / "
+            "stop_kwargs inputs — the grid owns the close stack")
+    extra_stop_kwargs = {}
+    for key, value in (stop_kwargs or {}).items():
+        if key in ("stop_loss_atr_mult", "trailing_stop_atr_mult"):
+            expected = stop_loss_atr_mult if key == "stop_loss_atr_mult" \
+                else trailing_stop_atr_mult
+            if value != expected:
+                raise ValueError(
+                    f"stop_kwargs.{key}={value!r} disagrees with {key}={expected!r}")
+            continue
+        extra_stop_kwargs[key] = value
     if close_stack_grid and direction is None:
         direction = "long"
     if direction == "short":
@@ -284,16 +297,24 @@ def walk_forward_optimize(
             trailing_stop_atr_mult=stack.get("trailing_stop_atr_mult"),
             close_strategies=stack.get("close_strategies"),
             direction=direction,
+            comparison_mode=comparison_mode,
+            **extra_stop_kwargs,
         ))
         for stack in stacks
     ]
     bt = stack_bts[0][1]
+    stack_validations = [
+        {"label": stack["label"], "close_validation": stack_bt._close_validation.to_dict()}
+        for stack, stack_bt in stack_bts
+    ]
+    grid_validation = aggregate_close_validations(
+        v["close_validation"] for v in stack_validations)
 
     needs_atr = any(stack.get("close_strategies") for stack, _ in stack_bts)
     uses_exits = needs_atr or any(
         stack.get("stop_loss_atr_mult") or stack.get("trailing_stop_atr_mult")
         for stack, _ in stack_bts
-    )
+    ) or any(stack_bt.stop_owner in STOP_OWNERS_NEEDING_ATR for _, stack_bt in stack_bts)
     if uses_exits:
         warmup = max(warmup, ATR_CLOSE_WARMUP)
 
@@ -349,6 +370,8 @@ def walk_forward_optimize(
                 train_seed = warmup_exit_long_entry(
                     signals_ext.iloc[:train_boundary_idx], bt.slippage_pct,
                 ) if train_boundary_idx else None
+            except CloseCapabilityError:
+                raise
             except _EXPECTED_FOLD_ERRORS as e:
                 if verbose:
                     print(f"    [skip] fold {fold+1} {strategy_name} {params}: {type(e).__name__}: {e}")
@@ -365,6 +388,8 @@ def walk_forward_optimize(
                         best_params = params
                         best_stack = stack
                         best_bt = stack_bt
+                except CloseCapabilityError:
+                    raise
                 except _EXPECTED_FOLD_ERRORS as e:
                     if verbose:
                         print(f"    [skip] fold {fold+1} {strategy_name} {params} "
@@ -387,6 +412,8 @@ def walk_forward_optimize(
                                       symbol=symbol, timeframe=timeframe,
                                       params=best_params, save=False,
                                       starting_long=test_seed)
+        except CloseCapabilityError:
+            raise
         except _EXPECTED_FOLD_ERRORS as e:
             if verbose:
                 print(f"    [skip] fold {fold+1} validation {strategy_name}: {type(e).__name__}: {e}")
@@ -400,6 +427,7 @@ def walk_forward_optimize(
                 k: best_stack.get(k) for k in
                 ("close_strategies", "stop_loss_atr_mult", "trailing_stop_atr_mult")
             },
+            "best_close_stack_validation": best_bt._close_validation.to_dict(),
             "train_metric": best_metric,
             "test_result": test_result,
             "train_period": f"{train_df.index[0].strftime('%Y-%m-%d')} to {train_df.index[-1].strftime('%Y-%m-%d')}",
@@ -416,7 +444,9 @@ def walk_forward_optimize(
                   f"MaxDD: {test_result['max_drawdown_pct']:.2f}%")
 
     if not window_results:
-        return {"error": "No valid optimization windows", "strategy": strategy_name}
+        return {"error": "No valid optimization windows", "strategy": strategy_name,
+                "close_validation": grid_validation,
+                "close_stack_validations": stack_validations}
 
     oos_returns = [w["test_result"]["total_return_pct"] for w in window_results]
     oos_sharpes = [w["test_result"]["sharpe_ratio"] for w in window_results]
@@ -444,6 +474,8 @@ def walk_forward_optimize(
         "oos_worst_drawdown": round(min(oos_drawdowns), 2),
         "most_common_best_params": most_common_params,
         "most_common_best_close_stack": most_common_stack,
+        "close_validation": grid_validation,
+        "close_stack_validations": stack_validations,
         "window_results": window_results,
     }
 
@@ -461,6 +493,8 @@ def walk_forward_optimize(
         print(f"  Most Stable Params: {summary['most_common_best_params']}")
         if len(stack_bts) > 1:
             print(f"  Most Stable Close Stack: {summary['most_common_best_close_stack']}")
+        from backtester import format_close_validation
+        print(f"  {format_close_validation(grid_validation)}")
 
     return summary
 
@@ -602,6 +636,35 @@ DEFAULT_PARAM_RANGES = {
         "buffer_atr_mult": [0.1, 0.25, 0.5],
         "confirm_bars": [1, 2, 3],
     },
+    "chaikin_money_flow_breakout": {
+        "flow_window": [10, 20, 40, 80],
+        "breakout_window": [10, 20, 40, 80],
+        "flow_threshold": [0.0, 0.05, 0.10, 0.20],
+    },
+    "open_interest_breakout": {
+        "price_lookback": [10, 20, 40],
+        "oi_lookback": [2, 4, 8],
+        "oi_change_threshold": [0.0, 0.002, 0.005, 0.01],
+    },
+    "connors_rsi_reversion": {
+        "price_period": [2, 3, 5],
+        "streak_period": [2, 3],
+        "rank_window": [50, 100, 150],
+        "oversold": [5.0, 10.0, 20.0],
+        "overbought": [80.0, 90.0, 95.0],
+    },
+    "vortex_trend": {
+        "period": [7, 14, 21, 28],
+        "min_separation": [0.0, 0.02, 0.05, 0.10],
+    },
+    "relative_vigor_index": {
+        "period": [4, 6, 8, 10, 14, 20, 30],
+        "zero_line_filter": [True],
+    },
+    "awesome_oscillator": {
+        "fast_period": [3, 5, 8, 13],
+        "slow_period": [21, 34, 55, 89],
+    },
     "analog_retrieval": {
         "horizon": [6, 12, 24],
         "k_neighbors": [15, 25, 50],
@@ -639,6 +702,11 @@ DEFAULT_PARAM_RANGES = {
     "donchian_breakout": {
         "entry_period": [10, 20, 30],
         "exit_period": [5, 10, 15],
+    },
+    "commodity_channel_trend": {
+        "lookback": [14, 20, 30, 50],
+        "threshold": [50.0, 100.0, 150.0, 200.0],
+        "trend_period": [20, 50, 100, 150],
     },
     "momentum_pro": {
         "ema_fast": [13, 20, 26],

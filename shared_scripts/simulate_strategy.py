@@ -18,9 +18,12 @@ sys.path.insert(0, os.path.join(ROOT, "backtest"))
 
 from atr import ensure_atr_indicator
 from regime import normalize_regime_gate_on_failure
-from backtester import Backtester
+from backtester import Backtester, CloseCapabilityError
 from registry_loader import load_registry, registry_for_strategy_type
-from run_backtest import _apply_htf_filter_to_df
+from run_backtest import (_apply_htf_filter_to_df, _atr_window_evidence,
+                          _resolve_regime_windows_spec, live_stop_engine_inputs,
+                          stop_raw_fields)
+from backtester import STOP_FIELD_KEYS, STOP_GEOMETRY_INPUT_KEYS, STOP_UNITS_PREVIEW
 
 
 def _fee_platform(platform: str, strategy_type: str) -> str:
@@ -171,6 +174,46 @@ def _resolve_atr_regime_stop(cfg: dict, canon: str):
     return resolved
 
 
+_PREVIEW_LEVERAGE_SOURCES = {
+    "tuner_override": True,
+    "strategy_config": True,
+    "loader_default": False,
+}
+
+
+def _preview_stop_kwargs(cfg: dict) -> dict:
+    resolved = {k: cfg.get(k) for k in STOP_FIELD_KEYS + STOP_GEOMETRY_INPUT_KEYS}
+    resolved["stop_loss_atr_mult_regime"] = _resolve_atr_regime_stop(
+        cfg, "stop_loss_atr_mult_regime")
+    resolved["trailing_stop_atr_mult_regime"] = _resolve_atr_regime_stop(
+        cfg, "trailing_stop_atr_mult_regime")
+    if not any(v is not None for v in resolved.values()):
+        return {}
+    if cfg.get("stop_units") != "live_percent":
+        raise ValueError(
+            "preview payload carries stop fields without stop_units='live_percent'; "
+            "refusing to guess whether they are live percent or engine fractions")
+    source = str(cfg.get("leverage_source") or "")
+    if source not in _PREVIEW_LEVERAGE_SOURCES:
+        raise ValueError(f"preview payload leverage_source must be one of "
+                         f"{sorted(_PREVIEW_LEVERAGE_SOURCES)}, got {source!r}")
+    leverage = resolved.get("leverage")
+    if leverage is None:
+        lev = {"status": "missing", "source": source, "value": None}
+    elif not isinstance(leverage, (int, float)) or isinstance(leverage, bool) or leverage <= 0:
+        lev = {"status": "invalid", "source": source, "value": None}
+    else:
+        lev = {"status": "verified" if _PREVIEW_LEVERAGE_SOURCES[source] else "unverified",
+               "source": source, "value": float(leverage)}
+    window_evidence = _atr_window_evidence(cfg, dict(cfg.get("regime") or {}))
+    kwargs, context = live_stop_engine_inputs(
+        resolved, raw_fields=stop_raw_fields(resolved), source=STOP_UNITS_PREVIEW,
+        leverage=lev, extra_evidence={"atr_regime_window": window_evidence})
+    kwargs["capability_context"] = context
+    kwargs["stop_platform"] = str(cfg.get("platform") or "").strip().lower()
+    return kwargs
+
+
 def _simulate_one(cfg: dict, candles: List[dict]) -> List[dict]:
     strategy_type = str(cfg.get("type") or "spot")
     if strategy_type == "options":
@@ -231,18 +274,11 @@ def _simulate_one(cfg: dict, candles: List[dict]) -> List[dict]:
         regime_enabled=regime_enabled,
         regime_period=int(regime_cfg.get("period") or 14),
         regime_adx_threshold=float(regime_cfg.get("adx_threshold") or 20),
+        regime_windows_spec=_resolve_regime_windows_spec(regime_cfg),
         allowed_regimes=allowed,
         regime_gate_on_failure=gate_on_failure,
-        stop_loss_atr_mult=cfg.get("stop_loss_atr_mult"),
-        stop_loss_pct=cfg.get("stop_loss_pct"),
-        stop_loss_margin_pct=cfg.get("stop_loss_margin_pct"),
-        trailing_stop_atr_mult=cfg.get("trailing_stop_atr_mult"),
-        trailing_stop_pct=cfg.get("trailing_stop_pct"),
-        stop_loss_atr_mult_regime=_resolve_atr_regime_stop(
-            cfg, "stop_loss_atr_mult_regime"),
-        trailing_stop_atr_mult_regime=_resolve_atr_regime_stop(
-            cfg, "trailing_stop_atr_mult_regime"),
         strategy_type=strategy_type,
+        **_preview_stop_kwargs(cfg),
     )
     results = bt.run(
         df_signals,
@@ -273,6 +309,9 @@ def _run_payload(payload: dict) -> dict:
         cfg = dict(item.get("config") or item)
         try:
             out[label] = _simulate_one(cfg, candles)
+        except CloseCapabilityError as exc:
+            return {"error": f"{label}: {exc}", "markers": {},
+                    "label": label, "close_capability": exc.to_dict()}
         except Exception as exc:
             return {"error": f"{label}: {exc}", "markers": out}
     return {"markers": out}

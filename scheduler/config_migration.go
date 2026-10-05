@@ -7,7 +7,7 @@ import (
 	"strings"
 )
 
-const CurrentConfigVersion = 19
+const CurrentConfigVersion = 20
 
 const MinSupportedConfigVersion = 13
 
@@ -151,17 +151,22 @@ func NewFieldsSince(version int) []ConfigField {
 }
 
 func MigrateConfig(configPath string, fieldValues map[string]string, cfg *Config) error {
+	_, err := migrateConfigFile(configPath, fieldValues)
+	return err
+}
+
+func migrateConfigFile(configPath string, fieldValues map[string]string) (*noEdgeMigrationReport, error) {
 	data, err := os.ReadFile(configPath)
 	if err != nil {
-		return fmt.Errorf("read config: %w", err)
+		return nil, fmt.Errorf("read config: %w", err)
 	}
-	newData, err := migrateConfigData(data, fieldValues)
+	newData, report, err := migrateConfigDataReport(data, fieldValues)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	tmpPath := configPath + ".tmp"
 	if err := os.WriteFile(tmpPath, newData, 0600); err != nil {
-		return fmt.Errorf("write tmp: %w", err)
+		return nil, fmt.Errorf("write tmp: %w", err)
 	}
 	if err := os.Rename(tmpPath, configPath); err != nil {
 		// The config file is commonly bind-mounted into the container,
@@ -170,17 +175,22 @@ func MigrateConfig(configPath string, fieldValues map[string]string, cfg *Config
 		// instead of re-migrating on every start.
 		if werr := os.WriteFile(configPath, newData, 0600); werr != nil {
 			os.Remove(tmpPath)
-			return fmt.Errorf("rename config: %v (in-place rewrite: %v)", err, werr)
+			return nil, fmt.Errorf("rename config: %v (in-place rewrite: %v)", err, werr)
 		}
 		os.Remove(tmpPath)
 	}
-	return nil
+	return report, nil
 }
 
 func migrateConfigData(data []byte, fieldValues map[string]string) ([]byte, error) {
+	out, _, err := migrateConfigDataReport(data, fieldValues)
+	return out, err
+}
+
+func migrateConfigDataReport(data []byte, fieldValues map[string]string) ([]byte, *noEdgeMigrationReport, error) {
 	var raw map[string]interface{}
 	if err := json.Unmarshal(data, &raw); err != nil {
-		return nil, fmt.Errorf("parse config: %w", err)
+		return nil, nil, fmt.Errorf("parse config: %w", err)
 	}
 
 	oldVer := 0
@@ -189,11 +199,11 @@ func migrateConfigData(data []byte, fieldValues map[string]string) ([]byte, erro
 	}
 
 	if oldVer != 0 && oldVer < MinSupportedConfigVersion {
-		return nil, errUnsupportedConfigVersion(oldVer)
+		return nil, nil, errUnsupportedConfigVersion(oldVer)
 	}
 	if oldVer == 0 {
 		if key, found := versionlessConfigRemovedTranslationKey(data); found {
-			return nil, errVersionlessRemovedTranslationKey(key)
+			return nil, nil, errVersionlessRemovedTranslationKey(key)
 		}
 	}
 
@@ -215,29 +225,38 @@ func migrateConfigData(data []byte, fieldValues map[string]string) ([]byte, erro
 
 	if oldVer < 16 || hasLegacyUserDefaultAliases(raw) {
 		if err := migrateV16UserDefaults(raw); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 
 	if oldVer < 18 || hasLegacyTrailStopATRRegimeKey(raw) {
 		if err := migrateV18TrailStopATRRegimeKey(raw); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 
 	if oldVer < 19 || hasLegacyV19AtrMultRegimeKey(raw) {
 		if err := migrateV19AtrMultRegimeKey(raw); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
+	}
+
+	var report *noEdgeMigrationReport
+	if oldVer < 20 || hasLegacyAllowDeprecatedKey(raw) {
+		r, err := migrateV20NoEdge(raw, oldVer)
+		if err != nil {
+			return nil, nil, err
+		}
+		report = r
 	}
 
 	raw["config_version"] = CurrentConfigVersion
 
 	newData, err := json.MarshalIndent(raw, "", "  ")
 	if err != nil {
-		return nil, fmt.Errorf("marshal: %w", err)
+		return nil, nil, fmt.Errorf("marshal: %w", err)
 	}
-	return newData, nil
+	return newData, report, nil
 }
 
 func setNestedField(obj map[string]interface{}, path string, value string) {
@@ -307,6 +326,10 @@ func deliverConfigMigrationNotices(baseVersion int, notifier *MultiNotifier) {
 
 func runConfigMigrationNotices(cfg *Config, notifier *MultiNotifier, configPath string) {
 	baseVersion := cfg.MigrationBaseVersion()
+	defer deliverNoEdgeMigrationNotice(cfg.NoEdgeMigrationReport(), notifier)
+	if baseVersion >= CurrentConfigVersion {
+		return
+	}
 	fields := NewFieldsSince(baseVersion)
 
 	if len(fields) == 0 {
