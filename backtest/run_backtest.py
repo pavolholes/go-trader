@@ -1491,7 +1491,6 @@ def run_single_backtest(
         trailing_stop_pct=trailing_stop_pct,
         stop_loss_atr_mult_regime=stop_loss_atr_mult_regime,
         trailing_stop_atr_mult_regime=trailing_stop_atr_mult_regime,
-        leverage=leverage,
         max_drawdown_pct=max_drawdown_pct,
         trailing_stop_min_move_pct=trailing_stop_min_move_pct,
         stop_platform=stop_platform,
