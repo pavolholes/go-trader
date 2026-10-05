@@ -25,6 +25,7 @@ from backtester import (
     COMPARISON_MODE_STRICT,
     LEDGER_EVENTS_SCHEMA,
     LEDGER_EVENTS_SCHEMA_VERSION,
+    STOP_UNITS_LIVE_CONFIG,
     Backtester,
     CloseCapabilityError,
     _apply_direction_invert_value,
@@ -32,6 +33,8 @@ from backtester import (
     _normalize_open_action,
     _open_action_from_signal,
     decode_close_validation,
+    leverage_evidence,
+    stop_raw_fields,
 )
 
 REPORT_SCHEMA = "go-trader.ledger-reconciliation-report"
@@ -976,6 +979,23 @@ def market_strategy_checks(market: dict, name: str, params: dict, direction: str
     return out
 
 
+def _live_stop_kwargs(stops: dict, leverage) -> dict:
+    from run_backtest import live_stop_engine_inputs
+    raw = dict(stops, leverage=leverage)
+    resolved = dict(stops)
+    if _is_number(leverage) and leverage > 0:
+        resolved["leverage"] = leverage
+        lev = leverage_evidence(leverage, "config", True)
+    else:
+        resolved["leverage"] = 1.0
+        lev = {"status": "unverified", "source": "default", "value": 1.0}
+    kwargs, context = live_stop_engine_inputs(
+        resolved, raw_fields=stop_raw_fields(raw), source=STOP_UNITS_LIVE_CONFIG, leverage=lev)
+    kwargs["capability_context"] = context
+    kwargs["stop_platform"] = "hyperliquid"
+    return kwargs
+
+
 def run_simulation(market: dict, signals: pd.DataFrame, plan: dict) -> dict:
     manifest, dataset, win = market["manifest"], market["dataset"], market["window"]
     spec = om.execution_spec(manifest, dataset)
@@ -995,10 +1015,10 @@ def run_simulation(market: dict, signals: pd.DataFrame, plan: dict) -> dict:
         kwargs["slippage_pct"] = spec["half_spread_pct"] + spec["slippage_pct"]
         cost_model = {"kind": "flat_taker_fee_and_adverse_price",
                       "commission_pct": kwargs["commission_pct"], "slippage_pct": kwargs["slippage_pct"]}
-    for key in ("stop_loss_atr_mult", "stop_loss_pct", "trailing_stop_atr_mult", "trailing_stop_pct",
-                "stop_loss_margin_pct"):
-        if plan.get(key):
-            kwargs[key] = plan[key]
+    stops = {key: plan[key] for key in ("stop_loss_atr_mult", "stop_loss_pct", "trailing_stop_atr_mult",
+                                        "trailing_stop_pct", "stop_loss_margin_pct") if plan.get(key)}
+    if stops:
+        kwargs.update(_live_stop_kwargs(stops, plan.get("leverage")))
     if plan.get("allow_scale_in"):
         kwargs["allow_scale_in"] = True
         kwargs["scale_in"] = plan.get("scale_in")
@@ -1492,6 +1512,7 @@ def compare(export_path: str, input_path: str, mode: str = COMPARISON_MODE_STRIC
                         "stop_loss_margin_pct"):
                 if _active(strategy.get(key)):
                     plan[key] = strategy[key]
+            plan["leverage"] = strategy.get("leverage")
             if strategy.get("allow_scale_in"):
                 plan["allow_scale_in"] = True
                 plan["scale_in"] = strategy.get("scale_in")

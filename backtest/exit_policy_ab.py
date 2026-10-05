@@ -43,6 +43,12 @@ STOP_FIELD_KEYS = (
     "trailing_stop_pct",
     "stop_loss_atr_mult_regime",
     "trailing_stop_atr_mult_regime",
+    "leverage",
+    "max_drawdown_pct",
+    "trailing_stop_min_move_pct",
+    "stop_platform",
+    "strategy_type",
+    "capability_context",
 )
 
 
@@ -405,12 +411,32 @@ def _regime_label_series(df, regime_cfg: dict):
     return [str(x or "") for x in work["regime"].tolist()]
 
 
+def _arm_stop_owner(close_refs: Optional[Sequence[dict]], stops: Optional[dict],
+                    regime_windows_spec=None) -> Optional[str]:
+    from backtester import CapabilityContext, build_stop_capability_context
+    stops = stops or {}
+    fields = {k: v for k, v in stops.items()
+              if k not in ("stop_platform", "strategy_type", "capability_context")}
+    context = build_stop_capability_context(
+        platform=stops.get("stop_platform") or FEE_PLATFORM,
+        strategy_type=stops.get("strategy_type") or "perps",
+        close_refs=close_refs, fields=fields,
+        regime_windows_spec=regime_windows_spec,
+        capability_context=stops.get("capability_context"))
+    if not isinstance(context, CapabilityContext) or context.resolved_stop_owner is None:
+        return None
+    return context.resolved_stop_owner["name"]
+
+
 def _backtester_kwargs(open_name: str, params: Optional[dict],
                        close_refs: Optional[Sequence[dict]], direction: Optional[str],
                        capital: float, gate: dict,
                        stops: Optional[dict] = None,
                        comparison_mode: Optional[str] = None) -> dict:
-    use_regime = bool(gate.get("allowed_regimes"))
+    from backtester import STOP_OWNERS_NEEDING_LABEL
+    use_regime = (bool(gate.get("allowed_regimes"))
+                  or _arm_stop_owner(close_refs, stops, gate.get("windows_spec"))
+                  in STOP_OWNERS_NEEDING_LABEL)
     kw = dict(
         comparison_mode=comparison_mode,
         initial_capital=capital, platform=FEE_PLATFORM,
@@ -557,6 +583,12 @@ def _stops_from_kwargs(kwargs: dict) -> dict:
     return {k: kwargs.get(k) for k in STOP_FIELD_KEYS if kwargs.get(k) is not None}
 
 
+def _stops_for_json(stops: Optional[dict]) -> Optional[dict]:
+    if stops is None:
+        return None
+    return {k: (v.to_dict() if hasattr(v, "to_dict") else v) for k, v in stops.items()}
+
+
 _UNREPLAYABLE_ENTRY_SHAPERS = (
     "invert_signal",
     "regime_directional_policy",
@@ -579,6 +611,22 @@ def _reject_unreplayable_entry_shapers(kwargs: dict) -> None:
             f"'<live close json>' --direction <long|short> (drop --baseline-config).")
 
 
+def _stops_have_owner(stops: Optional[dict]) -> bool:
+    if not stops:
+        return False
+    from backtester import build_stop_capability_context
+    fields = {k: v for k, v in stops.items()
+              if k not in ("stop_platform", "strategy_type", "capability_context")}
+    context = build_stop_capability_context(
+        platform=stops.get("stop_platform") or FEE_PLATFORM,
+        strategy_type=stops.get("strategy_type") or "perps",
+        close_refs=None, fields=fields)
+    owner = context.resolved_stop_owner["name"]
+    if owner == "legacy":
+        return any(stops.get(k) not in (None, 0, 0.0) for k in STOP_FIELD_KEYS[:7])
+    return owner != "none"
+
+
 def _candidate_stops(mode: str, incumbent_stops: dict) -> dict:
     if mode == "drop":
         return {}
@@ -595,7 +643,7 @@ _STOP_CLASS_CANDIDATE_NAMES = {
 
 def _candidate_stacks_on_inherited_stop(candidate_close: Optional[Sequence[dict]],
                                         mode: str, incumbent_stops: dict) -> bool:
-    if mode != "inherit" or not incumbent_stops or not candidate_close:
+    if mode != "inherit" or not candidate_close or not _stops_have_owner(incumbent_stops):
         return False
     return any(isinstance(r, dict) and r.get("name") in _STOP_CLASS_CANDIDATE_NAMES
                for r in candidate_close)
@@ -979,8 +1027,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                      "direction": spec["direction"]},
             "incumbent_close": spec["incumbent_close"],
             "candidate_close": spec["candidate_close"],
-            "control_stops": spec.get("control_stops"),
-            "candidate_stops": spec.get("candidate_stops"),
+            "control_stops": _stops_for_json(spec.get("control_stops")),
+            "candidate_stops": _stops_for_json(spec.get("candidate_stops")),
+            "stop_units": "engine_fraction",
             "candidate_stops_mode": spec.get("candidate_stops_mode"),
             "replayable": spec["replayable"],
             "comparison_mode": spec.get("comparison_mode"),
