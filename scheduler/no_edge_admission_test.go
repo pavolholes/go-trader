@@ -407,15 +407,15 @@ func TestNoEdgeMigrationNoticeReachesOwnerOrLog(t *testing.T) {
 		t.Fatal(err)
 	}
 	mock := &mockNotifier{}
-	runConfigMigrationDM(cfg, NewMultiNotifier(notifierBackend{notifier: mock, ownerID: "owner"}), path)
+	runConfigMigrationDM(cfg, NewMultiNotifier(notifierBackend{notifier: mock, ownerID: "owner", channels: map[string]string{"hyperliquid": "ch-test"}}), path)
 	var notice string
-	for _, dm := range mock.dms {
-		if strings.Contains(dm.content, "edge_status: no_edge") {
-			notice = dm.content
+	for _, msg := range mock.messages {
+		if strings.Contains(msg.content, "edge_status: no_edge") {
+			notice = msg.content
 		}
 	}
 	if notice == "" {
-		t.Fatalf("owner received no v20 notice: %+v", mock.dms)
+		t.Fatalf("owner received no v20 notice: %+v", mock.messages)
 	}
 	ia, ib := strings.Index(notice, "hl-a: close=macd"), strings.Index(notice, "hl-b: open=rsi")
 	if ia < 0 || ib < 0 || ia > ib || strings.Contains(notice, "hl-pre") {
