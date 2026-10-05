@@ -3994,7 +3994,7 @@ class Backtester:
                         gross_realized=gross_realized, entry_fee_allocated=entry_fee_allocated,
                     )
 
-            elif not plain_short_for_bar and signal == 1 and position == 0 and cash > 0 and not regime_blocked and not risk_entry_blocked and not self._cb_active and (atr_series is None or self._stamp_entry_atr(atr_series, idx, fill_price) > 0):
+            elif not plain_short_for_bar and signal == 1 and position == 0 and cash > 0 and not regime_blocked and not risk_entry_blocked:
                 # BUY — go long (#980: entry_fraction of flat-state cash;
                 # 1.0 = all available cash, today's math exactly)
                 effective_price = fill_price * (1 + self.slippage_pct)
