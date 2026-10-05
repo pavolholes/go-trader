@@ -155,7 +155,7 @@ def test_non_replayable_m6_close_excluded():
             {"key": "good", "candidate_close": [{"name": "atr_stop", "params": {"atr_mult": 2}}]},
         ]}), _STUDY_DIR)
     entries = {e["key"]: e for e in asug.expand_candidates(spec)}
-    assert entries["m6.bad"]["precondition_errors"] == ["excluded_not_replayable"]
+    assert entries["m6.bad"]["precondition_errors"] == ["close_capability_refused:LIVE_ONLY_CLOSE"]
     assert entries["m6.good"]["precondition_errors"] == []
 
 
@@ -192,8 +192,12 @@ def test_shipped_full_options_spec_loads_and_expands():
     entries = asug.expand_candidates(spec)
     kinds = {e["kind"] for e in entries}
     assert kinds == {"open", "exit_ab"}
-    ab = [e for e in entries if e["kind"] == "exit_ab"]
-    assert all(e["precondition_errors"] == [] for e in ab)
+    ab = {e["key"]: e for e in entries if e["kind"] == "exit_ab"}
+    atr_trail = ab["m6.atr_trail"]["candidate"]
+    assert atr_trail["candidate_close"] == []
+    assert atr_trail["candidate_stops"] == {"trailing_stop_atr_mult": 3.0}
+    assert atr_trail["candidate_stop_only"] is True
+    assert all(e["precondition_errors"] == [] for e in ab.values())
     assert len({e["key"] for e in entries}) == len(entries)
 
 

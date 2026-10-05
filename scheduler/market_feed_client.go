@@ -202,10 +202,10 @@ func (c *sharedFeedClient) roundTrip(ctx context.Context, socket string, req fee
 	if err := json.Unmarshal(blob, &head); err != nil {
 		return h, nil, &feedEndpointError{Kind: feedErrMalformed, Detail: fmt.Sprintf("reply header: %v", err)}
 	}
-	if head.V != feedWireVersion || head.SealVersion != feedSealVersion || head.PayloadVersion != marketSnapshotVersion {
+	if head.V != feedWireVersion || !feedSealVersionSupported(head.SealVersion) || head.PayloadVersion != marketSnapshotVersion {
 		return h, nil, &feedEndpointError{Kind: feedErrIncompatible, Detail: fmt.Sprintf(
-			"feed speaks wire v%d, seal v%d, payload v%d; this consumer needs wire v%d, seal v%d, payload v%d",
-			head.V, head.SealVersion, head.PayloadVersion, feedWireVersion, feedSealVersion, marketSnapshotVersion)}
+			"feed speaks wire v%d, seal v%d, payload v%d; this consumer needs wire v%d, seal v%d or v%d, payload v%d",
+			head.V, head.SealVersion, head.PayloadVersion, feedWireVersion, feedSealVersionBase, feedSealVersion, marketSnapshotVersion)}
 	}
 	if err := decodeFeedStrict(blob, &h); err != nil {
 		return h, nil, &feedEndpointError{Kind: feedErrMalformed, Detail: fmt.Sprintf("reply header: %v", err)}
@@ -245,7 +245,7 @@ func (c *sharedFeedClient) fetchFrom(ctx context.Context, ep sharedFeedEndpoint,
 			if derr != nil {
 				return nil, h, &feedEndpointError{Kind: feedErrMalformed, Detail: derr.Error()}
 			}
-			if doc.Instance != h.Instance || doc.Generation != h.Generation || doc.Source != h.Source || doc.SealedAtMs != h.SealedAtMs {
+			if doc.Instance != h.Instance || doc.Generation != h.Generation || doc.Source != h.Source || doc.SealedAtMs != h.SealedAtMs || doc.V != h.SealVersion {
 				return nil, h, &feedEndpointError{Kind: feedErrMalformed, Detail: "seal metadata does not match its reply header"}
 			}
 			return doc, h, nil
@@ -444,6 +444,7 @@ func degradedSharedSnapshot(key int64, now time.Time) *marketSnapshot {
 		keys:              map[marketFeedKey]*marketSnapshotKey{},
 		mids:              map[string]feedMid{},
 		funding:           map[string]feedFunding{},
+		observations:      map[feedObservationKey]*marketSnapshotObservation{},
 	}
 }
 
@@ -472,6 +473,20 @@ func applySealCoverage(snap *marketSnapshot, reqs cycleMarketRequirements) []str
 		}
 		if _, ok := snap.funding[coin]; !ok {
 			gaps = append(gaps, fmt.Sprintf("funding for %s is not in the seal", coin))
+		}
+	}
+	obsKeys := make([]feedObservationKey, 0, len(reqs.Observations))
+	for k := range reqs.Observations {
+		obsKeys = append(obsKeys, k)
+	}
+	sortFeedObservationKeys(obsKeys)
+	for _, k := range obsKeys {
+		entry, ok := snap.observations[k]
+		switch {
+		case !ok || entry == nil:
+			gaps = append(gaps, fmt.Sprintf("%s is not in the seal", k.PayloadID()))
+		case entry.WindowMs < reqs.Observations[k]:
+			gaps = append(gaps, fmt.Sprintf("%s window %dms is below the %dms this consumer needs", k.PayloadID(), entry.WindowMs, reqs.Observations[k]))
 		}
 	}
 	return gaps
@@ -541,6 +556,20 @@ func sharedFeedCompatibilityLines(prefix string, descs []feedEndpointDescription
 			got := fundingServed[coin]
 			if (need.Scalar && !got.Scalar) || (need.Records && !got.Records) {
 				gaps = append(gaps, "funding "+coin+" not served")
+			}
+		}
+		obsServed := make(map[feedObservationKey]int64, len(desc.Observations))
+		for _, ob := range desc.Observations {
+			obsServed[feedObservationKey{Host: ob.Host, Namespace: ob.Namespace, Coin: ob.Coin, Kind: ob.Kind}] = ob.WindowMs
+		}
+		for _, k := range req.observationKeys() {
+			need := req.Observations[k]
+			got, ok := obsServed[k]
+			switch {
+			case !ok:
+				gaps = append(gaps, k.PayloadID()+" not served")
+			case got < need:
+				gaps = append(gaps, fmt.Sprintf("%s window %dms < %dms", k.PayloadID(), got, need))
 			}
 		}
 		cadenceSet := make(map[int]bool, len(desc.Cadences))

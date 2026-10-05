@@ -28,17 +28,18 @@ const (
 )
 
 type feedSeal struct {
-	Key        int64
-	Bytes      []byte
-	Hash       string
-	Generation uint64
-	SealedAt   time.Time
-	Source     string
-	KeysTotal  int
-	KeysReady  int
-	KeysStale  int
-	Mids       int
-	PrepareDur time.Duration
+	Key         int64
+	Bytes       []byte
+	Hash        string
+	SealVersion int
+	Generation  uint64
+	SealedAt    time.Time
+	Source      string
+	KeysTotal   int
+	KeysReady   int
+	KeysStale   int
+	Mids        int
+	PrepareDur  time.Duration
 }
 
 type feedSealOutcome struct {
@@ -322,7 +323,7 @@ func (s *feedSealer) sealOne(ctx context.Context, key int64) {
 	}
 	s.budgetAlert(key, delta, rep)
 	frozenAt := s.owner.now()
-	snap := freezeMarketSnapshot(s.owner, reqs, feedSealEvaluationID(key), frozenAt)
+	snap := freezeMarketSnapshot(s.owner, reqs, feedSealEvaluationID(key), frozenAt, time.Unix(key, 0).UTC())
 	if rep.ReadyOnlyRefreshed {
 		markUnrefreshedKeysNotReady(snap, rep.RefreshedKeys, key)
 	}
@@ -344,15 +345,16 @@ func (s *feedSealer) sealOne(ctx context.Context, key int64) {
 		return
 	}
 	seal := &feedSeal{
-		Key:        key,
-		Bytes:      blob,
-		Hash:       hash,
-		Generation: doc.Generation,
-		SealedAt:   feedMsTime(doc.SealedAtMs),
-		Source:     s.source,
-		KeysTotal:  len(doc.Keys),
-		Mids:       len(doc.Mids),
-		PrepareDur: prepDur,
+		Key:         key,
+		Bytes:       blob,
+		Hash:        hash,
+		SealVersion: doc.V,
+		Generation:  doc.Generation,
+		SealedAt:    feedMsTime(doc.SealedAtMs),
+		Source:      s.source,
+		KeysTotal:   len(doc.Keys),
+		Mids:        len(doc.Mids),
+		PrepareDur:  prepDur,
 	}
 	for _, k := range doc.Keys {
 		if k.Readiness.Ready {
@@ -464,12 +466,13 @@ func (s *feedSealer) lookupLocked(key int64, now time.Time) feedWireHeader {
 		Key:            key,
 		Instance:       s.instance,
 		Source:         s.source,
-		SealVersion:    feedSealVersion,
+		SealVersion:    s.coverageSealVersionLocked(),
 		PayloadVersion: marketSnapshotVersion,
 		Generation:     s.owner.Generation(),
 	}
 	if seal, ok := s.ring[key]; ok {
 		h.Status = feedWireStatusSealed
+		h.SealVersion = seal.SealVersion
 		h.Generation = seal.Generation
 		h.SealedAtMs = feedTimeMs(seal.SealedAt)
 		h.Hash = seal.Hash
@@ -524,6 +527,16 @@ func (s *feedSealer) sealBytes(key int64) []byte {
 	return nil
 }
 
+func (s *feedSealer) coverageSealVersionLocked() int {
+	return feedSealVersionFor(len(s.coverage.Observations) > 0)
+}
+
+func (s *feedSealer) coverageSealVersion() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.coverageSealVersionLocked()
+}
+
 func (s *feedSealer) describe() *feedDescribe {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -570,6 +583,12 @@ func (s *feedSealer) describe() *feedDescribe {
 		need := s.coverage.Funding[c]
 		d.Funding = append(d.Funding, feedDescribeFunding{Coin: c, Scalar: need.Scalar, Records: need.Records})
 	}
+	for _, key := range s.coverage.observationKeys() {
+		d.Observations = append(d.Observations, feedDescribeObservation{
+			Host: key.Host, Namespace: key.Namespace, Coin: key.Coin, Kind: key.Kind,
+			Source: feedObservationSourceHLWS, WindowMs: s.coverage.Observations[key],
+		})
+	}
 	if s.lastSeal != nil {
 		d.LastSealKey = s.lastSeal.Key
 		d.LastSealHash = s.lastSeal.Hash
@@ -611,7 +630,13 @@ func (o *marketFeedOwner) publishedCoverage() map[marketFeedKey]bool {
 }
 
 func fullCycleRequirements(req feedRequirements) cycleMarketRequirements {
-	out := cycleMarketRequirements{Funding: make(map[string]feedFundingNeed, len(req.Funding))}
+	out := cycleMarketRequirements{
+		Funding:      make(map[string]feedFundingNeed, len(req.Funding)),
+		Observations: make(map[feedObservationKey]int64, len(req.Observations)),
+	}
+	for key, window := range req.Observations {
+		out.Observations[key] = window
+	}
 	for _, key := range req.Order {
 		out.Keys = append(out.Keys, cycleMarketRequirement{Key: key, Required: req.Keys[key]})
 	}
@@ -713,15 +738,16 @@ func (srv *feedUnixServer) handle(conn net.Conn) {
 	}
 	switch req.Op {
 	case feedWireOpDescribe:
+		d := srv.sealer.describe()
 		h := feedWireHeader{
 			V:              feedWireVersion,
 			Status:         feedWireStatusDescribe,
 			Instance:       srv.sealer.instance,
 			Source:         srv.sealer.source,
 			Generation:     srv.sealer.owner.Generation(),
-			SealVersion:    feedSealVersion,
+			SealVersion:    feedSealVersionFor(len(d.Observations) > 0),
 			PayloadVersion: marketSnapshotVersion,
-			Describe:       srv.sealer.describe(),
+			Describe:       d,
 		}
 		_ = writeFeedJSONFrame(conn, h)
 	case feedWireOpSnapshot:
@@ -748,7 +774,7 @@ func (srv *feedUnixServer) replyError(conn net.Conn, detail string) {
 		Detail:         detail,
 		Instance:       srv.sealer.instance,
 		Source:         srv.sealer.source,
-		SealVersion:    feedSealVersion,
+		SealVersion:    srv.sealer.coverageSealVersion(),
 		PayloadVersion: marketSnapshotVersion,
 	})
 }

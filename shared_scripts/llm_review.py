@@ -15,15 +15,29 @@ API_KEY_ENV = "ANTHROPIC_API_KEY"
 DEFAULT_WORD_CAP = 55
 DEFAULT_MAX_DEBATE_ROUNDS = 1
 PER_CALL_TIMEOUT_S = 60
-MAX_TOKENS_PER_CALL = 400
+MAX_TOKENS_PER_CALL = 16000
+EFFORT = "low"
+DEFAULT_MODEL = "claude-opus-5-5"
 OHLCV_LIMIT = 100
 
 VALID_VERDICTS = ("bullish", "bearish", "mixed")
 
+USAGE_STDERR_PREFIX = "llm_review_usage "
+
+JUDGE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "verdict": {"type": "string", "enum": list(VALID_VERDICTS)},
+        "rationale": {"type": "string"},
+    },
+    "required": ["verdict", "rationale"],
+    "additionalProperties": False,
+}
+
 STYLE_RULES = (
     "Write for a smart 18-year-old with no trading background: plain language, "
     "no jargon, no indicator names without a one-word gloss. "
-    "HARD CAP: {cap} words. Never exceed it."
+    "Keep it to {cap} words or fewer; the digest cuts everything after word {cap}."
 )
 
 
@@ -117,15 +131,38 @@ def gather_market_context(ctx):
     return {"ohlcv_summary": ohlcv_summary, "funding": funding}
 
 
-def build_llm_call(model, api_url=ANTHROPIC_API_URL, timeout=PER_CALL_TIMEOUT_S):
+def new_usage():
+    return {"calls": 0, "input_tokens": 0, "output_tokens": 0}
+
+
+def record_usage(usage, reply_usage):
+    if usage is None:
+        return
+    usage["calls"] += 1
+    if isinstance(reply_usage, dict):
+        for key in ("input_tokens", "output_tokens"):
+            value = reply_usage.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                usage[key] += value
+    try:
+        print(USAGE_STDERR_PREFIX + json.dumps(usage), file=sys.stderr, flush=True)
+    except (OSError, ValueError):
+        pass
+
+
+def build_llm_call(model, api_url=ANTHROPIC_API_URL, timeout=PER_CALL_TIMEOUT_S, usage=None):
     api_key = os.environ.get(API_KEY_ENV, "")
     if not api_key:
         raise RuntimeError(f"{API_KEY_ENV} is not set")
 
-    def llm_call(system, user):
+    def llm_call(system, user, schema=None):
+        output_config = {"effort": EFFORT}
+        if schema is not None:
+            output_config["format"] = {"type": "json_schema", "schema": schema}
         payload = json.dumps({
             "model": model,
             "max_tokens": MAX_TOKENS_PER_CALL,
+            "output_config": output_config,
             "system": system,
             "messages": [{"role": "user", "content": user}],
         }).encode("utf-8")
@@ -134,8 +171,23 @@ def build_llm_call(model, api_url=ANTHROPIC_API_URL, timeout=PER_CALL_TIMEOUT_S)
             "x-api-key": api_key,
             "anthropic-version": ANTHROPIC_VERSION,
         })
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(f"API HTTP {e.code}: {api_error_message(e)}") from None
+        if not isinstance(body, dict):
+            raise RuntimeError("API response is not a JSON object")
+        record_usage(usage, body.get("usage"))
+        stop_reason = body.get("stop_reason")
+        if stop_reason == "refusal":
+            details = body.get("stop_details")
+            category = details.get("category") if isinstance(details, dict) else None
+            raise RuntimeError(f"model refused (category: {category or 'unspecified'})")
+        if stop_reason == "max_tokens":
+            raise RuntimeError(f"reply cut off at max_tokens={MAX_TOKENS_PER_CALL}")
+        if stop_reason != "end_turn":
+            raise RuntimeError(f"unexpected stop_reason {stop_reason!r}")
         parts = body.get("content") or []
         text = "".join(p.get("text", "") for p in parts if p.get("type") == "text")
         if not text.strip():
@@ -143,6 +195,17 @@ def build_llm_call(model, api_url=ANTHROPIC_API_URL, timeout=PER_CALL_TIMEOUT_S)
         return text.strip()
 
     return llm_call
+
+
+def api_error_message(err):
+    try:
+        body = json.loads(err.read().decode("utf-8"))
+        message = body["error"]["message"]
+        if isinstance(message, str) and message.strip():
+            return message.strip()[:300]
+    except Exception:
+        pass
+    return str(err.reason or "request failed")
 
 
 def entry_summary(ctx):
@@ -159,25 +222,19 @@ def entry_summary(ctx):
 
 
 def parse_judge_output(text, word_cap):
-    raw = str(text or "").strip()
-    if raw.startswith("```"):
-        raw = raw.strip("`")
-        if raw.startswith("json"):
-            raw = raw[4:]
-        raw = raw.strip()
     try:
-        obj = json.loads(raw)
-        verdict = str(obj.get("verdict", "")).strip().lower()
-        rationale = str(obj.get("rationale", "")).strip()
-        if verdict in VALID_VERDICTS and rationale:
-            return verdict, truncate_to_word_cap(rationale, word_cap)
-    except (ValueError, AttributeError):
-        pass
-    lowered = raw.lower()
-    found = [v for v in VALID_VERDICTS if v in lowered]
-    if len(found) == 1:
-        return found[0], truncate_to_word_cap(raw, word_cap)
-    raise RuntimeError("judge output had no parseable verdict")
+        obj = json.loads(text)
+    except (TypeError, ValueError):
+        raise RuntimeError("judge output is not valid JSON") from None
+    if not isinstance(obj, dict) or set(obj) != {"verdict", "rationale"}:
+        raise RuntimeError("judge output does not match the verdict schema")
+    verdict = obj["verdict"]
+    rationale = obj["rationale"]
+    if not isinstance(verdict, str) or verdict not in VALID_VERDICTS:
+        raise RuntimeError(f"judge verdict {verdict!r} is not one of {', '.join(VALID_VERDICTS)}")
+    if not isinstance(rationale, str) or not rationale.strip():
+        raise RuntimeError("judge rationale is empty")
+    return verdict, truncate_to_word_cap(rationale, word_cap)
 
 
 def run_pipeline(ctx, market, llm_call, max_debate_rounds=DEFAULT_MAX_DEBATE_ROUNDS,
@@ -225,11 +282,11 @@ def run_pipeline(ctx, market, llm_call, max_debate_rounds=DEFAULT_MAX_DEBATE_ROU
 
     judge_raw = llm_call(
         "You are the risk manager issuing the desk's final read on an already-open "
-        "position. This is commentary only — the trade stands regardless. " + style +
-        ' Reply with ONLY a JSON object: {"verdict": "bullish"|"bearish"|"mixed", '
-        '"rationale": "<plain-language reasoning>"}.',
+        "position. This is commentary only — the trade stands regardless. "
+        "Give a verdict (bullish, bearish or mixed) and the rationale for it. " + style,
         f"{entry}\nAnalyst notes:\n{notes}\nDebate:\n"
         + ("\n".join(transcript) if transcript else "(debate skipped)"),
+        schema=JUDGE_SCHEMA,
     )
     verdict, rationale = parse_judge_output(judge_raw, word_cap)
 
@@ -245,21 +302,23 @@ def main():
     if "--probe-only" in sys.argv[1:]:
         print(json.dumps({"status": "ok"}))
         return 0
+    usage = new_usage()
     try:
         ctx = json.loads(sys.stdin.read())
         if not isinstance(ctx, dict):
             raise ValueError("stdin payload must be a JSON object")
-        model = ctx.get("model") or "claude-sonnet-5"
+        model = ctx.get("model") or DEFAULT_MODEL
         word_cap = int(ctx.get("word_cap") or DEFAULT_WORD_CAP)
         rounds = ctx.get("max_debate_rounds")
         rounds = DEFAULT_MAX_DEBATE_ROUNDS if rounds is None else int(rounds)
         market = gather_market_context(ctx)
-        llm_call = build_llm_call(model)
+        llm_call = build_llm_call(model, usage=usage)
         out = run_pipeline(ctx, market, llm_call, max_debate_rounds=rounds, word_cap=word_cap)
+        out["usage"] = dict(usage)
         print(json.dumps(out))
         return 0
     except Exception as e:
-        print(json.dumps({"error": f"{type(e).__name__}: {e}"}))
+        print(json.dumps({"error": f"{type(e).__name__}: {e}", "usage": dict(usage)}))
         return 1
 
 

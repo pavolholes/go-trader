@@ -59,6 +59,64 @@ def trade_samples_from_results(results: dict) -> List[dict]:
     return out
 
 
+def positions_from_results(results: dict) -> List[dict]:
+    grouped: dict = {}
+    order = []
+    for t in results.get("trades") or []:
+        key = (str(t["entry_date"]), t.get("side") or "long")
+        if key not in grouped:
+            grouped[key] = {"entry_date": key[0], "side": key[1],
+                            "exit_date": str(t["exit_date"]), "net_pnl": 0.0,
+                            "fees": 0.0, "entry_notional": 0.0,
+                            "exit_notional": 0.0, "bars_held": 0,
+                            "closes": 0, "exit_reasons": []}
+            order.append(key)
+        g = grouped[key]
+        shares = float(t.get("shares") or 0.0)
+        g["exit_date"] = str(t["exit_date"])
+        g["net_pnl"] += float(t.get("pnl") or 0.0)
+        g["fees"] += float(t.get("entry_fee") or 0.0) + float(t.get("exit_fee") or 0.0)
+        g["entry_notional"] += shares * float(t.get("entry_price") or 0.0)
+        g["exit_notional"] += shares * float(t.get("exit_price") or 0.0)
+        g["bars_held"] = max(g["bars_held"], int(t.get("bars_held") or 0))
+        g["closes"] += 1
+        g["exit_reasons"].append(t.get("exit_reason") or "")
+    out = []
+    for key in order:
+        g = grouped[key]
+        g["net_pnl"] = round(g["net_pnl"], 6)
+        g["fees"] = round(g["fees"], 6)
+        out.append(g)
+    return out
+
+
+def execution_metrics(results: dict, capital: float) -> dict:
+    positions = positions_from_results(results)
+    fees = sum(p["fees"] for p in positions)
+    traded = sum(p["entry_notional"] + p["exit_notional"] for p in positions)
+    bars_in_market = sum(p["bars_held"] for p in positions)
+    out = {
+        "positions": len(positions),
+        "long_positions": sum(1 for p in positions if p["side"] == "long"),
+        "short_positions": sum(1 for p in positions if p["side"] == "short"),
+        "trade_records": len(results.get("trades") or []),
+        "fees_usd": round(fees, 6),
+        "funding_pnl_usd": float(results.get("total_funding_pnl") or 0.0),
+        "traded_notional_usd": round(traded, 6),
+        "turnover": round(traded / capital, 6) if capital else None,
+        "bars_in_market": bars_in_market,
+        "net_pnl_usd": round(float(results.get("final_capital") or 0.0) - capital, 6),
+        "position_list": positions,
+    }
+    execution = results.get("execution")
+    if execution:
+        out["rejected_entries"] = execution["rejected_entry_count"]
+        out["skipped_partial_closes"] = execution["skipped_partial_close_count"]
+        out["close_residual_qty"] = execution["close_residual_qty"]
+        out["combined_adverse_price_pct"] = execution["combined_adverse_price_pct"]
+    return out
+
+
 def dd_adjusted_return(return_pct: float, max_dd_pct: float) -> float:
     if not max_dd_pct:
         return 0.0
@@ -213,26 +271,90 @@ def run_leg(reg, name: str, params: Optional[dict], symbol: str, timeframe: str,
             slippage_pct: Optional[float] = None,
             keep_trades: bool = False,
             intrabar_resolution: str = "ohlc_walk",
-            exchange_id: Optional[str] = None) -> Optional[dict]:
+            exchange_id: Optional[str] = None,
+            manifest_ctx: Optional[dict] = None,
+            comparison_mode: Optional[str] = None,
+            stop_kwargs: Optional[dict] = None) -> Optional[dict]:
     from atr import ensure_atr_indicator
     import pandas as pd
     from data_fetcher import load_cached_data
-    from backtester import Backtester
-    from run_backtest import (FUNDING_COLUMN_STRATEGIES, _attach_funding_if_needed,
-                              _build_profile_label_series)
+    from backtester import Backtester, validate_close_capabilities
+    from run_backtest import (FUNDING_COLUMN_STRATEGIES, OBSERVATION_INPUT_STRATEGIES,
+                              _attach_funding_if_needed, _build_profile_label_series)
 
-    start, end = window
-    load_kwargs = {} if exchange_id is None else {"exchange_id": exchange_id}
-    df = load_cached_data(symbol, timeframe, start_date=start, end_date=end,
-                          **load_kwargs)
-    if df.empty:
-        return None
-    if end is not None:
-        df = df[df.index < pd.Timestamp(end)]
+    validate_close_capabilities(close_refs=close_strategies,
+                                comparison_mode=comparison_mode,
+                                platform=FEE_PLATFORM, phase="preflight")
+
+    manifest_window = None
+    manifest_info = None
+    execution_spec = None
+    observation_params = {}
+    if manifest_ctx is None and name in OBSERVATION_INPUT_STRATEGIES:
+        raise ValueError(
+            f"{name} reads recorded open interest as an entry input; only the --manifest path "
+            "(schema offline_candle_manifest/v2 with an open_interest series) can run it")
+    if manifest_ctx is not None:
+        import offline_manifest as om
+        if name in FUNDING_COLUMN_STRATEGIES:
+            raise ValueError(
+                f"{name} reads funding as an entry input; the frozen manifest path "
+                "attaches funding only as a cost")
+        if profile_allocation:
+            raise ValueError("profile_allocation is not supported on the manifest path")
+        if exchange_id is not None:
+            raise ValueError("exchange_id and a manifest are mutually exclusive")
+        if commission_pct is not None or slippage_pct is not None:
+            raise ValueError("the manifest owns fees and slippage; do not also pass "
+                             "commission_pct or slippage_pct")
+        manifest = manifest_ctx["manifest"]
+        dataset = om.dataset_by_key(manifest, dataset_key(symbol, timeframe))
+        df, manifest_window, candle_cov = om.window_frame(
+            manifest, dataset, manifest_ctx["window"])
+        df, funding_cov = om.attach_funding_cost(df, dataset, manifest_window)
+        oi_cov = None
+        if name in OBSERVATION_INPUT_STRATEGIES:
+            if dataset.get("open_interest") is None:
+                raise ValueError(
+                    f"{name} reads open interest as an entry input; manifest dataset "
+                    f"{dataset['key']} attaches no open_interest series")
+            oi_obs, oi_cov = om.attach_open_interest(manifest, dataset, manifest_window)
+            observation_params = {"open_interest_observations": oi_obs}
+        spec = om.execution_spec(manifest, dataset,
+                                 manifest_ctx.get("cost_multiplier", 1.0))
+        if close_strategies:
+            execution_spec = spec
+            commission_pct = None
+            slippage_pct = None
+        else:
+            commission_pct = spec["taker_fee_pct"]
+            slippage_pct = spec["half_spread_pct"] + spec["slippage_pct"]
+        manifest_info = {
+            "provenance": dict(manifest["provenance"]),
+            "dataset": dataset["key"],
+            "candles_sha256": dataset["candles"]["sha256"],
+            "funding_sha256": (dataset["funding"] or {}).get("sha256"),
+            "candle_coverage": candle_cov,
+            "funding_coverage": funding_cov,
+            "open_interest_coverage": oi_cov,
+            "open_interest_sha256": (dataset.get("open_interest") or {}).get("sha256"),
+            "cost_multiplier": manifest_ctx.get("cost_multiplier", 1.0),
+            "cost_model": "execution_spec" if execution_spec else "legacy_flat",
+            "execution_spec": spec,
+        }
+    else:
+        start, end = window
+        load_kwargs = {} if exchange_id is None else {"exchange_id": exchange_id}
+        df = load_cached_data(symbol, timeframe, start_date=start, end_date=end,
+                              **load_kwargs)
         if df.empty:
             return None
-    if name in FUNDING_COLUMN_STRATEGIES:
-        df = _attach_funding_if_needed(df, name, symbol, start)
+        if end is not None:
+            df = df[df.index < pd.Timestamp(end)]
+            if df.empty:
+                return None
+        if name in FUNDING_COLUMN_STRATEGIES:
+            df = _attach_funding_if_needed(df, name, symbol, start)
 
     strat = reg.STRATEGY_REGISTRY.get(name)
     if strat is None:
@@ -243,7 +365,7 @@ def run_leg(reg, name: str, params: Optional[dict], symbol: str, timeframe: str,
         param_sets = profile_allocation["param_sets"]
         df_signals = None
         for p in sorted(param_sets):
-            p_params = {**(strat_params or {}), **(param_sets[p] or {})}
+            p_params = {**(strat_params or {}), **(param_sets[p] or {}), **observation_params}
             res = reg.apply_strategy(name, df, p_params)
             if df_signals is None:
                 df_signals = res.copy()
@@ -255,13 +377,29 @@ def run_leg(reg, name: str, params: Optional[dict], symbol: str, timeframe: str,
         df_signals["_profile_label"] = _build_profile_label_series(
             df_signals, profile_allocation["window_spec"]).values
     else:
-        df_signals = reg.apply_strategy(name, df, strat_params)
+        df_signals = reg.apply_strategy(name, df, {**(strat_params or {}), **observation_params}
+                                        if observation_params else strat_params)
         if close_strategies:
             df_signals = ensure_atr_indicator(df_signals)
 
     use_regime = (regime_enabled or bool(allowed_regimes)
                   or bool(regime_windows_spec)
                   or bool(regime_directional_policy))
+
+    indicator_frame = None
+    if manifest_window is not None:
+        import offline_manifest as om
+        if use_regime and "regime" not in df_signals.columns:
+            from regime import ensure_regime_columns
+            ensure_regime_columns(
+                df_signals,
+                period=regime_period,
+                adx_threshold=regime_adx_threshold,
+                windows_spec=regime_windows_spec,
+            )
+        indicator_frame = df_signals
+        df_signals = om.slice_window(df_signals, manifest_window)
+        df = om.slice_window(df, manifest_window)
     bt_kwargs = dict(
         initial_capital=capital, platform=FEE_PLATFORM,
         open_strategy={"name": name, "params": dict(strat_params or {})},
@@ -277,15 +415,26 @@ def run_leg(reg, name: str, params: Optional[dict], symbol: str, timeframe: str,
         regime_windows_spec=regime_windows_spec,
         commission_pct=commission_pct,
         intrabar_resolution=intrabar_resolution,
+        comparison_mode=comparison_mode,
     )
     if slippage_pct is not None:
         bt_kwargs["slippage_pct"] = slippage_pct
+    if execution_spec is not None:
+        bt_kwargs["execution_spec"] = execution_spec
     if regime_directional_policy:
         bt_kwargs["regime_directional_policy"] = regime_directional_policy
         bt_kwargs["regime_directional_certified"] = True
+    for key, value in (stop_kwargs or {}).items():
+        if key in ("stop_loss_atr_mult", "trailing_stop_atr_mult"):
+            if value != bt_kwargs[key]:
+                raise ValueError(
+                    f"stop_kwargs.{key}={value!r} disagrees with {key}={bt_kwargs[key]!r}")
+            continue
+        bt_kwargs[key] = value
     bt = Backtester(**bt_kwargs)
     results = bt.run(df_signals, strategy_name=name, symbol=symbol,
-                     timeframe=timeframe, params=strat_params, save=False)
+                     timeframe=timeframe, params=strat_params, save=False,
+                     indicator_frame=indicator_frame)
     closes = df["close"].astype(float)
     bh = round((closes.iloc[-1] - closes.iloc[0]) / closes.iloc[0] * 100, 2)
     leg = leg_from_results(results, bh_return_pct=bh)
@@ -294,14 +443,19 @@ def run_leg(reg, name: str, params: Optional[dict], symbol: str, timeframe: str,
     except (AttributeError, TypeError):
         span_days = None
     leg["span_days"] = round(span_days, 4) if span_days else span_days
+    leg["close_validation"] = results.get("close_validation")
     if keep_trades:
         leg["trade_samples"] = trade_samples_from_results(results)
+    if manifest_info is not None:
+        leg["manifest"] = manifest_info
+        leg["execution"] = execution_metrics(results, capital)
     return leg
 
 
 def compute_incumbent_legs(reg, datasets: List[tuple], window: tuple,
                            capital: float, *,
-                           intrabar_resolution: str = "ohlc_walk") -> dict:
+                           intrabar_resolution: str = "ohlc_walk",
+                           manifest_ctx: Optional[dict] = None) -> dict:
     out = {}
     for symbol, timeframe in datasets:
         ds = dataset_key(symbol, timeframe)
@@ -309,8 +463,27 @@ def compute_incumbent_legs(reg, datasets: List[tuple], window: tuple,
         for name in INCUMBENTS:
             out[ds][name] = run_leg(reg, name, None, symbol, timeframe,
                                     window, capital=capital,
-                                    intrabar_resolution=intrabar_resolution)
+                                    intrabar_resolution=intrabar_resolution,
+                                    manifest_ctx=manifest_ctx)
     return out
+
+
+def manifest_windows(manifest: dict) -> dict:
+    return {name: (w["start"], w["end"]) for name, w in manifest["windows"].items()}
+
+
+def manifest_datasets(manifest: dict) -> List[tuple]:
+    return [(d["coin"], manifest["interval"]) for d in manifest["datasets"]]
+
+
+def candidate_close_preflight(candidate: dict) -> dict:
+    from backtester import validate_close_capabilities
+    return validate_close_capabilities(
+        close_refs=candidate.get("close_strategies"),
+        comparison_mode=candidate.get("comparison_mode"),
+        platform=FEE_PLATFORM,
+        strategy_type=str(candidate.get("type") or "perps").strip().lower(),
+        phase="preflight").to_dict()
 
 
 def validate_candidate(candidate: dict) -> dict:
@@ -331,6 +504,7 @@ def validate_candidate(candidate: dict) -> dict:
             "close_strategies (the open/close engine models both sides) or "
             "evaluate each leg separately.")
     ctype = str(candidate.get("type") or "perps").strip().lower()
+    candidate_close_preflight(candidate)
     if candidate.get("invert_signal") and ctype not in ("perps", "manual"):
         raise ValueError(
             f"candidate sets invert_signal on type={ctype!r}, but "
@@ -342,6 +516,7 @@ def validate_candidate(candidate: dict) -> dict:
             "candidate sets both stop_loss_atr_mult and "
             "trailing_stop_atr_mult; the stop owners are mutually exclusive "
             "— pick one.")
+    candidate_stop_kwargs(candidate)
     pal = candidate.get("profile_allocation")
     if pal:
         from backtester import _parse_profile_allocation
@@ -439,10 +614,24 @@ def validate_candidate(candidate: dict) -> dict:
     return candidate
 
 
+def candidate_stop_kwargs(candidate: dict) -> Optional[dict]:
+    if candidate.get("stop_context") is None:
+        return None
+    from run_backtest import stop_kwargs_from_json
+    kwargs = stop_kwargs_from_json(candidate["stop_context"])
+    for key in ("stop_loss_atr_mult", "trailing_stop_atr_mult"):
+        if kwargs.get(key) != candidate.get(key):
+            raise ValueError(
+                f"candidate.{key}={candidate.get(key)!r} disagrees with "
+                f"candidate.stop_context.{key}={kwargs.get(key)!r}")
+    return kwargs
+
+
 def run_candidate_leg(reg, candidate: dict, symbol: str, timeframe: str,
                       window: tuple, capital: float = DEFAULT_CAPITAL, *,
                       keep_trades: bool = False,
-                      intrabar_resolution: str = "ohlc_walk") -> Optional[dict]:
+                      intrabar_resolution: str = "ohlc_walk",
+                      manifest_ctx: Optional[dict] = None) -> Optional[dict]:
     return run_leg(
         reg, candidate["name"], candidate.get("params"),
         symbol, timeframe, window, capital=capital,
@@ -458,33 +647,53 @@ def run_candidate_leg(reg, candidate: dict, symbol: str, timeframe: str,
             candidate.get("regime_adx_threshold") or 20.0),
         regime_windows_spec=candidate.get("regime_windows_spec"),
         regime_directional_policy=candidate.get("regime_directional_policy"),
+        regime_enabled=bool(candidate.get("regime_enabled")),
         keep_trades=keep_trades,
         intrabar_resolution=intrabar_resolution,
+        manifest_ctx=manifest_ctx,
+        comparison_mode=candidate.get("comparison_mode"),
+        stop_kwargs=candidate_stop_kwargs(candidate),
     )
 
 
 def evaluate_window(reg, candidate: dict, datasets: List[tuple],
                     window_name: str, capital: float,
                     bars_memo: dict, *,
-                    intrabar_resolution: str = "ohlc_walk") -> dict:
+                    intrabar_resolution: str = "ohlc_walk",
+                    manifest: Optional[dict] = None,
+                    cost_multiplier: float = 1.0) -> dict:
     validate_candidate(candidate)
-    window = WINDOWS[window_name]
-    if window_name not in bars_memo:
-        bars_memo[window_name] = incumbent_bars(
+    manifest_ctx = None
+    if manifest is not None:
+        window = manifest_windows(manifest)[window_name]
+        manifest_ctx = {"manifest": manifest, "window": window_name,
+                        "cost_multiplier": cost_multiplier}
+    else:
+        window = WINDOWS[window_name]
+    memo_key = (window_name if manifest is None
+                else (manifest["path"], window_name, cost_multiplier))
+    if memo_key not in bars_memo:
+        bars_memo[memo_key] = incumbent_bars(
             compute_incumbent_legs(reg, datasets, window, capital,
-                                   intrabar_resolution=intrabar_resolution))
-    bars = bars_memo[window_name]
+                                   intrabar_resolution=intrabar_resolution,
+                                   manifest_ctx=manifest_ctx))
+    bars = bars_memo[memo_key]
 
     candidate_legs = {}
     for symbol, timeframe in datasets:
         ds = dataset_key(symbol, timeframe)
         candidate_legs[ds] = run_candidate_leg(
             reg, candidate, symbol, timeframe, window, capital=capital,
-            intrabar_resolution=intrabar_resolution)
+            intrabar_resolution=intrabar_resolution,
+            manifest_ctx=manifest_ctx)
     score = score_candidate(candidate_legs, bars)
     score["window"] = window_name
     score["window_range"] = list(window)
     score["bars"] = bars
+    from backtester import aggregate_close_validations
+    ran = [leg.get("close_validation") for leg in candidate_legs.values() if leg is not None]
+    score["close_validation"] = aggregate_close_validations(
+        ran or [candidate_close_preflight(candidate)])
     return score
 
 
@@ -519,6 +728,9 @@ def format_window_report(score: dict) -> str:
             f"{_fmt(leg['max_dd_pct'])} {_fmt(leg['bh_return_pct'])} "
             f"{leg['trades']:>6}  {beats}"
         )
+    if score.get("close_validation") is not None:
+        from backtester import format_close_validation
+        lines.append(format_close_validation(score["close_validation"]))
     if score.get("verdict") == "no data":
         lines.append("verdict: NO DATA")
         return "\n".join(lines)
@@ -594,10 +806,14 @@ def build_parser() -> argparse.ArgumentParser:
                         "close_strategies?, direction?, invert_signal?, "
                         "stop_loss_atr_mult?, trailing_stop_atr_mult?, "
                         "allowed_regimes?, regime_windows_spec?, "
-                        "regime_directional_policy?, profile_allocation?}. "
+                        "regime_enabled?, regime_directional_policy?, "
+                        "profile_allocation?, stop_context?}. "
                         "Overrides --strategy/--params. allowed_regimes enables "
                         "the entry gate on the M1 bar (legacy lookback unless "
-                        "regime_windows_spec picks another classifier).")
+                        "regime_windows_spec picks another classifier); "
+                        "regime_enabled stamps the regime label a regime or "
+                        "unified stop owner resolves from; stop_context is "
+                        "the engine-fraction stop context tune_live.py writes.")
     p.add_argument("--registry", choices=["spot", "futures"], default="spot")
     p.add_argument("--direction", default=None,
                    choices=["long", "short", "both"],
@@ -638,8 +854,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--capital", type=float, default=DEFAULT_CAPITAL)
     p.add_argument("--sweep", action="append", default=None, metavar="P=V1,V2",
                    help="Plateau sweep over a param (repeatable; cartesian)")
-    p.add_argument("--sweep-window", default="oos", choices=list(WINDOWS),
-                   help="Window the sweep is scored on (default: oos)")
+    p.add_argument("--sweep-window", default=None,
+                   help="Window the sweep is scored on (default: oos; with "
+                        "--manifest it must be named explicitly, e.g. the "
+                        "declared training window)")
+    p.add_argument("--manifest", default=None, metavar="PATH",
+                   help="#1649 frozen offline manifest (offline_manifest.py): "
+                        "datasets, finite windows, warm-up, venue candles, "
+                        "funding cost, fees, spread/slippage and lot/minimum "
+                        "rules come from the manifest; hashes are verified and "
+                        "no network fetch happens. Default: off (legacy loader).")
+    p.add_argument("--cost-multiplier", type=float, default=1.0,
+                   help="With --manifest: scale spread and slippage (cost "
+                        "sensitivity). Default 1.0.")
     p.add_argument("--profile-allocation", default=None,
                    help="#998 regime-profile allocation JSON: {window_spec:"
                         "{classifier,period,...}, profiles:{label:profile}, "
@@ -651,6 +878,15 @@ def build_parser() -> argparse.ArgumentParser:
                    choices=["ohlc_walk", "bar_close"], default="ohlc_walk",
                    help="SL race resolution (#1271): ohlc_walk (default) or "
                         "bar_close (reproduce pre-#1271 documented baselines).")
+    p.add_argument("--comparison-mode", dest="comparison_mode", default=None,
+                   metavar="MODE",
+                   help="#1683 close comparison mode for the candidate. Omitted = "
+                        "strict (refuses time_stop/zscore_target, whose live "
+                        "inputs no platform supplies, and HL-live-only closes). "
+                        "'approximate' opts research into those exits; every leg, "
+                        "window and the JSON payload carry close_validation with "
+                        "incomplete parity. Overrides nothing: a candidate JSON "
+                        "comparison_mode that differs is an error.")
     return p
 
 
@@ -685,20 +921,50 @@ def main(argv: Optional[List[str]] = None) -> int:
         candidate["regime_directional_policy"] = json.loads(
             args.regime_directional_policy)
 
+    if args.comparison_mode is not None:
+        if "comparison_mode" in candidate and candidate["comparison_mode"] != args.comparison_mode:
+            raise SystemExit(
+                f"--comparison-mode {args.comparison_mode!r} conflicts with the candidate "
+                f"JSON comparison_mode {candidate['comparison_mode']!r}; pick one")
+        candidate["comparison_mode"] = args.comparison_mode
+
     try:
         validate_candidate(candidate)
     except ValueError as exc:
         raise SystemExit(str(exc))
 
+    manifest = None
+    known_windows = WINDOWS
+    if args.manifest:
+        import offline_manifest as om
+        try:
+            manifest = om.load_manifest(args.manifest)
+        except om.ManifestError as exc:
+            raise SystemExit(f"manifest error: {exc}")
+        known_windows = manifest_windows(manifest)
+        if args.datasets:
+            raise SystemExit("--datasets and --manifest are mutually exclusive; "
+                             "the manifest owns the datasets")
+        if args.sweep and not args.sweep_window:
+            raise SystemExit("--manifest sweeps need an explicit --sweep-window "
+                             f"(known: {list(known_windows)})")
+    elif args.cost_multiplier != 1.0:
+        raise SystemExit("--cost-multiplier needs --manifest")
+    sweep_window = args.sweep_window or "oos"
+    if args.sweep and sweep_window not in known_windows:
+        raise SystemExit(f"unknown --sweep-window {sweep_window!r}; known: {list(known_windows)}")
+
     if args.windows:
         window_names = [w.strip() for w in args.windows.split(",") if w.strip()]
-        unknown = [w for w in window_names if w not in WINDOWS]
+        unknown = [w for w in window_names if w not in known_windows]
         if unknown:
-            raise SystemExit(f"unknown windows {unknown}; known: {list(WINDOWS)}")
+            raise SystemExit(f"unknown windows {unknown}; known: {list(known_windows)}")
     else:
-        window_names = list(WINDOWS)
+        window_names = list(known_windows)
 
-    if args.datasets:
+    if manifest is not None:
+        datasets = manifest_datasets(manifest)
+    elif args.datasets:
         datasets = [parse_dataset_arg(d) for d in args.datasets.split(",") if d.strip()]
     else:
         datasets = list(DATASETS)
@@ -717,11 +983,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     for wname in window_names:
         score = evaluate_window(reg, candidate, datasets, wname,
                                 args.capital, bars_memo,
-                                intrabar_resolution=args.intrabar_resolution)
+                                intrabar_resolution=args.intrabar_resolution,
+                                manifest=manifest,
+                                cost_multiplier=args.cost_multiplier)
         window_scores.append(score)
         print(format_window_report(score))
 
     print(format_summary(window_scores))
+    from backtester import aggregate_close_validations, format_close_validation
+    print(format_close_validation(aggregate_close_validations(
+        s.get("close_validation") for s in window_scores)))
 
     sweep_rows = []
     if args.sweep:
@@ -730,21 +1001,36 @@ def main(argv: Optional[List[str]] = None) -> int:
         for label, params in expand_sweep(base, specs):
             combo = dict(candidate)
             combo["params"] = params
-            score = evaluate_window(reg, combo, datasets, args.sweep_window,
+            score = evaluate_window(reg, combo, datasets, sweep_window,
                                     args.capital, bars_memo,
-                                    intrabar_resolution=args.intrabar_resolution)
+                                    intrabar_resolution=args.intrabar_resolution,
+                                    manifest=manifest,
+                                    cost_multiplier=args.cost_multiplier)
             sweep_rows.append({"label": label, "params": params, "score": score})
-        print(format_sweep_report(sweep_rows, args.sweep_window))
+        print(format_sweep_report(sweep_rows, sweep_window))
 
     if args.json_out:
+        manifest_meta = None
+        if manifest is not None:
+            import offline_manifest as om
+            manifest_meta = {
+                "path": os.path.relpath(manifest["path"]),
+                "sha256": om.sha256_file(manifest["path"]),
+                "provenance": manifest["provenance"],
+                "cost_multiplier": args.cost_multiplier,
+            }
         payload = {
             "candidate": candidate,
             "registry": args.registry,
             "incumbents": INCUMBENTS,
             "datasets": [dataset_key(s, t) for s, t in datasets],
-            "windows": {w: list(WINDOWS[w]) for w in window_names},
+            "windows": {w: list(known_windows[w]) for w in window_names},
+            "manifest": manifest_meta,
             "window_scores": window_scores,
             "sweep": sweep_rows,
+            "close_validation": aggregate_close_validations(
+                [s.get("close_validation") for s in window_scores]
+                + [r["score"].get("close_validation") for r in sweep_rows]),
         }
         with open(args.json_out, "w") as fh:
             json.dump(payload, fh, indent=2, default=str)
