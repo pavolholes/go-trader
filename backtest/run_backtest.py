@@ -1308,6 +1308,8 @@ def run_single_backtest(
     cost_multiplier: float = 1.0,
     comparison_mode: Optional[str] = None,
     leverage: Optional[float] = None,
+    max_drawdown_pct: Optional[float] = None,
+    trailing_stop_min_move_pct: Optional[float] = None,
     circuit_breaker_max_drawdown_pct: Optional[float] = None,
     save: bool = False,
     margin_per_trade_usd: Optional[float] = None,
