@@ -1993,7 +1993,6 @@ class Backtester:
                  profile_allocation: Optional[dict] = None,
                  circuit_breaker_max_drawdown_pct: Optional[float] = None,
                  margin_per_trade_usd: Optional[float] = None,
-                 leverage: float = 1.0,
                  intrabar_resolution: str = "ohlc_walk",
                  risk_per_trade_pct: Optional[float] = None,
                  allow_scale_in: bool = False,
