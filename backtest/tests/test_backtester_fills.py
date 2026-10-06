@@ -258,6 +258,7 @@ def test_fixed_margin_intrabar_stop_books_realized_pnl(
         margin_per_trade_usd=10.0,
         leverage=2.0,
         intrabar_resolution="ohlc_walk",
+        comparison_mode="approximate",
     )
 
     results = bt.run(df, strategy_name=f"margin-intrabar-{side}", save=False)
