@@ -1,6 +1,6 @@
 # go-trader
 
-Guardrails only; details in SKILL.md, docs/POST_UPDATE_HISTORY.md. Max 17000 bytes (CI `docs` gate), target 16500. Never split; `AGENTS.md` symlinks. Shorten wording, keep guardrails. Fork: docs/GO-TRADER_OVERRIDES_PAVOL.md (preserve)
+Guardrails: SKILL.md; docs/POST_UPDATE_HISTORY.md; docs/research/blofin-close-evaluator-implementation-audit.md. Max 17000B (target16500B); AGENTS.md symlink; never split. Preserve docs/GO-TRADER_OVERRIDES_PAVOL.md.
 
 ## Env
 - Go 1.26.2 (`/opt/homebrew/bin/go`). Python: `uv run --no-sync python`; scheduler `.venv/bin/python3`; `uv sync` per worktree.

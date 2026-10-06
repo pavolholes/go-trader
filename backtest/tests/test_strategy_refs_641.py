@@ -684,6 +684,34 @@ def test_load_strategy_config_rejects(tmp_path, name):
             path, spec["sid"], inject_user_defaults=spec.get("inject", False))
 
 
+def test_blofin_dynamic_regime_close_is_a_supported_backtest_cohort(tmp_path):
+    regime_block = {
+        label: {
+            "stop_loss_atr": 2.0,
+            "tp_tiers": [
+                {"atr_multiple": 100.0, "close_fraction": 0.5},
+                {"atr_multiple": 200.0, "close_fraction": 1.0},
+            ],
+        }
+        for label in ("trending_up", "trending_down", "ranging")
+    }
+    config = _cfg(15, [{
+        "id": "bl-dyn-btc",
+        "type": "perps",
+        "platform": "blofin",
+        "open_strategy": {"name": "tema_cross_bd"},
+        "close_strategy": {
+            "name": "tiered_tp_atr_live_regime_dynamic",
+            "params": {"regime_confirm_cycles": 2, "trend_regime": regime_block},
+        },
+    }], regime={"enabled": True, "period": 14, "adx_threshold": 25})
+    path = _write_full_config(tmp_path, config)
+    kwargs = run_backtest.load_strategy_config(path, "bl-dyn-btc")
+    assert kwargs["platform"] == "blofin"
+    bt = Backtester(initial_capital=1000, **kwargs)
+    assert bt._dynamic_close_confirm_cycles == 2
+
+
 def test_load_strategy_config_then_backtester_parity(tmp_path):
     path = _write_config(tmp_path, version=15, strategies=[
         {

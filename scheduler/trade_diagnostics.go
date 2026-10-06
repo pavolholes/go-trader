@@ -32,22 +32,28 @@ const (
 )
 
 type TradeDiagnosticsRow struct {
-	RowID           int64
-	StrategyID      string
-	PositionID      string
-	Symbol          string
-	Side            string
-	Timeframe       string
-	RegimeAtOpen    string
-	CloseReason     string
-	EntryPrice      float64
-	ExitPrice       float64
-	Quantity        float64
-	RealizedPnL     float64
-	EntryATR        float64
-	StopLossATRMult *float64
-	OpenedAt        time.Time
-	ClosedAt        time.Time
+	RowID                int64
+	StrategyID           string
+	PositionID           string
+	Symbol               string
+	Side                 string
+	Timeframe            string
+	RegimeAtOpen         string
+	CloseReason          string
+	CloseSource          string
+	CloseEvaluator       string
+	CloseEvaluatorReason string
+	CloseTPTier          string
+	CloseSLTriggerPx     *float64
+	CaptureBasis         string
+	EntryPrice           float64
+	ExitPrice            float64
+	Quantity             float64
+	RealizedPnL          float64
+	EntryATR             float64
+	StopLossATRMult      *float64
+	OpenedAt             time.Time
+	ClosedAt             time.Time
 
 	MFEPrice     *float64
 	MAEPrice     *float64
@@ -66,6 +72,10 @@ type TradeDiagnosticsRow struct {
 }
 
 func captureTradeDiagnostics(s *StrategyState, pos *Position, closePrice, realizedPnL float64, reason string, closedAt time.Time) {
+	captureTradeDiagnosticsWithAttribution(s, pos, closePrice, realizedPnL, reason, closedAt, nil)
+}
+
+func captureTradeDiagnosticsWithAttribution(s *StrategyState, pos *Position, closePrice, realizedPnL float64, reason string, closedAt time.Time, attribution *CloseAttribution) {
 	if s == nil || pos == nil {
 		return
 	}
@@ -76,21 +86,44 @@ func captureTradeDiagnostics(s *StrategyState, pos *Position, closePrice, realiz
 		return
 	}
 	row := TradeDiagnosticsRow{
-		StrategyID:      s.ID,
-		PositionID:      pos.TradePositionID,
-		Symbol:          pos.Symbol,
-		Side:            pos.Side,
-		RegimeAtOpen:    pos.Regime,
-		CloseReason:     reason,
-		EntryPrice:      pos.AvgCost,
-		ExitPrice:       closePrice,
-		Quantity:        pos.Quantity,
+		StrategyID:   s.ID,
+		PositionID:   pos.TradePositionID,
+		Symbol:       pos.Symbol,
+		Side:         pos.Side,
+		RegimeAtOpen: pos.Regime,
+		CloseReason:  reason,
+		CloseSource:  diagnosticCloseSource(reason),
+		EntryPrice:   pos.AvgCost,
+		ExitPrice:    closePrice,
+		Quantity: func() float64 {
+			if pos.InitialQuantity > 0 {
+				return pos.InitialQuantity
+			}
+			return pos.Quantity
+		}(),
 		RealizedPnL:     realizedPnL,
 		EntryATR:        pos.EntryATR,
 		StopLossATRMult: pos.StopLossATRMult,
 		OpenedAt:        pos.OpenedAt,
 		ClosedAt:        closedAt,
 		MetricsStatus:   diagMetricsPending,
+		CaptureBasis:    "price_only",
+	}
+	if pos.StopLossTriggerPx > 0 {
+		v := pos.StopLossTriggerPx
+		row.CloseSLTriggerPx = &v
+	}
+	if attribution != nil {
+		if attribution.Source != "" {
+			row.CloseSource = attribution.Source
+		}
+		row.CloseEvaluator = attribution.Evaluator
+		row.CloseEvaluatorReason = attribution.Reason
+		row.CloseTPTier = attribution.TPTier
+		if attribution.StopLossTriggerPx > 0 {
+			v := attribution.StopLossTriggerPx
+			row.CloseSLTriggerPx = &v
+		}
 	}
 	if pos.LLMVerdict != "" {
 		v := pos.LLMVerdict
@@ -114,6 +147,24 @@ func captureTradeDiagnostics(s *StrategyState, pos *Position, closePrice, realiz
 	}
 	if tradeDiagnosticsEnqueue != nil {
 		tradeDiagnosticsEnqueue(row)
+	}
+}
+
+func diagnosticCloseSource(reason string) string {
+	r := strings.ToLower(strings.TrimSpace(reason))
+	switch {
+	case strings.HasPrefix(r, "close_evaluator:"):
+		return "evaluator"
+	case strings.HasPrefix(r, "risk_stop:"):
+		return "risk_stop"
+	case strings.Contains(r, "stop_loss"), strings.Contains(r, "trailing_stop"):
+		return "risk_stop"
+	case r == "signal":
+		return "signal"
+	case strings.Contains(r, "circuit_breaker"), strings.Contains(r, "kill_switch"):
+		return "circuit_breaker"
+	default:
+		return "system"
 	}
 }
 

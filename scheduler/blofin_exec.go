@@ -1,6 +1,10 @@
 package main
 
-import "fmt"
+import (
+	"fmt"
+	"strconv"
+	"strings"
+)
 
 // blofinIsLive reports whether --mode=live appears in strategy args.
 func blofinIsLive(args []string) bool {
@@ -15,16 +19,38 @@ func blofinSymbol(args []string) string {
 	return ""
 }
 
+func applyBloFinManageOnly(result *BloFinResult, posQty float64, posSide string) {
+	if result == nil {
+		return
+	}
+	if result.CloseFraction > 0 && posQty > 0 {
+		result.Signal = composeOpenCloseSignal("none", result.CloseFraction, posSide)
+		return
+	}
+	result.Signal = 0
+}
+
 // runBloFinCheck runs check_blofin.py signal-check mode (Phase 3, no lock).
 func runBloFinCheck(sc StrategyConfig, prices map[string]float64, posCtx PositionCtx, regime *RegimeConfig, notifier *MultiNotifier, logger *StrategyLogger) (*BloFinResult, string, float64, bool) {
 	args := append([]string{}, sc.Args...)
 	args = appendOpenCloseArgs(args, sc, posCtx)
+	args = appendBloFinPositionContextArgs(args, posCtx)
 	if sc.HTFFilter {
 		args = append(args, "--htf-filter")
 	}
 	args = appendRegimeArgs(args, regime)
 	args = appendStrategyRegimeWindowArgs(args, sc, regime)
 	args = appendRegimePayloadArg(args, sc, regime)
+	if sc.Platform == "blofin" && sc.Type == "perps" && posCtx.Quantity > 0 && posCtx.BarsHeldKnown && blofinCloseNeedsPositionHistory(sc) {
+		limit := posCtx.BarsHeld + 2
+		if limit < 200 {
+			limit = 200
+		}
+		if limit > 5000 {
+			limit = 5000
+		}
+		args = append(args, "--ohlcv-limit", strconv.Itoa(limit))
+	}
 	if refsArgs, err := buildStrategyRefsArg(sc, "", false); err != nil {
 		logger.Warn("Failed to marshal strategy refs: %v", err)
 	} else if len(refsArgs) > 0 {
@@ -49,6 +75,9 @@ func runBloFinCheck(sc StrategyConfig, prices map[string]float64, posCtx Positio
 	if stderr != "" {
 		logger.Info("stderr: %s", stderr)
 	}
+	for _, warning := range result.CloseContextWarnings {
+		logger.Warn("BloFin close context: %s", warning)
+	}
 	if result.Error != "" {
 		logger.Error("Script returned error: %s", result.Error)
 		notifyScriptFailure(notifier, sc, scriptFailureError, result.Error)
@@ -70,6 +99,37 @@ func runBloFinCheck(sc StrategyConfig, prices map[string]float64, posCtx Positio
 		return nil, "", 0, false
 	}
 	return result, signalStr, price, true
+}
+
+func blofinCloseNeedsPositionHistory(sc StrategyConfig) bool {
+	for _, ref := range sc.closeRefs() {
+		name := strings.ToLower(strings.TrimSpace(ref.Name))
+		if name == "avwap_stop" || name == "time_stop" {
+			return true
+		}
+	}
+	return false
+}
+
+func appendBloFinPositionContextArgs(args []string, pos PositionCtx) []string {
+	if pos.Quantity <= 0 {
+		return args
+	}
+	out := append([]string(nil), args...)
+	if !pos.OpenedAt.IsZero() {
+		out = append(out, "--position-opened-at-ms", strconv.FormatInt(pos.OpenedAt.UTC().UnixMilli(), 10))
+	}
+	if pos.BarsHeldKnown {
+		out = append(out, "--position-bars-held", strconv.Itoa(pos.BarsHeld))
+	}
+	if label := strings.TrimSpace(pos.RegimeAppliedLabel); label != "" {
+		out = append(out, "--position-regime-applied", label)
+	}
+	if label := strings.TrimSpace(pos.RegimePendingLabel); label != "" {
+		out = append(out, "--position-regime-pending-label", label)
+		out = append(out, "--position-regime-pending-count", strconv.Itoa(pos.RegimePendingCount))
+	}
+	return out
 }
 
 // runBloFinExecuteOrder places a live BloFin order (Phase 3, no lock).
@@ -149,6 +209,35 @@ func runBloFinExecuteOrder(sc StrategyConfig, result *BloFinResult, price, cash,
 	return execResult, true
 }
 
+func blofinCloseAttribution(result *BloFinResult) *CloseAttribution {
+	if result == nil {
+		return nil
+	}
+	source := strings.TrimSpace(result.CloseSource)
+	if source == "" {
+		if result.CloseFraction > 0 {
+			source = "evaluator"
+		} else {
+			source = "signal"
+		}
+	}
+	evaluator := strings.TrimSpace(result.CloseEvaluator)
+	if evaluator == "" && source == "evaluator" {
+		evaluator = strings.TrimSpace(result.CloseStrategy)
+	}
+	tier := ""
+	if result.TPTier != nil {
+		tier = fmt.Sprint(result.TPTier)
+	}
+	return &CloseAttribution{
+		Source:            source,
+		Evaluator:         evaluator,
+		Reason:            strings.TrimSpace(result.CloseReason),
+		TPTier:            tier,
+		StopLossTriggerPx: result.StopLossPrice,
+	}
+}
+
 // executeBloFinResult applies a BloFin result to state. Must be called under Lock.
 func executeBloFinResult(sc StrategyConfig, s *StrategyState, db *StateDB, result *BloFinResult, execResult *BloFinExecuteResult, signalStr string, price float64, regime *RegimeConfig, logger *StrategyLogger, notifier *MultiNotifier) (int, string) {
 	sym := result.Symbol
@@ -187,7 +276,7 @@ func executeBloFinResult(sc StrategyConfig, s *StrategyState, db *StateDB, resul
 		}
 		return 0, ""
 	}
-	exec, err := ExecutePerpsSignalWithLeverageDeferredOpen(s, result.Signal, result.Symbol, fillPrice, PerpsSizingFor(sc, fillPrice, result.ATRValue), fillQty, fillOID, fillFee, EffectiveDirection(sc), result.CloseFraction, logger)
+	exec, err := ExecutePerpsSignalWithLeverageDeferredOpenAttributed(s, result.Signal, result.Symbol, fillPrice, PerpsSizingFor(sc, fillPrice, result.ATRValue), fillQty, fillOID, fillFee, EffectiveDirection(sc), result.CloseFraction, logger, blofinCloseAttribution(result))
 	if err != nil {
 		logger.Error("Trade execution failed: %v", err)
 		return 0, ""
@@ -196,6 +285,7 @@ func executeBloFinResult(sc StrategyConfig, s *StrategyState, db *StateDB, resul
 	stampEntryATRIfOpened(s, result.Symbol, result.Indicators)
 	stampPositionRegimeIfOpened(s, result.Symbol, regimePayloadValue(result.Regime), sc, regime)
 	if pos, ok := s.Positions[sym]; ok {
+		armBloFinVirtualStopOnOpen(sc, pos)
 		if sc.Platform == "blofin" && execResult != nil && execResult.Execution != nil && execResult.Execution.Fill != nil && execResult.Execution.Fill.ContractValue > 0 {
 			pos.Multiplier = execResult.Execution.Fill.ContractValue
 		}

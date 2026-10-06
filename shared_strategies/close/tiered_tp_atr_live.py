@@ -48,6 +48,7 @@ def evaluate(position: dict, market: dict, params: dict) -> dict:
         {
             "close_fraction": close_fraction,
             "reason": f"tiered_tp_atr_live:{geometry.atr_label}:{multiple:g}",
+            "tp_tier": multiple,
         },
         position, geometry, hit_tiers, side,
     )

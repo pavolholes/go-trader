@@ -475,6 +475,12 @@ func positionCtxForCheck(sc StrategyConfig, pos *Position, regime *RegimeConfig)
 	if label := protectionATRRegimeLabel(pos, sc); label != "" {
 		ctx.Regime = label
 	}
+	if ctx.RegimeAppliedLabel == "" {
+		ctx.RegimeAppliedLabel = ctx.Regime
+	}
+	if sc.Platform == "blofin" && sc.Type == "perps" && pos.Quantity > 0 {
+		ctx.BarsHeld, ctx.BarsHeldKnown = completedBarsHeld(pos.OpenedAt, time.Now().UTC(), strategyDisplayTimeframe(sc))
+	}
 	if sc.Platform == "hyperliquid" {
 		ctx.OnChainTPResting, ctx.OnChainTPBlocked = hlOnChainTPState(sc, pos)
 	}

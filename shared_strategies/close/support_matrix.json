@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "platforms": {
+    "blofin-perps": {
+      "atr_stop": {
+        "supported": true,
+        "required_context": ["position.side", "position.avg_cost", "position.current_quantity", "position.entry_atr", "market.mark_price"],
+        "stop_owner": "evaluator",
+        "notes": "Virtual ATR stop evaluated on each BloFin scheduler check."
+      },
+      "avwap_stop": {
+        "supported": true,
+        "required_context": ["position.opened_at", "market.avwap", "market.mark_price"],
+        "stop_owner": "evaluator",
+        "notes": "BloFin supplies a completed-candle AVWAP anchored at the position open when the open strategy has no avwap column."
+      },
+      "tiered_tp_atr": {
+        "supported": true,
+        "required_context": ["position.side", "position.avg_cost", "position.current_quantity", "position.initial_quantity", "position.entry_atr", "market.mark_price"],
+        "stop_owner": "close_sl_or_strategy_atr",
+        "notes": "The close ref may own sl_atr_mult; otherwise configure strategy-level stop_loss_atr_mult or stop_loss_atr_mult_regime."
+      },
+      "tiered_tp_atr_live": {
+        "supported": true,
+        "required_context": ["position.side", "position.avg_cost", "position.current_quantity", "position.entry_atr", "market.atr", "market.mark_price"],
+        "stop_owner": "strategy_atr",
+        "notes": "TP-only; requires an independent strategy-level ATR stop."
+      },
+      "tiered_tp_atr_regime": {
+        "supported": true,
+        "required_context": ["position.regime", "position.entry_atr", "market.mark_price"],
+        "stop_owner": "close_sl_or_strategy_atr",
+        "notes": "The close ref may own sl_atr_mult; otherwise configure strategy-level stop_loss_atr_mult or stop_loss_atr_mult_regime."
+      },
+      "tiered_tp_atr_live_regime": {
+        "supported": true,
+        "required_context": ["market.regime", "market.atr", "position.entry_atr", "market.mark_price"],
+        "stop_owner": "unified_or_strategy_atr",
+        "notes": "A unified per-regime close owns its declared per-regime SL; a TP-only close requires a strategy-level ATR stop."
+      },
+      "tiered_tp_atr_live_regime_dynamic": {
+        "supported": true,
+        "required_context": ["market.regime", "market.atr", "position.regime_applied", "position.regime_pending", "position.entry_atr", "market.mark_price"],
+        "stop_owner": "unified_virtual_stop",
+        "notes": "Per-regime TP/SL uses persisted scheduler state, a two-cycle regime confirmation by default, and a software-managed virtual stop. BloFin Copy TPSL is not assumed."
+      },
+      "tiered_tp_pct": {
+        "supported": true,
+        "required_context": ["position.side", "position.avg_cost", "position.current_quantity", "position.initial_quantity", "market.mark_price"],
+        "stop_owner": "strategy_atr",
+        "notes": "TP-only; requires an independent strategy-level ATR stop."
+      },
+      "time_stop": {
+        "supported": true,
+        "required_context": ["position.opened_at", "position.bars_held", "strategy.timeframe"],
+        "stop_owner": "strategy_atr",
+        "notes": "Counts elapsed, completed timeframe bars from the persisted position open time; requires an independent strategy-level ATR stop."
+      },
+      "trailing_tp_ratchet": {
+        "supported": true,
+        "required_context": ["position.side", "position.entry_atr", "position.high_water", "position.ratchet_tier_watermark", "market.mark_price"],
+        "stop_owner": "ratchet_virtual_stop",
+        "notes": "Ratchet progress/high-water/trail are persisted by the scheduler; a breached trail submits a sized market close. No resting Hyperliquid order is assumed."
+      },
+      "trailing_tp_ratchet_regime": {
+        "supported": true,
+        "required_context": ["position.regime", "position.side", "position.entry_atr", "position.high_water", "position.ratchet_tier_watermark", "market.mark_price"],
+        "stop_owner": "ratchet_regime_virtual_stop",
+        "notes": "Requires regime.enabled and trailing_stop_atr_mult_regime; ratchet progress/high-water/trail persist in scheduler state."
+      },
+      "zscore_target": {
+        "supported": true,
+        "required_context": ["position.side", "position.current_quantity", "market.zscore", "strategy.timeframe"],
+        "stop_owner": "strategy_atr",
+        "notes": "Z-score is calculated from the configured lookback of completed candle closes; requires an independent strategy-level ATR stop."
+      }
+    }
+  }
+}

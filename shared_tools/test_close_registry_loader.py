@@ -27,11 +27,15 @@ def test_list_strategies_detailed_shape():
     detailed = list_strategies_detailed()
     assert detailed, "expected at least one registered close evaluator"
     for entry in detailed:
-        assert set(entry.keys()) == {"name", "description", "default_params", "platforms"}
+        assert set(entry.keys()) == {"name", "description", "default_params", "platforms", "support"}
         assert isinstance(entry["name"], str) and entry["name"]
         assert isinstance(entry["description"], str) and entry["description"]
         assert isinstance(entry["default_params"], dict)
         assert isinstance(entry["platforms"], list) and entry["platforms"]
+        assert "blofin-perps" in entry["support"]
+        assert set(entry["support"]["blofin-perps"]) == {
+            "supported", "required_context", "stop_owner", "notes"
+        }
 
 
 def test_list_strategies_detailed_spot_check_known_evaluators():
@@ -39,6 +43,23 @@ def test_list_strategies_detailed_spot_check_known_evaluators():
     for name in ("tiered_tp_atr_live", "trailing_tp_ratchet", "avwap_stop"):
         assert name in by_name
     assert by_name["avwap_stop"]["default_params"] == {"buffer_atr_mult": 0.25, "atr_source": "live"}
+
+
+def test_blofin_perps_registry_matches_explicit_support_matrix():
+    detailed = {entry["name"]: entry for entry in list_strategies_detailed()}
+    matrix_path = Path(__file__).resolve().parents[1] / "shared_strategies" / "close" / "support_matrix.json"
+    matrix = json.loads(matrix_path.read_text())
+    expected = {
+        name for name, rule in matrix["platforms"]["blofin-perps"].items()
+        if rule["supported"]
+    }
+    assert set(detailed) == set(matrix["platforms"]["blofin-perps"])
+    actual = {
+        name for name, entry in detailed.items()
+        if "blofin-perps" in entry["platforms"]
+    }
+    assert actual == expected
+    assert set(_CLOSE_REGISTRY_LOADER.build_close_registry("blofin-perps")) == expected
 
 
 def test_cli_list_json_emits_same_shape_as_python_call():

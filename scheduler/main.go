@@ -2431,9 +2431,35 @@ func main() {
 							}
 						}
 					} else if sc.Platform == "blofin" || sc.Platform == "blofin_spot" {
-						if result, signalStr, price, ok := runBloFinCheck(sc, prices, blofinPosCtx, cfg.Regime, notifier, logger); ok {
+						var result *BloFinResult
+						var signalStr string
+						var price float64
+						var ok bool
+						if sc.Platform == "blofin" && sc.Type == "perps" {
+							if sym := blofinSymbol(sc.Args); sym != "" {
+								if mark := prices[sym]; mark > 0 {
+									stopResult, ratchetAlert := prepareBloFinVirtualClose(sc, stratState, sym, mark, &mu, logger)
+									notifyRatchetTrigger(notifier, sc.NotifyRatchetTriggersEnabled(cfg), ratchetAlert)
+									if stopResult != nil {
+										storeRegime := globalRegimeStore.PayloadForStrategy(sc, cfg.Regime)
+										stopResult.Regime = &storeRegime
+										result, signalStr, price, ok = stopResult, signalLabel(stopResult.Signal), mark, true
+									}
+								}
+							}
+							mu.RLock()
+							if pos := stratState.Positions[blofinSymbol(sc.Args)]; pos != nil {
+								blofinPosCtx = positionCtxForCheck(sc, pos, cfg.Regime)
+								blofinPosSide, blofinPosQty, blofinAvgCost = blofinPosCtx.Side, blofinPosCtx.Quantity, blofinPosCtx.AvgCost
+							}
+							mu.RUnlock()
+						}
+						if !ok {
+							result, signalStr, price, ok = runBloFinCheck(sc, prices, blofinPosCtx, cfg.Regime, notifier, logger)
+						}
+						if ok {
 							if cbManageOnly {
-								result.Signal = 0
+								applyBloFinManageOnly(result, blofinPosQty, blofinPosSide)
 							}
 							prices[result.Symbol] = price
 							storeRegime := globalRegimeStore.PayloadForStrategy(sc, cfg.Regime)
@@ -2471,6 +2497,13 @@ func main() {
 							mu.Lock()
 							syncStrategyRegimeState(stratState, positionRegime, cfg.Regime)
 							mu.Unlock()
+							if sc.Platform == "blofin" && strategyUsesDynamicRegimeClose(sc) {
+								if stopResult := advanceBloFinDynamicCloseRegime(sc, stratState, result.Symbol, price, &mu, logger); stopResult != nil {
+									stopResult.Regime = &positionRegime
+									result = stopResult
+									signalStr = signalLabel(result.Signal)
+								}
+							}
 							currentDirRegime := regimeDirectionalLabel(sc, storeRegime, cfg.Regime)
 							posDirRegime := blofinPosCtx.DirectionalRegime
 							var dirCertStates map[string]string

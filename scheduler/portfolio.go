@@ -86,6 +86,63 @@ type ClosedPosition struct {
 	DurationSeconds int64     `json:"duration_seconds"`
 }
 
+type CloseAttribution struct {
+	Source            string
+	Evaluator         string
+	Reason            string
+	TPTier            string
+	StopLossTriggerPx float64
+}
+
+func (a *CloseAttribution) persistedReason(fallback string) string {
+	if a == nil {
+		return fallback
+	}
+	source := strings.TrimSpace(a.Source)
+	reason := strings.TrimSpace(a.Reason)
+	switch source {
+	case "evaluator":
+		return fmt.Sprintf("close_evaluator:%s:%s", strings.TrimSpace(a.Evaluator), reason)
+	case "risk_stop":
+		return "risk_stop:" + reason
+	case "signal":
+		return "signal"
+	case "":
+		return fallback
+	default:
+		if reason == "" {
+			return source
+		}
+		return source + ":" + reason
+	}
+}
+
+func (a *CloseAttribution) detailSuffix() string {
+	if a == nil {
+		return ""
+	}
+	parts := []string{}
+	if a.Source != "" {
+		parts = append(parts, "close_source="+a.Source)
+	}
+	if a.Evaluator != "" {
+		parts = append(parts, "close_evaluator="+a.Evaluator)
+	}
+	if a.Reason != "" {
+		parts = append(parts, "close_reason="+a.Reason)
+	}
+	if a.TPTier != "" {
+		parts = append(parts, "tp_tier="+a.TPTier)
+	}
+	if a.StopLossTriggerPx > 0 {
+		parts = append(parts, fmt.Sprintf("sl_trigger_px=%.10g", a.StopLossTriggerPx))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return " [" + strings.Join(parts, "; ") + "]"
+}
+
 type ClosedOptionPosition struct {
 	StrategyID      string    `json:"strategy_id"`
 	PositionID      string    `json:"position_id"`
@@ -105,6 +162,10 @@ type ClosedOptionPosition struct {
 }
 
 func recordClosedPosition(s *StrategyState, pos *Position, closePrice, realizedPnL float64, reason string, closedAt time.Time) {
+	recordClosedPositionWithAttribution(s, pos, closePrice, realizedPnL, reason, closedAt, nil)
+}
+
+func recordClosedPositionWithAttribution(s *StrategyState, pos *Position, closePrice, realizedPnL float64, reason string, closedAt time.Time, attribution *CloseAttribution) {
 	var duration int64
 	if !pos.OpenedAt.IsZero() {
 		duration = int64(closedAt.Sub(pos.OpenedAt).Seconds())
@@ -120,12 +181,13 @@ func recordClosedPosition(s *StrategyState, pos *Position, closePrice, realizedP
 		ClosedAt:        closedAt,
 		ClosePrice:      closePrice,
 		RealizedPnL:     realizedPnL,
-		CloseReason:     reason,
+		CloseReason:     attribution.persistedReason(reason),
 		DurationSeconds: duration,
 	})
-	captureTradeDiagnostics(s, pos, closePrice, realizedPnL, reason, closedAt)
+	persistedReason := attribution.persistedReason(reason)
+	captureTradeDiagnosticsWithAttribution(s, pos, closePrice, realizedPnL, persistedReason, closedAt, attribution)
 	if pos.Quantity > 0 && !pos.isHedgeLeg() {
-		recordReplayDecision(s, ReplayDecisionFullClose, pos.Symbol, pos.Side, pos.Quantity, closePrice, reason, closedAt, 0, "")
+		recordReplayDecision(s, ReplayDecisionFullClose, pos.Symbol, pos.Side, pos.Quantity, closePrice, persistedReason, closedAt, 0, "")
 	}
 }
 
@@ -889,7 +951,7 @@ func FuturesOrderSkipReason(signal int, posSide string) string {
 }
 
 func ExecutePerpsSignalWithLeverage(s *StrategyState, signal int, symbol string, price float64, sizing PerpsSizing, fillQty float64, fillOID string, fillFee float64, direction string, closeFraction float64, logger *StrategyLogger) (int, error) {
-	return executePerpsSignalWithLeverage(s, signal, symbol, price, sizing, fillQty, fillOID, fillFee, direction, closeFraction, logger, func(trade Trade) {
+	return executePerpsSignalWithLeverage(s, signal, symbol, price, sizing, fillQty, fillOID, fillFee, direction, closeFraction, logger, nil, func(trade Trade) {
 		RecordTrade(s, trade)
 	})
 }
@@ -904,8 +966,12 @@ func posMult(pos *Position) float64 {
 }
 
 func ExecutePerpsSignalWithLeverageDeferredOpen(s *StrategyState, signal int, symbol string, price float64, sizing PerpsSizing, fillQty float64, fillOID string, fillFee float64, direction string, closeFraction float64, logger *StrategyLogger) (SignalExecutionResult, error) {
+	return ExecutePerpsSignalWithLeverageDeferredOpenAttributed(s, signal, symbol, price, sizing, fillQty, fillOID, fillFee, direction, closeFraction, logger, nil)
+}
+
+func ExecutePerpsSignalWithLeverageDeferredOpenAttributed(s *StrategyState, signal int, symbol string, price float64, sizing PerpsSizing, fillQty float64, fillOID string, fillFee float64, direction string, closeFraction float64, logger *StrategyLogger, attribution *CloseAttribution) (SignalExecutionResult, error) {
 	var result SignalExecutionResult
-	trades, err := executePerpsSignalWithLeverage(s, signal, symbol, price, sizing, fillQty, fillOID, fillFee, direction, closeFraction, logger, func(trade Trade) {
+	trades, err := executePerpsSignalWithLeverage(s, signal, symbol, price, sizing, fillQty, fillOID, fillFee, direction, closeFraction, logger, attribution, func(trade Trade) {
 		t := trade
 		result.OpenTrade = &t
 	})
@@ -913,7 +979,7 @@ func ExecutePerpsSignalWithLeverageDeferredOpen(s *StrategyState, signal int, sy
 	return result, err
 }
 
-func executePerpsSignalWithLeverage(s *StrategyState, signal int, symbol string, price float64, sizing PerpsSizing, fillQty float64, fillOID string, fillFee float64, direction string, closeFraction float64, logger *StrategyLogger, recordOpen func(Trade)) (int, error) {
+func executePerpsSignalWithLeverage(s *StrategyState, signal int, symbol string, price float64, sizing PerpsSizing, fillQty float64, fillOID string, fillFee float64, direction string, closeFraction float64, logger *StrategyLogger, closeAttribution *CloseAttribution, recordOpen func(Trade)) (int, error) {
 	if direction == "" {
 		direction = DirectionLong
 	}
@@ -993,6 +1059,7 @@ func executePerpsSignalWithLeverage(s *StrategyState, signal int, symbol string,
 			if partialClose {
 				details = fmt.Sprintf("Partial-close short %.6f, PnL: $%.2f (fee $%.2f)", closeQty, pnl, fee)
 			}
+			details += closeAttribution.detailSuffix()
 			trade := Trade{
 				Timestamp:       now,
 				StrategyID:      s.ID,
@@ -1014,6 +1081,9 @@ func executePerpsSignalWithLeverage(s *StrategyState, signal int, symbol string,
 			trade.Regime = s.Regime
 			trade.EntryATR = pos.EntryATR
 			trade.StopLossTriggerPx = pos.StopLossTriggerPx
+			if closeAttribution != nil && closeAttribution.StopLossTriggerPx > 0 {
+				trade.StopLossTriggerPx = closeAttribution.StopLossTriggerPx
+			}
 			trade.StopLossATRMult = pos.StopLossATRMult
 			trade.TPTiersJSON = pos.TPTiersJSON
 			RecordTrade(s, trade)
@@ -1022,11 +1092,11 @@ func executePerpsSignalWithLeverage(s *StrategyState, signal int, symbol string,
 				pos.RealizedPnLAccum += pnl
 				pos.Quantity -= closeQty
 				if !pos.isHedgeLeg() {
-					recordReplayDecision(s, ReplayDecisionPartialClose, symbol, pos.Side, closeQty, execPrice, "", now, 0, "")
+					recordReplayDecision(s, ReplayDecisionPartialClose, symbol, pos.Side, closeQty, execPrice, closeAttribution.persistedReason("signal"), now, 0, "")
 				}
 				logger.Info("Partial-close short %s: %.6f (remaining %.6f) @ $%.2f (fee $%.2f) | PnL: $%.2f", symbol, closeQty, pos.Quantity, execPrice, fee, pnl)
 			} else {
-				recordClosedPosition(s, pos, execPrice, pos.RealizedPnLAccum+pnl, "signal", now)
+				recordClosedPositionWithAttribution(s, pos, execPrice, pos.RealizedPnLAccum+pnl, "signal", now, closeAttribution)
 				delete(s.Positions, symbol)
 				clearHLPerpsPositionAlertThrottles(s, symbol)
 				logger.Info("Closed short %s @ $%.2f (fee $%.2f) | PnL: $%.2f", symbol, execPrice, fee, pnl)
@@ -1167,6 +1237,7 @@ func executePerpsSignalWithLeverage(s *StrategyState, signal int, symbol string,
 			if partialClose {
 				details = fmt.Sprintf("Partial-close long %.6f, PnL: $%.2f (fee $%.2f)", closeQty, pnl, fee)
 			}
+			details += closeAttribution.detailSuffix()
 			trade := Trade{
 				Timestamp:       now,
 				StrategyID:      s.ID,
@@ -1188,6 +1259,9 @@ func executePerpsSignalWithLeverage(s *StrategyState, signal int, symbol string,
 			trade.Regime = s.Regime
 			trade.EntryATR = pos.EntryATR
 			trade.StopLossTriggerPx = pos.StopLossTriggerPx
+			if closeAttribution != nil && closeAttribution.StopLossTriggerPx > 0 {
+				trade.StopLossTriggerPx = closeAttribution.StopLossTriggerPx
+			}
 			trade.StopLossATRMult = pos.StopLossATRMult
 			trade.TPTiersJSON = pos.TPTiersJSON
 			RecordTrade(s, trade)
@@ -1196,11 +1270,11 @@ func executePerpsSignalWithLeverage(s *StrategyState, signal int, symbol string,
 				pos.RealizedPnLAccum += pnl
 				pos.Quantity -= closeQty
 				if !pos.isHedgeLeg() {
-					recordReplayDecision(s, ReplayDecisionPartialClose, symbol, pos.Side, closeQty, execPrice, "", now, 0, "")
+					recordReplayDecision(s, ReplayDecisionPartialClose, symbol, pos.Side, closeQty, execPrice, closeAttribution.persistedReason("signal"), now, 0, "")
 				}
 				logger.Info("Partial-close long %s: %.6f (remaining %.6f) @ $%.2f (fee $%.2f) | PnL: $%.2f", symbol, closeQty, pos.Quantity, execPrice, fee, pnl)
 			} else {
-				recordClosedPosition(s, pos, execPrice, pos.RealizedPnLAccum+pnl, "signal", now)
+				recordClosedPositionWithAttribution(s, pos, execPrice, pos.RealizedPnLAccum+pnl, "signal", now, closeAttribution)
 				delete(s.Positions, symbol)
 				clearHLPerpsPositionAlertThrottles(s, symbol)
 				logger.Info("SELL %s: %.6f @ $%.2f (fee $%.2f) | PnL: $%.2f", symbol, closeQty, execPrice, fee, pnl)

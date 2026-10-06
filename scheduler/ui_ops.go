@@ -48,27 +48,33 @@ func (ss *StatusServer) handleAPILeaderboard(w http.ResponseWriter, r *http.Requ
 }
 
 type uiDiagnosticsRow struct {
-	StrategyID    string    `json:"strategy_id"`
-	PositionID    string    `json:"position_id,omitempty"`
-	Symbol        string    `json:"symbol"`
-	Side          string    `json:"side"`
-	Timeframe     string    `json:"timeframe,omitempty"`
-	RegimeAtOpen  string    `json:"regime_at_open,omitempty"`
-	CloseReason   string    `json:"close_reason,omitempty"`
-	EntryPrice    float64   `json:"entry_price"`
-	ExitPrice     float64   `json:"exit_price"`
-	Quantity      float64   `json:"quantity"`
-	NetPnL        float64   `json:"net_pnl"`
-	EntryATR      float64   `json:"entry_atr,omitempty"`
-	OpenedAt      time.Time `json:"opened_at"`
-	ClosedAt      time.Time `json:"closed_at"`
-	MFEPrice      *float64  `json:"mfe_price"`
-	MAEPrice      *float64  `json:"mae_price"`
-	FavorablePct  *float64  `json:"favorable_pct"`
-	AdversePct    *float64  `json:"adverse_pct"`
-	CaptureRatio  *float64  `json:"capture_ratio"`
-	MetricsStatus string    `json:"metrics_status"`
-	LLMVerdict    *string   `json:"llm_verdict"`
+	StrategyID           string    `json:"strategy_id"`
+	PositionID           string    `json:"position_id,omitempty"`
+	Symbol               string    `json:"symbol"`
+	Side                 string    `json:"side"`
+	Timeframe            string    `json:"timeframe,omitempty"`
+	RegimeAtOpen         string    `json:"regime_at_open,omitempty"`
+	CloseReason          string    `json:"close_reason,omitempty"`
+	CloseSource          string    `json:"close_source,omitempty"`
+	CloseEvaluator       string    `json:"close_evaluator,omitempty"`
+	CloseEvaluatorReason string    `json:"close_evaluator_reason,omitempty"`
+	CloseTPTier          string    `json:"close_tp_tier,omitempty"`
+	CloseSLTriggerPx     *float64  `json:"close_sl_trigger_px,omitempty"`
+	CaptureBasis         string    `json:"capture_basis"`
+	EntryPrice           float64   `json:"entry_price"`
+	ExitPrice            float64   `json:"exit_price"`
+	Quantity             float64   `json:"quantity"`
+	NetPnL               float64   `json:"net_pnl"`
+	EntryATR             float64   `json:"entry_atr,omitempty"`
+	OpenedAt             time.Time `json:"opened_at"`
+	ClosedAt             time.Time `json:"closed_at"`
+	MFEPrice             *float64  `json:"mfe_price"`
+	MAEPrice             *float64  `json:"mae_price"`
+	FavorablePct         *float64  `json:"favorable_pct"`
+	AdversePct           *float64  `json:"adverse_pct"`
+	CaptureRatio         *float64  `json:"capture_ratio"`
+	MetricsStatus        string    `json:"metrics_status"`
+	LLMVerdict           *string   `json:"llm_verdict"`
 }
 
 func (ss *StatusServer) handleAPIDiagnostics(w http.ResponseWriter, r *http.Request) {
@@ -143,27 +149,33 @@ func (ss *StatusServer) handleAPIDiagnostics(w http.ResponseWriter, r *http.Requ
 	out := make([]uiDiagnosticsRow, 0, len(rows))
 	for _, rrow := range rows {
 		out = append(out, uiDiagnosticsRow{
-			StrategyID:    rrow.StrategyID,
-			PositionID:    rrow.PositionID,
-			Symbol:        rrow.Symbol,
-			Side:          rrow.Side,
-			Timeframe:     rrow.Timeframe,
-			RegimeAtOpen:  rrow.RegimeAtOpen,
-			CloseReason:   rrow.CloseReason,
-			EntryPrice:    rrow.EntryPrice,
-			ExitPrice:     rrow.ExitPrice,
-			Quantity:      rrow.Quantity,
-			NetPnL:        diagRowNetPnL(rrow, netByPos),
-			EntryATR:      rrow.EntryATR,
-			OpenedAt:      rrow.OpenedAt,
-			ClosedAt:      rrow.ClosedAt,
-			MFEPrice:      rrow.MFEPrice,
-			MAEPrice:      rrow.MAEPrice,
-			FavorablePct:  rrow.FavorablePct,
-			AdversePct:    rrow.AdversePct,
-			CaptureRatio:  rrow.CaptureRatio,
-			MetricsStatus: rrow.MetricsStatus,
-			LLMVerdict:    rrow.LLMVerdict,
+			StrategyID:           rrow.StrategyID,
+			PositionID:           rrow.PositionID,
+			Symbol:               rrow.Symbol,
+			Side:                 rrow.Side,
+			Timeframe:            rrow.Timeframe,
+			RegimeAtOpen:         rrow.RegimeAtOpen,
+			CloseReason:          rrow.CloseReason,
+			CloseSource:          rrow.CloseSource,
+			CloseEvaluator:       rrow.CloseEvaluator,
+			CloseEvaluatorReason: rrow.CloseEvaluatorReason,
+			CloseTPTier:          rrow.CloseTPTier,
+			CloseSLTriggerPx:     rrow.CloseSLTriggerPx,
+			CaptureBasis:         rrow.CaptureBasis,
+			EntryPrice:           rrow.EntryPrice,
+			ExitPrice:            rrow.ExitPrice,
+			Quantity:             rrow.Quantity,
+			NetPnL:               diagRowNetPnL(rrow, netByPos),
+			EntryATR:             rrow.EntryATR,
+			OpenedAt:             rrow.OpenedAt,
+			ClosedAt:             rrow.ClosedAt,
+			MFEPrice:             rrow.MFEPrice,
+			MAEPrice:             rrow.MAEPrice,
+			FavorablePct:         rrow.FavorablePct,
+			AdversePct:           rrow.AdversePct,
+			CaptureRatio:         rrow.CaptureRatio,
+			MetricsStatus:        rrow.MetricsStatus,
+			LLMVerdict:           rrow.LLMVerdict,
 		})
 	}
 	writeJSON(w, map[string]any{

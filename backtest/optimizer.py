@@ -640,6 +640,14 @@ DEFAULT_PARAM_RANGES = {
         "entry_period": [10, 20, 30],
         "exit_period": [5, 10, 15],
     },
+    "breakout_retest": {
+        "channel_lookback": [15, 20, 30],
+        "compression_lookback": [40, 60],
+        "compression_quantile": [0.20, 0.30],
+        "volume_multiplier": [1.2, 1.5],
+        "retest_window": [3, 5],
+        "retest_atr_buffer": [0.25, 0.50],
+    },
     "momentum_pro": {
         "ema_fast": [13, 20, 26],
         "ema_mid": [34, 50, 80],

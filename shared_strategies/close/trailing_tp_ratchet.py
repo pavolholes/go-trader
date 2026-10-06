@@ -230,6 +230,7 @@ def _evaluate(position: dict, market: dict, params: dict, *, regime_table: bool)
     return {
         "close_fraction": close_fraction,
         "reason": f"{tag}{suffix}:{multiple:g}",
+        "tp_tier": multiple,
     }
 
 

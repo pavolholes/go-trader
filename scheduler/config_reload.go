@@ -621,7 +621,7 @@ func validateHotReloadStateCompatible(cfg, next *Config, state *AppState) error 
 			errs = append(errs, fmt.Sprintf("strategy[%s] margin_mode changed with open positions (%q -> %q; flatten first or restart after close)",
 				sc.ID, sc.MarginMode, ns.MarginMode))
 		}
-		if hyperliquidManagedStopReloadGuard(sc) && strategyHasOpenPositions(stateStrategy(state, sc.ID)) {
+		if managedPerpsStopReloadGuard(sc) && strategyHasOpenPositions(stateStrategy(state, sc.ID)) {
 			oldTrailing := sc.TrailingStopPct != nil && *sc.TrailingStopPct > 0
 			newTrailing := ns.TrailingStopPct != nil && *ns.TrailingStopPct > 0
 			if oldTrailing != newTrailing {
@@ -657,6 +657,20 @@ func validateHotReloadStateCompatible(cfg, next *Config, state *AppState) error 
 			} else if oldTrailingRegime && !sc.TrailingStopATRMultRegime.EqualEffectiveForReload(ns.TrailingStopATRMultRegime) {
 				errs = append(errs, fmt.Sprintf("strategy[%s] trailing_stop_atr_mult_regime shape changed with open positions (flatten first or restart after close)",
 					sc.ID))
+			}
+			if sc.Platform == "blofin" && sc.Type == "perps" {
+				if !floatPtrEqual(sc.StopLossATRMult, ns.StopLossATRMult) {
+					errs = append(errs, fmt.Sprintf("strategy[%s] BloFin virtual stop_loss_atr_mult changed with an open position (flatten first or restart after close)", sc.ID))
+				}
+				if !sc.StopLossATRMultRegime.EqualForReload(ns.StopLossATRMultRegime) {
+					errs = append(errs, fmt.Sprintf("strategy[%s] BloFin virtual stop_loss_atr_mult_regime changed with an open position (flatten first or restart after close)", sc.ID))
+				}
+				if !floatPtrEqual(sc.TrailingStopATRMult, ns.TrailingStopATRMult) {
+					errs = append(errs, fmt.Sprintf("strategy[%s] BloFin virtual trailing_stop_atr_mult changed with an open position (flatten first or restart after close)", sc.ID))
+				}
+				if !sc.TrailingStopATRMultRegime.EqualForReload(ns.TrailingStopATRMultRegime) {
+					errs = append(errs, fmt.Sprintf("strategy[%s] BloFin virtual trailing_stop_atr_mult_regime changed with an open position (flatten first or restart after close)", sc.ID))
+				}
 			}
 		}
 		if sc.Type == "perps" && sc.Platform == "hyperliquid" && strategyHasOpenPositions(stateStrategy(state, sc.ID)) {
@@ -715,7 +729,7 @@ func validateHotReloadStateCompatible(cfg, next *Config, state *AppState) error 
 				}
 			}
 		}
-		if (sc.Type == "perps" || sc.Type == "manual") && sc.Platform == "hyperliquid" && strategyHasOpenPositions(stateStrategy(state, sc.ID)) {
+		if managedPerpsStopReloadGuard(sc) && strategyHasOpenPositions(stateStrategy(state, sc.ID)) {
 			oldRules, _ := parseStrategyTPSLAfterRules(sc)
 			newRules, _ := parseStrategyTPSLAfterRules(ns)
 			if !oldRules.EqualForReload(newRules) {
@@ -729,6 +743,9 @@ func validateHotReloadStateCompatible(cfg, next *Config, state *AppState) error 
 			if strategyUsesTrailingTPRatchetClose(sc) && !trailingRatchetRulesEqualForReload(sc, ns) {
 				errs = append(errs, fmt.Sprintf("strategy[%s] trailing_tp_ratchet tier table changed with open positions (flatten first or restart after close)",
 					sc.ID))
+			}
+			if sc.Platform == "blofin" && !reflect.DeepEqual(sc.CloseStrategy, ns.CloseStrategy) {
+				errs = append(errs, fmt.Sprintf("strategy[%s] BloFin close evaluator or params changed with an open position (flatten first or restart after close)", sc.ID))
 			}
 		}
 	}
@@ -911,6 +928,10 @@ func stateStrategy(state *AppState, id string) *StrategyState {
 
 func hyperliquidManagedStopReloadGuard(sc StrategyConfig) bool {
 	return sc.Platform == "hyperliquid" && (sc.Type == "perps" || sc.Type == "manual")
+}
+
+func managedPerpsStopReloadGuard(sc StrategyConfig) bool {
+	return hyperliquidManagedStopReloadGuard(sc) || (sc.Platform == "blofin" && sc.Type == "perps")
 }
 
 func strategyHasOpenPositions(s *StrategyState) bool {

@@ -632,8 +632,8 @@ func validateRegimeATRConfig(cfg *Config) []string {
 				if sc.TrailingStopATRMultRegime.IsConfigured() {
 					errs = append(errs, fmt.Sprintf("%s: stop_loss_atr_mult_regime is mutually exclusive with trailing_stop_atr_mult_regime", prefix))
 				}
-				if sc.Platform != "hyperliquid" || sc.Type != "perps" {
-					errs = append(errs, fmt.Sprintf("%s: stop_loss_atr_mult_regime is HL perps only", prefix))
+				if (sc.Platform != "hyperliquid" || sc.Type != "perps") && !(sc.Platform == "blofin" && sc.Type == "perps") {
+					errs = append(errs, fmt.Sprintf("%s: stop_loss_atr_mult_regime is supported for HL perps and BloFin perps only", prefix))
 				}
 			}
 		}
@@ -659,20 +659,31 @@ func validateRegimeATRConfig(cfg *Config) []string {
 				if sc.StopLossATRMult != nil {
 					errs = append(errs, fmt.Sprintf("%s: trailing_stop_atr_mult_regime is mutually exclusive with stop_loss_atr_mult", prefix))
 				}
-				manualRatchet := sc.Type == "manual" && strategyUsesTrailingTPRatchetClose(*sc)
-				if sc.Platform != "hyperliquid" || (sc.Type != "perps" && !manualRatchet) {
-					errs = append(errs, fmt.Sprintf("%s: trailing_stop_atr_mult_regime is HL perps only (or HL manual trailing_tp_ratchet_regime)", prefix))
+				manualRatchet := sc.Type == "manual" && sc.Platform == "hyperliquid" && strategyUsesTrailingTPRatchetRegimeClose(*sc)
+				blofinRatchet := sc.Platform == "blofin" && sc.Type == "perps" && strategyUsesTrailingTPRatchetRegimeClose(*sc)
+				if (sc.Platform != "hyperliquid" || (sc.Type != "perps" && !manualRatchet)) && !blofinRatchet {
+					errs = append(errs, fmt.Sprintf("%s: trailing_stop_atr_mult_regime is supported for HL perps/manual ratchet_regime or BloFin perps ratchet_regime only", prefix))
 				}
 			}
 		}
 
 		for _, ref := range sc.closeRefs() {
 			name := strings.ToLower(strings.TrimSpace(ref.Name))
+			if name == "tiered_tp_atr_live" || name == "tiered_tp_atr_live_regime" || name == dynamicCloseStrategyName {
+				if raw, ok := ref.Params["atr_source"]; ok {
+					source, isString := raw.(string)
+					source = strings.ToLower(strings.TrimSpace(source))
+					if !isString || (source != "entry" && source != "live") {
+						errs = append(errs, fmt.Sprintf("%s.close_strategy(%s).atr_source: must be %q or %q", prefix, ref.Name, "entry", "live"))
+					}
+				}
+			}
 			if name == dynamicCloseStrategyName {
 				usesRegime = true
 				subPrefix := fmt.Sprintf("%s.close_strategy(%s)", prefix, ref.Name)
-				if sc.Platform != "hyperliquid" || (sc.Type != "perps" && sc.Type != "manual") {
-					errs = append(errs, fmt.Sprintf("%s: %s is HL perps/manual only", subPrefix, ref.Name))
+				blofinDynamic := sc.Platform == "blofin" && sc.Type == "perps"
+				if (sc.Platform != "hyperliquid" || (sc.Type != "perps" && sc.Type != "manual")) && !blofinDynamic {
+					errs = append(errs, fmt.Sprintf("%s: %s is supported for HL perps/manual and BloFin perps only", subPrefix, ref.Name))
 				}
 				if !closeParamsAreUnifiedRegime(ref.Params) {
 					errs = append(errs, fmt.Sprintf("%s: requires unified per-regime trend_regime block", subPrefix))
@@ -705,9 +716,17 @@ func validateRegimeATRConfig(cfg *Config) []string {
 			}
 			for k := range ref.Params {
 				switch k {
-				case "use_defaults", "tp_tiers", "tiers", "atr_source", "sl_after", "sl_atr_mult":
+				case "use_defaults", "tp_tiers", "tiers", "atr_source", "sl_after":
+				case "sl_atr_mult":
+					if name != "tiered_tp_atr_regime" {
+						errs = append(errs, fmt.Sprintf("%s: unknown param %q (allowed: use_defaults, tp_tiers, atr_source, sl_after)", subPrefix, k))
+					}
 				default:
-					errs = append(errs, fmt.Sprintf("%s: unknown param %q (allowed: use_defaults, tp_tiers, atr_source, sl_after, sl_atr_mult)", subPrefix, k))
+					if name == "tiered_tp_atr_regime" {
+						errs = append(errs, fmt.Sprintf("%s: unknown param %q (allowed: use_defaults, tp_tiers, atr_source, sl_after, sl_atr_mult)", subPrefix, k))
+					} else {
+						errs = append(errs, fmt.Sprintf("%s: unknown param %q (allowed: use_defaults, tp_tiers, atr_source, sl_after)", subPrefix, k))
+					}
 				}
 			}
 			if useDefaults {

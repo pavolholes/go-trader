@@ -47,6 +47,26 @@ def test_partial_fetch_does_not_claim_tail_coverage(db_path):
     assert stub.calls == 2
 
 
+def test_store_false_returns_fetched_funding_without_cache_writes(db_path, monkeypatch):
+    stub = StubAdapter(_BASE_MS, hours=24)
+    monkeypatch.setattr(
+        _FUNDING_FETCHER,
+        "store_funding_rates",
+        lambda *args, **kwargs: pytest.fail("store=False wrote funding rates"),
+    )
+    monkeypatch.setattr(
+        _FUNDING_FETCHER,
+        "store_funding_coverage",
+        lambda *args, **kwargs: pytest.fail("store=False wrote funding coverage"),
+    )
+    result = load_cached_funding(
+        "BTC", "2026-01-01", "2026-01-01 20:00", adapter=stub,
+        db_path=db_path, store=False,
+    )
+    assert not result.empty
+    assert stub.calls == 1
+
+
 def test_disjoint_fetches_do_not_poison_middle(db_path):
     db = db_path
     stub = StubAdapter(_BASE_MS, hours=24 * 300)

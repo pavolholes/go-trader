@@ -71,6 +71,7 @@ var knownShortNames = map[string]string{
 	"sweep_squeeze_combo":     "ssc",
 	"adx_trend":               "adxt",
 	"donchian_breakout":       "dbo",
+	"breakout_retest":         "brt",
 	"session_breakout":        "sbo",
 	"bear_pullback_st":        "bps",
 	"vwap_rejection_st":       "vrs",

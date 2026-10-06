@@ -2073,8 +2073,9 @@ func validateConfig(cfg *Config, skipLiveCredentialChecks bool) error {
 				errs = append(errs, fmt.Sprintf("%s: trailing_stop_atr_mult must be >= 0, got %g", prefix, mult))
 			}
 			manualRatchet := sc.Type == "manual" && strategyUsesTrailingTPRatchetClose(sc)
-			if sc.Platform != "hyperliquid" || (sc.Type != "perps" && !manualRatchet) {
-				errs = append(errs, fmt.Sprintf("%s: trailing_stop_atr_mult is only supported for HL perps strategies or HL manual trailing_tp_ratchet strategies (got platform=%q type=%q)", prefix, sc.Platform, sc.Type))
+			blofinRatchet := sc.Platform == "blofin" && sc.Type == "perps" && strategyUsesTrailingTPRatchetClose(sc)
+			if (sc.Platform != "hyperliquid" || (sc.Type != "perps" && !manualRatchet)) && !blofinRatchet {
+				errs = append(errs, fmt.Sprintf("%s: trailing_stop_atr_mult is supported for HL perps/manual ratchet or BloFin perps ratchet only (got platform=%q type=%q)", prefix, sc.Platform, sc.Type))
 			}
 			if mult > 0 {
 				fixedPct := 0.0
@@ -2099,8 +2100,8 @@ func validateConfig(cfg *Config, skipLiveCredentialChecks bool) error {
 			if mult < 0 {
 				errs = append(errs, fmt.Sprintf("%s: stop_loss_atr_mult must be >= 0, got %g", prefix, mult))
 			}
-			if (sc.Type != "perps" && sc.Type != "manual") || sc.Platform != "hyperliquid" {
-				errs = append(errs, fmt.Sprintf("%s: stop_loss_atr_mult is only supported for HL perps strategies (got platform=%q type=%q)", prefix, sc.Platform, sc.Type))
+			if ((sc.Type != "perps" && sc.Type != "manual") || sc.Platform != "hyperliquid") && !(sc.Platform == "blofin" && sc.Type == "perps") {
+				errs = append(errs, fmt.Sprintf("%s: stop_loss_atr_mult is supported for HL perps/manual and BloFin perps (bot-managed) only (got platform=%q type=%q)", prefix, sc.Platform, sc.Type))
 			}
 			if mult > 0 {
 				fixedPct := 0.0
@@ -2316,6 +2317,7 @@ func validateConfig(cfg *Config, skipLiveCredentialChecks bool) error {
 
 	errs = append(errs, validateRegimeATRConfig(cfg)...)
 	errs = append(errs, validateTPTierLadders(cfg)...)
+	errs = append(errs, validateBloFinCloseSupport(cfg)...)
 
 	if len(errs) > 0 {
 		return fmt.Errorf("config validation errors:\n  %s", strings.Join(errs, "\n  "))

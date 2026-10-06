@@ -29,6 +29,7 @@ from sweep_squeeze_combo import sweep_squeeze_combo_core
 from adx_trend import adx_trend_core
 from bear_pullback_st import bear_pullback_st_core
 from donchian_breakout import donchian_breakout_core
+from breakout_retest import breakout_retest_core
 from funding_skew import funding_skew_core
 from momentum_pro import momentum_pro_core
 from mean_reversion_pro import mean_reversion_pro_core
@@ -86,6 +87,7 @@ M5_DEPRECATED_EDGE_STRATEGIES = frozenset({
 })
 
 DISCOVERY_HIDDEN_STRATEGIES = frozenset({
+    "breakout_retest",
     "amd_ifvg",
     "analog_retrieval",
     "donchian_breakout",
@@ -1238,6 +1240,39 @@ def donchian_breakout_strategy(df: pd.DataFrame, **params) -> pd.DataFrame:
 
 
 @register(
+    'breakout_retest',
+    'RESEARCH ONLY: after low-ATR compression, require a volume-backed channel break and enter only on a confirmed retest and reclaim; no breakout-bar chase',
+    {
+        'channel_lookback': 20,
+        'atr_period': 14,
+        'compression_lookback': 60,
+        'compression_quantile': 0.30,
+        'volume_window': 20,
+        'volume_multiplier': 1.5,
+        'retest_window': 5,
+        'retest_atr_buffer': 0.35,
+        'allow_short': False,
+    },
+    platforms=('futures',),
+    variants={'futures': {'default_params': {'allow_short': True}}},
+    backtest_only=True,
+    constraints=[
+        'channel_lookback > 0',
+        'atr_period > 0',
+        'compression_lookback > 0',
+        'compression_quantile > 0',
+        'compression_quantile < 1',
+        'volume_window > 0',
+        'volume_multiplier > 0',
+        'retest_window > 0',
+        'retest_atr_buffer >= 0',
+    ],
+)
+def breakout_retest_strategy(df: pd.DataFrame, **params) -> pd.DataFrame:
+    return breakout_retest_core(df, **params)
+
+
+@register(
     "bear_pullback_st",
     "Bear Pullback Short — short bear-market rallies into EMA20/50 resistance with RSI rebound + ADX trend filter",
     {
@@ -1660,7 +1695,7 @@ PLATFORM_ORDER: Dict[str, List[str]] = {
         "anchored_vwap_channel", "anchored_vwap_reversion", "chart_pattern",
         "liquidity_sweeps", "parabolic_sar", "range_scalper",
         "sweep_squeeze_combo", "adx_trend", "delta_neutral_funding",
-        "funding_skew", "donchian_breakout", "session_breakout", "bear_pullback_st",
+        "funding_skew", "donchian_breakout", "breakout_retest", "session_breakout", "bear_pullback_st",
         "vwap_rejection_st", "momentum_pro", "mean_reversion_pro", "rsi_bb_combo",
         "consolidation_range", "atr_band_revert", "mtf_confluence", "vol_momentum",
         "regime_adaptive", "regime_adaptive_htf", "analog_retrieval", "ob_touch", "hold",

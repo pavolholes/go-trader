@@ -9,10 +9,11 @@ import (
 )
 
 type closeRegistryEntry struct {
-	Name          string                 `json:"name"`
-	Description   string                 `json:"description"`
-	DefaultParams map[string]interface{} `json:"default_params"`
-	Platforms     []string               `json:"platforms"`
+	Name          string                           `json:"name"`
+	Description   string                           `json:"description"`
+	DefaultParams map[string]interface{}           `json:"default_params"`
+	Platforms     []string                         `json:"platforms"`
+	Support       map[string]closeEvaluatorSupport `json:"support"`
 }
 
 var (
@@ -72,6 +73,13 @@ func formatCloseRegistryEntry(e closeRegistryEntry, userClose CloseDefaultsMap) 
 	platforms := append([]string(nil), e.Platforms...)
 	sort.Strings(platforms)
 	fmt.Fprintf(&sb, "  platforms: %s\n", strings.Join(platforms, ", "))
+	if support, ok := e.Support["blofin-perps"]; ok {
+		if support.Supported {
+			fmt.Fprintf(&sb, "  BloFin perps: supported — %s\n", support.Notes)
+		} else {
+			fmt.Fprintf(&sb, "  BloFin perps: unsupported — %s\n", support.Notes)
+		}
+	}
 
 	keys := make([]string, 0, len(e.DefaultParams)+1)
 	for k := range e.DefaultParams {

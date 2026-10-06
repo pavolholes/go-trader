@@ -16,7 +16,8 @@ VALID_POSITION_SIDES = {"", "long", "short"}
 VALID_OPEN_ACTIONS = {"long", "short", "none"}
 POSITION_CONTEXT_PARAM_KEYS = {
     "side", "avg_cost", "current_quantity", "initial_quantity", "entry_atr", "regime",
-    "risk_anchor_price", "tp_model",
+    "risk_anchor_price", "tp_model", "bars_held", "opened_at_ms", "regime_applied_label",
+    "regime_pending_label", "regime_pending_count",
 }
 
 
@@ -27,6 +28,8 @@ class CloseEvaluation:
     sl_price: float = 0.0
     atr_value: float = 0.0
     tier_fill_price: float = 0.0
+    reason: str = ""
+    tp_tier: object = None
 
 
 @dataclass
@@ -270,14 +273,26 @@ def validate_close_strategy_names(
     get_close_strategy: Callable[[str], object],
     list_open_strategies: Optional[Callable[[], Iterable[str]]] = None,
     list_close_strategies: Optional[Callable[[], Iterable[str]]] = None,
+    required_platform: Optional[str] = None,
 ) -> None:
     for name in close_names:
         resolved = canonical_close_name(name)
         try:
-            get_close_strategy(resolved)
-            continue
+            entry = get_close_strategy(resolved)
         except ValueError:
             pass
+        else:
+            if required_platform:
+                platforms = tuple(entry.get("platforms", ())) if isinstance(entry, dict) else ()
+                if required_platform not in platforms:
+                    support = (entry.get("support") or {}).get(required_platform, {}) if isinstance(entry, dict) else {}
+                    detail = str(support.get("notes") or "")
+                    suffix = f": {detail}" if detail else ""
+                    raise ValueError(
+                        f"Close strategy '{resolved}' is not supported on "
+                        f"{required_platform}{suffix}"
+                    )
+            continue
         try:
             entry = get_open_strategy(resolved)
         except ValueError as exc:
@@ -397,7 +412,7 @@ def evaluate_open_close(
         if avwap_value == avwap_value and avwap_value > 0:
             market = {**market, "avwap": avwap_value}
             avwap_injected = True
-    if not avwap_injected and close_names_include_avwap_stop(close_names):
+    if not avwap_injected and "avwap" not in market and close_names_include_avwap_stop(close_names):
         warn_avwap_stop_missing_context()
     for name in close_names:
         resolved, _ = rewrite_deprecated_close_ref(name, None)
@@ -419,6 +434,8 @@ def evaluate_open_close(
                     sl_price=result.get("sl_price", 0.0),
                     atr_value=result.get("atr_value", 0.0),
                     tier_fill_price=_positive_price(result.get("tier_fill_price")),
+                    reason=str(result.get("reason") or ""),
+                    tp_tier=result.get("tp_tier"),
                 ))
                 continue
             except ValueError as exc:
@@ -432,6 +449,7 @@ def evaluate_open_close(
         close_evals.append(CloseEvaluation(
             strategy=resolved,
             close_fraction=_last_close_fraction(result, signal, position_side),
+            reason="open_signal_close",
         ))
 
     return OpenCloseEvaluation(
@@ -478,6 +496,13 @@ def finalize_decision(
     if evaluation.close_owner:
         decision["close_owner"] = evaluation.close_owner
     best = best_close_evaluation(evaluation.close_evaluations)
+    if best is not None and close_fraction > 0:
+        decision["close_evaluator"] = best.strategy
+        decision["close_source"] = "evaluator"
+        if best.reason:
+            decision["close_reason"] = best.reason
+        if best.tp_tier is not None:
+            decision["tp_tier"] = best.tp_tier
     if best is not None and best.tier_fill_price > 0:
         decision["close_tier_fill_price"] = best.tier_fill_price
     return decision

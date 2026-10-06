@@ -98,6 +98,6 @@ def evaluate(position: dict, market: dict, params: dict) -> dict:
     if close_fraction <= 0:
         return {"close_fraction": 0.0, "reason": "noop:already_taken"}
     return with_tier_fill_price(
-        {"close_fraction": close_fraction, "reason": f"tiered_tp_atr:{multiple:g}"},
+        {"close_fraction": close_fraction, "reason": f"tiered_tp_atr:{multiple:g}", "tp_tier": multiple},
         position, geometry, hit_tiers, side,
     )

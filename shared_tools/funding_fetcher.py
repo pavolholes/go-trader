@@ -39,7 +39,8 @@ def load_cached_funding(coin: str,
                         end_date=None,
                         exchange: str = "hyperliquid",
                         adapter=None,
-                        db_path: Optional[str] = None) -> pd.DataFrame:
+                        db_path: Optional[str] = None,
+                        store: bool = True) -> pd.DataFrame:
     start_ts = _to_utc_ms(start_date)
     end_ts = _to_utc_ms(end_date) if end_date is not None else int(time.time() * 1000)
 
@@ -53,11 +54,17 @@ def load_cached_funding(coin: str,
         adapter = _hl_adapter()
     records = adapter.get_funding_history_range(coin, start_ts, end_ts)
     if records:
-        store_funding_rates(records, exchange, coin, **db_kwargs)
-        last_t = int(records[-1]["time"])
-        covered_end = end_ts if last_t >= end_ts - tol else last_t
-        store_funding_coverage(exchange, coin, start_ts, covered_end, **db_kwargs)
-        return load_funding_rates(exchange, coin, start_ts, end_ts, **db_kwargs)
+        if store:
+            store_funding_rates(records, exchange, coin, **db_kwargs)
+            last_t = int(records[-1]["time"])
+            covered_end = end_ts if last_t >= end_ts - tol else last_t
+            store_funding_coverage(exchange, coin, start_ts, covered_end, **db_kwargs)
+            return load_funding_rates(exchange, coin, start_ts, end_ts, **db_kwargs)
+        out = pd.DataFrame({
+            "timestamp": [int(r["time"]) for r in records],
+            "rate": [float(r["rate"]) for r in records],
+        })
+        return out.loc[(out["timestamp"] >= start_ts) & (out["timestamp"] <= end_ts)].sort_values("timestamp")
     return load_funding_rates(exchange, coin, start_ts, end_ts, **db_kwargs)
 
 

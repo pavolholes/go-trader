@@ -44,14 +44,14 @@ def _get_leverage_for_symbol(symbol: str) -> float:
     return _SYMBOL_LEVERAGE_MAP.get(symbol, 75)
 
 
-def _attach_funding_if_needed(df, strategy_name, symbol, since):
+def _attach_funding_if_needed(df, strategy_name, symbol, since, store=True):
     if strategy_name not in FUNDING_COLUMN_STRATEGIES or df.empty:
         return df
     from funding_fetcher import (attach_funding_accrual_column,
                                  attach_funding_column, load_cached_funding)
     coin = symbol.split("/")[0]
     try:
-        funding = load_cached_funding(coin, since, end_date=df.index[-1])
+        funding = load_cached_funding(coin, since, end_date=df.index[-1], store=store)
     except Exception as e:
         print(f"[WARN] funding history fetch failed for {coin}: {e} — "
               f"'{strategy_name}' will produce zero entries.")
@@ -684,7 +684,8 @@ def _capture_promotion_baseline(cfg: dict, sc: dict) -> dict:
 
 def load_strategy_config(config_path: str, strategy_id: str,
                          inject_user_defaults: bool = False,
-                         include_promotion_baseline: bool = False) -> dict:
+                         include_promotion_baseline: bool = False,
+                         include_runtime_inputs: bool = False) -> dict:
     import json as _json
     with open(config_path) as fh:
         cfg = _normalize_atr_regime_keys(_json.load(fh))
@@ -770,11 +771,22 @@ def load_strategy_config(config_path: str, strategy_id: str,
                     close_refs.append({"name": ref["name"], "params": dict(ref.get("params") or {})})
         for ref in close_refs:
             if ref.get("name") == "tiered_tp_atr_live_regime_dynamic":
-                raise ValueError(
-                    f"{config_path}: strategy {strategy_id!r} uses "
-                    f"tiered_tp_atr_live_regime_dynamic, which is HL-live-only "
-                    f"in this release (backtester parity deferred — see #843)."
-                )
+                if (
+                    str(sc.get("platform") or "").strip().lower() != "blofin"
+                    or str(sc.get("type") or "perps").strip().lower() != "perps"
+                ):
+                    raise ValueError(
+                        f"{config_path}: strategy {strategy_id!r} uses "
+                        f"tiered_tp_atr_live_regime_dynamic, which is backtestable "
+                        f"here only for BloFin perps with the scheduler-managed "
+                        f"virtual stop; other platform parity remains deferred."
+                    )
+                if not regime_cfg.get("enabled"):
+                    raise ValueError(
+                        f"{config_path}: strategy {strategy_id!r} uses "
+                        "tiered_tp_atr_live_regime_dynamic, which requires "
+                        "regime.enabled=true."
+                    )
         if inject_user_defaults:
             _apply_user_close_defaults(close_refs, user_defaults, sc)
         direction = _effective_direction(sc)
@@ -1029,6 +1041,21 @@ def load_strategy_config(config_path: str, strategy_id: str,
             "atr_method": atr_method,
             "platform": str(sc.get("platform") or "").strip().lower(),
         }
+        if include_runtime_inputs:
+            out.update({
+                "symbol": (
+                    str(sc.get("symbol") or (cfg_args[1] if len(cfg_args) > 1 else "")).strip()
+                    or None
+                ),
+                "timeframe": (
+                    str(sc.get("timeframe") or (cfg_args[2] if len(cfg_args) > 2 else "")).strip()
+                    or None
+                ),
+                "capital": sc.get("capital"),
+                "leverage": sc.get("leverage"),
+                "margin_per_trade_usd": sc.get("margin_per_trade_usd"),
+                "max_drawdown_pct": sc.get("max_drawdown_pct"),
+            })
         if include_promotion_baseline:
             out["promotion_baseline"] = promotion_baseline
         return out
@@ -1110,17 +1137,17 @@ def run_single_backtest(
     print(f"  Symbol: {symbol} | Timeframe: {timeframe} | Since: {since}")
     if close_strategies:
         print(f"  Close strategies: {[r.get('name') for r in close_strategies]}")
-        # Inject Go-compatible defaults when tp_enabled is not explicitly set
-        # (Blofin parity: Go fees/tiered-TP assume tp_enabled=False by default).
+        # Keep the current BloFin live evaluator default (TP enabled); the
+        # legacy false default remains for other platform cohorts.
         for cr in close_strategies:
             cr_params = cr.setdefault("params", {})
-            cr_params.setdefault("tp_enabled", False)
+            cr_params.setdefault("tp_enabled", str(platform or "").lower() == "blofin")
 
-    df = load_cached_data(symbol, timeframe, exchange_id=platform, start_date=since)
+    df = load_cached_data(symbol, timeframe, exchange_id=platform, start_date=since, store=save)
     if df.empty:
         print("No data available!")
         return None
-    df = _attach_funding_if_needed(df, strategy_name, symbol, since)
+    df = _attach_funding_if_needed(df, strategy_name, symbol, since, store=save)
 
     print(f"  Data: {len(df)} candles from {df.index[0]} to {df.index[-1]}")
 
@@ -1578,6 +1605,19 @@ def main(argv=None):
     platform_explicit = any(
         a == "--platform" or str(a).startswith("--platform=") for a in argv
     )
+    symbol_explicit = any(
+        a == "--symbol" or str(a).startswith("--symbol=") for a in argv
+    )
+    timeframe_explicit = any(
+        a in ("--timeframe", "-tf") or str(a).startswith("--timeframe=")
+        for a in argv
+    )
+    capital_explicit = any(
+        a == "--capital" or str(a).startswith("--capital=") for a in argv
+    )
+    registry_explicit = any(
+        a == "--registry" or str(a).startswith("--registry=") for a in argv
+    )
     args = _build_parser().parse_args(argv)
     args.defaults = _resolve_defaults_mode(args)
 
@@ -1608,13 +1648,24 @@ def main(argv=None):
         if args.mode != "single":
             print("--config is only valid with --mode single (loads one strategy by --strategy <id>)")
             sys.exit(1)
-        live_kwargs = load_strategy_config(args.config, args.strategy,
-                                           inject_user_defaults=(args.defaults == "user"))
+        live_kwargs = load_strategy_config(
+            args.config, args.strategy,
+            inject_user_defaults=(args.defaults == "user"),
+            include_runtime_inputs=True,
+        )
         if not platform_explicit:
             live_platform = str(live_kwargs.get("platform") or "").strip().lower()
             if live_platform:
                 args.platform = live_platform
         config_platform = live_kwargs.get("platform", "")
+        if not symbol_explicit and live_kwargs.get("symbol"):
+            args.symbol = live_kwargs["symbol"]
+        if not timeframe_explicit and live_kwargs.get("timeframe"):
+            args.timeframe = live_kwargs["timeframe"]
+        if not capital_explicit and live_kwargs.get("capital") is not None:
+            args.capital = float(live_kwargs["capital"])
+        if not registry_explicit and live_kwargs.get("strategy_type") == "perps":
+            args.registry = "futures"
         # Live config refs take precedence; --close-strategy on top is rejected
         # to avoid silent overrides.
         if close_refs:
@@ -1668,6 +1719,14 @@ def main(argv=None):
             "hurst_gate",
         )
         live_stop_kwargs = {k: live_kwargs[k] for k in stop_keys if k in live_kwargs}
+        for key in ("margin_per_trade_usd", "leverage"):
+            value = live_kwargs.get(key)
+            if value is not None:
+                live_stop_kwargs[key] = float(value)
+        if live_kwargs.get("max_drawdown_pct") is not None:
+            live_stop_kwargs["circuit_breaker_max_drawdown_pct"] = float(
+                live_kwargs["max_drawdown_pct"]
+            )
         args.regime_enabled = live_kwargs.get("regime_enabled", args.regime_enabled)
         args.regime_period = live_kwargs.get("regime_period", args.regime_period)
         args.regime_adx_threshold = live_kwargs.get(
@@ -1680,7 +1739,7 @@ def main(argv=None):
             args.allowed_regimes, live_kwargs.get("regime_windows_spec"))
 
     if args.platform is None:
-        args.platform = "hyperliquid" if config_platform == "hyperliquid" else "binanceus"
+        args.platform = config_platform if config_platform in ("hyperliquid", "blofin") else "binanceus"
 
     if args.stop_loss_atr_mult is not None:
         live_stop_kwargs.setdefault("stop_loss_atr_mult", args.stop_loss_atr_mult)

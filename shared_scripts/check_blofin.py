@@ -127,7 +127,162 @@ def _position_ctx_from_args(args):
     regime = (getattr(args, "position_regime", "") or "").strip()
     if regime:
         ctx["regime"] = regime
+    applied = (getattr(args, "position_regime_applied", "") or "").strip()
+    if applied:
+        ctx["regime_applied_label"] = applied
+    pending_label = (getattr(args, "position_regime_pending_label", "") or "").strip()
+    if pending_label:
+        ctx["regime_pending_label"] = pending_label
+        ctx["regime_pending_count"] = max(
+            0, int(getattr(args, "position_regime_pending_count", 0) or 0)
+        )
+    bars_held = getattr(args, "position_bars_held", None)
+    if bars_held is not None:
+        ctx["bars_held"] = max(0, int(bars_held))
+    opened_at_ms = getattr(args, "position_opened_at_ms", None)
+    if opened_at_ms is not None:
+        ctx["opened_at_ms"] = int(opened_at_ms)
     return ctx
+
+
+def _timeframe_duration_ms(timeframe):
+    value = str(timeframe or "").strip()
+    if len(value) < 2:
+        return 0
+    try:
+        count = int(value[:-1])
+    except (TypeError, ValueError):
+        return 0
+    if count <= 0:
+        return 0
+    raw_unit = value[-1]
+    unit = raw_unit.lower()
+    scale = {"m": 60_000, "h": 3_600_000, "d": 86_400_000, "w": 604_800_000}.get(unit)
+    if raw_unit == "M":
+        scale = 30 * 86_400_000
+    if scale is None:
+        return 0
+    return count * scale
+
+
+def _closed_candles(df, timeframe, now=None):
+    import pandas as pd
+
+    duration_ms = _timeframe_duration_ms(timeframe)
+    if duration_ms <= 0 or df is None or df.empty:
+        return df.iloc[0:0] if df is not None else df
+    now = pd.Timestamp.now(tz="UTC") if now is None else pd.Timestamp(now)
+    if now.tzinfo is None:
+        now = now.tz_localize("UTC")
+    else:
+        now = now.tz_convert("UTC")
+    if str(timeframe or "").strip().endswith("M"):
+        try:
+            months = int(str(timeframe).strip()[:-1])
+        except (TypeError, ValueError):
+            return df.iloc[0:0]
+        if months <= 0:
+            return df.iloc[0:0]
+        closes_at = df.index + pd.DateOffset(months=months)
+    else:
+        closes_at = df.index + pd.to_timedelta(duration_ms, unit="ms")
+    return df.loc[closes_at <= now]
+
+
+def _completed_bars_held_from_candles(df, timeframe, opened_at_ms, now=None):
+    import pandas as pd
+
+    try:
+        opened_at_ms = int(opened_at_ms)
+    except (TypeError, ValueError):
+        return None
+    if opened_at_ms <= 0:
+        return None
+    candles = _closed_candles(df, timeframe, now)
+    if candles is None or candles.empty:
+        return None
+    opened_at = pd.Timestamp(opened_at_ms, unit="ms", tz="UTC")
+    if candles.index[0] > opened_at:
+        return None
+    duration_ms = _timeframe_duration_ms(timeframe)
+    if str(timeframe or "").strip().endswith("M"):
+        months = int(str(timeframe).strip()[:-1])
+        closes_at = candles.index + pd.DateOffset(months=months)
+    else:
+        closes_at = candles.index + pd.to_timedelta(duration_ms, unit="ms")
+    return int((closes_at > opened_at).sum())
+
+
+def _configured_zscore_params(close_names, close_params_by_name):
+    params_by_name = close_params_by_name or {}
+    for name in close_names or []:
+        if str(name or "").strip().lower() != "zscore_target":
+            continue
+        params = params_by_name.get(name, params_by_name.get("zscore_target", {})) or {}
+        try:
+            lookback = int(params.get("lookback", 0) or 0)
+            target = float(params.get("z_target", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0, 0.0
+        return lookback, target
+    return 0, 0.0
+
+
+def _closed_candle_zscore(df, timeframe, lookback, now=None):
+    if lookback < 2:
+        return None
+    candles = _closed_candles(df, timeframe, now)
+    if candles is None or len(candles) < lookback or "close" not in candles:
+        return None
+    import pandas as pd
+
+    closes = pd.to_numeric(candles["close"], errors="coerce").dropna().iloc[-lookback:]
+    if len(closes) != lookback:
+        return None
+    values = closes.to_numpy(dtype=float)
+    mean = float(values.mean())
+    std = float(values.std(ddof=0))
+    if not math.isfinite(mean) or not math.isfinite(std) or std <= 0:
+        return None
+    zscore = (float(values[-1]) - mean) / std
+    return zscore if math.isfinite(zscore) else None
+
+
+def _position_anchored_avwap(df, timeframe, opened_at_ms, now=None):
+    import pandas as pd
+
+    try:
+        opened_at_ms = int(opened_at_ms)
+    except (TypeError, ValueError):
+        return None
+    if opened_at_ms <= 0 or _timeframe_duration_ms(timeframe) <= 0:
+        return None
+    candles = _closed_candles(df, timeframe, now)
+    if candles is None or candles.empty:
+        return None
+    opened_at = pd.Timestamp(opened_at_ms, unit="ms", tz="UTC")
+    if candles.index[0] > opened_at:
+        return None
+    # A bar already in progress at entry has no within-bar volume split, so
+    # anchor at the first candle open at/after the position-open timestamp.
+    anchor_idx = candles.index.searchsorted(opened_at, side="left")
+    if anchor_idx >= len(candles):
+        return None
+    candles = candles.iloc[anchor_idx:]
+    if candles.empty:
+        return None
+    volume = pd.to_numeric(candles["volume"], errors="coerce").fillna(0.0)
+    typical = (
+        pd.to_numeric(candles["high"], errors="coerce")
+        + pd.to_numeric(candles["low"], errors="coerce")
+        + pd.to_numeric(candles["close"], errors="coerce")
+    ) / 3.0
+    valid = volume > 0
+    total_volume = float(volume.loc[valid].sum())
+    if total_volume <= 0:
+        return None
+    avwap = float((typical.loc[valid] * volume.loc[valid]).sum() / total_volume)
+    return avwap if math.isfinite(avwap) and avwap > 0 else None
 
 
 def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=False,
@@ -160,12 +315,14 @@ def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=
         configured_names = [open_strategy or strategy_name]
         for name in configured_names:
             get_strategy(name)
+        close_names = parse_close_strategies(close_strategies)
         validate_close_strategy_names(
-            parse_close_strategies(close_strategies),
+            close_names,
             get_strategy,
             get_close_strategy,
             list_strategies,
             list_close_strategies,
+            required_platform="blofin-perps" if inst_type == "swap" else None,
         )
 
         adapter = BloFinExchangeAdapter()
@@ -261,6 +418,7 @@ def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=
             merged = {**strategy_params_override, **strategy_params}
             strategy_params = merged
         decision = None
+        close_context_warnings = []
         if open_close_enabled:
             market_ctx = {"mark_price": float(df["close"].iloc[-1])}
             atr_now = latest_atr(df, method=atr_method)
@@ -268,6 +426,72 @@ def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=
                 market_ctx["atr"] = atr_now
             if live_regime:
                 market_ctx["regime"] = live_regime
+            zscore_lookback, zscore_target = _configured_zscore_params(
+                close_names, close_params_by_name
+            )
+            if zscore_lookback > 0 and zscore_target > 0:
+                zscore = _closed_candle_zscore(df, timeframe, zscore_lookback)
+                if zscore is not None:
+                    market_ctx["zscore"] = zscore
+                elif "zscore_target" in close_names:
+                    close_context_warnings.append(
+                        f"zscore_target needs {zscore_lookback} valid completed candles; no finite z-score was available"
+                    )
+            if "avwap_stop" in close_names and position_ctx:
+                avwap = _position_anchored_avwap(
+                    df, timeframe, position_ctx.get("opened_at_ms")
+                )
+                if avwap is not None:
+                    market_ctx["avwap"] = avwap
+                elif position_ctx.get("opened_at_ms"):
+                    close_context_warnings.append(
+                        "avwap_stop has no position-open anchored AVWAP yet; it requires at least one completed full candle after entry"
+                    )
+            if (
+                "time_stop" in close_names
+                and position_ctx
+                and position_ctx.get("current_quantity", 0) > 0
+                and position_ctx.get("opened_at_ms") is not None
+            ):
+                candle_bars_held = _completed_bars_held_from_candles(
+                    df, timeframe, position_ctx["opened_at_ms"]
+                )
+                if candle_bars_held is not None:
+                    position_ctx["bars_held"] = candle_bars_held
+                else:
+                    close_context_warnings.append(
+                        "time_stop candle history does not cover the persisted position open time; using the scheduler's elapsed-bar count if available"
+                    )
+            if (
+                "time_stop" in close_names
+                and position_ctx
+                and position_ctx.get("current_quantity", 0) > 0
+                and position_ctx.get("bars_held") is None
+            ):
+                close_context_warnings.append(
+                    "time_stop has no bars_held: the persisted position opened_at or strategy timeframe is unavailable"
+                )
+            if (
+                position_ctx
+                and position_ctx.get("current_quantity", 0) > 0
+                and float(position_ctx.get("entry_atr", 0) or 0) <= 0
+                and any(name in close_names for name in (
+                    "tiered_tp_atr", "tiered_tp_atr_regime",
+                    "tiered_tp_atr_live_regime_dynamic",
+                    "trailing_tp_ratchet", "trailing_tp_ratchet_regime",
+                ))
+            ):
+                close_context_warnings.append(
+                    "the configured BloFin close requires Position.EntryATR, but the restored position has no valid entry ATR"
+                )
+            if (
+                "tiered_tp_atr_live_regime" in close_names
+                and "tiered_tp_atr_live_regime_dynamic" not in close_names
+                and not live_regime
+            ):
+                close_context_warnings.append(
+                    "tiered_tp_atr_live_regime has no live regime label for this candle"
+                )
             evaluation = evaluate_open_close(
                 apply_strategy,
                 get_strategy,
@@ -284,6 +508,19 @@ def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=
             )
             result_df = evaluation.open_result_df
             signal = evaluation.open_signal
+            if "avwap_stop" in close_names and "avwap" not in market_ctx:
+                open_result = evaluation.open_result_df
+                open_avwap = None
+                if not open_result.empty and "avwap" in open_result.columns:
+                    try:
+                        value = float(open_result["avwap"].iloc[-1])
+                        open_avwap = value if math.isfinite(value) and value > 0 else None
+                    except (TypeError, ValueError):
+                        open_avwap = None
+                if open_avwap is None:
+                    close_context_warnings.append(
+                        "avwap_stop has neither an open-strategy avwap column nor a position-anchored BloFin AVWAP"
+                    )
         else:
             result_df = apply_strategy(strategy_name, df, strategy_params or None)
             signal = normalize_signal(result_df.iloc[-1].get("signal", 0))
@@ -344,6 +581,17 @@ def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=
                 except (ValueError, TypeError):
                     pass
 
+        if open_close_enabled:
+            for key in ("zscore", "avwap"):
+                value = market_ctx.get(key)
+                if value is not None:
+                    try:
+                        fval = float(value)
+                        if math.isfinite(fval):
+                            indicators[key] = round(fval, 6)
+                    except (ValueError, TypeError):
+                        pass
+
         if htf_info:
             for k, v in htf_info.items():
                 if isinstance(v, (int, float)):
@@ -363,6 +611,8 @@ def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=
         }
         if decision:
             output.update(decision)
+        if close_context_warnings:
+            output["close_context_warnings"] = close_context_warnings
         print(json.dumps(output))
 
     except Exception as e:
@@ -529,6 +779,11 @@ def main():
         parser.add_argument("--position-entry-atr", type=float, default=None)
         parser.add_argument("--position-risk-anchor-price", type=float, default=None)
         parser.add_argument("--position-regime", default="")
+        parser.add_argument("--position-regime-applied", default="")
+        parser.add_argument("--position-regime-pending-label", default="")
+        parser.add_argument("--position-regime-pending-count", type=int, default=0)
+        parser.add_argument("--position-opened-at-ms", type=int, default=None)
+        parser.add_argument("--position-bars-held", type=int, default=None)
         parser.add_argument("--mark-price", type=float, default=0.0)
         parser.add_argument("--probe-only", action="store_true")
         args = parser.parse_args()
