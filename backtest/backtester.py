@@ -3207,7 +3207,7 @@ class Backtester:
             execution_log["entry_lot_residual_qty"] += requested_qty - qty
             return effective_price, qty, notional * spec["taker_fee_pct"]
 
-    def _book_close(idx, close_fraction: float, raw_fill: float, slippage: float,
+        def _book_close(idx, close_fraction: float, raw_fill: float, slippage: float,
                     reason: str, bar_mark: float, seed_price: float,
                     fee_pct: Optional[float] = None, decision_bar=None,
                     timing: str = "bar_open_fill",
