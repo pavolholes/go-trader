@@ -3362,6 +3362,7 @@ class Backtester:
                     cash_before=cash_before, cash_after=cash, hold=hold,
                     gross_realized=gross_realized,
                     entry_fee_allocated=entry_fee_allocated,
+                    synthetic=(record_kind == "terminal_liquidation"),
                 )
             return sl_after_moved
 
