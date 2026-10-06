@@ -3471,29 +3471,6 @@ class Backtester:
                 equity = cash + position * mark_price
             equity_curve.append({"date": idx, "equity": equity})
 
-            # Insolvency with a still-open, unprotected position is terminal.
-            # Give an already-triggered stop, an explicit opposing signal, or
-            # a configured close evaluator the opportunity to book its exit
-            # before modelling the venue liquidation.
-            side_before = "long" if position > 0 else "short"
-            opposing_signal = (position > 0 and signal < 0) or (position < 0 and signal > 0)
-            stop_already_triggered = (
-                position != 0 and sl_trigger_px > 0
-                and self._sl_hit(side_before, mark_price, sl_trigger_px)
-            )
-            close_evaluator_owns_exit = bool(self.close_strategies)
-            if (equity <= 0 and position != 0 and not opposing_signal
-                    and not stop_already_triggered and not close_evaluator_owns_exit):
-                _book_close(
-                    idx, 1.0, mark_price, self.slippage_pct,
-                    "liquidation", mark_price, mark_price,
-                )
-                cash = 0.0
-                equity_curve[-1]["equity"] = 0.0
-                for future_idx in df.index[i + 1:]:
-                    equity_curve.append({"date": future_idx, "equity": 0.0})
-                break
-
             # Circuit breaker: track peak equity and manage cooldown
             if self.circuit_breaker_max_drawdown_pct is not None:
                 if equity > self._cb_peak_equity:
@@ -4365,6 +4342,29 @@ class Backtester:
             # Circuit breaker override (highest priority)
             if self._cb_active and position != 0 and not pending_signal_sl_close:
                 pending_signal_sl_close = True
+
+            # Check insolvency after this bar's signal/close/stop paths have
+            # had a chance to book an exit. A pending next-open stop is also
+            # allowed to execute before terminal liquidation.
+            if position != 0 and not pending_signal_sl_close:
+                if self._margin_per_trade_usd and self._margin_locked > 0:
+                    unrealized_pnl = position * (mark_price - avg_cost)
+                    terminal_equity = (
+                        cash + self._margin_locked + unrealized_pnl
+                        - (self._notional if position < 0 else 0)
+                    )
+                else:
+                    terminal_equity = cash + position * mark_price
+                if terminal_equity <= 0:
+                    _book_close(
+                        idx, 1.0, mark_price, self.slippage_pct,
+                        "liquidation", mark_price, mark_price,
+                    )
+                    cash = 0.0
+                    equity_curve[-1]["equity"] = 0.0
+                    for future_idx in df.index[i + 1:]:
+                        equity_curve.append({"date": future_idx, "equity": 0.0})
+                    break
 
             # #1271: promote any surviving trigger to a carried, pierce-
             # eligible level for the next bar (plain-path mirror of the
