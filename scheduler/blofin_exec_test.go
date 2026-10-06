@@ -32,6 +32,31 @@ func TestBloFinPendingFillAlertIsNotScriptFailure(t *testing.T) {
 	}
 }
 
+func TestRunBloFinCheckPassesNoEdgeAcknowledgement(t *testing.T) {
+	old := runBloFinCheckFn
+	t.Cleanup(func() { runBloFinCheckFn = old })
+	var gotArgs []string
+	runBloFinCheckFn = func(_ string, args []string) (*BloFinResult, string, error) {
+		gotArgs = append([]string(nil), args...)
+		return &BloFinResult{Symbol: "BTC", Price: 100, Mode: "live"}, "", nil
+	}
+	acknowledged := true
+	sc := StrategyConfig{
+		ID: "live-no-edge-btc", Platform: "blofin", Type: "perps",
+		Script:      "shared_scripts/check_blofin.py",
+		Args:        []string{"sma_crossover", "BTC", "1h", "--mode=live"},
+		AllowNoEdge: &acknowledged,
+	}
+	logger := &StrategyLogger{stratID: sc.ID, writer: io.Discard}
+	_, _, _, ok := runBloFinCheck(sc, nil, PositionCtx{}, nil, nil, logger)
+	if !ok {
+		t.Fatal("mock BloFin check failed")
+	}
+	if !strings.Contains(strings.Join(gotArgs, " "), allowNoEdgeFlag) {
+		t.Fatalf("BloFin check argv %v does not contain %s", gotArgs, allowNoEdgeFlag)
+	}
+}
+
 func TestAppendBloFinPositionContextArgsCarriesPersistedCloseInputs(t *testing.T) {
 	openedAt := time.Date(2026, 10, 3, 9, 0, 0, 0, time.UTC)
 	got := appendBloFinPositionContextArgs([]string{"momentum", "BTC", "15m"}, PositionCtx{

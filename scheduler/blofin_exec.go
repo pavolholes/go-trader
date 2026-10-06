@@ -31,6 +31,8 @@ func applyBloFinManageOnly(result *BloFinResult, posQty float64, posSide string)
 }
 
 // runBloFinCheck runs check_blofin.py signal-check mode (Phase 3, no lock).
+var runBloFinCheckFn = RunBloFinCheck
+
 func runBloFinCheck(sc StrategyConfig, prices map[string]float64, posCtx PositionCtx, regime *RegimeConfig, notifier *MultiNotifier, logger *StrategyLogger) (*BloFinResult, string, float64, bool) {
 	args := append([]string{}, sc.Args...)
 	args = appendOpenCloseArgs(args, sc, posCtx)
@@ -61,9 +63,10 @@ func runBloFinCheck(sc StrategyConfig, prices map[string]float64, posCtx Positio
 			args = append(args, fmt.Sprintf("--mark-price=%g", mid))
 		}
 	}
+	args = appendAllowNoEdgeArg(args, sc)
 	logger.Info("Running: python3 %s %v", sc.Script, args)
 
-	result, stderr, err := RunBloFinCheck(sc.Script, args)
+	result, stderr, err := runBloFinCheckFn(sc.Script, args)
 	if err != nil {
 		logger.Error("Script failed: %v", err)
 		if stderr != "" {
