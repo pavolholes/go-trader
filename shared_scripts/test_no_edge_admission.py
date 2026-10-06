@@ -7,9 +7,10 @@ import pytest
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 SCRIPTS = os.path.join(REPO, "shared_scripts")
-CREDENTIAL_PREFIXES = ("HYPERLIQUID", "OKX", "ROBINHOOD", "TOPSTEP", "PROJECTX")
+CREDENTIAL_PREFIXES = ("HYPERLIQUID", "OKX", "ROBINHOOD", "TOPSTEP", "PROJECTX", "BLOFIN")
 
 SOLO_SCRIPTS = [
+    ("check_blofin.py", ["rsi", "BTC", "1h"]),
     ("check_hyperliquid.py", ["vortex_trend", "BTC", "4h"]),
     ("check_topstep.py", ["rsi", "ES", "1h"]),
     ("check_okx.py", ["rsi", "BTC", "1h", "--inst-type=swap"]),
