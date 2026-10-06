@@ -205,7 +205,9 @@ def test_no_short_reentry_after_blowup_plain_path():
     res = _run(_df(closes, signals))
     assert res["total_trades"] == 1
     assert res["trades"][0]["pnl"] < 0
-    assert res["final_capital"] == pytest.approx(-5000.0)
+    assert res["liquidated"] is True
+    assert res["final_capital"] == pytest.approx(0.0)
+    assert res["trades"][0]["exit_reason"] == "liquidation"
 
 
 def test_consecutive_reentry_attempts_after_blowup_do_not_compound():
@@ -213,7 +215,9 @@ def test_consecutive_reentry_attempts_after_blowup_do_not_compound():
     signals = [-1, 0, 1, -1, -1, -1, 0]
     res = _run(_df(closes, signals))
     assert res["total_trades"] == 1
-    assert res["final_capital"] == pytest.approx(-5000.0)
+    assert res["liquidated"] is True
+    assert res["final_capital"] == pytest.approx(0.0)
+    assert res["trades"][0]["exit_reason"] == "liquidation"
 
 
 def test_cash_zero_boundary_books_no_phantom_trade():
