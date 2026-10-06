@@ -1,8 +1,8 @@
 # GO-TRADER OVERRIDES PAVOL
 
 Pavol fork overrides vs upstream `richkuo/go-trader`. MUST be preserved across
-upstream merges. Base: v0.107.0 (`97e2681`, merged 2026-10-05; previous base
-v0.106.0). This file is referenced from `CLAUDE.md` (root `AGENTS.md` is a
+upstream merges. Base: v0.108.0 (`ba51562`, merged 2026-10-06; previous base
+v0.107.0). This file is referenced from `CLAUDE.md` (root `AGENTS.md` is a
 symlink to it).
 
 ## 1. New files (upstream does not have them — keep on merge)

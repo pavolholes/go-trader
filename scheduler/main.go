@@ -2343,7 +2343,7 @@ func main() {
 							result.Signal = 0
 						}
 						mu.Lock()
-						syncStrategyRegimeState(stratState, positionRegime, cfg.Regime)
+						syncStrategyRegimeState(stratState, storeRegime, cfg.Regime)
 						trades, detail = executeSpotResult(sc, stratState, stratDB, result, signalStr, price, cfg.Regime, cfg, hurstDecision, logger)
 						mu.Unlock()
 					}
@@ -3089,7 +3089,7 @@ func main() {
 							result.Signal = 0
 						}
 						mu.Lock()
-						syncStrategyRegimeState(stratState, positionRegime, cfg.Regime)
+						syncStrategyRegimeState(stratState, storeRegime, cfg.Regime)
 						mu.Unlock()
 						var execResult *TopStepExecuteResult
 						liveExecFailed := false
