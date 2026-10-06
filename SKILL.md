@@ -106,7 +106,18 @@ Live-mode risk defaults offered by `init`: per-strategy spot drawdown 5%, per-st
 
 All regime labels must be present (exhaustive, no fallback). Tier counts may differ per label. The block **owns the stop loss** through per-regime `stop_loss_atr`, so declaring any strategy-level stop field alongside it is rejected at load. The whole block is hot-reload-gated as a unit: change it while a position is open and the reload is refused. Flatten first.
 
-**Dynamic variant** (`tiered_tp_atr_live_regime_dynamic`, HL perps/manual and BloFin perps): the same block, plus an optional top-level `regime_confirm_cycles`. It is the number of consecutive cycles a new ATR-regime label must hold before the position applies it. On Hyperliquid, protection sync re-places stop-loss and take-profit orders for the new label. On BloFin, the scheduler persists pending/applied labels and runs a virtual ATR stop; a confirmed regime may tighten that stop, but never loosens it. BloFin Copy TPSL is not assumed. A paper Hyperliquid position moves its stop as **Paper stops** describes. The default is `2`. The value must be a whole JSON number >= 1, and `1` applies a change on the first cycle that shows it. A string, a boolean, `null`, `0`, a negative value, a fraction, or a value past the integer range fails to load. The key is part of the hot-reload-gated block. It is an unknown param on the other two unified closes. BloFin perps are backtestable; `run_backtest.py --config` continues to reject Hyperliquid dynamic configuration.
+**Dynamic variant** (`tiered_tp_atr_live_regime_dynamic`, HL perps/manual and BloFin perps): the same block, plus an optional top-level `regime_confirm_cycles`.
+It is the number of consecutive cycles a new ATR-regime label must hold before the position applies it.
+On Hyperliquid, protection sync re-places stop-loss and take-profit orders for the new label.
+On BloFin, the scheduler persists pending/applied labels and runs a virtual ATR stop; a confirmed regime may tighten that stop, but never loosens it.
+BloFin Copy TPSL is not assumed.
+A paper Hyperliquid position moves its stop as **Paper stops** describes.
+The default is `2`.
+The value must be a whole JSON number >= 1, and `1` applies a change on the first cycle that shows it.
+A string, a boolean, `null`, `0`, a negative value, a fraction, or a value past the integer range fails to load.
+The key is part of the hot-reload-gated block.
+It is an unknown param on the other two unified closes.
+BloFin perps are backtestable; `run_backtest.py --config` continues to reject Hyperliquid dynamic configuration.
 
 **Trailing-ratchet close** (`trailing_tp_ratchet` / `trailing_tp_ratchet_regime`): a trailing-ATR stop where each cleared take-profit tier tightens the trail and optionally scales out.
 The scalar form needs a positive strategy-level `trailing_stop_atr_mult` (the initial loose trail, and the sole stop owner).
