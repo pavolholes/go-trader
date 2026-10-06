@@ -527,12 +527,30 @@ def _check_capability_declared(request: CloseCapabilityRequest) -> list:
     return out
 
 
+# Pavol fork: BloFin perps parity — these closes have a scheduler-managed
+# implementation (virtual stops, completed-candle contexts) declared in
+# shared_strategies/close/support_matrix.json, so the HL-live-only and
+# research-context refusals do not apply on platform == "blofin".
+_BLOFIN_PARITY_CLOSES = frozenset({
+    "tiered_tp_atr_live_regime_dynamic",
+    "time_stop",
+    "zscore_target",
+    "avwap_stop",
+})
+
+
+def _blofin_parity_exempts(platform, close_name: str) -> bool:
+    return str(platform or "").strip().lower() == "blofin" \
+        and close_name in _BLOFIN_PARITY_CLOSES
+
+
 def _check_live_only_close(request: CloseCapabilityRequest) -> list:
     out = []
     for idx, ref in enumerate(request.close_refs):
         cap = CLOSE_CAPABILITIES.get(ref["name"])
         if ref["name"] in request.registered_closes and cap is not None \
-                and cap.live == CLOSE_LIVE_ONLY:
+                and cap.live == CLOSE_LIVE_ONLY \
+                and not _blofin_parity_exempts(request.platform, ref["name"]):
             out.append(capability_refusal(
                 "LIVE_ONLY_CLOSE", ref["name"], close_ref_index=idx,
                 details={"message": f"{ref['name']} is HL-live-only: the common "
@@ -547,7 +565,8 @@ def _check_live_close_context(request: CloseCapabilityRequest) -> list:
     for idx, ref in enumerate(request.close_refs):
         cap = CLOSE_CAPABILITIES.get(ref["name"])
         if ref["name"] not in request.registered_closes or cap is None \
-                or cap.live != CLOSE_LIVE_RESEARCH_CONTEXT:
+                or cap.live != CLOSE_LIVE_RESEARCH_CONTEXT \
+                or _blofin_parity_exempts(request.platform, ref["name"]):
             continue
         details = {"mode": request.mode, "platform": request.platform,
                    "strategy_type": request.strategy_type}

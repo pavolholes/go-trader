@@ -1018,15 +1018,16 @@ def load_strategy_config(config_path: str, strategy_id: str,
         stop_context = stops["stop_context"]
         for ref in close_refs:
             if ref.get("name") == "tiered_tp_atr_live_regime_dynamic":
-                if (
-                    str(sc.get("platform") or "").strip().lower() != "blofin"
-                    or str(sc.get("type") or "perps").strip().lower() != "perps"
-                ):
+                if str(sc.get("platform") or "").strip().lower() != "blofin":
+                    # Other platforms: leave it to the close-capability policy
+                    # (HL-live-only refusal), which reports a structured error.
+                    continue
+                if str(sc.get("type") or "perps").strip().lower() != "perps":
                     raise ValueError(
                         f"{config_path}: strategy {strategy_id!r} uses "
                         f"tiered_tp_atr_live_regime_dynamic, which is backtestable "
                         f"here only for BloFin perps with the scheduler-managed "
-                        f"virtual stop; other platform parity remains deferred."
+                        f"virtual stop."
                     )
                 if not (cfg.get("regime") or {}).get("enabled"):
                     raise ValueError(
