@@ -2777,6 +2777,7 @@ class Backtester:
         trades = []
         current_trade = None
         equity_curve = []
+        terminal_insolvency = False
         rec = _LedgerEventRecorder(self.initial_capital) if record_events else None
 
         avg_cost = 0.0
@@ -3206,10 +3207,11 @@ class Backtester:
             execution_log["entry_lot_residual_qty"] += requested_qty - qty
             return effective_price, qty, notional * spec["taker_fee_pct"]
 
-        def _book_close(idx, close_fraction: float, raw_fill: float, slippage: float,
-                        reason: str, bar_mark: float, seed_price: float,
-                        fee_pct: Optional[float] = None, decision_bar=None,
-                        timing: str = "bar_open_fill") -> bool:
+    def _book_close(idx, close_fraction: float, raw_fill: float, slippage: float,
+                    reason: str, bar_mark: float, seed_price: float,
+                    fee_pct: Optional[float] = None, decision_bar=None,
+                    timing: str = "bar_open_fill",
+                    record_kind: str = "close") -> bool:
             nonlocal position, cash, avg_cost, initial_quantity, entry_atr_value
             nonlocal current_trade, sl_trigger_px, sl_tiers_processed
             nonlocal post_tp_trail_mult, sl_high_water_px
@@ -3349,7 +3351,7 @@ class Backtester:
 
             if rec is not None:
                 rec.record(
-                    "close", bar=idx, decision_bar=decision_bar, timing=timing,
+                    record_kind, bar=idx, decision_bar=decision_bar, timing=timing,
                     side="long" if qty_before > 0 else "short",
                     action="sell" if qty_before > 0 else "buy",
                     quantity=qty_to_close, raw_price=raw_fill,
@@ -4356,16 +4358,18 @@ class Backtester:
                 else:
                     terminal_equity = cash + position * mark_price
                 if terminal_equity <= 0:
+                    if rec is not None:
+                        rec.mark_interval_end(
+                            bar=idx, cash=cash, position=position,
+                            avg_cost=avg_cost, hold=hold,
+                        )
                     _book_close(
                         idx, 1.0, mark_price, self.slippage_pct,
                         "liquidation", mark_price, mark_price,
+                        record_kind="terminal_liquidation",
                     )
                     cash = 0.0
-                    # The venue liquidation consumes any residual account
-                    # deficit. Keep the booked terminal close event's cash
-                    # ledger aligned with the zero-cash liquidation result.
-                    if rec is not None and rec.events:
-                        rec.events[-1]["cash_after"] = cash
+                    terminal_insolvency = True
                     equity_curve[-1]["equity"] = 0.0
                     for future_idx in df.index[i + 1:]:
                         equity_curve.append({"date": future_idx, "equity": 0.0})
@@ -4380,7 +4384,7 @@ class Backtester:
             if position != 0:
                 sl_pierce_armed = True
 
-        if rec is not None:
+        if rec is not None and not terminal_insolvency:
             rec.mark_interval_end(bar=df.index[-1], cash=cash, position=position,
                                   avg_cost=avg_cost, hold=hold)
         if position != 0:
