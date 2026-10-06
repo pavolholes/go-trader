@@ -4361,6 +4361,11 @@ class Backtester:
                         "liquidation", mark_price, mark_price,
                     )
                     cash = 0.0
+                    # The venue liquidation consumes any residual account
+                    # deficit. Keep the booked terminal close event's cash
+                    # ledger aligned with the zero-cash liquidation result.
+                    if rec is not None and rec.events:
+                        rec.events[-1]["cash_after"] = cash
                     equity_curve[-1]["equity"] = 0.0
                     for future_idx in df.index[i + 1:]:
                         equity_curve.append({"date": future_idx, "equity": 0.0})
