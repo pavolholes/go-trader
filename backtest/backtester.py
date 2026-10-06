@@ -4349,7 +4349,10 @@ class Backtester:
             # Check insolvency after this bar's signal/close/stop paths have
             # had a chance to book an exit. A pending next-open stop is also
             # allowed to execute before terminal liquidation.
-            if position != 0 and not pending_signal_sl_close:
+            terminal_liquidation_allowed = (
+                self._margin_per_trade_usd is not None or position < 0
+            )
+            if position != 0 and terminal_liquidation_allowed and not pending_signal_sl_close:
                 if self._margin_per_trade_usd and self._margin_locked > 0:
                     unrealized_pnl = position * (mark_price - avg_cost)
                     terminal_equity = (
