@@ -8,7 +8,7 @@ Guardrails: SKILL.md; docs/POST_UPDATE_HISTORY.md; docs/research/blofin-close-ev
 
 ## Priorities
 - **Always the best solution.** Cost/compute/time/effort/code never narrow options; branch+PR, issue-claim vs code, destructive-action safety win.
-- **Never give time/effort estimates.** Complexity=scope+risk
+- **No time/effort estimates.** Complexity=scope+risk
 
 ## Repo (`scheduler/`=one `package main`)
 - `executor.go`/`shutdown.go`: side effects via `runPythonSideEffect`, NEVER `runPython`. Live HL book needs `confirmHyperliquidExecuteFill` (finite `Fill.AvgPx>0`+`TotalSz>0`); `check_hyperliquid.py execute` exits 1 if no fill.
@@ -24,7 +24,7 @@ Guardrails: SKILL.md; docs/POST_UPDATE_HISTORY.md; docs/research/blofin-close-ev
 - `daily_loss.go`: hold-only, UNLATCHED pure read, PRE-FEE realized PnL, never force-closes, per partition; new `portfolio_risk` gates copy it.
 - `exposure_cap.go`: blocking-only, direction-aware; one exposure model `computeAssetDeltas` (`ComputeCorrelation` too). `notional_cap.go`: hold-only via `pausedBlocksSignal`, never skips cycle, restart-required.
 - `replay_{log,mirror}.go`: DEFAULT-OFF, HL perps, flat-only hot-reload, 1 mirror/source.
-- `hl_batch.go`: shared-state failure=same-cycle per-strategy fallback, never blank close/SL/ratchet/protection/hedge; `GO_TRADER_HL_BATCH=0` disables. `market_feed=websocket|shared`: checks read one sealed stdin `marketSnapshot`; missing frame=error, NEVER private fetch.
+- `hl_batch.go`: shared-state failure=same-cycle per-strategy fallback, never blank close/SL/ratchet/protection/hedge; `GO_TRADER_HL_BATCH=0` disables. `closed_bar_decisions`: missing `closed_bar_decision` block=script error, holds signal. `market_feed=websocket|shared`: checks read one sealed stdin `marketSnapshot`; missing frame=error, NEVER private fetch.
 - `market_feed_*.go`: `role: feed` runs BEFORE `LoadConfig` (no state/lock/probe). Seal bytes immutable; missed/evicted/pre-start key=`unavailable`, NEVER current data; sealer never takes `mu`. Consumer: 1 deadline/cycle, non-nil degraded snapshot, primary>backup. REST feed: `/info` via `feedBudgetAcquire`; key ready ONLY if refreshed that deadline. Closed-bar correction (`market_feed_correction.go`): reads outside `feedMu`, closed bars only, never `LastRecvAt`, never touches seals or readiness; ledger reasons `correction`/`correction_retry`. `shared-feed-convert.sh`: opt-in, NEVER run by update; failed switch restores byte copy.
 - `migrate-service-layout.py`: opt-in, NEVER run by update; target authoritative from enable-intent; recovery NEVER restarts source from stale snapshot.
 - `hyperliquid_fills.go`: `HLFillLookup.Px`=VWAP; `ClosedPnLGross` never into `Trade.RealizedPnL`; unconfirmed SL fills=gaps, never books.
@@ -40,7 +40,7 @@ Guardrails: SKILL.md; docs/POST_UPDATE_HISTORY.md; docs/research/blofin-close-ev
 - `shared_wallet*.go`: PRE-FEE `realized_pnl`, net via `tradeNetPnL*`. Pool budgeting: 2+ live HL/OKX perps omit capital fields, `margin_per_trade_usd`>0; allocated-pool flat-only.
 - `kill_switch_limit_orders.go`: cancel each `pending_limit_orders` ROW pre-flatten; **never gate `reconcilePendingLimitOrders` on kill-switch**; cancel!=adoption, never auto-delete unadopted fill.
 - `orphan_limit_cancel_alerts.go`: cancel-only lane, status-FIRST finalize, books NO fill; `orphanLimitCancelState`=SSoT (off-book fill=UNTRACKED POSITION). `limit_fill_exposure.go`: books limit fill ONLY once live exposure confirms; per-coin aggregate, never per-row greedy; fail-closed same-dir+contained; `unreadable`/`unbacked` refuse book+block delete.
-- `shared_scripts/`: check scripts take `--regime-payload-json`, probed at start. `check_hyperliquid.py` close gate: live-only, lot-floored, never full close, no lot=no gate. `platforms/<name>/adapter.py`: 1 `*ExchangeAdapter`; HL `_sz_decimals()` via `name_to_asset`. `funding_fetcher.py`: `merge_asof` backward, DISJOINT `funding_coverage`; `regime.py` ATR `simple`.
+- `shared_scripts/`: check scripts take `--regime-payload-json`, probed at start. Lot gate (floor, never full close): live partial=`check_hyperliquid.py`, no lot=no gate; HL perps paper (+opens/adds)=Go, sub-min/no lot=HOLD+no write+quiet cycle. `platforms/<name>/adapter.py`: 1 `*ExchangeAdapter`; HL `_sz_decimals()` via `name_to_asset`. `funding_fetcher.py`: `merge_asof` backward, DISJOINT `funding_coverage`; `regime.py` ATR `simple`.
 - `shared_strategies/`: open SSoT `open/registry.py`; **`open/{spot,futures}/strategies.py`=shims, never edit.** Close: `close/registry.py` via `from close_registry_loader import ..`, never bare `import registry`. `hurst_exponent`=SSoT.
 - HL tier parity: `tp_model: resting_limit` evaluators == `buildHyperliquidProtectionPlan` (SSoT `tp_tier_parity.json`); `close_tier_fill_price` paper-only; ladder load=`validateTPTierLadders`.
 
@@ -49,7 +49,7 @@ Guardrails: SKILL.md; docs/POST_UPDATE_HISTORY.md; docs/research/blofin-close-ev
 - New platform: SKILL.md Custom Platform Integration touchpoints; check scripts use public methods.
 - Subprocess: stdout JSON, exit 1 on error; Go parses anyway.
 - Locking: `mu RWMutex`, 6 phases (RLock>Lock(CheckRisk)>no-lock subprocess>Lock(execute)>marks>RLock(status)); symbol locks>`mu`. OUTSIDE `mu`: HL fill resolver, reconciliation-close alerts, `cashflow_journal.go`. Skip-reason checks BEFORE spawn; Phase 1 captures `posSide`+`posQty`; `liveExecFailed` guards live exec.
-- Dispatch by `s.Platform`, never ID prefix. Perps paper=`ExecuteSpotSignalWithFillFee`, live=`RunHyperliquidExecute`; futures=`ExecuteFuturesSignalWithFillFee`.
+- Dispatch by `s.Platform`, never ID prefix. HL live=`RunHyperliquidExecute`; futures=`ExecuteFuturesSignalWithFillFee`.
 - Single `CloseStrategy` owns exit; close before open; partial close keeps `InitialQuantity`, suppresses SL replace.
 - `dueStrategies` value-copied: update `cfg.Strategies` first. Owner=`OwnerStrategyID`; shared-coin reconcile non-destructive; SL attribution by OID+qty, else `hl_sync_external`.
 - Trades: `is_close`/`realized_pnl`; `#T` counts opens by `(strategy_id,position_id)`. HL kill-switch shared-coin fill split fails closed; close side short=buy else sell. Invert: composer (`invert_open_signal`+echo); Go never negates; same-side close zeroed.
@@ -63,14 +63,14 @@ Guardrails: SKILL.md; docs/POST_UPDATE_HISTORY.md; docs/research/blofin-close-ev
 
 ## PRs and issues
 - Never bare `#N` in lists; PR verification follows `## Summary`. Commits, PR and issue bodies end `LLM: <model> | <effort> | Harness: <action>`, no `Co-authored-by`. PR/commit format: `scripts/check_pr_metadata.py`.
-- Long-lived PR: diff `origin/main..HEAD` for reverts before merge.
+- Long-lived PR: diff `origin/main..HEAD` for reverts.
 - Reviews also follow `.github/prompts/pr-review-format-local.md`, never gate on CI; findings restate as invariant, list breaking states (inverse, compound).
 - `.github/workflows/claude.yml`: mode routing fail-closed (untrusted/fork=review); no-execution in agent; commit/push implement-only; prompt never holds `"`, `` ` ``, `$`.
 - rk-skills workflow skills=CI-only, no settings pin.
 
 ## Deploy
 - **Update only with `bash scripts/update.sh --restart`. Never rebuild Go alone**: Go+Python share 1 argv contract per SHA; `update_resolve_db_exclude` lists all state files (incl. `paper_sources[].db_file`).
-- Exit codes: probe 78, singleton 79, storage 80, units `RestartPreventExitStatus=78 79 80`. Ownership over ALL files (incl. `--once`) precedes migration/startup write; unit edits: `daemon-reload`.
+- Exit codes (units `RestartPreventExitStatus`): probe 78, singleton 79, storage 80. Ownership over ALL files (incl. `--once`) precedes migration/startup write; unit edits: `daemon-reload`.
 - Post-update: SKILL.md Post-Update Agent Protocol; Python-launcher change: smoke `./go-trader --once` (daemon off).
 - Scripts: root git via `update_git` (py: exact-tree `-c`), never `*`/config; foreign-owned tree: confined units, Go only from `git archive`, probe as owner; give-back fd-pinned, no hard links; root `uv sync` copy-mode; uv/go via `update_resolve_tool`.
 

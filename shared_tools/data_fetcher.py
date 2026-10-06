@@ -11,6 +11,49 @@ import pandas as pd
 from storage import store_ohlcv, load_ohlcv
 
 
+def _blofin_adapter():
+    """Resolve platforms/blofin/adapter.py.
+
+    Both BloFin and Hyperliquid ship a top-level ``adapter`` module, so under
+    a shared pytest process the first import wins the ``sys.modules`` cache
+    and can shadow the other platform. A plain import is tried first; when
+    the cached module is not ours, the file is loaded by path under a
+    distinct module name.
+    """
+    import sys
+    mod = sys.modules.get("blofin_platform_adapter")
+    if mod is not None:
+        return mod
+    try:
+        # NOTE: plain __import__ (not importlib.import_module) so test
+        # doubles patching builtins.__import__ keep working.
+        cand = __import__("adapter", fromlist=["BloFinExchangeAdapter"])
+    except ImportError:
+        cand = None
+    cand_file = getattr(cand, "__file__", None)
+    if isinstance(cand_file, str):
+        if cand_file.replace(os.sep, "/").endswith("platforms/blofin/adapter.py"):
+            sys.modules["blofin_platform_adapter"] = cand
+            return cand
+    elif cand is not None and hasattr(cand, "BloFinExchangeAdapter"):
+        # Test double (no real __file__): use it but never cache it, so it
+        # cannot leak into other tests sharing this process.
+        return cand
+    import importlib.util
+    path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "..", "platforms", "blofin", "adapter.py",
+    )
+    spec = importlib.util.spec_from_file_location("blofin_platform_adapter", path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["blofin_platform_adapter"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+OHLCV_TIMESTAMP_KIND = "open"
+
+
 def get_exchange(exchange_id: str = "binanceus") -> ccxt.Exchange:
     exchange_class = getattr(ccxt, exchange_id)
     exchange = exchange_class({
@@ -61,11 +104,8 @@ def fetch_ohlcv_blofin(
     store: bool = True,
 ) -> pd.DataFrame:
     """OHLCV from BloFin public REST (spot and perps share /market/candles)."""
-    import sys
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "platforms", "blofin"))
-    from adapter import BloFinExchangeAdapter
     base = (symbol or "").split("/")[0].split("-")[0].strip().upper()
-    raw = BloFinExchangeAdapter().get_ohlcv(base, timeframe, limit)
+    raw = _blofin_adapter().BloFinExchangeAdapter().get_ohlcv(base, timeframe, limit)
     if not raw:
         return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
     df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
@@ -92,6 +132,26 @@ def fetch_ohlcv_blofin_spot(
     df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
     if store:
         store_ohlcv(df, "blofin_spot", symbol, timeframe)
+    df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms")
+    df.set_index("datetime", inplace=True)
+    return df
+
+
+def fetch_ohlcv_rows(
+    symbol: str,
+    timeframe: str,
+    limit: int,
+    exchange_id: str = "binanceus",
+) -> list:
+    exchange = get_exchange(exchange_id)
+    raw = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+    return [list(r) for r in (raw or [])]
+
+
+def ohlcv_rows_frame(rows: list) -> pd.DataFrame:
+    if not rows:
+        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
     df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms")
     df.set_index("datetime", inplace=True)
     return df

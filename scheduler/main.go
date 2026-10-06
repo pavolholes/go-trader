@@ -717,6 +717,8 @@ func main() {
 		}
 	}
 
+	hlLotMetadata.configure(feedOwnerCtx)
+
 	lastRun := make(map[string]time.Time)
 	var lastLiquidationAudit time.Time
 	offCycleAuditSaveDirty := false
@@ -2169,11 +2171,19 @@ func main() {
 							prices[result.Symbol] = price
 							storeRegime := globalRegimeStore.PayloadForStrategy(sc, cfg.Regime)
 							result.Regime = &storeRegime
-							if gateRegime, regimeBlocked := applyRegimeGate(sc, storeRegime, cfg.Regime, okxPosQty); regimeBlocked {
-								logger.Info("Regime gate: open signal blocked (%s)", regimeGateBlockDetail(gateRegime))
+							decisionGate := closedBarGateViewFor(sc, result.StrategyDecisionFields, storeRegime, cfg.Regime)
+							logClosedBarDecision(sc, result.StrategyDecisionFields, logger)
+							if !decisionGate.Held {
+								if gateRegime, regimeBlocked := applyRegimeGate(sc, decisionGate.Regime, cfg.Regime, okxPosQty); regimeBlocked {
+									logger.Info("Regime gate: open signal blocked (%s)", regimeGateBlockDetail(gateRegime))
+									result.Signal = 0
+								}
+							}
+							hurstDecision := closedBarHurstGate(sc, decisionGate, cfg.Regime, stratState, &mu, okxPosQty)
+							if decisionGate.HoldReason != "" && pausedBlocksSignal(result.Signal, result.CloseFraction, okxPosQty, okxPosSide, true, false) {
+								logger.Warn("Closed-bar decision: %s signal suppressed — %s (#1712)", signalStr, decisionGate.HoldReason)
 								result.Signal = 0
 							}
-							hurstDecision := advanceHurstGate(sc, storeRegime, cfg.Regime, stratState, &mu, okxPosQty)
 							if hurstDecision.Holds && pausedBlocksSignal(result.Signal, result.CloseFraction, okxPosQty, okxPosSide, true, false) {
 								logger.Info("Hurst gate: %s signal suppressed — %s (#1411)", signalStr, hurstDecision.Detail)
 								result.Signal = 0
@@ -2229,11 +2239,19 @@ func main() {
 							prices[result.Symbol] = price
 							storeRegime := globalRegimeStore.PayloadForStrategy(sc, cfg.Regime)
 							result.Regime = &storeRegime
-							if gateRegime, regimeBlocked := applyRegimeGate(sc, storeRegime, cfg.Regime, rhPosQty); regimeBlocked {
-								logger.Info("Regime gate: open signal blocked (%s)", regimeGateBlockDetail(gateRegime))
+							decisionGate := closedBarGateViewFor(sc, result.StrategyDecisionFields, storeRegime, cfg.Regime)
+							logClosedBarDecision(sc, result.StrategyDecisionFields, logger)
+							if !decisionGate.Held {
+								if gateRegime, regimeBlocked := applyRegimeGate(sc, decisionGate.Regime, cfg.Regime, rhPosQty); regimeBlocked {
+									logger.Info("Regime gate: open signal blocked (%s)", regimeGateBlockDetail(gateRegime))
+									result.Signal = 0
+								}
+							}
+							hurstDecision := closedBarHurstGate(sc, decisionGate, cfg.Regime, stratState, &mu, rhPosQty)
+							if decisionGate.HoldReason != "" && pausedBlocksSignal(result.Signal, result.CloseFraction, rhPosQty, rhPosSide, true, false) {
+								logger.Warn("Closed-bar decision: %s signal suppressed — %s (#1712)", signalStr, decisionGate.HoldReason)
 								result.Signal = 0
 							}
-							hurstDecision := advanceHurstGate(sc, storeRegime, cfg.Regime, stratState, &mu, rhPosQty)
 							if hurstDecision.Holds && pausedBlocksSignal(result.Signal, result.CloseFraction, rhPosQty, rhPosSide, true, false) {
 								logger.Info("Hurst gate: %s signal suppressed — %s (#1411)", signalStr, hurstDecision.Detail)
 								result.Signal = 0
@@ -2286,13 +2304,20 @@ func main() {
 						}
 					} else if result, signalStr, price, ok := runSpotCheck(sc, prices, spotPosCtx, cfg.Regime, resolveATRMethod(sc, cfg), notifier, logger); ok {
 						storeRegime := globalRegimeStore.PayloadForStrategy(sc, cfg.Regime)
-						positionRegime := regimePayloadForPosition(storeRegime, regimePayloadValue(result.Regime))
-						result.Regime = &positionRegime
-						if gateRegime, regimeBlocked := applyRegimeGate(sc, storeRegime, cfg.Regime, spotPosCtx.Quantity); regimeBlocked {
-							logger.Info("Regime gate: open signal blocked (%s)", regimeGateBlockDetail(gateRegime))
+						result.Regime = &storeRegime
+						decisionGate := closedBarGateViewFor(sc, result.StrategyDecisionFields, storeRegime, cfg.Regime)
+						logClosedBarDecision(sc, result.StrategyDecisionFields, logger)
+						if !decisionGate.Held {
+							if gateRegime, regimeBlocked := applyRegimeGate(sc, decisionGate.Regime, cfg.Regime, spotPosCtx.Quantity); regimeBlocked {
+								logger.Info("Regime gate: open signal blocked (%s)", regimeGateBlockDetail(gateRegime))
+								result.Signal = 0
+							}
+						}
+						hurstDecision := closedBarHurstGate(sc, decisionGate, cfg.Regime, stratState, &mu, spotPosCtx.Quantity)
+						if decisionGate.HoldReason != "" && pausedBlocksSignal(result.Signal, result.CloseFraction, spotPosCtx.Quantity, spotPosCtx.Side, true, false) {
+							logger.Warn("Closed-bar decision: %s signal suppressed — %s (#1712)", signalStr, decisionGate.HoldReason)
 							result.Signal = 0
 						}
-						hurstDecision := advanceHurstGate(sc, storeRegime, cfg.Regime, stratState, &mu, spotPosCtx.Quantity)
 						if hurstDecision.Holds && pausedBlocksSignal(result.Signal, result.CloseFraction, spotPosCtx.Quantity, spotPosCtx.Side, true, false) {
 							logger.Info("Hurst gate: %s signal suppressed — %s (#1411)", signalStr, hurstDecision.Detail)
 							result.Signal = 0
@@ -2387,11 +2412,19 @@ func main() {
 							prices[result.Symbol] = price
 							storeRegime := globalRegimeStore.PayloadForStrategy(sc, cfg.Regime)
 							result.Regime = &storeRegime
-							if gateRegime, regimeBlocked := applyRegimeGate(sc, storeRegime, cfg.Regime, okxPosQty); regimeBlocked {
-								logger.Info("Regime gate: open signal blocked (%s)", regimeGateBlockDetail(gateRegime))
+							decisionGate := closedBarGateViewFor(sc, result.StrategyDecisionFields, storeRegime, cfg.Regime)
+							logClosedBarDecision(sc, result.StrategyDecisionFields, logger)
+							if !decisionGate.Held {
+								if gateRegime, regimeBlocked := applyRegimeGate(sc, decisionGate.Regime, cfg.Regime, okxPosQty); regimeBlocked {
+									logger.Info("Regime gate: open signal blocked (%s)", regimeGateBlockDetail(gateRegime))
+									result.Signal = 0
+								}
+							}
+							hurstDecision := closedBarHurstGate(sc, decisionGate, cfg.Regime, stratState, &mu, okxPosQty)
+							if decisionGate.HoldReason != "" && pausedBlocksSignal(result.Signal, result.CloseFraction, okxPosQty, okxPosSide, PerpsAllowsLong(sc), PerpsAllowsShort(sc)) {
+								logger.Warn("Closed-bar decision: %s signal suppressed — %s (#1712)", signalStr, decisionGate.HoldReason)
 								result.Signal = 0
 							}
-							hurstDecision := advanceHurstGate(sc, storeRegime, cfg.Regime, stratState, &mu, okxPosQty)
 							if hurstDecision.Holds && pausedBlocksSignal(result.Signal, result.CloseFraction, okxPosQty, okxPosSide, PerpsAllowsLong(sc), PerpsAllowsShort(sc)) {
 								logger.Info("Hurst gate: %s signal suppressed — %s (#1411)", signalStr, hurstDecision.Detail)
 								result.Signal = 0
@@ -2566,11 +2599,19 @@ func main() {
 						}
 						storeRegime := globalRegimeStore.PayloadForStrategy(sc, cfg.Regime)
 						result.Regime = &storeRegime
-						if gateRegime, regimeBlocked := applyRegimeGate(sc, storeRegime, cfg.Regime, hlPosQty); regimeBlocked {
-							logger.Info("Regime gate: open signal blocked (%s)", regimeGateBlockDetail(gateRegime))
+						decisionGate := closedBarGateViewFor(sc, result.StrategyDecisionFields, storeRegime, cfg.Regime)
+						logClosedBarDecision(sc, result.StrategyDecisionFields, logger)
+						if !decisionGate.Held {
+							if gateRegime, regimeBlocked := applyRegimeGate(sc, decisionGate.Regime, cfg.Regime, hlPosQty); regimeBlocked {
+								logger.Info("Regime gate: open signal blocked (%s)", regimeGateBlockDetail(gateRegime))
+								result.Signal = 0
+							}
+						}
+						hurstDecision := closedBarHurstGate(sc, decisionGate, cfg.Regime, stratState, &mu, hlPosQty)
+						if decisionGate.HoldReason != "" && pausedBlocksSignal(result.Signal, result.CloseFraction, hlPosQty, hlPosSide, PerpsAllowsLong(sc), PerpsAllowsShort(sc)) {
+							logger.Warn("Closed-bar decision: %s signal suppressed — %s (#1712)", signalStr, decisionGate.HoldReason)
 							result.Signal = 0
 						}
-						hurstDecision := advanceHurstGate(sc, storeRegime, cfg.Regime, stratState, &mu, hlPosQty)
 						if hurstDecision.Holds && pausedBlocksSignal(result.Signal, result.CloseFraction, hlPosQty, hlPosSide, PerpsAllowsLong(sc), PerpsAllowsShort(sc)) {
 							logger.Info("Hurst gate: %s signal suppressed — %s (#1411)", signalStr, hurstDecision.Detail)
 							result.Signal = 0
@@ -2781,11 +2822,7 @@ func main() {
 							}
 						}
 						if !hyperliquidIsLive(sc.Args) && result.Signal == 0 && hlPosQty > 0 {
-							flipAt := hlStep.historyLen(&mu)
-							if flipTrades, flipDetail := advancePaperDynamicCloseRegime(sc, stratState, stratDB, result.Symbol, price, &mu, logger); flipTrades > 0 {
-								hlStep.bindWindow(&mu, flipAt, flipDetail)
-							}
-							runPaperPostTPStopLossAdjustment(sc, stratState, result.Symbol, price, cfg, &mu, notifier, logger)
+							runPaperHLQuietCycleMaintenance(sc, stratState, stratDB, result.Symbol, price, cfg, &mu, notifier, logger, hlStep)
 						}
 						scaleInAddQty := 0.0
 						if result.Signal != 0 && sc.Type == "perps" && sc.AllowScaleIn {
@@ -2867,6 +2904,9 @@ func main() {
 								}
 							}
 						}
+						if result.Signal != 0 && hlPaperSyntheticFill(sc, execResult != nil) {
+							hlLotMetadata.Ensure(result.Symbol)
+						}
 						if !liveExecFailed {
 							mu.Lock()
 							var openTrade *Trade
@@ -2947,6 +2987,9 @@ func main() {
 							if execResult == nil && !hyperliquidIsLive(sc.Args) && result.Signal != 0 && execTrades > 0 {
 								runPaperPostTPStopLossAdjustment(sc, stratState, result.Symbol, price, cfg, &mu, notifier, logger)
 							}
+							if paperHLHeldPartialCloseNeedsQuietMaintenance(sc, result, execTrades, hlPosQty) {
+								runPaperHLQuietCycleMaintenance(sc, stratState, stratDB, result.Symbol, price, cfg, &mu, notifier, logger, hlStep)
+							}
 						}
 						if hlProfileResolved {
 							mu.Lock()
@@ -3011,13 +3054,20 @@ func main() {
 					if result, signalStr, price, ok := runTopStepCheck(sc, prices, tsPosCtx, cfg.Regime, resolveATRMethod(sc, cfg), notifier, logger); ok {
 						prices[result.Symbol] = price
 						storeRegime := globalRegimeStore.PayloadForStrategy(sc, cfg.Regime)
-						positionRegime := regimePayloadForPosition(storeRegime, regimePayloadValue(result.Regime))
-						result.Regime = &positionRegime
-						if gateRegime, regimeBlocked := applyRegimeGate(sc, storeRegime, cfg.Regime, tsContracts); regimeBlocked {
-							logger.Info("Regime gate: open signal blocked (%s)", regimeGateBlockDetail(gateRegime))
+						result.Regime = &storeRegime
+						decisionGate := closedBarGateViewFor(sc, result.StrategyDecisionFields, storeRegime, cfg.Regime)
+						logClosedBarDecision(sc, result.StrategyDecisionFields, logger)
+						if !decisionGate.Held {
+							if gateRegime, regimeBlocked := applyRegimeGate(sc, decisionGate.Regime, cfg.Regime, tsContracts); regimeBlocked {
+								logger.Info("Regime gate: open signal blocked (%s)", regimeGateBlockDetail(gateRegime))
+								result.Signal = 0
+							}
+						}
+						hurstDecision := closedBarHurstGate(sc, decisionGate, cfg.Regime, stratState, &mu, tsContracts)
+						if decisionGate.HoldReason != "" && pausedBlocksSignal(result.Signal, result.CloseFraction, tsContracts, tsPosSide, true, true) {
+							logger.Warn("Closed-bar decision: %s signal suppressed — %s (#1712)", signalStr, decisionGate.HoldReason)
 							result.Signal = 0
 						}
-						hurstDecision := advanceHurstGate(sc, storeRegime, cfg.Regime, stratState, &mu, tsContracts)
 						if hurstDecision.Holds && pausedBlocksSignal(result.Signal, result.CloseFraction, tsContracts, tsPosSide, true, true) {
 							logger.Info("Hurst gate: %s signal suppressed — %s (#1411)", signalStr, hurstDecision.Detail)
 							result.Signal = 0
@@ -3585,6 +3635,7 @@ func runSpotCheck(sc StrategyConfig, prices map[string]float64, posCtx PositionC
 	args = appendStrategyRegimeWindowArgs(args, sc, regime)
 	args = appendRegimePayloadArg(args, sc, regime)
 	args = appendATRMethodArg(args, atrMethod)
+	args = appendClosedBarDecisionArgs(args, sc, regime)
 	if refsArgs, err := buildStrategyRefsArg(sc, "", false); err != nil {
 		logger.Warn("Failed to marshal strategy refs: %v", err)
 	} else if len(refsArgs) > 0 {
@@ -3610,6 +3661,12 @@ func runSpotCheck(sc StrategyConfig, prices map[string]float64, posCtx PositionC
 		logger.RunningOnFailure(sc.Script, args)
 		logger.Error("Script returned error: %s", result.Error)
 		notifyScriptFailure(notifier, sc, scriptFailureError, result.Error)
+		return nil, "", 0, false
+	}
+	if msg := closedBarDecisionContractError(sc, result.StrategyDecisionFields); msg != "" {
+		logger.RunningOnFailure(sc.Script, args)
+		logger.Error("Script returned error: %s", msg)
+		notifyScriptFailure(notifier, sc, scriptFailureError, msg)
 		return nil, "", 0, false
 	}
 	clearScriptFailure(notifier, sc)
@@ -3644,7 +3701,7 @@ func executeSpotResult(sc StrategyConfig, s *StrategyState, db *StateDB, result 
 		return 0, ""
 	}
 	trades := exec.TradesExecuted
-	stampEntryATRIfOpened(s, result.Symbol, result.Indicators)
+	closedBarStampEntryATR(sc, s, result.Symbol, exec.OpenTrade != nil, result.StrategyDecisionFields, result.Indicators)
 	stampPositionRegimeIfOpened(s, result.Symbol, regimePayloadValue(result.Regime), sc, regime)
 	stampDirectionCertifiedAtOpenIfOpened(s, result.Symbol, exec.OpenTrade != nil, sc, regime)
 	stampATRMethodAtOpenIfOpened(s, result.Symbol, exec.OpenTrade != nil, sc, cfg)
@@ -3955,6 +4012,7 @@ func runHyperliquidCheck(sc *StrategyConfig, prices map[string]float64, posCtx P
 	args = appendStrategyRegimeWindowArgs(args, *sc, regime)
 	args = appendRegimePayloadArg(args, *sc, regime)
 	args = appendATRMethodArg(args, atrMethod)
+	args = appendClosedBarDecisionArgs(args, *sc, regime)
 	if refsArgs, err := buildStrategyRefsArg(*sc, closeOwner, sentInvert); err != nil {
 		logger.Warn("Failed to marshal strategy refs: %v", err)
 	} else if len(refsArgs) > 0 {
@@ -4000,6 +4058,10 @@ func finishHyperliquidCheck(sc *StrategyConfig, prices map[string]float64, posCt
 			result = nil
 		} else if result.OpenSignalInverted != sentInvert {
 			errMsg = fmt.Sprintf("open-signal-inverted contract mismatch: sent invert_open_signal=%t but the check returned open_signal_inverted=%t; holding this signal because the check script may have inverted a side Go did not ask for (redeploy with scripts/update.sh so Go and Python match)", sentInvert, result.OpenSignalInverted)
+			mode = scriptFailureError
+			result = nil
+		} else if msg := closedBarDecisionContractError(*sc, result.StrategyDecisionFields); msg != "" {
+			errMsg = msg
 			mode = scriptFailureError
 			result = nil
 		}
@@ -4349,15 +4411,22 @@ func executeHyperliquidResultDeferredOpen(sc StrategyConfig, s *StrategyState, r
 		}
 	}
 
-	exec, err := ExecutePerpsSignalWithLeverageDeferredOpen(s, result.Signal, result.Symbol, bookPrice, sizing, fillQty, fillOID, fillFee, EffectiveDirection(sc), bookCloseFraction, logger)
+	lotPolicy := newHLPaperLotPolicy(sc, result.Symbol, price, execResult != nil)
+	exec, err := executePerpsSignalWithLotPolicyDeferredOpen(s, result.Signal, result.Symbol, bookPrice, sizing, fillQty, fillOID, fillFee, EffectiveDirection(sc), bookCloseFraction, logger, lotPolicy)
 	if err != nil {
 		logger.Error("Trade execution failed: %v", err)
 		return 0, "", nil, nil
 	}
 	trades := exec.TradesExecuted
+	if trades == 0 && exec.HoldReason != "" {
+		if preCloseQty > 0 {
+			result.PaperPartialCloseHold = exec.HoldReason
+		}
+		return 0, "", nil, nil
+	}
 	if trades > 0 && paperSignalCloseOwnsUnifiedTier(sc, result) {
 		if pos := s.Positions[result.Symbol]; pos != nil && pos.Quantity > 0 && preCloseQty > pos.Quantity+1e-9 {
-			recordPaperUnifiedTPConsumption(sc, pos, preCloseQty, preCloseInit)
+			recordPaperUnifiedTPConsumptionAtLot(sc, pos, preCloseQty, preCloseInit, lotPolicy.bookedLot())
 		}
 	}
 	if trades > 0 && len(result.SizedCloseCanceledOIDs) > 0 {
@@ -4366,7 +4435,7 @@ func executeHyperliquidResultDeferredOpen(sc StrategyConfig, s *StrategyState, r
 		}
 	}
 	openTrade := exec.OpenTrade
-	stampEntryATRIfOpened(s, result.Symbol, result.Indicators)
+	closedBarStampEntryATR(sc, s, result.Symbol, openTrade != nil, result.StrategyDecisionFields, result.Indicators)
 	stampPositionRegimeIfOpened(s, result.Symbol, regimePayloadValue(result.Regime), sc, regime)
 	stampDirectionCertifiedAtOpenIfOpened(s, result.Symbol, openTrade != nil, sc, regime)
 	stampATRMethodAtOpenIfOpened(s, result.Symbol, openTrade != nil, sc, cfg)
@@ -4472,6 +4541,7 @@ func runTopStepCheck(sc StrategyConfig, prices map[string]float64, posCtx Positi
 	args = appendStrategyRegimeWindowArgs(args, sc, regime)
 	args = appendRegimePayloadArg(args, sc, regime)
 	args = appendATRMethodArg(args, atrMethod)
+	args = appendClosedBarDecisionArgs(args, sc, regime)
 	if refsArgs, err := buildStrategyRefsArg(sc, "", false); err != nil {
 		logger.Warn("Failed to marshal strategy refs: %v", err)
 	} else if len(refsArgs) > 0 {
@@ -4495,6 +4565,12 @@ func runTopStepCheck(sc StrategyConfig, prices map[string]float64, posCtx Positi
 		logger.RunningOnFailure(sc.Script, args)
 		logger.Error("Script returned error: %s", result.Error)
 		notifyScriptFailure(notifier, sc, scriptFailureError, result.Error)
+		return nil, "", 0, false
+	}
+	if msg := closedBarDecisionContractError(sc, result.StrategyDecisionFields); msg != "" {
+		logger.RunningOnFailure(sc.Script, args)
+		logger.Error("Script returned error: %s", msg)
+		notifyScriptFailure(notifier, sc, scriptFailureError, msg)
 		return nil, "", 0, false
 	}
 	clearScriptFailure(notifier, sc)
@@ -4623,7 +4699,7 @@ func executeTopStepResult(sc StrategyConfig, s *StrategyState, db *StateDB, resu
 		return 0, ""
 	}
 	trades := exec.TradesExecuted
-	stampEntryATRIfOpened(s, result.Symbol, result.Indicators)
+	closedBarStampEntryATR(sc, s, result.Symbol, exec.OpenTrade != nil, result.StrategyDecisionFields, result.Indicators)
 	stampPositionRegimeIfOpened(s, result.Symbol, regimePayloadValue(result.Regime), sc, regime)
 	stampDirectionCertifiedAtOpenIfOpened(s, result.Symbol, exec.OpenTrade != nil, sc, regime)
 	stampATRMethodAtOpenIfOpened(s, result.Symbol, exec.OpenTrade != nil, sc, cfg)
@@ -4665,6 +4741,7 @@ func runRobinhoodCheck(sc StrategyConfig, prices map[string]float64, posCtx Posi
 	args = appendStrategyRegimeWindowArgs(args, sc, regime)
 	args = appendRegimePayloadArg(args, sc, regime)
 	args = appendATRMethodArg(args, atrMethod)
+	args = appendClosedBarDecisionArgs(args, sc, regime)
 	if refsArgs, err := buildStrategyRefsArg(sc, "", false); err != nil {
 		logger.Warn("Failed to marshal strategy refs: %v", err)
 	} else if len(refsArgs) > 0 {
@@ -4688,6 +4765,12 @@ func runRobinhoodCheck(sc StrategyConfig, prices map[string]float64, posCtx Posi
 		logger.RunningOnFailure(sc.Script, args)
 		logger.Error("Script returned error: %s", result.Error)
 		notifyScriptFailure(notifier, sc, scriptFailureError, result.Error)
+		return nil, "", 0, false
+	}
+	if msg := closedBarDecisionContractError(sc, result.StrategyDecisionFields); msg != "" {
+		logger.RunningOnFailure(sc.Script, args)
+		logger.Error("Script returned error: %s", msg)
+		notifyScriptFailure(notifier, sc, scriptFailureError, msg)
 		return nil, "", 0, false
 	}
 	clearScriptFailure(notifier, sc)
@@ -4791,7 +4874,7 @@ func executeRobinhoodResult(sc StrategyConfig, s *StrategyState, db *StateDB, re
 		return 0, "", ""
 	}
 	trades := exec.TradesExecuted
-	stampEntryATRIfOpened(s, result.Symbol, result.Indicators)
+	closedBarStampEntryATR(sc, s, result.Symbol, exec.OpenTrade != nil, result.StrategyDecisionFields, result.Indicators)
 	stampPositionRegimeIfOpened(s, result.Symbol, regimePayloadValue(result.Regime), sc, regime)
 	stampDirectionCertifiedAtOpenIfOpened(s, result.Symbol, exec.OpenTrade != nil, sc, regime)
 	stampATRMethodAtOpenIfOpened(s, result.Symbol, exec.OpenTrade != nil, sc, cfg)
@@ -4846,6 +4929,7 @@ func runOKXCheck(sc StrategyConfig, prices map[string]float64, posCtx PositionCt
 	args = appendStrategyRegimeWindowArgs(args, sc, regime)
 	args = appendRegimePayloadArg(args, sc, regime)
 	args = appendATRMethodArg(args, atrMethod)
+	args = appendClosedBarDecisionArgs(args, sc, regime)
 	if refsArgs, err := buildStrategyRefsArg(sc, "", false); err != nil {
 		logger.Warn("Failed to marshal strategy refs: %v", err)
 	} else if len(refsArgs) > 0 {
@@ -4869,6 +4953,12 @@ func runOKXCheck(sc StrategyConfig, prices map[string]float64, posCtx PositionCt
 		logger.RunningOnFailure(sc.Script, args)
 		logger.Error("Script returned error: %s", result.Error)
 		notifyScriptFailure(notifier, sc, scriptFailureError, result.Error)
+		return nil, "", 0, false
+	}
+	if msg := closedBarDecisionContractError(sc, result.StrategyDecisionFields); msg != "" {
+		logger.RunningOnFailure(sc.Script, args)
+		logger.Error("Script returned error: %s", msg)
+		notifyScriptFailure(notifier, sc, scriptFailureError, msg)
 		return nil, "", 0, false
 	}
 	clearScriptFailure(notifier, sc)
@@ -5002,7 +5092,7 @@ func executeOKXResult(sc StrategyConfig, s *StrategyState, db *StateDB, result *
 		return 0, "", ""
 	}
 	trades := exec.TradesExecuted
-	stampEntryATRIfOpened(s, result.Symbol, result.Indicators)
+	closedBarStampEntryATR(sc, s, result.Symbol, exec.OpenTrade != nil, result.StrategyDecisionFields, result.Indicators)
 	stampPositionRegimeIfOpened(s, result.Symbol, regimePayloadValue(result.Regime), sc, regime)
 	stampDirectionCertifiedAtOpenIfOpened(s, result.Symbol, exec.OpenTrade != nil, sc, regime)
 	stampATRMethodAtOpenIfOpened(s, result.Symbol, exec.OpenTrade != nil, sc, cfg)

@@ -11,22 +11,24 @@ import (
 )
 
 type StrategyDecisionFields struct {
-	StopLossPrice      float64        `json:"sl_price,omitempty"`
-	ATRValue           float64        `json:"atr_value,omitempty"`
-	OpenStrategy       string         `json:"open_strategy,omitempty"`
-	CloseStrategies    []string       `json:"close_strategies,omitempty"`
-	OpenAction         string         `json:"open_action,omitempty"`
-	CloseFraction      float64        `json:"close_fraction"`
-	CloseStrategy      string         `json:"close_strategy,omitempty"`
-	CloseEvaluator     string         `json:"close_evaluator,omitempty"`
-	CloseReason        string         `json:"close_reason,omitempty"`
-	CloseSource        string         `json:"close_source,omitempty"`
-	TPTier             interface{}    `json:"tp_tier,omitempty"`
-	CloseGate          string         `json:"close_gate,omitempty"`
-	CloseOwner         string         `json:"close_owner,omitempty"`
-	CloseTierFillPrice float64        `json:"close_tier_fill_price,omitempty"`
-	OpenSignalInverted bool           `json:"open_signal_inverted,omitempty"`
-	Regime             *RegimePayload `json:"regime,omitempty"`
+	StopLossPrice      float64            `json:"sl_price,omitempty"`
+	ATRValue           float64            `json:"atr_value,omitempty"`
+	OpenStrategy       string             `json:"open_strategy,omitempty"`
+	CloseStrategies    []string           `json:"close_strategies,omitempty"`
+	OpenAction         string             `json:"open_action,omitempty"`
+	CloseFraction      float64            `json:"close_fraction"`
+	CloseStrategy      string             `json:"close_strategy,omitempty"`
+	CloseEvaluator     string             `json:"close_evaluator,omitempty"`
+	CloseReason        string             `json:"close_reason,omitempty"`
+	CloseSource        string             `json:"close_source,omitempty"`
+	TPTier             interface{}        `json:"tp_tier,omitempty"`
+	CloseGate          string             `json:"close_gate,omitempty"`
+	CloseOwner         string             `json:"close_owner,omitempty"`
+	CloseTierFillPrice float64            `json:"close_tier_fill_price,omitempty"`
+	OpenSignalInverted bool               `json:"open_signal_inverted,omitempty"`
+	Regime             *RegimePayload     `json:"regime,omitempty"`
+	ClosedBar          *ClosedBarDecision `json:"closed_bar_decision,omitempty"`
+	DecisionRegime     *RegimePayload     `json:"decision_regime,omitempty"`
 }
 
 type PositionCtx struct {
@@ -107,9 +109,13 @@ func appendOpenCloseArgs(args []string, sc StrategyConfig, pos PositionCtx) []st
 	return out
 }
 
+func sendsStrategyRefs(sc StrategyConfig) bool {
+	return effectiveOpenStrategy(sc) != "" || sc.CloseStrategy != nil
+}
+
 func buildStrategyRefsArg(sc StrategyConfig, closeOwner string, invertOpen bool) ([]string, error) {
 	openName := effectiveOpenStrategy(sc)
-	if openName == "" && sc.CloseStrategy == nil {
+	if !sendsStrategyRefs(sc) {
 		return nil, nil
 	}
 	payload := map[string]interface{}{}

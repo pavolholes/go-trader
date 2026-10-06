@@ -54,7 +54,7 @@ cd go-trader
 uv sync --no-dev
 ```
 
-This installs a service host. In a development checkout or worktree, run `uv sync`.
+This installs a service host. In a development checkout or worktree, run `uv sync`, which also installs the test tools (`pytest`, `pytest-mock`, `pytest-xdist`) from the `dev` dependency group.
 
 If the repo already exists, ask whether to reconfigure, update, or do a fresh install before changing it.
 
@@ -119,6 +119,23 @@ Tier triggers use entry ATR.
 Scope: Hyperliquid perps and `type=manual`.
 Backtestable.
 In live mode only (paper places no venue order and must match the backtester), the Hyperliquid check script rewrites a partial close whose lot-floored quantity is zero or whose value at the check-time price is below the venue minimum order value plus a 3% safety margin (the execute-side market close submits at 1% limit slippage and the price can drift before submission) to a noop (`close_gate: below_venue_minimum`); a full close is never rewritten (`current_close_fraction` snaps a final tier within `1e-9` of the whole remainder to exactly `1.0`), and the gate is skipped when the lot size cannot be resolved (adapter meta, else the `/tmp/hl_meta.json` cache under `market_feed=websocket`, never a fetch).
+Paper Hyperliquid perps (#1716) book synthetic entries, flips, scale-in adds and partial closes (signal partials and paper take-profit tier fills) at venue lot sizes (`scheduler/hyperliquid_paper_lot.go`).
+The scheduler reads `universe[].szDecimals` for the exact coin from the public `meta` request through `hlPostInfoTo` (`scheduler/hyperliquid_lot_metadata.go`), at the endpoint the adapter uses (`HYPERLIQUID_TESTNET=1` selects testnet).
+The refresh runs outside `mu`, before the execute lock (and in the paper no-signal upkeep of a strategy with `sl_after` rules), and only one refresh per endpoint runs at a time.
+It is charged to the websocket feed ledger when one exists, else to a local enforced ledger of 4 requests a minute, with reason `lot_metadata`.
+A snapshot is refreshed after 1 hour and expires after 6 hours; a failed refresh retries after 30 seconds, doubling up to 10 minutes; a response above 8 MiB is refused.
+A valid `szDecimals` of 0 is a lot size; an absent, null, non-integer, negative, above-12 or duplicated entry is refused for that coin.
+Each quantity is floored the way `adapter.floor_lot_size` floors it (`hlFloorLotSize`: the shortest decimal string plus 1e-9 lot of slack, Python's 28-digit decimal context).
+An entry or add holds when its floored quantity is 0 or its floored value at the booked price is below $10.30 ($10 plus the 3% margin).
+A partial close holds on the same test at the decision price (the cycle mid), and a value equal to $10.30 passes, as in the live gate; a tier fill still books at the tier price.
+A held order writes nothing: no cash, fee, trade, risk result, tier consumption, position stamp or alert, and a held partial close never opens the other side.
+When the lot size is unknown (no snapshot, expired, coin absent or entry refused) these orders hold, and one `[hl-lot]` line is logged per endpoint and coin until the lot size returns, which logs one `restored` line.
+Full signal closes, full stops and paper kill-switch and circuit-breaker flattening still close the whole book, also for unrounded legacy positions and during an outage.
+A flip books its full close and holds only the new open when that open fails the test, the same as an open refused for cash.
+A cycle whose partial close holds (for example a sub-lot leftover that the close evaluator asks for again after a floored tier) runs the paper no-signal upkeep (`runPaperHLQuietCycleMaintenance`: dynamic-regime stop re-arm and breach, then the `sl_after` move), as live does when its close gate rewrites the same close to a noop.
+A paper tier counts as cleared, for `sl_after` and for unified take-profit consumption, when the closed ratio reaches the threshold within `1e-9` or when the quantity still missing to the threshold floors to zero lots at the coin's lot size (`paperTierClearedByLot`); a close more than one lot short does not clear it, and replay-mirror strategies keep the exact ratio test.
+Confirmed live fills and replay-mirror rows keep their booked quantities.
+Remaining differences, pinned by `TestHLPaperLotParityWithLiveGateAndBacktester` (`-tags pyintegration`): live opens round to the nearest lot, the execution-spec backtester reserves the taker fee before it floors an entry and rejects scale-in, no path gates a full close, and the paper tier price can differ from the decision price.
 A **full close on a shared coin** (two or more live HL perps strategies on the coin) is sent as a sized close to protect peer exposure.
 Every sized execute-lane close (a partial close, a shared-coin full close, a legacy reverse-signal close with close fraction 0, a `type=manual` cycle close and an operator `manual-close`) takes its size and order type from `planHLCloseOrder` (`scheduler/hyperliquid_close_plan.go`).
 The key is the strategy's side and book, the peers' books on the coin split by side (hedge legs and `type=manual` peers included, `hlPeerBooksOnCoin`) and the signed on-chain net `S`.
@@ -359,7 +376,7 @@ The build version comes from the tree, or from the `--rsync-from` source when th
 A git failure names the tree, its owner, the account that ran git, and the git error.
 `scripts/test_migrate_service_layout_fixture.sh` (scenario `update`; Linux systemd host, run by the `shell-suites` CI job) proves the update, the rollback, the feed build and `--all` on such trees.
 
-**`--rsync-from <src>`** replaces `git pull --ff-only` with an rsync from a source clone. It preserves `.git/`, `scheduler/config.json` (or its transition symlink), `state.db` and its WAL sidecars, `.venv/`, and the live binary. Use it when the deployment directory has local changes or was not cloned from origin. Before the restart it warns on stderr about any required `EnvironmentFile=` the unit declares but the disk does not have; optional entries prefixed with `-` are skipped silently.
+**`--rsync-from <src>`** replaces `git pull --ff-only` with an rsync from a source clone. It preserves `.git/`, `scheduler/config.json` (or its transition symlink), `state.db` and its WAL sidecars, `.venv/`, the top-level `logs/` directory (the systemd unit's `ReadWritePaths` needs it), and the live binary. Use it when the deployment directory has local changes or was not cloned from origin. Before the restart it warns on stderr about any required `EnvironmentFile=` the unit declares but the disk does not have; optional entries prefixed with `-` are skipped silently.
 
 **Signal mode** (`--restart-mode signal` or `RESTART_MODE=signal`) SIGTERMs the PID in `GO_TRADER_PIDFILE` (default `./go-trader.pid`), respawns through `GO_TRADER_RUN_SH` (default `./run.sh`), then polls `/health` and PID freshness with the same verify-and-rollback flow as systemd mode. Generate a starter `run.sh` with `bash scripts/create-run-sh.sh`. Other signal-mode variables: `GO_TRADER_SIGNAL_LOG`. When systemd mode meets a missing unit (systemctl exit 5), update.sh retries in signal mode automatically if `go-trader.pid` and an executable `run.sh` are present.
 
@@ -426,6 +443,10 @@ Never apply a runtime-default change silently when the operator has not been sho
 
 When in doubt, treat a commit as a runtime default and prompt. Per-release narrative for every archived entry lives in [`docs/POST_UPDATE_HISTORY.md`](docs/POST_UPDATE_HISTORY.md); regenerate a fresh candidate list from `git log --oneline -50`.
 
+- **`closed_bar_decisions` (#1712, new opt-in field).** Dormant until set; with it off nothing changes. After an update, mention it and, only if the operator wants backtest-aligned decisions, offer it on a new paper strategy ID (entries can start up to one bar later). Warn before the restart if a config names a custom check script, because the probe now sends `--closed-bar-decisions` and `--decision-regime-timeframe`, and update a `market_feed: shared` feed service in the same release.
+- **Paper Hyperliquid perps book venue lot sizes (#1716, runtime default, no opt-out).** Paper HL perps entries, flips, scale-in adds and partial closes (tier fills included) now floor to the coin's `szDecimals`, and hold with no book write when the floored order is 0 or below $10.30 or when the lot size is unknown. Full closes, stops and kill-switch flattening are unchanged. After an update, list every paper HL perps strategy and its open positions, tell the operator that paper results before and after this update are not comparable (recommend a new paper strategy ID when a clean comparison matters), and check the start log for `[hl-lot] ... unavailable` lines. No config, `state.db` or Python change; deploy with `bash scripts/update.sh --restart`.
+- **Args parameter flags warn at load when `--strategy-refs` supersedes them (#1711, runtime default with no behavior shift).** After an update, run `./go-trader inspect --all` (or read the start log), list each strategy that shows the new `[WARN]` with the unused args entry, and prompt per strategy: delete the entry (trading unchanged), or move the value into `open_strategy.params` or the matching field (trading changes, so recommend a new paper strategy ID). Apply an approved edit only with a restart, because an args change blocks SIGHUP hot reload. Default if the operator declines: nothing changes, and the warning repeats on each start.
+
 | Category | How to recognize it | What to do |
 | --- | --- | --- |
 | Auto-migration | `CurrentConfigVersion` bumped; the loader rewrites the JSON on next start | Summarize. No prompt. Warn that a rewrite replaces a still-symlinked `scheduler/config.json` with a regular file |
@@ -485,6 +506,7 @@ Global slash commands register at startup, covering every guild the bot is in pl
 **Read-only** — any guild or DM, anyone. They read live in-process state with no HTTP round trip. Replies are public in-channel unless `discord.ephemeral_replies: true`.
 
 `/go-trader-status`, `/go-trader-health`, `/go-trader-positions`, `/go-trader-pnl`, `/go-trader-leaderboard [top]`, `/go-trader-circuit-breakers`, `/go-trader-dead-strategies`, `/go-trader-correlation`, `/go-trader-closing-strategies`. The four that fetch live marks (`status`, `positions`, `pnl`, `leaderboard`) defer the ACK so they do not blow Discord's 3-second deadline.
+`scripts/post-paper-leaderboards.py --port <paper status_port> --channel <Discord channel id> [--top N] [--dry-run]` posts the cross-coin paper leaderboard to Discord from the paper service's status API, reading `DISCORD_BOT_TOKEN` (and `GO_TRADER_STATUS_TOKEN` when the status server has a token); a 10-minute sentinel file dedupes repeat posts.
 
 **Ops and mutating ops** — owner-only AND DM-only:
 
@@ -550,7 +572,7 @@ Mandatory `trades` accounting columns missing = refused (no migration runs); inv
 The output must not exist (symlinks and hard links included), must not use a sidecar name, and must sit outside the snapshot, state and configuration directories; it is written to a private staging file beside it and linked into place without replacement only after every input is re-verified.
 A killed export leaves no output, at most a `.<name>.<hex>.staging` file.
 
-**Contract (schema `go-trader.booked-ledger`, `schema_version` 1).** Required top-level fields: `inspected_revision` (the binary's source commit from `-X main.SourceCommit`, which `update.sh` stamps from the exported commit; else `null`, never the version label), `capture_manifest_sha256`, `time_basis` `UTC`, `timestamp_meanings`, `selection`, `capture`, `snapshot_files`, `current_effective_configuration` (basis `current_at_capture`: selected strategy, `regime`, partition `portfolio_risk`; no tokens or credentials), `events` and `wallet_orphan_context`.
+**Contract (schema `go-trader.booked-ledger`, `schema_version` 1).** Required top-level fields: `inspected_revision` (the binary's source commit from `-X main.SourceCommit`, which `update.sh` stamps from the exported commit; else `null`, never the version label), `capture_manifest_sha256`, `time_basis` `UTC`, `timestamp_meanings`, `selection`, `capture`, `snapshot_files`, `current_effective_configuration` (basis `current_at_capture`: selected strategy, `regime`, partition `portfolio_risk`, and the optional `atr_method` object with the strategy value, the root value and the method `resolveATRMethod` resolves; no tokens or credentials), `events` and `wallet_orphan_context`.
 Events are the selected strategy's every `trades` row in `rowid` order (keyset pages of 500 in one transaction); `event_key` = `<source_role>/trades/<rowid>`, unique only within its manifest.
 Every data field is `{value, raw_value, status, reason, provenance[]}`: status `available`/`unavailable`/`not_applicable`, reason `column_absent`/`stored_null`/`unstamped`/`not_recorded`/`ambiguous_evidence`/`not_applicable`.
 Stored amounts, gross flags, fees (zero and negative kept) and identifiers are copied, never recomputed; order ids are decimal strings.
@@ -587,7 +609,20 @@ Each version 2 segment declares `basis` (`raw_config`: the strategy as written; 
 Every entry has `status` (`verified` needs a nonempty `source`) and `value`; presence entries add `present`, with verified absence as `present: false, value: null` and an explicit zero kept distinct.
 A loader-resolved value never proves a field was explicit.
 The optional top-level `initial_stop_geometry_evidence` maps a booked event key to `{status, source, stamp: "initial_entry"}`.
+The optional version 2 segment field `atr_defaults.root_atr_method` (a presence entry) is the root `atr_method`; the loader never stamps it into the strategy.
 The report records the input version it read.
+
+**ATR method.** The comparison resolves the method as live does: the strategy `atr_method`, else a verified root value, else `simple` only when the root value is verified absent.
+The resolution and its evidence requirement apply only when the simulation reads ATR (a close strategy or an ATR stop owner).
+With no strategy value and no verified root evidence (always the case for a version 1 input without a strategy value), the run is refused with `atr_method_unverified`; approximate mode substitutes the declared root value or `simple` and lists it.
+A strategy value or a declared root value (verified or not) other than `simple` or `wilder` is `atr_configuration_invalid` in both modes, also when the simulation reads no ATR, because live config validation rejects it at either level; it is never approximated.
+The report `atr_method` section holds the method, its source (`strategy`, `root`, `live_default`, `unverified_substitute` or `not_used`) and the evidence.
+Wilder ATR is recursive, so the indicator-history check needs a long warm-up when an ATR stop owner is active (1500 hourly bars passed in issue 1682's production run; 400 did not).
+
+**Decision timing (#1712).** The historical strategy's `closed_bar_decisions` is a capability row (`decision_timing`) and the report `timestamps.decision_timing` section.
+`true` is modeled: live decision inputs use the bar the simulator decides on, but a booked record time can still trail the bar boundary (per-strategy timer, entry gates, retries), and under `market_feed: websocket` or `shared` a decision can read a closed bar before a later venue correction.
+`false` or omitted is legacy runtime timing, reported as informational with the limitation that a closed-bar simulation cannot establish forming-bar decision parity without recorded decision evidence.
+A non-boolean value is refused; recognizing the flag never removes another refusal.
 
 **Stops.** `resolve_historical_stops` builds one stop context per segment.
 `raw_config` runs `run_backtest.resolve_raw_config_stops`, the in-memory resolver the file loader also uses: normalization, the verified user close and regime-ATR defaults, then the scalar ATR default, the drawdown fallback and one percent conversion.
@@ -1070,6 +1105,7 @@ Per-strategy:
 | `paused` | all | `false`. Holds opens, adds and flips while closes, trailing stop, ratchet and protection sync keep running. Hot-reloadable always, including while open. Shows `⏸️ paused:` in Discord `/status`. |
 | `allow_no_edge` | all but options | JSON boolean only. Required to admit an effective `no_edge` open or close-fallback reference outside explicit `--mode=paper`; an explicit `false` stays refused. Live use still warns. Adding or removing it on a live strategy is restart-required (SIGHUP refuses it before admission); paper changes hot-reload. Replaces `allow_deprecated`, which v20 migration removes. |
 | `htf_filter` | all | Skips counter-trend signals. Restart-required. |
+| `closed_bar_decisions` | Binance.US spot, OKX spot/perps, HL perps; opt-in | JSON boolean, default `false`. The signal, the exported entry ATR and entry sizing come from the last bar closed at or before the check's evaluation cutoff, as in the backtester; stops, trailing stops, ratchets and take-profits keep the current mark, ATR and regime. Missing or unverifiable closed history holds candle-derived opens and closes while protection continues. **Restart-required.** § Closed-Bar Decisions. |
 | `open_strategy` | all | `{name, params}`; otherwise the name comes from `args[0]` |
 | `close_strategy` | all | The single exit ref `{name, params}`; nil = open-as-close. A legacy `close_strategies` array of length ≤1 still parses, length >1 is rejected. |
 | `direction` | perps | `"long"` (default), `"short"` (opens shorts only), `"both"`. Hot-reloadable when flat. |
@@ -1328,6 +1364,7 @@ Both binaries must be one release with the ownership-lock contract, and **both u
 4. **Rollback.** With both units stopped, `--rollback` restores the retained config and drop-in and never touches a database, so the paper strategies come back under their bare ids; the paper source config is never rewritten. Records the combined process wrote to either file after cutover stay in that file.
 
 **Folding into a new paper service.** `--new-target <name> --status-port <n>` (exclusive with `--live`) folds every `--source` and the optional `--paper` deployment into a new template service `go-trader@<name>`, so no folded deployment becomes the combined one and keeps a coin name and port.
+`--status-port` must lie in the range the scheduler loads, `statusPortMinimum` through `65535 - statusPortMaxAttempts + 1` (1024 through 65531 today), which the script reads from `scheduler/server.go`; any other value, or an unreadable bound, exits 2 before any temporary file or check, `--diff` included.
 The target's own `live` and default `paper` scopes hold no strategy unless `--paper` is given.
 Preflight refuses with exit 19 when `/opt/go-trader-<name>`, `/var/lib/go-trader/<name>`, the unit file or its drop-in directory already exists, when the unit is enabled, masked, active or failed (the refusal names `systemctl reset-failed` for a failed unit), when a folded unit does not load from the installed `go-trader@.service`, when the folded units run as different users, when the installed template or journald namespace config differs from the release's copy, when the first folded deployment has no git `origin`, has uncommitted changes to tracked files, or runs a commit that no `origin` branch contains (a branch checkout needs its own `origin` branch to contain it; a detached checkout uses the default branch, else the first `origin` branch that contains it), when a running process has bound `--status-port`, and when two folded `.env` files give one variable different values (the refusal names the variable, never a value).
 Different releases still exit 11 and different `config_version`s exit 18.
@@ -1447,6 +1484,39 @@ When a circuit-breaker close books a row from the model rather than a real fill,
 If the coin goes flat on-chain while the row still covers only part of the close, the residual was finished by another mechanism such as a resting stop. That raises an owner alert, at most once a day per strategy and symbol, saying that the trade row, `closed_positions`, and cash are inconsistent. Fix it with `backfill trade-ledger` or reconcile by hand.
 
 ---
+
+## Closed-Bar Decisions
+
+`closed_bar_decisions: true` (#1712) makes a strategy decide on the last closed bar, the bar the backtester trades from (signal at bar N, fill at the open of bar N+1, entry ATR of bar N).
+It is off by default; the default stays off until a paper comparison measures the effect.
+
+**Supported scope.** Binance.US spot (`shared_scripts/check_strategy.py`), OKX spot and perps (`shared_scripts/check_okx.py`) and Hyperliquid perps (`shared_scripts/check_hyperliquid.py`), legacy and composed strategies, on the fixed-duration timeframes `1m`, `3m`, `5m`, `15m`, `30m`, `1h`, `2h`, `4h`, `6h`, `8h`, `12h` and `1d` (Hyperliquid: only its own intervals).
+`loadConfig` refuses the flag on `manual`, options, TopStep, Robinhood, a custom check script, another timeframe, a higher-timeframe filter or regime timeframe outside that list, `delta_neutral_funding`, `open_interest_breakout`, `funding_skew` on OKX, and `regime_directional_policy`, `regime_window_divergence` or `regime_profile_allocation` (those resolve before the check runs, so they would read the current regime).
+A replay mirror with the flag needs an explicit `replay_source_id`, and a named mirror and its source must agree on the flag.
+Changing the flag is restart-required; SIGHUP refuses it.
+
+**Closure.** The check captures one evaluation cutoff: the sealed snapshot's deadline (or its seal time when earlier or absent) in `market_feed: websocket|shared`, or the clock before the fetch in REST mode.
+A bar is closed when its close boundary is at or before the cutoff; a final row that is already closed is kept.
+Hyperliquid rows keep their native `t` and `T` (`T = t + interval - 1`), and the sealed payload carries a per-row `timing` sidecar plus `decision_cutoff_ms` only for frames an enabled strategy requests; Binance.US and OKX use the ccxt opening time plus the fixed interval.
+The row timestamps a strategy sees are unchanged.
+Unknown or contradictory timing, duplicate or overlapping bars, invalid prices, fewer than 30 closed bars, a payload without timing (an older producer), a missing dependency or a failed regime or higher-timeframe candle fetch hold the candle decision: the check returns `closed_bar_decision.held: true`, no open and no candle-derived close, and composed close evaluators still run on current inputs.
+A sealed-feed check never falls back to a private fetch.
+Limitation under `market_feed: websocket` and `shared`: the seal settles 5s after the deadline, while the first closed-bar correction read starts at close+5s, so the first check after a boundary usually decides on the socket-stored bar before any correction (§ Closed-bar correction); a venue revision that lands later reaches only later seals, so a booked open, its sizing and its entry ATR can differ from the backtester's corrected bar.
+A later check on the same bar re-evaluates the corrected values (Repeat rule). `market_feed: rest` fetches after the boundary and has no such gap.
+Enabled strategies request one more raw row (signal, higher-timeframe and regime frames) so the closed view keeps the same history length.
+
+**Decision and protection views.** On the closed view: the open strategy, candle-derived closes (legacy signals and unknown-close fallbacks), `indicators.atr` (the strategy's own ATR column, else the `atr_method` ATR), the higher-timeframe filter (bars closed by the decision boundary), `funding_skew` records (time at or before the boundary), and the decision regime, computed in the check from the regime timeframe's closed bars and returned as `decision_regime`.
+The regime gate and the Hurst gate read `decision_regime`; a missing one holds position-increasing signals even when `regime_gate_on_failure` is `open`.
+On the current view: the price and mark override, the market ATR, the injected regime and AVWAP passed to close evaluators, the regime store, position regime stamps, divergence, dynamic exits and every Go protection path.
+Entry sizing and `Position.EntryATR` both read the closed `indicators.atr`; an existing position keeps a nonzero entry ATR, and a zero entry ATR is stamped from the next check whose decision is not held, so ATR stops still arm.
+An enabled replay mirror sizes and stamps from the source row's `entry_atr`; an open row without a valid one is not booked: the mirror sends an `open-without-entry-atr` drift alert, marks the row applied and applies the later rows.
+
+**Repeat rule.** There is no consumed-bar watermark.
+Every due check re-evaluates the selected closed bar against the current position and gates, so a gate hold, a failed check or a failed execution retries the same bar on the next check, and existing same-side guards, scale-in rules and fill confirmation stay authoritative.
+
+**Contract.** Go sends `--closed-bar-decisions` (and `--decision-regime-timeframe=<tf>` when regime is on) and requires the `closed_bar_decision` block back; a missing or unexpected block is a script error that holds the signal.
+In a Hyperliquid batch the slot carries `closed_bar_decisions: true`, mixed slots share the raw frame and each selects its own view, and shared-state failure falls back to per-strategy checks in the same cycle.
+With the flag off the argv, the batch slot and the check output (apart from its generated timestamp) are unchanged.
 
 ## Hyperliquid Batched Signal Checks
 
