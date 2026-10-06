@@ -43,8 +43,8 @@ func TestRunBloFinCheckPassesNoEdgeAcknowledgement(t *testing.T) {
 	acknowledged := true
 	sc := StrategyConfig{
 		ID: "live-no-edge-btc", Platform: "blofin", Type: "perps",
-		Script: "shared_scripts/check_blofin.py",
-		Args: []string{"sma_crossover", "BTC", "1h", "--mode=live"},
+		Script:      "shared_scripts/check_blofin.py",
+		Args:        []string{"sma_crossover", "BTC", "1h", "--mode=live"},
 		AllowNoEdge: &acknowledged,
 	}
 	logger := &StrategyLogger{stratID: sc.ID, writer: io.Discard}
