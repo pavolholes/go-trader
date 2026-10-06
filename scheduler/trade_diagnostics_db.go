@@ -38,12 +38,23 @@ func insertTradeDiagnosticsRowAs(exec sqlExecer, row *TradeDiagnosticsRow, stora
 	if row == nil {
 		return fmt.Errorf("nil diagnostics row")
 	}
+	captureBasis := row.CaptureBasis
+	if captureBasis == "" {
+		captureBasis = "price_only"
+	}
 	res, err := exec.Exec(`INSERT INTO trade_diagnostics
 			(strategy_id, position_id, symbol, side, timeframe, regime_at_open, close_reason,
+			 close_source, close_evaluator, close_evaluator_reason, close_tp_tier, close_sl_trigger_px, capture_basis,
 			 entry_price, exit_price, quantity, realized_pnl, entry_atr, stop_loss_atr_mult,
 			 opened_at, closed_at, metrics_status, llm_verdict, hurst_at_open, hurst_size_mult)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			VALUES (
+				?, ?, ?, ?, ?, ?, ?, ?,
+				?, ?, ?, ?, ?, ?, ?, ?,
+				?, ?, ?, ?, ?, ?, ?, ?,
+				?
+			)`,
 		storageID, row.PositionID, row.Symbol, row.Side, row.Timeframe, row.RegimeAtOpen, row.CloseReason,
+		row.CloseSource, row.CloseEvaluator, row.CloseEvaluatorReason, row.CloseTPTier, nullableFloat64(row.CloseSLTriggerPx), captureBasis,
 		row.EntryPrice, row.ExitPrice, row.Quantity, row.RealizedPnL, row.EntryATR, nullableFloat64(row.StopLossATRMult),
 		formatTime(row.OpenedAt), formatTime(row.ClosedAt), row.MetricsStatus, nullableString(row.LLMVerdict),
 		nullableFloat64(row.HurstAtOpen), nullableFloat64(row.HurstSizeMult))
@@ -92,6 +103,7 @@ func (sdb *StateDB) TradeDiagnosticsRows(strategyID string) ([]TradeDiagnosticsR
 		return nil, fmt.Errorf("state db unavailable")
 	}
 	query := `SELECT rowid, strategy_id, position_id, symbol, side, timeframe, regime_at_open, close_reason,
+			close_source, close_evaluator, close_evaluator_reason, close_tp_tier, close_sl_trigger_px, capture_basis,
 			entry_price, exit_price, quantity, realized_pnl, entry_atr, stop_loss_atr_mult,
 			opened_at, closed_at, mfe_price, mae_price, favorable_pct, adverse_pct, capture_ratio,
 			metrics_status, llm_verdict
@@ -120,6 +132,7 @@ func (sdb *StateDB) TradeDiagnosticsRowsPage(strategyID string, limit, offset in
 	}
 	countQuery := `SELECT COUNT(*) FROM trade_diagnostics`
 	query := `SELECT rowid, strategy_id, position_id, symbol, side, timeframe, regime_at_open, close_reason,
+			close_source, close_evaluator, close_evaluator_reason, close_tp_tier, close_sl_trigger_px, capture_basis,
 			entry_price, exit_price, quantity, realized_pnl, entry_atr, stop_loss_atr_mult,
 			opened_at, closed_at, mfe_price, mae_price, favorable_pct, adverse_pct, capture_ratio,
 			metrics_status, llm_verdict
@@ -157,11 +170,12 @@ func (sdb *StateDB) scanTradeDiagnosticsRows(rows *sql.Rows) ([]TradeDiagnostics
 	var out []TradeDiagnosticsRow
 	for rows.Next() {
 		var r TradeDiagnosticsRow
-		var slMult, mfe, mae, fav, adv, capture sql.NullFloat64
+		var slMult, slTrigger, mfe, mae, fav, adv, capture sql.NullFloat64
 		var openedAt, closedAt string
 		var verdict sql.NullString
 		if err := rows.Scan(&r.RowID, &r.StrategyID, &r.PositionID, &r.Symbol, &r.Side, &r.Timeframe,
-			&r.RegimeAtOpen, &r.CloseReason, &r.EntryPrice, &r.ExitPrice, &r.Quantity, &r.RealizedPnL,
+			&r.RegimeAtOpen, &r.CloseReason, &r.CloseSource, &r.CloseEvaluator, &r.CloseEvaluatorReason,
+			&r.CloseTPTier, &slTrigger, &r.CaptureBasis, &r.EntryPrice, &r.ExitPrice, &r.Quantity, &r.RealizedPnL,
 			&r.EntryATR, &slMult, &openedAt, &closedAt, &mfe, &mae, &fav, &adv, &capture,
 			&r.MetricsStatus, &verdict); err != nil {
 			return nil, fmt.Errorf("scan trade diagnostics: %w", err)
@@ -169,6 +183,13 @@ func (sdb *StateDB) scanTradeDiagnosticsRows(rows *sql.Rows) ([]TradeDiagnostics
 		r.OpenedAt = parseTime(openedAt)
 		r.ClosedAt = parseTime(closedAt)
 		r.StopLossATRMult = nullFloatPtr(slMult)
+		r.CloseSLTriggerPx = nullFloatPtr(slTrigger)
+		if r.CloseSource == "" {
+			r.CloseSource = diagnosticCloseSource(r.CloseReason)
+		}
+		if r.CaptureBasis == "" {
+			r.CaptureBasis = "price_only"
+		}
 		r.MFEPrice = nullFloatPtr(mfe)
 		r.MAEPrice = nullFloatPtr(mae)
 		r.FavorablePct = nullFloatPtr(fav)
@@ -301,6 +322,7 @@ func (sdb *StateDB) TradeDiagnosticsRowsPageForStrategies(ids []string, limit, o
 		return nil, 0, fmt.Errorf("count trade diagnostics: %w", err)
 	}
 	query := `SELECT rowid, strategy_id, position_id, symbol, side, timeframe, regime_at_open, close_reason,
+			close_source, close_evaluator, close_evaluator_reason, close_tp_tier, close_sl_trigger_px, capture_basis,
 			entry_price, exit_price, quantity, realized_pnl, entry_atr, stop_loss_atr_mult,
 			opened_at, closed_at, mfe_price, mae_price, favorable_pct, adverse_pct, capture_ratio,
 			metrics_status, llm_verdict

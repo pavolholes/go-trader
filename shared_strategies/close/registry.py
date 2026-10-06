@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import json
 import os
 import sys
 from typing import Any, Callable, Dict, Optional, Tuple
@@ -28,6 +29,10 @@ from zscore_target import evaluate as zscore_target_evaluate
 from avwap_stop import evaluate as avwap_stop_evaluate
 
 VALID_PLATFORMS: Tuple[str, ...] = ("spot", "futures", "options")
+VALID_PLATFORM_KEYS: Tuple[str, ...] = (*VALID_PLATFORMS, "blofin-perps")
+
+with open(os.path.join(_THIS_DIR, "support_matrix.json"), encoding="utf-8") as _support_file:
+    CLOSE_SUPPORT_MATRIX = json.load(_support_file)
 
 STRATEGIES: Dict[str, Dict[str, Any]] = {}
 
@@ -36,18 +41,30 @@ def register(
     name: str,
     description: str,
     default_params: dict,
-    platforms: Tuple[str, ...] = VALID_PLATFORMS,
+    platforms: Optional[Tuple[str, ...]] = None,
 ) -> Callable:
     if name in STRATEGIES:
         raise ValueError(f"Close strategy '{name}' is already registered")
-    platforms = tuple(platforms)
+    platforms = tuple(platforms or VALID_PLATFORMS)
+    blofin_support = (
+        CLOSE_SUPPORT_MATRIX.get("platforms", {})
+        .get("blofin-perps", {})
+        .get(name, {
+            "supported": False,
+            "required_context": [],
+            "stop_owner": "",
+            "notes": "No BloFin support entry is declared.",
+        })
+    )
+    if blofin_support.get("supported"):
+        platforms = (*platforms, "blofin-perps")
     if not platforms:
         raise ValueError(f"{name}: platforms must be non-empty")
-    bad = set(platforms) - set(VALID_PLATFORMS)
+    bad = set(platforms) - set(VALID_PLATFORM_KEYS)
     if bad:
         raise ValueError(
             f"{name}: unknown platforms {sorted(bad)}; "
-            f"expected subset of {VALID_PLATFORMS}"
+            f"expected subset of {VALID_PLATFORM_KEYS}"
         )
 
     def decorator(fn):
@@ -56,6 +73,7 @@ def register(
             "description": description,
             "default_params": dict(default_params),
             "platforms": platforms,
+            "support": {"blofin-perps": dict(blofin_support)},
         }
         return fn
 
@@ -63,15 +81,16 @@ def register(
 
 
 def build_close_registry(platform: str) -> Dict[str, Dict[str, Any]]:
-    if platform not in VALID_PLATFORMS:
+    if platform not in VALID_PLATFORM_KEYS:
         raise ValueError(
-            f"Unknown platform {platform!r}; expected one of {VALID_PLATFORMS}"
+            f"Unknown platform {platform!r}; expected one of {VALID_PLATFORM_KEYS}"
         )
     return {
         name: {
             "fn": entry["fn"],
             "description": entry["description"],
             "default_params": dict(entry["default_params"]),
+            "support": {k: dict(v) for k, v in entry.get("support", {}).items()},
         }
         for name, entry in STRATEGIES.items()
         if platform in entry["platforms"]
@@ -106,6 +125,10 @@ def _normalize_result(name: str, result: Optional[dict]) -> dict:
             atr_value = 0.0
         if atr_value > 0:
             out["atr_value"] = atr_value
+
+    tier = result.get("tp_tier")
+    if tier is not None and isinstance(tier, (str, int, float)) and not isinstance(tier, bool):
+        out["tp_tier"] = tier
 
     try:
         fill_price = float(result.get("tier_fill_price", 0) or 0)
@@ -175,19 +198,19 @@ register(
 
 register(
     "tiered_tp_atr_live_regime_dynamic",
-    "Unified per-regime TP/SL — Hyperliquid prices tiers from entry ATR, the risk anchor and the confirmed applied regime label, the same inputs as the on-chain sync (#843, #1576)",
+    "Unified per-regime TP/SL — Hyperliquid prices tiers from entry ATR, risk anchor and applied regime for on-chain sync; BloFin perps persist two-cycle regime confirmation and manage a virtual ATR stop",
     {"atr_source": "live", "regime_confirm_cycles": 2},
 )(tiered_tp_atr_live_regime_dynamic_evaluate)
 
 register(
     "trailing_tp_ratchet",
-    "Tiered trail ratchet — tightens trailing_stop_atr_mult at each ATR tier (close_fraction may be 0)",
+    "Tiered trail ratchet — tightens trailing_stop_atr_mult at each ATR tier (close_fraction may be 0); BloFin perps use a persisted scheduler-managed virtual stop",
     {"tp_tiers": [dict(t) for t in DEFAULT_RATCHET_TIERS]},
 )(trailing_tp_ratchet_evaluate)
 
 register(
     "trailing_tp_ratchet_regime",
-    "Regime-keyed tiered trail ratchet — frozen at open via Position.Regime (#844)",
+    "Regime-keyed tiered trail ratchet — frozen at open via Position.Regime; BloFin perps use a persisted scheduler-managed virtual stop",
     {},
 )(trailing_tp_ratchet_regime_evaluate)
 

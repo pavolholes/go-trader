@@ -191,6 +191,10 @@ func TestAPIDiagnosticsNetPnLAndPendingMetrics(t *testing.T) {
 
 	row := &TradeDiagnosticsRow{
 		StrategyID: "hl-btc", PositionID: "pos-1", Symbol: "BTC", Side: "long",
+		CloseReason: "close_evaluator:tiered_tp_atr_regime:tiered_tp_atr_regime:trending_up:2.5",
+		CloseSource: "evaluator", CloseEvaluator: "tiered_tp_atr_regime",
+		CloseEvaluatorReason: "tiered_tp_atr_regime:trending_up:2.5", CloseTPTier: "2.5",
+		CloseSLTriggerPx: func() *float64 { v := 95.0; return &v }(), CaptureBasis: "price_only",
 		EntryPrice: 100, ExitPrice: 110, Quantity: 1,
 		RealizedPnL:   10,
 		OpenedAt:      time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
@@ -215,10 +219,16 @@ func TestAPIDiagnosticsNetPnLAndPendingMetrics(t *testing.T) {
 	}
 	var resp struct {
 		Rows []struct {
-			StrategyID    string   `json:"strategy_id"`
-			NetPnL        float64  `json:"net_pnl"`
-			CaptureRatio  *float64 `json:"capture_ratio"`
-			MetricsStatus string   `json:"metrics_status"`
+			StrategyID           string   `json:"strategy_id"`
+			NetPnL               float64  `json:"net_pnl"`
+			CaptureRatio         *float64 `json:"capture_ratio"`
+			MetricsStatus        string   `json:"metrics_status"`
+			CloseSource          string   `json:"close_source"`
+			CloseEvaluator       string   `json:"close_evaluator"`
+			CloseEvaluatorReason string   `json:"close_evaluator_reason"`
+			CloseTPTier          string   `json:"close_tp_tier"`
+			CloseSLTriggerPx     *float64 `json:"close_sl_trigger_px"`
+			CaptureBasis         string   `json:"capture_basis"`
 		} `json:"rows"`
 		Total int `json:"total"`
 	}
@@ -237,6 +247,12 @@ func TestAPIDiagnosticsNetPnLAndPendingMetrics(t *testing.T) {
 	}
 	if got.CaptureRatio != nil {
 		t.Errorf("capture_ratio = %v, want null while pending", *got.CaptureRatio)
+	}
+	if got.CloseSource != "evaluator" || got.CloseEvaluator != "tiered_tp_atr_regime" || got.CloseTPTier != "2.5" {
+		t.Errorf("close attribution source=%q evaluator=%q tier=%q", got.CloseSource, got.CloseEvaluator, got.CloseTPTier)
+	}
+	if got.CloseEvaluatorReason != "tiered_tp_atr_regime:trending_up:2.5" || got.CloseSLTriggerPx == nil || *got.CloseSLTriggerPx != 95 || got.CaptureBasis != "price_only" {
+		t.Errorf("close diagnostic details reason=%q SL=%v basis=%q", got.CloseEvaluatorReason, got.CloseSLTriggerPx, got.CaptureBasis)
 	}
 }
 

@@ -7,21 +7,28 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 type StrategyDecisionFields struct {
-	StopLossPrice      float64        `json:"sl_price,omitempty"`
-	ATRValue           float64        `json:"atr_value,omitempty"`
-	OpenStrategy       string         `json:"open_strategy,omitempty"`
-	CloseStrategies    []string       `json:"close_strategies,omitempty"`
-	OpenAction         string         `json:"open_action,omitempty"`
-	CloseFraction      float64        `json:"close_fraction"`
-	CloseStrategy      string         `json:"close_strategy,omitempty"`
-	CloseGate          string         `json:"close_gate,omitempty"`
-	CloseOwner         string         `json:"close_owner,omitempty"`
-	CloseTierFillPrice float64        `json:"close_tier_fill_price,omitempty"`
-	OpenSignalInverted bool           `json:"open_signal_inverted,omitempty"`
-	Regime             *RegimePayload `json:"regime,omitempty"`
+	StopLossPrice      float64            `json:"sl_price,omitempty"`
+	ATRValue           float64            `json:"atr_value,omitempty"`
+	OpenStrategy       string             `json:"open_strategy,omitempty"`
+	CloseStrategies    []string           `json:"close_strategies,omitempty"`
+	OpenAction         string             `json:"open_action,omitempty"`
+	CloseFraction      float64            `json:"close_fraction"`
+	CloseStrategy      string             `json:"close_strategy,omitempty"`
+	CloseEvaluator     string             `json:"close_evaluator,omitempty"`
+	CloseReason        string             `json:"close_reason,omitempty"`
+	CloseSource        string             `json:"close_source,omitempty"`
+	TPTier             interface{}        `json:"tp_tier,omitempty"`
+	CloseGate          string             `json:"close_gate,omitempty"`
+	CloseOwner         string             `json:"close_owner,omitempty"`
+	CloseTierFillPrice float64            `json:"close_tier_fill_price,omitempty"`
+	OpenSignalInverted bool               `json:"open_signal_inverted,omitempty"`
+	Regime             *RegimePayload     `json:"regime,omitempty"`
+	ClosedBar          *ClosedBarDecision `json:"closed_bar_decision,omitempty"`
+	DecisionRegime     *RegimePayload     `json:"decision_regime,omitempty"`
 }
 
 type PositionCtx struct {
@@ -32,6 +39,9 @@ type PositionCtx struct {
 	EntryATR                       float64
 	RiskAnchorPrice                float64
 	Regime                         string
+	RegimeAppliedLabel             string
+	RegimePendingLabel             string
+	RegimePendingCount             int
 	DirectionalRegime              string
 	RegimeWindows                  map[string]string
 	Profile                        string
@@ -39,6 +49,13 @@ type PositionCtx struct {
 	DirectionCertifiedStatesAtOpen map[string]string
 	OnChainTPResting               bool
 	OnChainTPBlocked               string
+	OpenedAt                       time.Time
+	BarsHeld                       int
+	BarsHeldKnown                  bool
+	StopLossTriggerPx              float64
+	StopLossHighWaterPx            float64
+	PostTPTrailingATRMult          float64
+	SLAdjustedTiersProcessed       int
 }
 
 func usesOpenCloseConfig(sc StrategyConfig) bool {
@@ -92,9 +109,13 @@ func appendOpenCloseArgs(args []string, sc StrategyConfig, pos PositionCtx) []st
 	return out
 }
 
+func sendsStrategyRefs(sc StrategyConfig) bool {
+	return effectiveOpenStrategy(sc) != "" || sc.CloseStrategy != nil
+}
+
 func buildStrategyRefsArg(sc StrategyConfig, closeOwner string, invertOpen bool) ([]string, error) {
 	openName := effectiveOpenStrategy(sc)
-	if openName == "" && sc.CloseStrategy == nil {
+	if !sendsStrategyRefs(sc) {
 		return nil, nil
 	}
 	payload := map[string]interface{}{}
@@ -166,7 +187,7 @@ func positionCtxFromPosition(pos *Position) PositionCtx {
 	if pos == nil {
 		return PositionCtx{}
 	}
-	return PositionCtx{
+	ctx := PositionCtx{
 		Side:                           pos.Side,
 		AvgCost:                        pos.AvgCost,
 		Quantity:                       pos.Quantity,
@@ -174,12 +195,61 @@ func positionCtxFromPosition(pos *Position) PositionCtx {
 		EntryATR:                       pos.EntryATR,
 		RiskAnchorPrice:                pos.RiskAnchorPrice,
 		Regime:                         pos.Regime,
+		RegimeAppliedLabel:             pos.RegimeAppliedLabel,
+		RegimePendingLabel:             pos.RegimePendingLabel,
+		RegimePendingCount:             pos.RegimePendingCount,
 		DirectionalRegime:              pos.Regime,
 		RegimeWindows:                  cloneStringMap(pos.RegimeWindows),
 		Profile:                        pos.OpenProfile,
 		DirectionCertifiedAtOpen:       pos.DirectionCertifiedAtOpen,
 		DirectionCertifiedStatesAtOpen: cloneStringMap(pos.DirectionCertifiedStatesAtOpen),
+		OpenedAt:                       pos.OpenedAt,
+		StopLossTriggerPx:              pos.StopLossTriggerPx,
+		StopLossHighWaterPx:            pos.StopLossHighWaterPx,
+		SLAdjustedTiersProcessed:       pos.SLAdjustedTiersProcessed,
 	}
+	if pos.PostTPTrailingATRMult != nil {
+		ctx.PostTPTrailingATRMult = *pos.PostTPTrailingATRMult
+	}
+	return ctx
+}
+
+func completedBarsHeld(openedAt, now time.Time, timeframe string) (int, bool) {
+	if openedAt.IsZero() || now.IsZero() {
+		return 0, false
+	}
+	tf := strings.TrimSpace(timeframe)
+	if len(tf) >= 2 && tf[len(tf)-1] == 'M' {
+		count, err := strconv.Atoi(tf[:len(tf)-1])
+		if err != nil || count <= 0 {
+			return 0, false
+		}
+		bucket := func(t time.Time) int64 {
+			u := t.UTC()
+			months := int64(u.Year())*12 + int64(u.Month()) - 1
+			return months / int64(count)
+		}
+		bars := bucket(now) - bucket(openedAt)
+		if bars < 0 || bars > int64(int(^uint(0)>>1)) {
+			return 0, false
+		}
+		return int(bars), true
+	}
+	duration, ok := diagTimeframeDuration(timeframe)
+	if !ok || duration <= 0 {
+		return 0, false
+	}
+	step := int64(duration)
+	openedBucket := openedAt.UTC().UnixNano() / step
+	nowBucket := now.UTC().UnixNano() / step
+	if nowBucket < openedBucket {
+		return 0, false
+	}
+	bars := nowBucket - openedBucket
+	if bars > int64(int(^uint(0)>>1)) {
+		return 0, false
+	}
+	return int(bars), true
 }
 
 func formatStrategyRef(ref StrategyRef) string {

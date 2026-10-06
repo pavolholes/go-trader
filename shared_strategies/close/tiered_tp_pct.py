@@ -55,4 +55,4 @@ def evaluate(position: dict, market: dict, params: dict) -> dict:
     close_fraction = current_close_fraction(position, cumulative_fraction)
     if close_fraction <= 0:
         return {"close_fraction": 0.0, "reason": "noop:already_taken"}
-    return {"close_fraction": close_fraction, "reason": f"tiered_tp_pct:{pct:g}"}
+    return {"close_fraction": close_fraction, "reason": f"tiered_tp_pct:{pct:g}", "tp_tier": pct}

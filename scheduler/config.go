@@ -657,6 +657,7 @@ type StrategyConfig struct {
 	Paused                      bool                     `json:"paused,omitempty"`
 	IntervalSeconds             int                      `json:"interval_seconds,omitempty"`
 	HTFFilter                   bool                     `json:"htf_filter,omitempty"`
+	ClosedBarDecisions          bool                     `json:"closed_bar_decisions,omitempty"`
 	ATRMethod                   string                   `json:"atr_method,omitempty"`
 	InvertSignal                bool                     `json:"invert_signal,omitempty"`
 	AllowShorts                 bool                     `json:"allow_shorts,omitempty"`
@@ -1140,8 +1141,8 @@ func loadConfigData(path string, data []byte, skipLiveCredentialChecks bool, rea
 	}
 
 	if cfg.StatusPort != 0 {
-		if cfg.StatusPort < 1024 {
-			return nil, fmt.Errorf("status_port %d is below 1024 (privileged ports require root and are not supported)", cfg.StatusPort)
+		if cfg.StatusPort < statusPortMinimum {
+			return nil, fmt.Errorf("status_port %d is below %d (privileged ports require root and are not supported)", cfg.StatusPort, statusPortMinimum)
 		}
 		if cfg.StatusPort > 65535-statusPortMaxAttempts+1 {
 			return nil, fmt.Errorf("status_port %d is too high (max %d to leave room for %d fallback attempts)", cfg.StatusPort, 65535-statusPortMaxAttempts+1, statusPortMaxAttempts)
@@ -1651,6 +1652,75 @@ func regimeDirectionalPolicyWarnings(cfg *Config) []string {
 	return out
 }
 
+var argsParamsFlags = []string{"--params", "--open-strategy", "--close-strategies"}
+
+func strategyRefsArgsWarnings(cfg *Config) []string {
+	if cfg == nil {
+		return nil
+	}
+	var out []string
+	for _, sc := range cfg.Strategies {
+		if sc.Type == "options" || !sendsStrategyRefs(sc) {
+			continue
+		}
+		seen := make(map[string]bool)
+		var paramsRaw string
+		for i, a := range sc.Args {
+			for _, flag := range argsParamsFlags {
+				switch {
+				case a == flag:
+					seen[flag] = true
+					if flag == "--params" && i+1 < len(sc.Args) {
+						paramsRaw = sc.Args[i+1]
+					}
+				case strings.HasPrefix(a, flag+"="):
+					seen[flag] = true
+					if flag == "--params" {
+						paramsRaw = strings.TrimPrefix(a, flag+"=")
+					}
+				}
+			}
+		}
+		if len(seen) == 0 {
+			continue
+		}
+		flags := make([]string, 0, len(seen))
+		for flag := range seen {
+			flags = append(flags, flag)
+		}
+		sort.Strings(flags)
+		msg := fmt.Sprintf("[WARN] %s: args carry %s, but the scheduler sends --strategy-refs for this strategy, so the check script ignores that value; move it into open_strategy.params (or the matching field) or delete it", sc.ID, strings.Join(flags, ", "))
+		if paramsRaw != "" && openStrategyParamsEqual(paramsRaw, sc.OpenStrategy.Params) {
+			msg += " (the --params value already equals open_strategy.params)"
+		}
+		out = append(out, msg)
+	}
+	return out
+}
+
+func openStrategyParamsEqual(raw string, params map[string]interface{}) bool {
+	var a, b interface{}
+	if err := json.Unmarshal([]byte(raw), &a); err != nil {
+		return false
+	}
+	blob, err := json.Marshal(params)
+	if err != nil {
+		return false
+	}
+	if err := json.Unmarshal(blob, &b); err != nil {
+		return false
+	}
+	sa, err := json.Marshal(a)
+	if err != nil {
+		return false
+	}
+	sb, err := json.Marshal(b)
+	if err != nil {
+		return false
+	}
+	return string(sa) == string(sb)
+}
+
 func validateConfig(cfg *Config, skipLiveCredentialChecks bool) error {
 	var errs []string
 	seenIDs := make(map[string]bool)
@@ -1680,6 +1750,8 @@ func validateConfig(cfg *Config, skipLiveCredentialChecks bool) error {
 	errs = append(errs, validatePaperSourcesConfig(cfg)...)
 
 	errs = append(errs, validateStorageIdentityConfig(cfg)...)
+
+	errs = append(errs, closedBarDecisionsConfigErrors(cfg)...)
 
 	if !validATRMethodValue(cfg.ATRMethod) {
 		errs = append(errs, fmt.Sprintf("atr_method must be %q or %q, got %q", ATRMethodSimple, ATRMethodWilder, cfg.ATRMethod))
@@ -2116,8 +2188,9 @@ func validateConfig(cfg *Config, skipLiveCredentialChecks bool) error {
 				errs = append(errs, fmt.Sprintf("%s: trailing_stop_atr_mult must be >= 0, got %g", prefix, mult))
 			}
 			manualRatchet := sc.Type == "manual" && strategyUsesTrailingTPRatchetClose(sc)
-			if sc.Platform != "hyperliquid" || (sc.Type != "perps" && !manualRatchet) {
-				errs = append(errs, fmt.Sprintf("%s: trailing_stop_atr_mult is only supported for HL perps strategies or HL manual trailing_tp_ratchet strategies (got platform=%q type=%q)", prefix, sc.Platform, sc.Type))
+			blofinRatchet := sc.Platform == "blofin" && sc.Type == "perps" && strategyUsesTrailingTPRatchetClose(sc)
+			if (sc.Platform != "hyperliquid" || (sc.Type != "perps" && !manualRatchet)) && !blofinRatchet {
+				errs = append(errs, fmt.Sprintf("%s: trailing_stop_atr_mult is supported for HL perps/manual ratchet or BloFin perps ratchet only (got platform=%q type=%q)", prefix, sc.Platform, sc.Type))
 			}
 			if mult > 0 {
 				fixedPct := 0.0
@@ -2142,8 +2215,8 @@ func validateConfig(cfg *Config, skipLiveCredentialChecks bool) error {
 			if mult < 0 {
 				errs = append(errs, fmt.Sprintf("%s: stop_loss_atr_mult must be >= 0, got %g", prefix, mult))
 			}
-			if (sc.Type != "perps" && sc.Type != "manual") || sc.Platform != "hyperliquid" {
-				errs = append(errs, fmt.Sprintf("%s: stop_loss_atr_mult is only supported for HL perps strategies (got platform=%q type=%q)", prefix, sc.Platform, sc.Type))
+			if ((sc.Type != "perps" && sc.Type != "manual") || sc.Platform != "hyperliquid") && !(sc.Platform == "blofin" && sc.Type == "perps") {
+				errs = append(errs, fmt.Sprintf("%s: stop_loss_atr_mult is supported for HL perps/manual and BloFin perps (bot-managed) only (got platform=%q type=%q)", prefix, sc.Platform, sc.Type))
 			}
 			if mult > 0 {
 				fixedPct := 0.0
@@ -2307,6 +2380,10 @@ func validateConfig(cfg *Config, skipLiveCredentialChecks bool) error {
 		fmt.Println(w)
 	}
 
+	for _, w := range strategyRefsArgsWarnings(cfg) {
+		fmt.Println(w)
+	}
+
 	knownPlatforms := make(map[string]bool)
 	for _, sc := range cfg.Strategies {
 		if p := strings.TrimSpace(sc.Platform); p != "" {
@@ -2359,6 +2436,7 @@ func validateConfig(cfg *Config, skipLiveCredentialChecks bool) error {
 
 	errs = append(errs, validateRegimeATRConfig(cfg)...)
 	errs = append(errs, validateTPTierLadders(cfg)...)
+	errs = append(errs, validateBloFinCloseSupport(cfg)...)
 
 	if len(errs) > 0 {
 		return fmt.Errorf("config validation errors:\n  %s", strings.Join(errs, "\n  "))

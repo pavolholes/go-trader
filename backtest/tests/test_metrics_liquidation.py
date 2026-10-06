@@ -105,7 +105,7 @@ def test_faster_bust_never_outranks_slower_on_sharpe():
 
 
 def test_short_leg_blowup_end_to_end():
-    closes = np.array([100, 100, 150, 250, 300, 300], dtype=float)
+    closes = np.array([100, 100, 150, 250, 80, 80], dtype=float)
     n = len(closes)
     idx = pd.date_range("2024-01-01", periods=n, freq="D")
     df = pd.DataFrame(
@@ -126,6 +126,11 @@ def test_short_leg_blowup_end_to_end():
     assert results["liquidated"] is True
     assert results["total_return_pct"] == pytest.approx(-100.0)
     assert results["max_drawdown_pct"] == pytest.approx(-100.0)
+    assert results["final_capital"] == pytest.approx(0.0)
+    assert results["total_trades"] == 1
+    assert results["trades"][0]["exit_reason"] == "liquidation"
+    assert results["trades"][0]["exit_date"] == str(idx[3])
+    assert results["close_reason_counts"]["liquidation"] == 1
 
 
 def _results(ret=-100.0, dd=-100.0, sharpe=-2.0, trades=3, liquidated=True):

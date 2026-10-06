@@ -86,6 +86,63 @@ type ClosedPosition struct {
 	DurationSeconds int64     `json:"duration_seconds"`
 }
 
+type CloseAttribution struct {
+	Source            string
+	Evaluator         string
+	Reason            string
+	TPTier            string
+	StopLossTriggerPx float64
+}
+
+func (a *CloseAttribution) persistedReason(fallback string) string {
+	if a == nil {
+		return fallback
+	}
+	source := strings.TrimSpace(a.Source)
+	reason := strings.TrimSpace(a.Reason)
+	switch source {
+	case "evaluator":
+		return fmt.Sprintf("close_evaluator:%s:%s", strings.TrimSpace(a.Evaluator), reason)
+	case "risk_stop":
+		return "risk_stop:" + reason
+	case "signal":
+		return "signal"
+	case "":
+		return fallback
+	default:
+		if reason == "" {
+			return source
+		}
+		return source + ":" + reason
+	}
+}
+
+func (a *CloseAttribution) detailSuffix() string {
+	if a == nil {
+		return ""
+	}
+	parts := []string{}
+	if a.Source != "" {
+		parts = append(parts, "close_source="+a.Source)
+	}
+	if a.Evaluator != "" {
+		parts = append(parts, "close_evaluator="+a.Evaluator)
+	}
+	if a.Reason != "" {
+		parts = append(parts, "close_reason="+a.Reason)
+	}
+	if a.TPTier != "" {
+		parts = append(parts, "tp_tier="+a.TPTier)
+	}
+	if a.StopLossTriggerPx > 0 {
+		parts = append(parts, fmt.Sprintf("sl_trigger_px=%.10g", a.StopLossTriggerPx))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return " [" + strings.Join(parts, "; ") + "]"
+}
+
 type ClosedOptionPosition struct {
 	StrategyID      string    `json:"strategy_id"`
 	PositionID      string    `json:"position_id"`
@@ -105,6 +162,10 @@ type ClosedOptionPosition struct {
 }
 
 func recordClosedPosition(s *StrategyState, pos *Position, closePrice, realizedPnL float64, reason string, closedAt time.Time) {
+	recordClosedPositionWithAttribution(s, pos, closePrice, realizedPnL, reason, closedAt, nil)
+}
+
+func recordClosedPositionWithAttribution(s *StrategyState, pos *Position, closePrice, realizedPnL float64, reason string, closedAt time.Time, attribution *CloseAttribution) {
 	var duration int64
 	if !pos.OpenedAt.IsZero() {
 		duration = int64(closedAt.Sub(pos.OpenedAt).Seconds())
@@ -120,12 +181,13 @@ func recordClosedPosition(s *StrategyState, pos *Position, closePrice, realizedP
 		ClosedAt:        closedAt,
 		ClosePrice:      closePrice,
 		RealizedPnL:     realizedPnL,
-		CloseReason:     reason,
+		CloseReason:     attribution.persistedReason(reason),
 		DurationSeconds: duration,
 	})
-	captureTradeDiagnostics(s, pos, closePrice, realizedPnL, reason, closedAt)
+	persistedReason := attribution.persistedReason(reason)
+	captureTradeDiagnosticsWithAttribution(s, pos, closePrice, realizedPnL, persistedReason, closedAt, attribution)
 	if pos.Quantity > 0 && !pos.isHedgeLeg() {
-		recordReplayDecision(s, ReplayDecisionFullClose, pos.Symbol, pos.Side, pos.Quantity, closePrice, reason, closedAt, 0, "")
+		recordReplayDecision(s, ReplayDecisionFullClose, pos.Symbol, pos.Side, pos.Quantity, closePrice, persistedReason, closedAt, 0, "")
 	}
 }
 
@@ -455,6 +517,7 @@ type SignalExecutionResult struct {
 	OpenTrade             *Trade
 	CashReconcileRequired bool
 	CashOverBudgetAlert   string
+	HoldReason            string
 }
 
 var tradePositionNonce uint64
@@ -889,9 +952,10 @@ func FuturesOrderSkipReason(signal int, posSide string) string {
 }
 
 func ExecutePerpsSignalWithLeverage(s *StrategyState, signal int, symbol string, price float64, sizing PerpsSizing, fillQty float64, fillOID string, fillFee float64, direction string, closeFraction float64, logger *StrategyLogger) (int, error) {
-	return executePerpsSignalWithLeverage(s, signal, symbol, price, sizing, fillQty, fillOID, fillFee, direction, closeFraction, logger, func(trade Trade) {
+	trades, _, err := executePerpsSignalWithLeverage(s, signal, symbol, price, sizing, fillQty, fillOID, fillFee, direction, closeFraction, logger, nil, func(trade Trade) {
 		RecordTrade(s, trade)
-	})
+	}, nil)
+	return trades, err
 }
 
 // posMult vrati contract multiplier pozicie (BloFin kontrakty -> mince).
@@ -904,16 +968,39 @@ func posMult(pos *Position) float64 {
 }
 
 func ExecutePerpsSignalWithLeverageDeferredOpen(s *StrategyState, signal int, symbol string, price float64, sizing PerpsSizing, fillQty float64, fillOID string, fillFee float64, direction string, closeFraction float64, logger *StrategyLogger) (SignalExecutionResult, error) {
+	return ExecutePerpsSignalWithLeverageDeferredOpenAttributed(s, signal, symbol, price, sizing, fillQty, fillOID, fillFee, direction, closeFraction, logger, nil)
+}
+
+func ExecutePerpsSignalWithLeverageDeferredOpenAttributed(s *StrategyState, signal int, symbol string, price float64, sizing PerpsSizing, fillQty float64, fillOID string, fillFee float64, direction string, closeFraction float64, logger *StrategyLogger, attribution *CloseAttribution) (SignalExecutionResult, error) {
 	var result SignalExecutionResult
-	trades, err := executePerpsSignalWithLeverage(s, signal, symbol, price, sizing, fillQty, fillOID, fillFee, direction, closeFraction, logger, func(trade Trade) {
+	trades, hold, err := executePerpsSignalWithLeverage(s, signal, symbol, price, sizing, fillQty, fillOID, fillFee, direction, closeFraction, logger, attribution, func(trade Trade) {
 		t := trade
 		result.OpenTrade = &t
-	})
+	}, nil)
 	result.TradesExecuted = trades
+	result.HoldReason = hold
 	return result, err
 }
 
-func executePerpsSignalWithLeverage(s *StrategyState, signal int, symbol string, price float64, sizing PerpsSizing, fillQty float64, fillOID string, fillFee float64, direction string, closeFraction float64, logger *StrategyLogger, recordOpen func(Trade)) (int, error) {
+func executePerpsSignalWithLotPolicyDeferredOpen(s *StrategyState, signal int, symbol string, price float64, sizing PerpsSizing, fillQty float64, fillOID string, fillFee float64, direction string, closeFraction float64, logger *StrategyLogger, lot *hlPaperLotPolicy) (SignalExecutionResult, error) {
+	var result SignalExecutionResult
+	trades, hold, err := executePerpsSignalWithLeverage(s, signal, symbol, price, sizing, fillQty, fillOID, fillFee, direction, closeFraction, logger, nil, func(trade Trade) {
+		t := trade
+		result.OpenTrade = &t
+	}, lot)
+	result.TradesExecuted = trades
+	result.HoldReason = hold
+	return result, err
+}
+
+func logHLPaperLotHold(logger *StrategyLogger, action, symbol string, d hlPaperLotDecision) {
+	if d.Hold == hlPaperHoldLotUnknown {
+		return
+	}
+	logger.Info("Paper %s %s held (%s): %s; no order booked", action, symbol, d.Hold, d.Detail)
+}
+
+func executePerpsSignalWithLeverage(s *StrategyState, signal int, symbol string, price float64, sizing PerpsSizing, fillQty float64, fillOID string, fillFee float64, direction string, closeFraction float64, logger *StrategyLogger, closeAttribution *CloseAttribution, recordOpen func(Trade), lot *hlPaperLotPolicy) (int, string, error) {
 	if direction == "" {
 		direction = DirectionLong
 	}
@@ -921,7 +1008,7 @@ func executePerpsSignalWithLeverage(s *StrategyState, signal int, symbol string,
 	allowsShort := direction == DirectionShort || direction == DirectionBoth
 	bidirectional := direction == DirectionBoth
 	if signal == 0 {
-		return 0, nil
+		return 0, "", nil
 	}
 	if sizing.SizingLeverage <= 0 {
 		sizing.SizingLeverage = 1
@@ -949,7 +1036,7 @@ func executePerpsSignalWithLeverage(s *StrategyState, signal int, symbol string,
 			} else {
 				logger.Info("Already long %s (qty=%.6f), skipping buy", symbol, pos.Quantity)
 			}
-			return 0, nil
+			return 0, "", nil
 		}
 		if pos, exists := s.Positions[symbol]; exists && pos.Side == "short" {
 			closeQty := pos.Quantity
@@ -961,6 +1048,14 @@ func executePerpsSignalWithLeverage(s *StrategyState, signal int, symbol string,
 				}
 				if closeQty > pos.Quantity {
 					closeQty = pos.Quantity
+				}
+				if lot != nil {
+					d := lot.partialClose(closeQty)
+					if d.Hold != "" {
+						logHLPaperLotHold(logger, "partial close "+pos.Side, symbol, d)
+						return 0, d.Hold, nil
+					}
+					closeQty = d.Qty
 				}
 			}
 			if bidirectional {
@@ -993,6 +1088,7 @@ func executePerpsSignalWithLeverage(s *StrategyState, signal int, symbol string,
 			if partialClose {
 				details = fmt.Sprintf("Partial-close short %.6f, PnL: $%.2f (fee $%.2f)", closeQty, pnl, fee)
 			}
+			details += closeAttribution.detailSuffix()
 			trade := Trade{
 				Timestamp:       now,
 				StrategyID:      s.ID,
@@ -1014,6 +1110,9 @@ func executePerpsSignalWithLeverage(s *StrategyState, signal int, symbol string,
 			trade.Regime = s.Regime
 			trade.EntryATR = pos.EntryATR
 			trade.StopLossTriggerPx = pos.StopLossTriggerPx
+			if closeAttribution != nil && closeAttribution.StopLossTriggerPx > 0 {
+				trade.StopLossTriggerPx = closeAttribution.StopLossTriggerPx
+			}
 			trade.StopLossATRMult = pos.StopLossATRMult
 			trade.TPTiersJSON = pos.TPTiersJSON
 			RecordTrade(s, trade)
@@ -1022,11 +1121,11 @@ func executePerpsSignalWithLeverage(s *StrategyState, signal int, symbol string,
 				pos.RealizedPnLAccum += pnl
 				pos.Quantity -= closeQty
 				if !pos.isHedgeLeg() {
-					recordReplayDecision(s, ReplayDecisionPartialClose, symbol, pos.Side, closeQty, execPrice, "", now, 0, "")
+					recordReplayDecision(s, ReplayDecisionPartialClose, symbol, pos.Side, closeQty, execPrice, closeAttribution.persistedReason("signal"), now, 0, "")
 				}
 				logger.Info("Partial-close short %s: %.6f (remaining %.6f) @ $%.2f (fee $%.2f) | PnL: $%.2f", symbol, closeQty, pos.Quantity, execPrice, fee, pnl)
 			} else {
-				recordClosedPosition(s, pos, execPrice, pos.RealizedPnLAccum+pnl, "signal", now)
+				recordClosedPositionWithAttribution(s, pos, execPrice, pos.RealizedPnLAccum+pnl, "signal", now, closeAttribution)
 				delete(s.Positions, symbol)
 				clearHLPerpsPositionAlertThrottles(s, symbol)
 				logger.Info("Closed short %s @ $%.2f (fee $%.2f) | PnL: $%.2f", symbol, execPrice, fee, pnl)
@@ -1034,17 +1133,17 @@ func executePerpsSignalWithLeverage(s *StrategyState, signal int, symbol string,
 			tradesExecuted++
 		}
 		if closeOnlyAction {
-			return tradesExecuted, nil
+			return tradesExecuted, "", nil
 		}
 		if !allowsLong {
 			if tradesExecuted == 0 {
 				logger.Info("No short position in %s to buy-cover, skipping (direction=%q)", symbol, direction)
 			}
-			return tradesExecuted, nil
+			return tradesExecuted, "", nil
 		}
 		if s.Cash < 1 && fillQty <= 0 {
 			logger.Info("Insufficient cash ($%.2f) to open long %s perp", s.Cash, symbol)
-			return tradesExecuted, nil
+			return tradesExecuted, "", nil
 		}
 		var execPrice, qty float64
 		if fillQty > 0 {
@@ -1052,19 +1151,27 @@ func executePerpsSignalWithLeverage(s *StrategyState, signal int, symbol string,
 			qty = fillQty - flipCloseQty
 			if qty <= 0 {
 				logger.Warn("Flip fill qty (%.6f) did not cover new long after closing short (%.6f); leaving flat", fillQty, flipCloseQty)
-				return tradesExecuted, nil
+				return tradesExecuted, "", nil
 			}
 		} else {
 			execPrice = ApplySlippage(price)
 			if execPrice <= 0 {
-				return tradesExecuted, nil
+				return tradesExecuted, "", nil
 			}
 			if sizing.RiskPerTradePct > 0 && sizing.RiskStopDistance <= 0 {
 				logger.Info("Risk-per-trade sizing: %s — refusing open long %s (fail-closed)", sizing.riskUnresolvedLabel(), symbol)
-				return tradesExecuted, nil
+				return tradesExecuted, "", nil
 			}
 			budget := PerpsOpenNotionalSized(s.Cash, execPrice, sizing)
 			qty = budget / execPrice
+			if lot != nil {
+				d := lot.entry(qty, execPrice)
+				if d.Hold != "" {
+					logHLPaperLotHold(logger, "open long", symbol, d)
+					return tradesExecuted, d.Hold, nil
+				}
+				qty = d.Qty
+			}
 		}
 		notional := qty * execPrice
 		useFillFee := flipCloseQty == 0
@@ -1119,12 +1226,12 @@ func executePerpsSignalWithLeverage(s *StrategyState, signal int, symbol string,
 	} else if signal == -1 {
 		if pos, exists := s.Positions[symbol]; exists && pos.Side == "short" && allowsShort {
 			logger.Info("Already short %s (qty=%.6f), skipping sell", symbol, pos.Quantity)
-			return 0, nil
+			return 0, "", nil
 		}
 		if pos, exists := s.Positions[symbol]; exists && pos.Side == "long" {
 			if !allowsLong {
 				logger.Warn("Orphan long %s under direction=%q (qty=%.6f); leaving in place — close manually if intentional", symbol, direction, pos.Quantity)
-				return tradesExecuted, nil
+				return tradesExecuted, "", nil
 			}
 			closeQty := pos.Quantity
 			if partialClose {
@@ -1135,6 +1242,14 @@ func executePerpsSignalWithLeverage(s *StrategyState, signal int, symbol string,
 				}
 				if closeQty > pos.Quantity {
 					closeQty = pos.Quantity
+				}
+				if lot != nil {
+					d := lot.partialClose(closeQty)
+					if d.Hold != "" {
+						logHLPaperLotHold(logger, "partial close "+pos.Side, symbol, d)
+						return 0, d.Hold, nil
+					}
+					closeQty = d.Qty
 				}
 			}
 			if bidirectional {
@@ -1167,6 +1282,7 @@ func executePerpsSignalWithLeverage(s *StrategyState, signal int, symbol string,
 			if partialClose {
 				details = fmt.Sprintf("Partial-close long %.6f, PnL: $%.2f (fee $%.2f)", closeQty, pnl, fee)
 			}
+			details += closeAttribution.detailSuffix()
 			trade := Trade{
 				Timestamp:       now,
 				StrategyID:      s.ID,
@@ -1188,6 +1304,9 @@ func executePerpsSignalWithLeverage(s *StrategyState, signal int, symbol string,
 			trade.Regime = s.Regime
 			trade.EntryATR = pos.EntryATR
 			trade.StopLossTriggerPx = pos.StopLossTriggerPx
+			if closeAttribution != nil && closeAttribution.StopLossTriggerPx > 0 {
+				trade.StopLossTriggerPx = closeAttribution.StopLossTriggerPx
+			}
 			trade.StopLossATRMult = pos.StopLossATRMult
 			trade.TPTiersJSON = pos.TPTiersJSON
 			RecordTrade(s, trade)
@@ -1196,11 +1315,11 @@ func executePerpsSignalWithLeverage(s *StrategyState, signal int, symbol string,
 				pos.RealizedPnLAccum += pnl
 				pos.Quantity -= closeQty
 				if !pos.isHedgeLeg() {
-					recordReplayDecision(s, ReplayDecisionPartialClose, symbol, pos.Side, closeQty, execPrice, "", now, 0, "")
+					recordReplayDecision(s, ReplayDecisionPartialClose, symbol, pos.Side, closeQty, execPrice, closeAttribution.persistedReason("signal"), now, 0, "")
 				}
 				logger.Info("Partial-close long %s: %.6f (remaining %.6f) @ $%.2f (fee $%.2f) | PnL: $%.2f", symbol, closeQty, pos.Quantity, execPrice, fee, pnl)
 			} else {
-				recordClosedPosition(s, pos, execPrice, pos.RealizedPnLAccum+pnl, "signal", now)
+				recordClosedPositionWithAttribution(s, pos, execPrice, pos.RealizedPnLAccum+pnl, "signal", now, closeAttribution)
 				delete(s.Positions, symbol)
 				clearHLPerpsPositionAlertThrottles(s, symbol)
 				logger.Info("SELL %s: %.6f @ $%.2f (fee $%.2f) | PnL: $%.2f", symbol, closeQty, execPrice, fee, pnl)
@@ -1208,17 +1327,17 @@ func executePerpsSignalWithLeverage(s *StrategyState, signal int, symbol string,
 			tradesExecuted++
 		}
 		if closeOnlyAction {
-			return tradesExecuted, nil
+			return tradesExecuted, "", nil
 		}
 		if !allowsShort {
 			if tradesExecuted == 0 {
 				logger.Info("No long position in %s to sell, skipping", symbol)
 			}
-			return tradesExecuted, nil
+			return tradesExecuted, "", nil
 		}
 		if s.Cash < 1 && fillQty <= 0 {
 			logger.Info("Insufficient cash ($%.2f) to open short %s perp", s.Cash, symbol)
-			return tradesExecuted, nil
+			return tradesExecuted, "", nil
 		}
 		var execPrice, qty float64
 		if fillQty > 0 {
@@ -1226,19 +1345,27 @@ func executePerpsSignalWithLeverage(s *StrategyState, signal int, symbol string,
 			qty = fillQty - flipCloseQty
 			if qty <= 0 {
 				logger.Warn("Flip fill qty (%.6f) did not cover new short after closing long (%.6f); leaving flat", fillQty, flipCloseQty)
-				return tradesExecuted, nil
+				return tradesExecuted, "", nil
 			}
 		} else {
 			execPrice = ApplySlippage(price)
 			if execPrice <= 0 {
-				return tradesExecuted, nil
+				return tradesExecuted, "", nil
 			}
 			if sizing.RiskPerTradePct > 0 && sizing.RiskStopDistance <= 0 {
 				logger.Info("Risk-per-trade sizing: %s — refusing open short %s (fail-closed)", sizing.riskUnresolvedLabel(), symbol)
-				return tradesExecuted, nil
+				return tradesExecuted, "", nil
 			}
 			budget := PerpsOpenNotionalSized(s.Cash, execPrice, sizing)
 			qty = budget / execPrice
+			if lot != nil {
+				d := lot.entry(qty, execPrice)
+				if d.Hold != "" {
+					logHLPaperLotHold(logger, "open short", symbol, d)
+					return tradesExecuted, d.Hold, nil
+				}
+				qty = d.Qty
+			}
 		}
 		notional := qty * execPrice
 		useFillFee := flipCloseQty == 0
@@ -1290,7 +1417,7 @@ func executePerpsSignalWithLeverage(s *StrategyState, signal int, symbol string,
 		logger.Info("SELL %s: %.6f @ $%.2f (%s, notional $%.2f, fee $%.2f) [open short]", symbol, qty, execPrice, leverageLabel, notional, fee)
 		tradesExecuted++
 	}
-	return tradesExecuted, nil
+	return tradesExecuted, "", nil
 }
 
 func perpsLeverageLabel(exchangeLeverage, sizingLeverage float64) string {

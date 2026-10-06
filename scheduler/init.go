@@ -50,6 +50,7 @@ var knownShortNames = map[string]string{
 	"protective_puts":             "pput",
 	"covered_calls":               "ccall",
 	"breakout":                    "bo",
+	"breakout_retest":             "brt",
 	"atr_breakout":                "atrbo",
 	"stoch_rsi":                   "stochrsi",
 	"ichimoku_cloud":              "ichi",
@@ -109,6 +110,7 @@ var registeredOpenStrategyPlatforms = map[string][]string{
 	"bear_pullback_st":            {"futures"},
 	"bollinger_bands":             {"spot", "futures"},
 	"breakout":                    {"futures"},
+	"breakout_retest":             {"futures"},
 	"chaikin_money_flow_breakout": {"futures"},
 	"chart_pattern":               {"spot", "futures"},
 	"commodity_channel_trend":     {"futures"},
@@ -174,6 +176,7 @@ var bidirectionalPerpsStrategies = map[string]bool{
 	"chart_pattern":               true,
 	"liquidity_sweeps":            true,
 	"bear_pullback_st":            true,
+	"breakout_retest":             true,
 	"vwap_rejection_st":           true,
 	"anchored_vwap":               true,
 	"anchored_vwap_channel":       true,
@@ -439,6 +442,7 @@ type InitOptions struct {
 	PortfolioMaxDrawdownPct     float64 `json:"portfolioMaxDrawdownPct,omitempty"`
 	PortfolioWarnThresholdPct   float64 `json:"portfolioWarnThresholdPct,omitempty"`
 	AllowNoEdge                 bool    `json:"allowNoEdge,omitempty"`
+	ClosedBarDecisions          bool    `json:"closedBarDecisions,omitempty"`
 	DiscordEnabled              bool
 	DiscordOwnerID              string
 	SpotChannelID               string
@@ -837,6 +841,17 @@ func generateConfig(opts InitOptions) *Config {
 			Windows: RegimeWindowsMap{
 				"medium": {Classifier: regimeClassifierComposite, Period: 20},
 			},
+		}
+	}
+
+	if opts.ClosedBarDecisions {
+		for i := range cfg.Strategies {
+			candidate := cfg.Strategies[i]
+			inferStrategyPlatform(&candidate)
+			candidate.ClosedBarDecisions = true
+			if len(closedBarDecisionStrategyErrors(candidate, cfg)) == 0 {
+				cfg.Strategies[i].ClosedBarDecisions = true
+			}
 		}
 	}
 
@@ -1353,6 +1368,11 @@ func runInit(args []string) int {
 	autoUpdate := "off"
 	htfFilter := true
 
+	fmt.Println("\nClosed-bar decisions decide signals, entry ATR and entry sizing on the last closed bar, as the backtester does.")
+	fmt.Println("Protection (stops, trailing stops, ratchets, take-profits) keeps current prices. Entries can start up to one bar later.")
+	fmt.Println("Supported: Binance.US spot, OKX spot/perps and Hyperliquid perps on fixed-duration timeframes; other strategies keep forming-bar decisions.")
+	closedBarDecisions := p.YesNo("Enable closed_bar_decisions on supported strategies?", false)
+
 	perpsStratIDs := make([]string, len(perpsStrategies))
 	for i, s := range perpsStrategies {
 		perpsStratIDs[i] = s.ID
@@ -1438,6 +1458,7 @@ func runInit(args []string) int {
 		OKXCapital:                okxCapital,
 		OKXDrawdown:               okxDrawdown,
 		HTFFilter:                 htfFilter,
+		ClosedBarDecisions:        closedBarDecisions,
 		EnableManual:              enableManual,
 		ManualSymbol:              manualSymbol,
 		ManualTimeframe:           manualTimeframe,

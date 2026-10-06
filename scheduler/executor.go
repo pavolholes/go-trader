@@ -63,6 +63,7 @@ type HyperliquidResult struct {
 	SizedCloseCanceledOIDs          []int64                `json:"-"`
 	SizedCloseBookedQty             float64                `json:"-"`
 	SizedClosePreSend               hlCloseView            `json:"-"`
+	PaperPartialCloseHold           string                 `json:"-"`
 }
 
 type HyperliquidFill struct {
@@ -1662,16 +1663,17 @@ func FetchFuturesMarks(symbols []string) (map[string]float64, string, error) {
 // BloFinResult is the JSON output from check_blofin.py (signal check mode).
 type BloFinResult struct {
 	StrategyDecisionFields
-	Strategy   string                 `json:"strategy"`
-	Symbol     string                 `json:"symbol"`
-	Timeframe  string                 `json:"timeframe"`
-	Signal     int                    `json:"signal"`
-	Price      float64                `json:"price"`
-	Indicators map[string]interface{} `json:"indicators"`
-	Mode       string                 `json:"mode"`
-	Platform   string                 `json:"platform"`
-	Timestamp  string                 `json:"timestamp"`
-	Error      string                 `json:"error,omitempty"`
+	Strategy             string                 `json:"strategy"`
+	Symbol               string                 `json:"symbol"`
+	Timeframe            string                 `json:"timeframe"`
+	Signal               int                    `json:"signal"`
+	Price                float64                `json:"price"`
+	Indicators           map[string]interface{} `json:"indicators"`
+	Mode                 string                 `json:"mode"`
+	Platform             string                 `json:"platform"`
+	Timestamp            string                 `json:"timestamp"`
+	CloseContextWarnings []string               `json:"close_context_warnings,omitempty"`
+	Error                string                 `json:"error,omitempty"`
 }
 
 // BloFinFill holds fill details from a live BloFin order.

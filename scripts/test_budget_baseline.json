@@ -34,6 +34,8 @@
     "backtest/tests/test_strategy_refs_641.py::test_flag_rejected_alongside_config",
     "backtest/tests/test_tune_live.py::test_build_candidate_dormant_gate_not_copied",
     "backtest/tests/test_tune_live.py::test_promotion_baseline_opt_in_spread_contract",
+    "scheduler/blofin_close_support_test.go::TestBloFinActiveRatchetParametersCannotHotReloadAcrossOpenPosition",
+    "scheduler/blofin_close_support_test.go::TestBloFinContextCloseParamsCannotBeConfiguredToNoOp",
     "scheduler/discord_test.go::TestFormatCategorySummary_CircuitBreakerActive",
     "scheduler/discord_test.go::TestFormatCategorySummary_NoCircuitBreaker",
     "scheduler/discord_test.go::TestFormatTradeDM_RatchetSuppressedOnNonDefaultATRWindow",

@@ -76,7 +76,7 @@ def test_run_single_backtest_threads_platform_to_backtester(monkeypatch):
     )
     monkeypatch.setattr(run_backtest, "Backtester", SpyBacktester)
     monkeypatch.setattr(run_backtest, "load_cached_data",
-                        lambda *a, **kw: df)
+                        lambda *a, **kw: (seen.setdefault("cache_store", kw.get("store")), df)[1])
 
     result = run_backtest.run_single_backtest(
         strategy_name="sma_crossover",
@@ -92,6 +92,50 @@ def test_run_single_backtest_threads_platform_to_backtester(monkeypatch):
         f"platform did not thread through to Backtester — got {seen}"
     )
     assert seen["capital"] == 777.0
+    assert seen["cache_store"] is False, "save=False must not populate the OHLCV cache"
+
+
+def test_blofin_backtest_defaults_tp_enabled_like_live(monkeypatch):
+    seen = {}
+
+    class SpyBacktester:
+        def __init__(self, initial_capital, platform="binanceus", close_strategies=None, **kwargs):
+            seen["platform"] = platform
+            seen["closes"] = close_strategies
+            self.commission_pct = 0.0
+
+        def run(self, df, **kwargs):
+            return {
+                "strategy_name": "momentum", "symbol": "BTC/USDT", "timeframe": "1h",
+                "start_date": str(df.index[0]), "end_date": str(df.index[-1]),
+                "initial_capital": 1000.0, "final_capital": 1000.0,
+                "total_return_pct": 0.0, "annual_return_pct": 0.0,
+                "sharpe_ratio": 0.0, "sortino_ratio": 0.0,
+                "max_drawdown_pct": 0.0, "calmar_ratio": 0.0,
+                "volatility_pct": 0.0, "win_rate": 0.0, "profit_factor": 0.0,
+                "total_trades": 0, "avg_win_pct": 0.0, "avg_loss_pct": 0.0,
+                "trades": [], "params": {},
+            }
+
+    df = pd.DataFrame(
+        {"open": [100] * 60, "high": [101] * 60, "low": [99] * 60,
+         "close": [100] * 60, "volume": [1000] * 60},
+        index=pd.date_range("2026-01-01", periods=60, freq="h"),
+    )
+    monkeypatch.setattr(run_backtest, "Backtester", SpyBacktester)
+    monkeypatch.setattr(run_backtest, "load_cached_data", lambda *a, **kw: df)
+    run_backtest.run_single_backtest(
+        strategy_name="momentum",
+        symbol="BTC/USDT",
+        timeframe="1h",
+        since="2026-01-01",
+        platform="blofin",
+        registry="futures",
+        close_strategies=[{"name": "tiered_tp_atr_regime", "params": {}}],
+        save=False,
+    )
+    assert seen["platform"] == "blofin"
+    assert seen["closes"][0]["params"]["tp_enabled"] is True
 
 
 def test_backtester_imports_under_script_style_sys_path(tmp_path):
@@ -243,3 +287,50 @@ def test_run_walk_forward_threads_close_stack_grid(monkeypatch):
     assert seen["close_stack_grid"] == grid
     assert seen["optimize_metric"] == "dd_adjusted_return"
     assert seen["direction"] == "long"
+
+
+def test_config_defaults_thread_perps_runtime_inputs(tmp_path, monkeypatch):
+    import json
+
+    config = {
+        "config_version": 19,
+        "regime": {"enabled": False},
+        "strategies": [{
+            "id": "live-sma-eth-30m",
+            "type": "perps",
+            "platform": "blofin",
+            "script": "shared_scripts/check_blofin.py",
+            "args": ["sma_crossover", "ETH", "30m", "--mode=live"],
+            "capital": 100.0,
+            "leverage": 75,
+            "margin_per_trade_usd": 10.0,
+            "max_drawdown_pct": 50.0,
+            "close_strategy": {
+                "name": "tiered_tp_atr_regime",
+                "params": {"sl_atr_mult": 2.5, "use_defaults": True},
+            },
+        }],
+    }
+    config_path = tmp_path / "blofin-config.json"
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    seen = {}
+
+    def spy_run_single(*args, **kwargs):
+        seen["args"] = args
+        seen["kwargs"] = kwargs
+
+    monkeypatch.setattr(run_backtest, "run_single_backtest", spy_run_single)
+    monkeypatch.setattr("sys.argv", [
+        "run_backtest.py", "--mode", "single",
+        "--config", str(config_path), "--strategy", "live-sma-eth-30m",
+    ])
+
+    run_backtest.main()
+
+    assert seen["args"] == ("sma_crossover", "ETH", "30m", "2022-01-01", 100.0)
+    assert seen["kwargs"]["registry"] == "futures"
+    assert seen["kwargs"]["platform"] == "blofin"
+    assert seen["kwargs"]["margin_per_trade_usd"] == 10.0
+    assert seen["kwargs"]["leverage"] == 75.0
+    assert seen["kwargs"]["circuit_breaker_max_drawdown_pct"] == 50.0
+    assert seen["kwargs"]["close_strategies"][0]["params"]["sl_atr_mult"] == 2.5

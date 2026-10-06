@@ -48,6 +48,36 @@ def test_close_tier_fill_price_follows_the_winning_close(close_results, want_fra
     ) == {"avg_cost": 100, "lookback": 5}
 
 
+def test_close_decision_preserves_evaluator_reason_and_tp_tier():
+    df = pd.DataFrame({"close": [100.0, 106.0]})
+
+    def apply_strategy(name, data, params=None):
+        result = data.copy()
+        result["signal"] = 0
+        return result
+
+    evaluation = evaluate_open_close(
+        apply_strategy,
+        lambda name: None,
+        df,
+        positional_strategy="open",
+        open_strategy="open",
+        close_strategies=["tiered_tp_atr_regime"],
+        position_side="long",
+        close_evaluate=lambda *_: {
+            "close_fraction": 0.5,
+            "reason": "tiered_tp_atr_regime:trending_up:2.5",
+            "tp_tier": 2.5,
+        },
+    )
+    decision = finalize_decision(evaluation, position_side="long")
+    assert decision["close_strategy"] == "tiered_tp_atr_regime"
+    assert decision["close_evaluator"] == "tiered_tp_atr_regime"
+    assert decision["close_source"] == "evaluator"
+    assert decision["close_reason"] == "tiered_tp_atr_regime:trending_up:2.5"
+    assert decision["tp_tier"] == 2.5
+
+
 def _signal_frame(signal):
     df = pd.DataFrame({"close": [100.0, 101.0], "signal": [0, signal]})
     return df

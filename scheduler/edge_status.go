@@ -27,6 +27,7 @@ var noEdgeStrategies = map[string]noEdgeEvidence{
 	"atr_breakout":                {"fee_audit_m5", noEdgeRefFeeAudit},
 	"awesome_oscillator":          {"study_fail", "backtest/candidates/awesome_oscillator_1660/REPORT.md"},
 	"bollinger_bands":             {"fee_audit_m5", noEdgeRefFeeAudit},
+	"breakout_retest":             {"unvalidated", "docs/research/breakout-retest-unvalidated.md"},
 	"chaikin_money_flow_breakout": {"study_fail", "backtest/candidates/chaikin_money_flow_1649/REPORT.md"},
 	"commodity_channel_trend":     {"study_fail", "backtest/candidates/commodity_channel_trend_1656/REPORT.md"},
 	"connors_rsi_reversion":       {"study_fail", "backtest/candidates/connors_rsi_reversion_1645/REPORT.md"},

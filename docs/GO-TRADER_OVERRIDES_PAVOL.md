@@ -1,8 +1,8 @@
 # GO-TRADER OVERRIDES PAVOL
 
 Pavol fork overrides vs upstream `richkuo/go-trader`. MUST be preserved across
-upstream merges. Base: v0.107.0 (`97e2681`, merged 2026-10-05; previous base
-v0.106.0). This file is referenced from `CLAUDE.md` (root `AGENTS.md` is a
+upstream merges. Base: v0.108.0 (`ba51562`, merged 2026-10-06; previous base
+v0.107.0). This file is referenced from `CLAUDE.md` (root `AGENTS.md` is a
 symlink to it).
 
 ## 1. New files (upstream does not have them — keep on merge)
@@ -22,6 +22,7 @@ symlink to it).
 | `shared_scripts/test_check_blofin_inst_type.py` | Regression tests for equals- and space-separated spot/swap registry selection |
 | `shared_scripts/test_check_ob_touch_history_floor.py` | Regression tests for 5m=2000 and 15m=1200 LTF fetch floors in BloFin/TopStep checks |
 | `scheduler/strategy_composition.go`, `strategy_composition_regime_payload_test.go` | Do not append empty shared regime payloads; check scripts locally compute regime if payload is absent/empty, and Go stamps that inline label for position TP/SL. Entry gate, Hurst, and evidence-gated directional policy still use shared-store fail-open/closed semantics |
+| `scheduler/blofin_virtual_close.go`, `scheduler/close_support.go`, `shared_strategies/close/support_matrix.json` | BloFin perps support matrix (shared by Go validation/Python registry), persisted scheduler-managed ratchet/dynamic virtual stops, and fail-closed stop-owner/context validation |
 | `shared_tools/regime.py`, `test_regime_injection.py` | Empty injected payload falls back to local OHLCV regime calculation; non-empty payload remains authoritative |
 | `scheduler/config_pavol_test.go` | Fork config tests (perps leverage, spot rejection, Discord channel env) — upstream #1597 deleted the original file content, ours live here |
 | `scheduler/risk_pavol_test.go` | Fork risk tests (BloFin force-close, concise warning, spot multiplier) — same reason |
@@ -45,7 +46,10 @@ symlink to it).
 | `scheduler/fees.go` | `BloFinTakerFeePct`, `CalculatePlatformSpotFee("blofin")` |
 | `scheduler/risk.go` | BloFin constants; perps margin DD inputs |
 | `scheduler/regime_atr.go` | `sl_atr_mult` close param allowed |
-| `scheduler/config.go` | `regime_directional_policy` allowed on BloFin perps; `sl_atr_mult` validation |
+| `scheduler/config.go`, `scheduler/regime_atr.go`, `scheduler/trailing_tp_ratchet.go`, `scheduler/config_reload.go` | `regime_directional_policy` allowed on BloFin perps; scalar/regime ATR virtual stop and `trailing_tp_ratchet*`/`tiered_tp_atr_live_regime_dynamic` validation for BloFin perps; hot reload of active close/stop state is blocked while a position is open |
+| `scheduler/blofin_exec.go`, `scheduler/strategy_composition.go`, `shared_scripts/check_blofin.py` | BloFin check context carries persisted position-open time and applied regime; completed `bars_held`, closed-candle `zscore`, and position-open AVWAP context are supplied/diagnosed |
+| `scheduler/trade_diagnostics.go`, `scheduler/trade_diagnostics_db.go`, `scheduler/ui_ops.go`, `scheduler/db.go` | Persist and surface close source/evaluator/reason/TP tier/virtual SL trigger; capture ratio is labelled `price_only`; diagnostic columns migrate idempotently |
+| `shared_tools/data_fetcher.py`, `backtest/backtester.py`, `backtest/run_backtest.py` | Refresh stale nonempty OHLCV cache tails; BloFin uses live TP-enabled default and fees; `save=False` avoids cache/result writes; BloFin dynamic close confirmation/stop parity |
 | `scheduler/portfolio.go`, `db.go`, `hyperliquid_balance.go`, `manual.go`, `deribit.go` | `Position.RealizedPnLAccum` — `closed_positions.realized_pnl` sums ALL legs, not final leg |
 
 ## 3. BloFin spot (platform `blofin_spot`, prefix `bls-`, type `spot`)

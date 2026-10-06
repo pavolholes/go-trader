@@ -49,6 +49,10 @@ def list_strategies_detailed() -> list[dict]:
             "description": registry[name]["description"],
             "default_params": registry[name]["default_params"],
             "platforms": list(registry[name]["platforms"]),
+            "support": {
+                key: dict(value)
+                for key, value in registry[name].get("support", {}).items()
+            },
         }
         for name in sorted(registry.keys())
     ]

@@ -37,7 +37,20 @@ json_get() {
 import json, sys
 doc = json.load(open(sys.argv[1]))
 for part in sys.argv[2].split("."):
-    doc = doc[int(part)] if isinstance(doc, list) else doc.get(part)
+    if isinstance(doc, list):
+        try:
+            index = int(part)
+        except ValueError:
+            print("")
+            sys.exit(0)
+        if index < 0 or index >= len(doc):
+            print("")
+            sys.exit(0)
+        doc = doc[index]
+    elif isinstance(doc, dict):
+        doc = doc.get(part)
+    else:
+        doc = None
     if doc is None:
         print("")
         sys.exit(0)
@@ -1640,31 +1653,7 @@ out=$(run_merge_args --source btc=coin-btc --source eth=coin-eth --diff 2>&1) &&
 assert_contains "$out" "diff: compose-refuse leaderboard_summaries key hyperliquid:sol:C-lb" "--diff names the leaderboard conflict"
 
 free_port() {
-    python3 - "${SCRIPT_DIR}/../scheduler/server.go" <<'PY'
-import re
-import socket
-import sys
-
-with open(sys.argv[1], encoding="utf-8") as fh:
-    found = re.search(r"^const statusPortMaxAttempts = (\d+)$", fh.read(), re.MULTILINE)
-if found is None:
-    sys.exit("free_port: cannot parse statusPortMaxAttempts from " + sys.argv[1])
-low = 1024
-high = 65535 - int(found.group(1)) + 1
-if high < low:
-    sys.exit("free_port: computed status port maximum %d is below %d" % (high, low))
-for _ in range(50):
-    s = socket.socket()
-    try:
-        s.bind(("127.0.0.1", 0))
-        port = s.getsockname()[1]
-    finally:
-        s.close()
-    if low <= port <= high:
-        print(port)
-        sys.exit(0)
-sys.exit("free_port: no kernel-assigned port within %d..%d after 50 attempts" % (low, high))
-PY
+    python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()'
 }
 
 nt_add_source() {

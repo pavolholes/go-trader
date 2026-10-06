@@ -527,12 +527,30 @@ def _check_capability_declared(request: CloseCapabilityRequest) -> list:
     return out
 
 
+# Pavol fork: BloFin perps parity — these closes have a scheduler-managed
+# implementation (virtual stops, completed-candle contexts) declared in
+# shared_strategies/close/support_matrix.json, so the HL-live-only and
+# research-context refusals do not apply on platform == "blofin".
+_BLOFIN_PARITY_CLOSES = frozenset({
+    "tiered_tp_atr_live_regime_dynamic",
+    "time_stop",
+    "zscore_target",
+    "avwap_stop",
+})
+
+
+def _blofin_parity_exempts(platform, close_name: str) -> bool:
+    return str(platform or "").strip().lower() == "blofin" \
+        and close_name in _BLOFIN_PARITY_CLOSES
+
+
 def _check_live_only_close(request: CloseCapabilityRequest) -> list:
     out = []
     for idx, ref in enumerate(request.close_refs):
         cap = CLOSE_CAPABILITIES.get(ref["name"])
         if ref["name"] in request.registered_closes and cap is not None \
-                and cap.live == CLOSE_LIVE_ONLY:
+                and cap.live == CLOSE_LIVE_ONLY \
+                and not _blofin_parity_exempts(request.platform, ref["name"]):
             out.append(capability_refusal(
                 "LIVE_ONLY_CLOSE", ref["name"], close_ref_index=idx,
                 details={"message": f"{ref['name']} is HL-live-only: the common "
@@ -547,7 +565,8 @@ def _check_live_close_context(request: CloseCapabilityRequest) -> list:
     for idx, ref in enumerate(request.close_refs):
         cap = CLOSE_CAPABILITIES.get(ref["name"])
         if ref["name"] not in request.registered_closes or cap is None \
-                or cap.live != CLOSE_LIVE_RESEARCH_CONTEXT:
+                or cap.live != CLOSE_LIVE_RESEARCH_CONTEXT \
+                or _blofin_parity_exempts(request.platform, ref["name"]):
             continue
         details = {"mode": request.mode, "platform": request.platform,
                    "strategy_type": request.strategy_type}
@@ -1596,7 +1615,11 @@ class _ProfileSwitcher:
 def _close_refs_use_regime_tiered_tp(refs: list[dict]) -> bool:
     for ref in refs:
         n = (ref.get("name") or "").strip().lower()
-        if n in ("tiered_tp_atr_regime", "tiered_tp_atr_live_regime"):
+        if n in (
+            "tiered_tp_atr_regime",
+            "tiered_tp_atr_live_regime",
+            "tiered_tp_atr_live_regime_dynamic",
+        ):
             return True
     return False
 
@@ -1744,6 +1767,56 @@ def _ungated_leg_notional(leg_notional: float, hurst_size_mult: float) -> float:
     if hurst_size_mult > 0:
         return leg_notional / hurst_size_mult
     return leg_notional
+
+
+def _position_avwap_prefix(df: pd.DataFrame):
+    """Return cumulative TPV/volume arrays for position-open anchored AVWAP."""
+    required = ("high", "low", "close", "volume")
+    if df is None or df.empty or any(column not in df.columns for column in required):
+        return None
+    high = pd.to_numeric(df["high"], errors="coerce").to_numpy(dtype=float)
+    low = pd.to_numeric(df["low"], errors="coerce").to_numpy(dtype=float)
+    close = pd.to_numeric(df["close"], errors="coerce").to_numpy(dtype=float)
+    volume = pd.to_numeric(df["volume"], errors="coerce").to_numpy(dtype=float)
+    valid = (
+        np.isfinite(high) & np.isfinite(low) & np.isfinite(close)
+        & np.isfinite(volume) & (high > 0) & (low > 0) & (close > 0)
+        & (volume > 0)
+    )
+    safe_volume = np.where(valid, volume, 0.0)
+    typical = (high + low + close) / 3.0
+    weighted = np.where(valid, typical * safe_volume, 0.0)
+    cumulative_tpv = np.concatenate(([0.0], np.cumsum(weighted)))
+    cumulative_volume = np.concatenate(([0.0], np.cumsum(safe_volume)))
+    if cumulative_volume[-1] <= 0:
+        return None
+    return pd.DatetimeIndex(df.index), cumulative_tpv, cumulative_volume
+
+
+def _position_anchored_avwap_from_prefix(prefix, opened_at, through_index: int) -> Optional[float]:
+    """Price-volume weighted typical price from the first candle open at/after entry."""
+    if prefix is None or opened_at is None:
+        return None
+    index, cumulative_tpv, cumulative_volume = prefix
+    try:
+        anchor = pd.Timestamp(opened_at)
+        if index.tz is None and anchor.tzinfo is not None:
+            anchor = anchor.tz_convert("UTC").tz_localize(None)
+        elif index.tz is not None and anchor.tzinfo is None:
+            anchor = anchor.tz_localize(index.tz)
+        elif index.tz is not None:
+            anchor = anchor.tz_convert(index.tz)
+        start = int(index.searchsorted(anchor, side="left"))
+        end = min(int(through_index), len(index) - 1)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if start < 0 or start > end or start >= len(index):
+        return None
+    volume = float(cumulative_volume[end + 1] - cumulative_volume[start])
+    if not math.isfinite(volume) or volume <= 0:
+        return None
+    value = float(cumulative_tpv[end + 1] - cumulative_tpv[start]) / volume
+    return value if math.isfinite(value) and value > 0 else None
 
 
 class Trade:
@@ -2242,6 +2315,28 @@ class Backtester:
         self._uses_regime_tiered_close = _close_refs_use_regime_tiered_tp(
             self._close_refs,
         )
+        self._dynamic_regime_close = next(
+            (
+                ref for ref in self._close_refs
+                if (ref.get("name") or "").strip().lower()
+                == "tiered_tp_atr_live_regime_dynamic"
+            ),
+            None,
+        )
+        self._dynamic_close_confirm_cycles = 2
+        if self._dynamic_regime_close is not None:
+            raw_confirm = (
+                (self._dynamic_regime_close.get("params") or {})
+                .get("regime_confirm_cycles", 2)
+            )
+            if (
+                isinstance(raw_confirm, bool)
+                or not isinstance(raw_confirm, (int, float))
+                or int(raw_confirm) != raw_confirm
+                or raw_confirm < 1
+            ):
+                raise ValueError("regime_confirm_cycles must be a whole number >= 1")
+            self._dynamic_close_confirm_cycles = int(raw_confirm)
         self._unified_close_params: Optional[dict] = None
         self._unified_scalar_params = None
         self._uses_trailing_ratchet_close = any(
@@ -2295,15 +2390,21 @@ class Backtester:
             self._unified_scalar_params = unified_regime_scalar_params
             for _ref in self._close_refs:
                 _n = (_ref.get("name") or "").strip().lower()
-                if _n not in ("tiered_tp_atr_regime", "tiered_tp_atr_live_regime"):
+                if _n not in (
+                    "tiered_tp_atr_regime",
+                    "tiered_tp_atr_live_regime",
+                    "tiered_tp_atr_live_regime_dynamic",
+                ):
                     continue
                 _params = _ref.get("params") or {}
                 if close_params_are_unified_regime(_params):
                     self._unified_close_params = dict(_params)
                 break
             if self._unified_close_params is not None:
+                _validation_params = dict(self._unified_close_params)
+                _validation_params.pop("regime_confirm_cycles", None)
                 _unified_errs = validate_unified_regime_close(
-                    self._unified_close_params,
+                    _validation_params,
                     labels=self._regime_primary_labels,
                 )
                 if _unified_errs:
@@ -2676,6 +2777,7 @@ class Backtester:
         trades = []
         current_trade = None
         equity_curve = []
+        terminal_insolvency = False
         rec = _LedgerEventRecorder(self.initial_capital) if record_events else None
 
         avg_cost = 0.0
@@ -2713,6 +2815,8 @@ class Backtester:
         # survives (by then any trigger is a real carried level).
         walk_mode = self.intrabar_resolution == "ohlc_walk"
         sl_pierce_armed = False
+        dynamic_pending_label = ""
+        dynamic_pending_count = 0
         self._active_sl_after_rules = self._sl_after_rules_static
         self._run_tp_tier_thresholds = list(self._tp_tier_thresholds_static)
         self._run_stop_loss_atr_mult: Optional[float] = None
@@ -2732,10 +2836,15 @@ class Backtester:
             ).reindex(df.index)
 
         avwap_series = df["avwap"] if "avwap" in df.columns else None
+        avwap_prefix = (
+            _position_avwap_prefix(df)
+            if self._close_names_include_avwap_stop()
+            else None
+        )
         if self._close_names_include_avwap_stop():
             avwap_usable = avwap_series is not None and bool(
                 (pd.to_numeric(avwap_series, errors="coerce") > 0).any()
-            )
+            ) or avwap_prefix is not None
             if not avwap_usable:
                 from strategy_composition import warn_avwap_stop_missing_context
                 warn_avwap_stop_missing_context()
@@ -2759,8 +2868,11 @@ class Backtester:
             return 0.0
 
         def stamp_open_from_label(stamp: str) -> None:
+            nonlocal dynamic_pending_label, dynamic_pending_count
             lab = (stamp or "").strip()
             self._run_position_regime = lab
+            dynamic_pending_label = ""
+            dynamic_pending_count = 0
             if self._uses_regime_tiered_close:
                 rules_rt, _ = self._sl_mod.parse_strategy_tp_sl_after_rules(
                     self._close_refs, regime=lab,
@@ -2846,6 +2958,47 @@ class Backtester:
                 print(f"[#1684] seeded position dropped: its {self._stop_owner} stop has no "
                       "entry ATR or regime label yet, so the run starts flat instead of "
                       "carrying an unprotected position.", file=sys.stderr)
+
+        def advance_dynamic_close_regime(label: str, side: str) -> bool:
+            nonlocal dynamic_pending_label, dynamic_pending_count
+            nonlocal sl_trigger_px, sl_pierce_armed
+            if (
+                self._dynamic_regime_close is None
+                or position == 0
+                or not label
+            ):
+                return False
+            applied = str(self._run_position_regime or "").strip()
+            if not applied:
+                stamp_open_from_label(label)
+                return False
+            if label == applied:
+                dynamic_pending_label = ""
+                dynamic_pending_count = 0
+                return False
+            if label == dynamic_pending_label:
+                dynamic_pending_count += 1
+            else:
+                dynamic_pending_label = label
+                dynamic_pending_count = 1
+            if dynamic_pending_count < self._dynamic_close_confirm_cycles:
+                return False
+
+            stamp_open_from_label(label)
+            candidate = self._initial_sl_trigger(
+                side, scale.geom_cost(avg_cost), entry_atr_value,
+            )
+            if candidate > 0:
+                current = sl_trigger_px
+                tighter = (
+                    current <= 0
+                    or (side == "long" and candidate > current)
+                    or (side == "short" and candidate < current)
+                )
+                if tighter:
+                    sl_trigger_px = candidate
+                    sl_pierce_armed = True
+            return self._sl_hit(side, mark_price, sl_trigger_px)
 
         if starting_long:
             effective_entry = starting_long["entry_price"]
@@ -3055,9 +3208,10 @@ class Backtester:
             return effective_price, qty, notional * spec["taker_fee_pct"]
 
         def _book_close(idx, close_fraction: float, raw_fill: float, slippage: float,
-                        reason: str, bar_mark: float, seed_price: float,
-                        fee_pct: Optional[float] = None, decision_bar=None,
-                        timing: str = "bar_open_fill") -> bool:
+                    reason: str, bar_mark: float, seed_price: float,
+                    fee_pct: Optional[float] = None, decision_bar=None,
+                    timing: str = "bar_open_fill",
+                    record_kind: str = "close") -> bool:
             nonlocal position, cash, avg_cost, initial_quantity, entry_atr_value
             nonlocal current_trade, sl_trigger_px, sl_tiers_processed
             nonlocal post_tp_trail_mult, sl_high_water_px
@@ -3087,6 +3241,11 @@ class Backtester:
                         "residual_qty": qty_to_close - floored,
                     })
                 qty_to_close = floored
+            position_before_close = abs(position)
+            close_ratio = (
+                min(max(qty_to_close / position_before_close, 0.0), 1.0)
+                if position_before_close > 0 else 0.0
+            )
             if position > 0:
                 effective_price = raw_fill * (1 - slippage)
                 proceeds = qty_to_close * effective_price
@@ -3095,7 +3254,7 @@ class Backtester:
                     # Pavol fork: margin-space sizing — return the closed
                     # fraction of locked margin plus realized PnL.
                     realized_pnl = qty_to_close * (effective_price - avg_cost)
-                    margin_return = self._margin_locked * (qty_to_close / position)
+                    margin_return = self._margin_locked * close_ratio
                     cash += margin_return + realized_pnl - commission
                 else:
                     cash += proceeds - commission
@@ -3106,11 +3265,21 @@ class Backtester:
                 commission = cost * fee_rate
                 if self._margin_per_trade_usd and self._margin_locked > 0:
                     realized_pnl = qty_to_close * (avg_cost - effective_price)
-                    margin_return = self._margin_locked * (qty_to_close / abs(position))
+                    margin_return = self._margin_locked * close_ratio
                     cash += margin_return - cost - commission
                 else:
                     cash -= cost + commission
                 position += qty_to_close
+
+            if self._margin_per_trade_usd and self._margin_locked > 0:
+                # Release collateral and short-sale proceeds with the closed
+                # quantity so returned margin is not also left locked.
+                self._margin_locked = max(
+                    self._margin_locked - margin_return, 0.0,
+                )
+                self._notional = max(
+                    self._notional * (1.0 - close_ratio), 0.0,
+                )
 
             if current_trade:
                 closed = Trade(current_trade.entry_date, current_trade.entry_price, current_trade.side)
@@ -3182,7 +3351,7 @@ class Backtester:
 
             if rec is not None:
                 rec.record(
-                    "close", bar=idx, decision_bar=decision_bar, timing=timing,
+                    record_kind, bar=idx, decision_bar=decision_bar, timing=timing,
                     side="long" if qty_before > 0 else "short",
                     action="sell" if qty_before > 0 else "buy",
                     quantity=qty_to_close, raw_price=raw_fill,
@@ -3193,6 +3362,7 @@ class Backtester:
                     cash_before=cash_before, cash_after=cash, hold=hold,
                     gross_realized=gross_realized,
                     entry_fee_allocated=entry_fee_allocated,
+                    synthetic=(record_kind == "terminal_liquidation"),
                 )
             return sl_after_moved
 
@@ -3272,6 +3442,7 @@ class Backtester:
                     plain_short_for_bar = effective_direction == "short"
 
             sl_after_just_applied = False
+            dynamic_regime_stop_hit = False
             ratchet_tightened = False
 
             if book_funding and position != 0:
@@ -3611,77 +3782,23 @@ class Backtester:
                         sl_trigger_px,
                     )
                     if raw_fill is not None:
-                        cash_before, qty_before, avg_before = cash, position, avg_cost
-                        gross_realized = None
-                        entry_fee_allocated = None
-                        qty_to_close = abs(position)
-                        if position > 0:
-                            effective_price = raw_fill * (1 - self.slippage_pct)
-                            proceeds = qty_to_close * effective_price
-                            commission = proceeds * self.commission_pct
-                            cash += proceeds - commission
-                        else:
-                            effective_price = raw_fill * (1 + self.slippage_pct)
-                            cost = qty_to_close * effective_price
-                            commission = cost * self.commission_pct
-                            cash -= cost + commission
-                        position = 0.0
-                        if current_trade:
-                            closed = Trade(
-                                current_trade.entry_date,
-                                current_trade.entry_price,
-                                current_trade.side,
-                            )
-                            closed.shares = qty_to_close
-                            closed.close(idx, effective_price)
-                            gross_realized = closed.pnl
-                            qty_frac = (
-                                qty_to_close / initial_quantity
-                                if initial_quantity > 0 else 1.0
-                            )
-                            _stamp_hold(closed, hold,
-                                        entry_atr=entry_atr_value,
-                                        exit_fee=commission, reason="sl",
-                                        qty_frac=qty_frac,
-                                        true_up_entry_fee=(
-                                            scale.scale_in_count > 0
-                                        ))
-                            entry_fee_allocated = closed.entry_fee
-                            closed.scale_in_adds = scale.scale_in_count
-                            trades.append(closed)
-                            current_trade = None
-                        avg_cost = 0.0
-                        initial_quantity = 0.0
-                        entry_atr_value = 0.0
-                        scale.reset()
-                        sl_trigger_px = 0.0
-                        sl_tiers_processed = 0
-                        post_tp_trail_mult = None
-                        sl_high_water_px = 0.0
-                        sl_pierce_armed = False
-                        self._active_sl_after_rules = self._sl_after_rules_static
-                        self._run_tp_tier_thresholds = list(
-                            self._tp_tier_thresholds_static,
+                        _book_close(
+                            idx, 1.0, raw_fill, self.slippage_pct,
+                            "sl", mark_price, raw_fill,
                         )
-                        self._run_stop_loss_atr_mult = None
-                        self._run_trailing_stop_atr_mult = None
-                        self._run_position_regime = ""
-                        if rec is not None:
-                            rec.record(
-                                'close', bar=idx, decision_bar=None,
-                                timing='intrabar_trigger_fill', side="long" if qty_before > 0 else "short", action="sell" if qty_before > 0 else "buy",
-                                quantity=qty_to_close, raw_price=raw_fill, effective_price=effective_price,
-                                fee_rate=self.commission_pct, fee_charged=commission, reason="sl",
-                                qty_before=qty_before, qty_after=position,
-                                avg_cost_before=avg_before, avg_cost_after=avg_cost,
-                                cash_before=cash_before, cash_after=cash, hold=hold,
-                                gross_realized=gross_realized, entry_fee_allocated=entry_fee_allocated,
-                            )
+                        sl_pierce_armed = False
 
                 if self.close_strategies and position != 0 and avg_cost > 0:
                     # Evaluator geometry (tiered-TP thresholds etc.) reads the
                     # frozen anchor, never the blend — mirroring the live
                     # on-chain protection path; PnL stays on the blend.
+                    position_avwap_value = (
+                        _position_anchored_avwap_from_prefix(
+                            avwap_prefix, current_trade.entry_date, i,
+                        )
+                        if avwap_prefix is not None and current_trade is not None
+                        else None
+                    )
                     pending_close_fraction, pending_close_reason, tier_fill_price = self._evaluate_close_strategies(
                         position, scale.geom_cost(avg_cost), initial_quantity,
                         entry_atr_value,
@@ -3691,6 +3808,9 @@ class Backtester:
                         bars_held=hold.bars,
                         zscore_series=zscore_series,
                         avwap_series=avwap_series,
+                        position_anchored_avwap=position_avwap_value,
+                        regime_pending_label=dynamic_pending_label,
+                        regime_pending_count=dynamic_pending_count,
                     )
                     if (
                         self._resting_tp_model
@@ -3704,6 +3824,18 @@ class Backtester:
                             sl_after_just_applied = True
                         pending_close_fraction = 0.0
                         pending_close_reason = ""
+                    if (
+                        self._dynamic_regime_close is not None
+                        and position != 0
+                        and open_action == "none"
+                    ):
+                        dynamic_regime_stop_hit = advance_dynamic_close_regime(
+                            _bar_close_regime(row),
+                            "long" if position > 0 else "short",
+                        )
+                        if dynamic_regime_stop_hit:
+                            pending_close_fraction = 1.0
+                            pending_close_reason = "dynamic_regime_stop"
                     if (
                         trailing_ratchet_active
                         and self._ratchet_mod
@@ -3778,8 +3910,9 @@ class Backtester:
                     if not walk_mode and sl_trigger_px > 0 and self._sl_hit(
                         side_now, mark_price, sl_trigger_px,
                     ):
-                        pending_close_fraction = 1.0
-                        pending_close_reason = "sl"
+                        if pending_close_fraction <= 0:
+                            pending_close_fraction = 1.0
+                            pending_close_reason = "dynamic_regime_stop" if dynamic_regime_stop_hit else "sl"
                 # Margin-based circuit breaker (per-trade drawdown, matches Go engine)
                 if (self._margin_per_trade_usd is not None
                     and self._margin_locked > 0
@@ -4213,6 +4346,41 @@ class Backtester:
             if self._cb_active and position != 0 and not pending_signal_sl_close:
                 pending_signal_sl_close = True
 
+            # Check insolvency after this bar's signal/close/stop paths have
+            # had a chance to book an exit. A pending next-open stop is also
+            # allowed to execute before terminal liquidation.
+            terminal_liquidation_allowed = (
+                self._margin_per_trade_usd is not None or position < 0
+            )
+            if position != 0 and terminal_liquidation_allowed and not pending_signal_sl_close:
+                if self._margin_per_trade_usd and self._margin_locked > 0:
+                    unrealized_pnl = position * (mark_price - avg_cost)
+                    terminal_equity = (
+                        cash + self._margin_locked + unrealized_pnl
+                        - (self._notional if position < 0 else 0)
+                    )
+                else:
+                    terminal_equity = cash + position * mark_price
+                if terminal_equity <= 0:
+                    if rec is not None:
+                        rec.mark_interval_end(
+                            bar=idx, cash=cash, position=position,
+                            avg_cost=avg_cost, hold=hold,
+                        )
+                    _book_close(
+                        idx, 1.0, mark_price, self.slippage_pct,
+                        "liquidation", mark_price, mark_price,
+                        record_kind="terminal_liquidation",
+                    )
+                    cash = 0.0
+                    if rec is not None and rec.events:
+                        rec.events[-1]["cash_after"] = cash
+                    terminal_insolvency = True
+                    equity_curve[-1]["equity"] = 0.0
+                    for future_idx in df.index[i + 1:]:
+                        equity_curve.append({"date": future_idx, "equity": 0.0})
+                    break
+
             # #1271: promote any surviving trigger to a carried, pierce-
             # eligible level for the next bar (plain-path mirror of the
             # open/close path's pre-continue arming).
@@ -4222,7 +4390,7 @@ class Backtester:
             if position != 0:
                 sl_pierce_armed = True
 
-        if rec is not None:
+        if rec is not None and not terminal_insolvency:
             rec.mark_interval_end(bar=df.index[-1], cash=cash, position=position,
                                   avg_cost=avg_cost, hold=hold)
         if position != 0:
@@ -4277,6 +4445,10 @@ class Backtester:
                     synthetic=True,
                 )
 
+        # The last in-loop snapshot is pre-close; replace it with terminal
+        # cash so EOD fills, fees, and slippage are reflected in return and DD.
+        if equity_curve:
+            equity_curve[-1]["equity"] = cash
         final_equity = cash
         equity_df = pd.DataFrame(equity_curve).set_index("date")
 
@@ -4413,7 +4585,10 @@ class Backtester:
                                    market_regime: str = "",
                                    bars_held: int = 0,
                                    zscore_series: Optional[pd.Series] = None,
-                                   avwap_series: Optional[pd.Series] = None
+                                   avwap_series: Optional[pd.Series] = None,
+                                   position_anchored_avwap: Optional[float] = None,
+                                   regime_pending_label: str = "",
+                                   regime_pending_count: int = 0
                                    ) -> Tuple[float, str, float]:
         evaluate, _list_strategies = _load_close_registry()
         side = "long" if position > 0 else "short"
@@ -4425,6 +4600,9 @@ class Backtester:
             "initial_quantity": float(initial_quantity or abs(position)),
             "entry_atr": float(entry_atr_value),
             "regime": str(position_regime or ""),
+            "regime_applied_label": str(position_regime or ""),
+            "regime_pending_label": str(regime_pending_label or ""),
+            "regime_pending_count": int(regime_pending_count or 0),
             "bars_held": int(bars_held),
         }
         if self._resting_tp_model:
@@ -4451,11 +4629,18 @@ class Backtester:
 
         if avwap_series is not None:
             try:
-                avwap_value = float(avwap_series.loc[idx])
+                series_avwap = float(avwap_series.loc[idx])
             except (KeyError, TypeError, ValueError):
-                avwap_value = float("nan")
-            if avwap_value == avwap_value and avwap_value > 0:
-                market_dict["avwap"] = avwap_value
+                series_avwap = float("nan")
+            if series_avwap == series_avwap and series_avwap > 0:
+                market_dict["avwap"] = series_avwap
+        if "avwap" not in market_dict and position_anchored_avwap is not None:
+            try:
+                anchored_avwap = float(position_anchored_avwap)
+            except (TypeError, ValueError):
+                anchored_avwap = 0.0
+            if math.isfinite(anchored_avwap) and anchored_avwap > 0:
+                market_dict["avwap"] = anchored_avwap
 
         best = 0.0
         best_reason = ""

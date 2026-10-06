@@ -16,7 +16,8 @@ VALID_POSITION_SIDES = {"", "long", "short"}
 VALID_OPEN_ACTIONS = {"long", "short", "none"}
 POSITION_CONTEXT_PARAM_KEYS = {
     "side", "avg_cost", "current_quantity", "initial_quantity", "entry_atr", "regime",
-    "risk_anchor_price", "tp_model",
+    "risk_anchor_price", "tp_model", "bars_held", "opened_at_ms", "regime_applied_label",
+    "regime_pending_label", "regime_pending_count",
 }
 
 
@@ -27,6 +28,8 @@ class CloseEvaluation:
     sl_price: float = 0.0
     atr_value: float = 0.0
     tier_fill_price: float = 0.0
+    reason: str = ""
+    tp_tier: object = None
 
 
 @dataclass
@@ -332,6 +335,48 @@ def parse_allow_no_edge_value(slot: dict, key: str = "allow_no_edge") -> Acknowl
     return Acknowledgement(False, f"{key} must be a JSON boolean, got {value!r}")
 
 
+def validate_close_strategy_names(
+    close_names: Iterable[str],
+    get_open_strategy: Callable[[str], object],
+    get_close_strategy: Callable[[str], object],
+    list_open_strategies: Optional[Callable[[], Iterable[str]]] = None,
+    list_close_strategies: Optional[Callable[[], Iterable[str]]] = None,
+    required_platform: Optional[str] = None,
+) -> None:
+    """Validate close refs, optionally enforcing platform support.
+
+    Fork extension: ``required_platform`` (e.g. ``"blofin-perps"``) rejects
+    evaluators not supported on that platform, using the close registry's
+    ``platforms``/``support`` metadata (see support_matrix.json).
+    """
+    for name in close_names:
+        resolved = canonical_close_name(name)
+        try:
+            entry = get_close_strategy(resolved)
+        except ValueError:
+            pass
+        else:
+            if required_platform:
+                platforms = tuple(entry.get("platforms", ())) if isinstance(entry, dict) else ()
+                if required_platform not in platforms:
+                    support = (entry.get("support") or {}).get(required_platform, {}) if isinstance(entry, dict) else {}
+                    detail = str(support.get("notes") or "")
+                    suffix = f": {detail}" if detail else ""
+                    raise ValueError(
+                        f"Close strategy '{resolved}' is not supported on "
+                        f"{required_platform}{suffix}"
+                    )
+            continue
+        try:
+            get_open_strategy(resolved)
+        except ValueError as exc:
+            raise ValueError(
+                f"Unknown close strategy: {name}. "
+                f"Available close strategies: {_safe_list_strategy_names(list_close_strategies)}; "
+                f"fallback open strategies: {_safe_list_strategy_names(list_open_strategies)}"
+            ) from exc
+
+
 def resolve_strategy_references(
     positional_strategy: str,
     open_strategy: Optional[str],
@@ -476,7 +521,7 @@ def strip_unsupported_position_context(fn, params: dict) -> dict:
 def evaluate_open_close(
     apply_strategy: Callable[[str, pd.DataFrame, Optional[dict]], pd.DataFrame],
     get_strategy: Callable[[str], object],
-    df: pd.DataFrame,
+    df: Optional[pd.DataFrame],
     positional_strategy: str,
     open_strategy: Optional[str],
     close_strategies: Optional[Iterable[str]],
@@ -488,11 +533,16 @@ def evaluate_open_close(
     close_params_by_name: Optional[dict[str, dict]] = None,
     close_owner: Optional[str] = None,
     invert_open_signal: bool = False,
+    protection_df: Optional[pd.DataFrame] = None,
+    protection_params: Optional[dict] = None,
 ) -> OpenCloseEvaluation:
     open_name = (open_strategy or positional_strategy).strip()
     close_names = effective_close_strategies(
         positional_strategy, open_name, close_strategies, close_owner
     )
+    decision_available = df is not None
+    if not decision_available and protection_df is None:
+        raise ValueError("evaluate_open_close needs a decision frame or a protection frame")
     cache: dict[tuple[str, str], pd.DataFrame] = {}
 
     def run(name: str, run_params: Optional[dict]) -> pd.DataFrame:
@@ -504,20 +554,33 @@ def evaluate_open_close(
             cache[key] = apply_strategy(name, df, run_params)
         return cache[key]
 
-    open_result = run(open_name, params)
-    open_signal = _last_signal(open_result)
+    if decision_available:
+        open_result = run(open_name, params)
+        open_signal = _last_signal(open_result)
+    else:
+        get_strategy(open_name)
+        open_result = pd.DataFrame()
+        open_signal = 0
     close_evals: list[CloseEvaluation] = []
-    market = market_ctx if market_ctx is not None else _default_market_ctx(df)
+    if market_ctx is not None:
+        market = market_ctx
+    else:
+        market = _default_market_ctx(protection_df if protection_df is not None else df)
+    avwap_source = open_result
+    if protection_df is not None and close_names:
+        get_strategy(open_name)
+        avwap_source = apply_strategy(
+            open_name, protection_df, protection_params if protection_params is not None else params)
     avwap_injected = False
-    if not open_result.empty and "avwap" in open_result.columns:
+    if not avwap_source.empty and "avwap" in avwap_source.columns:
         try:
-            avwap_value = float(open_result["avwap"].iloc[-1])
+            avwap_value = float(avwap_source["avwap"].iloc[-1])
         except (TypeError, ValueError):
             avwap_value = float("nan")
         if avwap_value == avwap_value and avwap_value > 0:
             market = {**market, "avwap": avwap_value}
             avwap_injected = True
-    if not avwap_injected and close_names_include_avwap_stop(close_names):
+    if not avwap_injected and "avwap" not in market and close_names_include_avwap_stop(close_names):
         warn_avwap_stop_missing_context()
     for name in close_names:
         resolved, _ = rewrite_deprecated_close_ref(name, None)
@@ -539,11 +602,16 @@ def evaluate_open_close(
                     sl_price=result.get("sl_price", 0.0),
                     atr_value=result.get("atr_value", 0.0),
                     tier_fill_price=_positive_price(result.get("tier_fill_price")),
+                    reason=str(result.get("reason") or ""),
+                    tp_tier=result.get("tp_tier"),
                 ))
                 continue
             except ValueError as exc:
                 if not _is_unknown_close_strategy_error(exc):
                     raise
+        if not decision_available:
+            close_evals.append(CloseEvaluation(strategy=resolved, close_fraction=0.0))
+            continue
         close_params = _merge_close_params(base_close_params, position_ctx)
         result = run(resolved, close_params)
         signal = _last_signal(result)
@@ -552,6 +620,7 @@ def evaluate_open_close(
         close_evals.append(CloseEvaluation(
             strategy=resolved,
             close_fraction=_last_close_fraction(result, signal, position_side),
+            reason="open_signal_close",
         ))
 
     return OpenCloseEvaluation(
@@ -598,6 +667,13 @@ def finalize_decision(
     if evaluation.close_owner:
         decision["close_owner"] = evaluation.close_owner
     best = best_close_evaluation(evaluation.close_evaluations)
+    if best is not None and close_fraction > 0:
+        decision["close_evaluator"] = best.strategy
+        decision["close_source"] = "evaluator"
+        if best.reason:
+            decision["close_reason"] = best.reason
+        if best.tp_tier is not None:
+            decision["tp_tier"] = best.tp_tier
     if best is not None and best.tier_fill_price > 0:
         decision["close_tier_fill_price"] = best.tier_fill_price
     return decision

@@ -10,8 +10,8 @@ import (
 )
 
 // Helpers below moved here on the v0.106.0 merge: upstream #1597 deleted
-// hurst_gate_test.go which used to define them, but this wiring test
-// (including the fork's 7-dispatch-site count) still needs them.
+// hurst_gate_test.go which used to define them; the wiring tests below
+// track the dispatch shape (closed-bar gates since upstream #1720).
 func hfp(v float64) *float64 { return &v }
 
 func hurstTestRegimeConfig(classifier string) *RegimeConfig {
@@ -47,17 +47,26 @@ func readMainSource(t *testing.T) string {
 
 func TestHurstGateWiredAtEveryRegimeGatedDispatchSite(t *testing.T) {
 	src := readMainSource(t)
-	gateSites := strings.Count(src, "applyRegimeGate(sc, storeRegime, cfg.Regime,")
-	hurstSites := strings.Count(src, "advanceHurstGate(sc, storeRegime, cfg.Regime, stratState, &mu,")
-	if gateSites != 7 {
-		t.Fatalf("expected 7 applyRegimeGate dispatch groups, found %d — if a platform arm was added or removed, wire/unwire its Hurst arm too (#1411)", gateSites)
+	// Since upstream #1720 (closed-bar decisions) the platform dispatches
+	// gate through closedBarGateViewFor/closedBarHurstGate pairs; only the
+	// fork's BloFin perps dispatch keeps the classic
+	// applyRegimeGate/advanceHurstGate pair.
+	gateSites := strings.Count(src, "closedBarGateViewFor(sc,")
+	hurstSites := strings.Count(src, "closedBarHurstGate(sc,")
+	if gateSites != 6 {
+		t.Fatalf("expected 6 closedBarGateViewFor dispatch groups, found %d — if a platform arm was added or removed, wire/unwire its Hurst arm too (#1411, #1720)", gateSites)
 	}
 	if hurstSites != gateSites {
-		t.Fatalf("found %d applyRegimeGate sites but %d advanceHurstGate arms — every regime-gated dispatch group must carry the Hurst gate (#1411)", gateSites, hurstSites)
+		t.Fatalf("found %d closedBarGateViewFor sites but %d closedBarHurstGate arms — every regime-gated dispatch group must carry the Hurst gate (#1411)", gateSites, hurstSites)
+	}
+	classicGates := strings.Count(src, "applyRegimeGate(sc, storeRegime, cfg.Regime,")
+	classicHursts := strings.Count(src, "advanceHurstGate(sc, storeRegime, cfg.Regime, stratState, &mu,")
+	if classicGates != 1 || classicHursts != 1 {
+		t.Fatalf("expected exactly the single classic BloFin pair (1 applyRegimeGate, 1 advanceHurstGate), found %d/%d", classicGates, classicHursts)
 	}
 	holds := strings.Count(src, "hurstDecision.Holds && pausedBlocksSignal(")
-	if holds != gateSites {
-		t.Fatalf("found %d Hurst hold arms but %d dispatch groups — every hold MUST be classified through pausedBlocksSignal so closes and reductions pass (#1411)", holds, gateSites)
+	if holds != gateSites+classicGates {
+		t.Fatalf("found %d Hurst hold arms but %d dispatch groups — every hold MUST be classified through pausedBlocksSignal so closes and reductions pass (#1411)", holds, gateSites+classicGates)
 	}
 }
 

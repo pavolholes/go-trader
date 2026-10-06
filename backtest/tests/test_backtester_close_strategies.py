@@ -74,6 +74,56 @@ def test_tiered_tp_atr_partial_then_full_close():
     assert result["final_capital"] == 1150.0
 
 
+def test_blofin_dynamic_regime_close_confirms_before_moving_virtual_stop():
+    df = _df_open_then_hold(
+        opens=[100.0, 100.0, 95.0, 89.0, 89.0],
+        closes=[100.0, 100.0, 95.0, 89.0, 89.0],
+        atrs=[10.0] * 5,
+    )
+    df["regime"] = ["trending_up", "trending_up", "ranging", "ranging", "ranging"]
+    close = {
+        "name": "tiered_tp_atr_live_regime_dynamic",
+        "params": {
+            "regime_confirm_cycles": 2,
+            "trend_regime": {
+                "trending_up": {
+                    "stop_loss_atr": 3.0,
+                    "tp_tiers": [
+                        {"atr_multiple": 100.0, "close_fraction": 0.5},
+                        {"atr_multiple": 200.0, "close_fraction": 1.0},
+                    ],
+                },
+                "trending_down": {
+                    "stop_loss_atr": 3.0,
+                    "tp_tiers": [
+                        {"atr_multiple": 100.0, "close_fraction": 0.5},
+                        {"atr_multiple": 200.0, "close_fraction": 1.0},
+                    ],
+                },
+                "ranging": {
+                    "stop_loss_atr": 1.0,
+                    "tp_tiers": [
+                        {"atr_multiple": 100.0, "close_fraction": 0.5},
+                        {"atr_multiple": 200.0, "close_fraction": 1.0},
+                    ],
+                },
+            },
+        },
+    }
+    result = Backtester(
+        initial_capital=1000,
+        commission_pct=0,
+        slippage_pct=0,
+        platform="blofin",
+        regime_enabled=True,
+        close_strategies=[close],
+    ).run(df, save=False)
+
+    assert result["total_trades"] == 1
+    assert result["trades"][0]["exit_price"] == 89.0
+    assert result["close_reason_counts"]["dynamic_regime_stop"] == 1
+
+
 @pytest.mark.parametrize("platform,atrs,want_exit_idx", [
     ("binanceus", [10, 10, 10, 10, 10], [3, 4]),
     ("hyperliquid", [10, 10, 30, 30, 30], [2, 3]),

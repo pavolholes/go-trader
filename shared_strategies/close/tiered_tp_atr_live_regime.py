@@ -11,12 +11,20 @@ from _helpers import (
 from tiered_tp_atr_regime import regime_ladder_for
 
 
-def evaluate_live_regime_tiers(position: dict, market: dict, params: dict, reason_name: str) -> dict:
+def evaluate_live_regime_tiers(
+    position: dict,
+    market: dict,
+    params: dict,
+    reason_name: str,
+    regime_source: str = "live",
+) -> dict:
     avg_cost = float_from(position, "avg_cost")
     current_quantity = float_from(position, "current_quantity")
     side = str(position.get("side", "") or "").strip().lower()
     mark_price = float_from(market, "mark_price")
-    geometry = resolve_tp_tier_geometry(position, market, params, live_atr=True, regime_source="live")
+    geometry = resolve_tp_tier_geometry(
+        position, market, params, live_atr=True, regime_source=regime_source
+    )
     regime = geometry.regime
 
     if mark_price <= 0:
@@ -52,6 +60,7 @@ def evaluate_live_regime_tiers(position: dict, market: dict, params: dict, reaso
                 f"{reason_name}:atr={geometry.atr_label}:"
                 f"regime={geometry.regime_label}:{regime}:{multiple:g}"
             ),
+            "tp_tier": multiple,
         },
         position, geometry, hit_tiers, side,
     )

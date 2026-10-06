@@ -158,6 +158,7 @@ def evaluate(position: dict, market: dict, params: dict) -> dict:
         {
             "close_fraction": close_fraction,
             "reason": f"tiered_tp_atr_regime:{regime}:{multiple:g}",
+            "tp_tier": multiple,
         },
         position, geometry, hit_tiers, side,
     )

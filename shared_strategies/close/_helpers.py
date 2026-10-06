@@ -157,6 +157,11 @@ def _resolve_tier_regime(position: dict, market: dict, regime_source: str, resti
     position_regime = str((position or {}).get("regime", "") or "").strip()
     if regime_source == "position":
         return position_regime, "frozen" if position_regime else ""
+    if regime_source == "applied":
+        applied = str(
+            (position or {}).get("regime_applied_label") or position_regime or ""
+        ).strip()
+        return applied, "applied" if applied else ""
     if regime_source != "live":
         return "", ""
     market_regime = str((market or {}).get("regime", "") or "").strip()

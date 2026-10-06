@@ -243,8 +243,10 @@ func validateTrailingTPRatchetClose(sc StrategyConfig, labels []string, regimeEn
 	}
 	prefix := fmt.Sprintf("strategy[%s]", sc.ID)
 	var errs []string
-	if sc.Platform != "hyperliquid" || (sc.Type != "perps" && sc.Type != "manual") {
-		errs = append(errs, fmt.Sprintf("%s: trailing_tp_ratchet* is HL perps/manual only", prefix))
+	blofinPerps := sc.Platform == "blofin" && sc.Type == "perps"
+	hyperliquidPerpsOrManual := sc.Platform == "hyperliquid" && (sc.Type == "perps" || sc.Type == "manual")
+	if !hyperliquidPerpsOrManual && !blofinPerps {
+		errs = append(errs, fmt.Sprintf("%s: trailing_tp_ratchet* is supported for HL perps/manual and BloFin perps only", prefix))
 	}
 	regimeVariant := false
 	for _, ref := range sc.closeRefs() {

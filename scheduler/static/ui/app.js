@@ -2200,7 +2200,7 @@
       const pnlClassName = row.pnl_pct > 0 ? "pnl-pos" : row.pnl_pct < 0 ? "pnl-neg" : "";
       const ddClassName = !row.drawdown_pct ? "" : row.drawdown_pct > 10 ? "dd-bad" : row.drawdown_pct > 5 ? "dd-mid" : "dd-good";
       return '<tr class="overview-row' + (row.id === state.activeID ? " active" : "") + '" data-id="' + escapeHTML(row.id) + '">' +
-        "<td>" + (row.paused ? '<span title="Paused">⏸</span> ' : "") + escapeHTML(row.id) + "</td>" +
+        "<td>" + (row.paused ? '<span title="Paused">⏸</span> ' : "") + (row.paused ? "<s>" + escapeHTML(row.id) + "</s>" : escapeHTML(row.id)) + "</td>" +
         "<td>" + escapeHTML(row.symbol || "-") + "</td>" +
         "<td>" + escapeHTML(String(row.trade_count || 0)) + "</td>" +
         '<td class="' + pnlClassName + '">' + escapeHTML(row.pool_budget ? "—" : fmtNumber(row.pnl)) + "</td>" +
@@ -2451,6 +2451,12 @@
         const capture = pending || row.capture_ratio === null || row.capture_ratio === undefined
           ? (pending ? "pending" : "-")
           : fmtNumber(row.capture_ratio);
+        const evaluator = row.close_evaluator
+          ? row.close_evaluator + (row.close_evaluator_reason ? ": " + row.close_evaluator_reason : "")
+          : (row.close_reason || "-");
+        const stopTrigger = row.close_sl_trigger_px === null || row.close_sl_trigger_px === undefined
+          ? "-"
+          : fmtNumber(row.close_sl_trigger_px);
         return "<tr>" +
           "<td>" + escapeHTML(when) + "</td>" +
           "<td>" + escapeHTML(row.strategy_id) + "</td>" +
@@ -2459,6 +2465,10 @@
           '<td class="' + opsPnlClass(row.net_pnl) + '">' + escapeHTML(fmtMoney(row.net_pnl)) + "</td>" +
           "<td>" + escapeHTML(pending ? "pending" : diagPct(row.favorable_pct)) + "</td>" +
           "<td>" + escapeHTML(pending ? "pending" : diagPct(row.adverse_pct)) + "</td>" +
+          "<td>" + escapeHTML(row.close_source || "-") + "</td>" +
+          "<td>" + escapeHTML(evaluator) + "</td>" +
+          "<td>" + escapeHTML(row.close_tp_tier || "-") + "</td>" +
+          "<td>" + escapeHTML(stopTrigger) + "</td>" +
           "<td>" + escapeHTML(capture) + "</td>" +
           "<td>" + escapeHTML(row.metrics_status || "-") + "</td>" +
           "</tr>";
