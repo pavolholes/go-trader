@@ -391,21 +391,10 @@ def resolve_strategy_references(
     for name in parse_close_strategies(close_strategies):
         resolved = canonical_close_name(name)
         try:
-            entry = get_close_strategy(resolved)
+            get_close_strategy(resolved)
+            continue
         except ValueError:
             pass
-        else:
-            if required_platform:
-                platforms = tuple(entry.get("platforms", ())) if isinstance(entry, dict) else ()
-                if required_platform not in platforms:
-                    support = (entry.get("support") or {}).get(required_platform, {}) if isinstance(entry, dict) else {}
-                    detail = str(support.get("notes") or "")
-                    suffix = f": {detail}" if detail else ""
-                    raise ValueError(
-                        f"Close strategy '{resolved}' is not supported on "
-                        f"{required_platform}{suffix}"
-                    )
-            continue
         try:
             get_open_strategy(resolved)
         except ValueError as exc:
