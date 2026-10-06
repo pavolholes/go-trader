@@ -3471,8 +3471,11 @@ class Backtester:
                 equity = cash + position * mark_price
             equity_curve.append({"date": idx, "equity": equity})
 
-            # Insolvency is terminal: later candles cannot resurrect this account.
-            if equity <= 0:
+            # Insolvency is terminal in margin mode only: with isolated
+            # margin the venue liquidates the book, so later candles cannot
+            # resurrect this account. Plain (non-margin) runs keep upstream
+            # economics (negative equity allowed).
+            if self._margin_per_trade_usd and equity <= 0:
                 if position != 0:
                     _book_close(
                         idx, 1.0, mark_price, self.slippage_pct,
