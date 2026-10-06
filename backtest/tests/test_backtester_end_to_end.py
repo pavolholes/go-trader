@@ -41,6 +41,8 @@ def test_end_to_end_golden_file():
 
     assert results["total_trades"] == 6
     assert results["final_capital"] == pytest.approx(923.53, abs=0.01)
-    assert results["total_return_pct"] == pytest.approx(-7.51, abs=0.01)
-    assert results["sharpe_ratio"] == pytest.approx(-0.686, abs=0.001)
+    # EOD close is booked into the terminal equity point (not the pre-close
+    # snapshot), so return/sharpe reflect terminal cash.
+    assert results["total_return_pct"] == pytest.approx(-7.65, abs=0.01)
+    assert results["sharpe_ratio"] == pytest.approx(-0.701, abs=0.001)
     assert results["max_drawdown_pct"] == pytest.approx(-17.66, abs=0.01)
