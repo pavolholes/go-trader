@@ -1,0 +1,21 @@
+--- research_registry_before
++++ research_registry_after
+@@ -618,5 +618,18 @@
+    "min_separation < 1"
+   ],
+   "RESEARCH, backtest-only (#1647) \u2014 Vortex trend crossover: VI+ and VI- are the period sums of |high - previous low| and |low - previous high| divided by the period sum of true range; long when VI+ minus VI- rises strictly above min_separation from at or below it on the previous bar, short on the mirror below -min_separation. Entry-only; pair with one explicit close strategy and one stop owner. Refused by every live check script; promotion requires a separate reviewed decision"
++ ],
++ [
++  "relative_vigor_index",
++  {
++   "period": 10,
++   "zero_line_filter": true
++  },
++  true,
++  [
++   "period >= 2",
++   "period <= 100"
++  ],
++  "RESEARCH, backtest-only (#1666) \u2014 Relative Vigor Index crossover: the period-bar mean of 1-2-2-1 smoothed close-minus-open over the mean of smoothed high-minus-low, with a 1-2-2-1 smoothed signal line; long on a strict upward cross of the signal line while the index is above zero, short on the mirror below zero (zero_line_filter). Any bad candle, timestamp defect or cadence gap inside the window holds. Entry-only; pair with one explicit close strategy and one stop owner. Refused by every live check script; promotion requires a separate reviewed decision"
+  ]
+ ]

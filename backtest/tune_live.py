@@ -18,12 +18,15 @@ for _p in (_THIS_DIR, os.path.join(_REPO, "shared_tools")):
 import auto_suggest
 from data_fetcher import load_cached_data
 from eval_windows import WINDOWS as M1_WINDOWS, PLATFORM as DATA_PLATFORM, FEE_PLATFORM
+from backtester import CloseCapabilityError
 from optimizer import DEFAULT_PARAM_RANGES, generate_param_grid, walk_forward_optimize
 from registry_loader import load_registry, registry_for_strategy_type
 from run_backtest import (
     FUNDING_COLUMN_STRATEGIES,
     _attach_funding_if_needed,
+    live_stop_kwargs,
     load_strategy_config,
+    stop_context_to_json,
 )
 
 SCHEMA_VERSION = 2
@@ -219,14 +222,17 @@ def build_candidate(open_name: str, params: dict, resolution: dict) -> dict:
         cand["stop_loss_atr_mult"] = resolution["stop_loss_atr_mult"]
     if resolution.get("trailing_stop_atr_mult") is not None:
         cand["trailing_stop_atr_mult"] = resolution["trailing_stop_atr_mult"]
+    if resolution.get("capability_context") is not None:
+        cand["stop_context"] = stop_context_to_json(resolution)
     if resolution.get("regime_enabled"):
+        cand["regime_enabled"] = True
         if resolution.get("allowed_regimes"):
             cand["allowed_regimes"] = list(resolution["allowed_regimes"])
-            if not resolution.get("regime_windows_spec"):
-                cand["regime_period"] = int(
-                    resolution.get("regime_period") or 14)
-                cand["regime_adx_threshold"] = float(
-                    resolution.get("regime_adx_threshold") or 20.0)
+        if not resolution.get("regime_windows_spec"):
+            cand["regime_period"] = int(
+                resolution.get("regime_period") or 14)
+            cand["regime_adx_threshold"] = float(
+                resolution.get("regime_adx_threshold") or 20.0)
         if resolution.get("regime_windows_spec"):
             cand["regime_windows_spec"] = copy.deepcopy(
                 resolution["regime_windows_spec"])
@@ -327,11 +333,15 @@ def run_stage1(open_name: str, grid: dict, resolution: dict, symbol: str,
         close_strategies=resolution.get("close_strategies") or None,
         stop_loss_atr_mult=resolution.get("stop_loss_atr_mult"),
         trailing_stop_atr_mult=resolution.get("trailing_stop_atr_mult"),
+        stop_kwargs=dict(live_stop_kwargs(resolution),
+                         strategy_type=resolution.get("strategy_type") or "perps"),
         optimize_metric=metric,
         direction=resolution.get("direction"),
+        comparison_mode=resolution.get("comparison_mode"),
     )
     if summary.get("error"):
-        return {"error": summary["error"], "n_bars": int(len(df))}
+        return {"error": summary["error"], "n_bars": int(len(df)),
+                "close_validation": summary.get("close_validation")}
     seen, survivors = set(), []
     for w in summary.get("window_results") or []:
         bp = w.get("best_params")
@@ -345,6 +355,7 @@ def run_stage1(open_name: str, grid: dict, resolution: dict, symbol: str,
         "survivors": survivors,
         "n_folds": int(summary.get("n_valid_folds") or 0),
         "n_bars": int(len(df)),
+        "close_validation": summary.get("close_validation"),
     }
 
 
@@ -417,6 +428,11 @@ def tune_strategy(config_path: str, strategy_id: str, symbol: str,
             inject_user_defaults=True,
             include_promotion_baseline=True,
         )
+    except CloseCapabilityError as exc:
+        result["status"] = "close_capability_refused"
+        result["error"] = str(exc)
+        result["close_capability"] = exc.to_dict()
+        return result
     except ValueError as exc:
         result["status"] = "config_error"
         result["error"] = str(exc)
@@ -429,12 +445,24 @@ def tune_strategy(config_path: str, strategy_id: str, symbol: str,
     result["baseline_params"] = baseline_params
     result["promotion_baseline"] = resolution.pop("promotion_baseline")
     result["close_strategies"] = copy.deepcopy(resolution.get("close_strategies") or [])
+    context = resolution.get("capability_context")
+    live_units = {}
+    if context is not None:
+        live_units = dict(context.to_dict()["input_evidence"]
+                          .get("resolved_live_units", {}).get("value") or {})
     result["stop_owner"] = {
-        k: resolution.get(k) for k in
+        k: live_units.get(k) for k in
         ("stop_loss_atr_mult", "trailing_stop_atr_mult",
          "stop_loss_atr_mult_regime", "trailing_stop_atr_mult_regime",
          "stop_loss_pct", "trailing_stop_pct", "stop_loss_margin_pct")
-        if resolution.get(k) not in (None, 0, 0.0)
+        if live_units.get(k) not in (None, 0, 0.0)
+    }
+    result["stop_owner_units"] = {
+        "stop_loss_pct": "live_percent", "trailing_stop_pct": "live_percent",
+        "stop_loss_margin_pct": "live_percent_of_margin",
+        "stop_loss_atr_mult": "atr_multiple", "trailing_stop_atr_mult": "atr_multiple",
+        "stop_loss_atr_mult_regime": "atr_multiple",
+        "trailing_stop_atr_mult_regime": "atr_multiple",
     }
 
     if not symbol or not timeframe:
@@ -532,7 +560,8 @@ def tune_strategy(config_path: str, strategy_id: str, symbol: str,
             return result
         result["stage1"] = {"ran": True, "n_folds": s1["n_folds"],
                             "n_bars": s1["n_bars"],
-                            "n_survivors": len(s1["survivors"])}
+                            "n_survivors": len(s1["survivors"]),
+                            "close_validation": s1.get("close_validation")}
         survivor_params = s1["survivors"]
 
     baseline_cand = build_candidate(open_name, baseline_params, resolution)
@@ -711,8 +740,12 @@ def main(argv=None) -> int:
         "stage2_windows": args.windows,
         "correction_alpha": args.alpha,
         "footer": FOOTER,
+        "close_capability_refusals": sorted(
+            r["strategy_id"] for r in results
+            if r.get("status") == "close_capability_refused"),
         "strategies": results,
     }
+    artifact["requested_set_complete"] = not artifact["close_capability_refusals"]
     write_progress(out_dir, {"phase": "done", "n_strategies": n,
                              "strategy_index": n})
 
@@ -747,6 +780,11 @@ def format_summary(artifact: dict) -> str:
         for s in r.get("survivors") or []:
             lines.append(f"      SURVIVOR {s['key']}: "
                          f"{(s.get('patch') or {}).get('param_changes')}")
+    if artifact.get("close_capability_refusals"):
+        lines.append("")
+        lines.append("*** INCOMPLETE — close capability refused: "
+                     + ", ".join(artifact["close_capability_refusals"])
+                     + "; the surviving set is not a complete tuning of this config ***")
     lines.append("")
     lines.append(FOOTER)
     return "\n".join(lines)

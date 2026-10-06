@@ -1,8 +1,8 @@
 # GO-TRADER OVERRIDES PAVOL
 
 Pavol fork overrides vs upstream `richkuo/go-trader`. MUST be preserved across
-upstream merges. Base: v0.106.0 (`0064f5d`, merged 2026-10-01; previous base
-v0.104.0). This file is referenced from `CLAUDE.md` (root `AGENTS.md` is a
+upstream merges. Base: v0.107.0 (`97e2681`, merged 2026-10-05; previous base
+v0.106.0). This file is referenced from `CLAUDE.md` (root `AGENTS.md` is a
 symlink to it).
 
 ## 1. New files (upstream does not have them — keep on merge)
@@ -115,9 +115,9 @@ Lavy stlpec (zoznam strategii + search + sparklines) je odstraneny z Table aj Su
 | File | Override |
 |---|---|
 | `shared_strategies/open/ob_touch.py`, `test_ob_touch.py` | New files (section 1) keep on merge |
-| `shared_strategies/open/registry.py` | `@register("ob_touch", ...)` block after `mtf_confluence_strategy`; `PLATFORM_ORDER` spot+futures entries before `"hold"`; defaults mirror the TradingView screenshot (internal 5, swing 50, 7 levels, Absolute/Precise/Previous, touch `wick`, spot `allow_short: False`, futures `True`); description documents the HTF factor guide (5m x 12 = 1H, 15m x 4 = 1H, 5m x 3 = 15m, 1 = single-TF); default `regime_direction_filter=true` blocks long entries in bearish directional regime labels and short entries in bullish labels (neutral/unknown labels remain ungated) |
+| `shared_strategies/open/registry.py` | `@register("ob_touch", ...)` block after `mtf_confluence_strategy` (must carry `short_entries=True`, required since upstream #1697 — registry import fails without it); `PLATFORM_ORDER` spot+futures entries before `"hold"`; defaults mirror the TradingView screenshot (internal 5, swing 50, 7 levels, Absolute/Precise/Previous, touch `wick`, spot `allow_short: False`, futures `True`); description documents the HTF factor guide (5m x 12 = 1H, 15m x 4 = 1H, 5m x 3 = 15m, 1 = single-TF); default `regime_direction_filter=true` blocks long entries in bearish directional regime labels and short entries in bullish labels (neutral/unknown labels remain ungated) |
 | `backtest/optimizer.py` | `DEFAULT_PARAM_RANGES["ob_touch"]` (CI param-ranges test fails without it) |
-| `scheduler/init.go` | `knownShortNames["ob_touch"]="obt"` (`"ob"` is taken); `bidirectionalPerpsStrategies["ob_touch"]=true` |
+| `scheduler/init.go` | `knownShortNames["ob_touch"]="obt"` (`"ob"` is taken); `bidirectionalPerpsStrategies["ob_touch"]=true`; `registeredOpenStrategyPlatforms["ob_touch"]={"spot","futures"}` (required by `scripts/test_go_python_registry_parity.py`) |
 | `shared_scripts/check_blofin.py`, `check_topstep.py` | `--htf-timeframe/--htf-limit` + `htf_df` injection gated on the effective open strategy being `ob_touch` |
 | `scheduler/regime_store.go` | TopStep paper skips parallel shared-regime Yahoo fetches; `check_topstep.py` computes regime inline from its signal candles. TopStep live remains on shared regime store. Test: `scheduler/regime_store_topstep_test.go` |
 | first-touch semantics | Pine parity kept: every fresh wick entry into the same zone fires again (crossunder semantics); pinned by `test_reentry_after_exit_fires_again`, no consumed-zone tracking |
