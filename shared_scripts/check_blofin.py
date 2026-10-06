@@ -288,12 +288,13 @@ def _position_anchored_avwap(df, timeframe, opened_at_ms, now=None):
 def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=False,
                      inst_type="swap", strategy_params_override=None,
                      open_strategy=None, close_strategies=None,
-                     position_side="", position_ctx=None,
-                     regime_enabled=False, regime_windows_spec=None, ohlcv_limit=200, regime_atr_window="",
-                     regime_payload_json=None,
-                     atr_method="simple",
-                     close_params_by_name=None,
-                     htf_timeframe="", htf_limit=300):
+                      position_side="", position_ctx=None,
+                      regime_enabled=False, regime_windows_spec=None, ohlcv_limit=200, regime_atr_window="",
+                      regime_payload_json=None,
+                      atr_method="simple",
+                      close_params_by_name=None,
+                      gate_mode=None, acknowledgement=None,
+                      htf_timeframe="", htf_limit=300):
     """Run strategy signal check using BloFin OHLCV data."""
     try:
         BloFinExchangeAdapter = _blofin_adapter().BloFinExchangeAdapter
@@ -309,9 +310,24 @@ def run_signal_check(strategy_name, symbol, timeframe, mode, htf_filter_enabled=
             normalize_signal,
             parse_close_strategies,
             validate_close_strategy_names,
+            admit_configured_strategies,
+            GateMode,
+            Acknowledgement,
+            GATE_MODE_MISSING,
         )
 
         open_close_enabled = bool(open_strategy or close_strategies)
+        admit_configured_strategies(
+            strategy_name,
+            open_strategy,
+            close_strategies,
+            gate_mode if gate_mode is not None else GateMode(GATE_MODE_MISSING),
+            acknowledgement if acknowledgement is not None else Acknowledgement(False),
+            get_strategy,
+            get_close_strategy,
+            list_strategies,
+            list_close_strategies,
+        )
         configured_names = [open_strategy or strategy_name]
         for name in configured_names:
             get_strategy(name)
@@ -755,6 +771,11 @@ def main():
         parser.add_argument("symbol")
         parser.add_argument("timeframe")
         parser.add_argument("--mode", default="paper")
+        parser.add_argument("--allow-no-edge", nargs="?", const=True, default=None)
+        parser.add_argument("--closed-bar-decisions", action="store_true", default=False,
+                            help="Accepted for argv compatibility; BloFin closed-bar decisions are not enabled.")
+        parser.add_argument("--decision-regime-timeframe", default="",
+                            help="Accepted for argv compatibility with the closed-bar check contract.")
         parser.add_argument("--htf-filter", action="store_true", default=False)
         parser.add_argument("--regime-enabled", action="store_true", default=False)
         parser.add_argument("--regime-windows-spec-json", default="")
@@ -789,6 +810,22 @@ def main():
         args = parser.parse_args()
         if args.probe_only:
             sys.exit(0)
+        if args.closed_bar_decisions:
+            print(json.dumps({
+                "strategy": args.strategy,
+                "symbol": args.symbol,
+                "timeframe": args.timeframe,
+                "signal": 0,
+                "price": 0,
+                "indicators": {},
+                "regime": None,
+                "mode": args.mode,
+                "platform": "blofin",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "error": "closed_bar_decisions is not supported on blofin: no verified candle closure contract is configured",
+            }))
+            sys.exit(1)
+        from strategy_composition import parse_allow_no_edge_tokens, parse_raw_gate_mode
         from strategy_composition import parse_strategy_refs_arg
         refs = parse_strategy_refs_arg(args.strategy_refs)
         open_strategy_name = refs["open_name"] if refs else args.open_strategy
@@ -809,6 +846,8 @@ def main():
             regime_payload_json=args.regime_payload_json,
             atr_method=args.atr_method,
             close_params_by_name=close_params_by_name,
+            gate_mode=parse_raw_gate_mode(sys.argv[1:]),
+            acknowledgement=parse_allow_no_edge_tokens(sys.argv[1:]),
             htf_timeframe=args.htf_timeframe,
             htf_limit=args.htf_limit,
         )
