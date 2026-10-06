@@ -4369,6 +4369,8 @@ class Backtester:
                         record_kind="terminal_liquidation",
                     )
                     cash = 0.0
+                    if rec is not None and rec.events:
+                        rec.events[-1]["cash_after"] = cash
                     terminal_insolvency = True
                     equity_curve[-1]["equity"] = 0.0
                     for future_idx in df.index[i + 1:]:
