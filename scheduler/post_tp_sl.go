@@ -1279,7 +1279,7 @@ func runPostTPStopLossAdjustment(
 		if result.StopLossOID > 0 && currentOID > 0 && notifier != nil && notifier.HasBackends() {
 			msg := fmt.Sprintf("**HL POST-TP SL CANCEL FAILED** [%s] %s old trigger OID %d may still be resting while new trigger OID %d was placed. Check HL open triggers before they accumulate toward the account cap. Error: %s",
 				sc.ID, symbol, currentOID, result.StopLossOID, result.CancelStopLossError)
-			notifier.SendToAllChannels(msg)
+			notifier.SendToTradeAlertChannels(msg)
 		}
 	}
 	if first.StopLossError != "" {

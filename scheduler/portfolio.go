@@ -730,7 +730,7 @@ func notifySpotLiveCashOverBudget(sender ownerDMSender, msg string) {
 	}
 	if mn, ok := sender.(*MultiNotifier); ok {
 		if mn != nil && mn.HasBackends() {
-			mn.SendToAllChannels(msg)
+			mn.SendToTradeAlertChannels(msg)
 		}
 		return
 	}

@@ -1362,6 +1362,13 @@ func main() {
 			for _, part := range cyclePartitions {
 				for _, msg := range scopeRisk[part].OperatorNotices {
 					if part.IsLive() {
+						if strings.HasPrefix(msg, "⚠️ **BLOFIN PORTFOLIO ENTRY HALT**") {
+							if ownerID := notifier.OwnerID(); ownerID != "" {
+								oldHeader := "⚠️ **BLOFIN PORTFOLIO ENTRY HALT**"
+								newHeader := "⚠️ <@" + ownerID + "> **BLOFIN PORTFOLIO ENTRY HALT**"
+								msg = strings.Replace(msg, oldHeader, newHeader, 1)
+							}
+						}
 						notifier.SendToTradeAlertChannels(msg)
 					} else {
 						notifier.SendToPartitionChannels(part, msg)
@@ -1549,7 +1556,7 @@ func main() {
 				if killSwitchAutoReset {
 					killSwitchMsg = formatKillSwitchAutoResetMessage(killSwitchMsg)
 				}
-				notifier.SendToAllChannels(killSwitchMsg)
+				notifier.SendToTradeAlertChannels(killSwitchMsg)
 			}
 
 			// One pass per paper partition: a latch in one folded source closes
@@ -1649,7 +1656,11 @@ func main() {
 				}
 				mu.Unlock()
 				if notifyWarn {
-					notifier.SendToPartitionChannels(part, warnMsg)
+					if part.IsLive() {
+						notifier.SendToTradeAlertChannels(warnMsg)
+					} else {
+						notifier.SendToPartitionChannels(part, warnMsg)
+					}
 				}
 				if warnLatchDeferredSince.IsZero() {
 					fmt.Printf("[WARN] [%s] %s\n", partitionLabel(part), sr.Reason)
@@ -3773,7 +3784,7 @@ func notifyPerStrategyCircuitBreakerWithSnapshot(sc StrategyConfig, snap perStra
 		TotalPortfolioValue: totalPortfolioValue,
 		RecentTrades:        recent,
 	})
-	notifier.SendToAllChannels(msg)
+	notifier.SendToTradeAlertChannels(msg)
 }
 
 func isFreshPerStrategyCircuitBreaker(reason string) bool {
@@ -4215,7 +4226,7 @@ func runHyperliquidExecuteOrder(sc StrategyConfig, result *HyperliquidResult, pr
 			if notifier != nil && notifier.HasBackends() {
 				msg := fmt.Sprintf("**HL OPEN-ORDER CAP HIT** [%s] %s position is UNPROTECTED — SL placement rejected: %s",
 					sc.ID, result.Symbol, execResult.StopLossError)
-				notifier.SendToAllChannels(msg)
+				notifier.SendToTradeAlertChannels(msg)
 			}
 		} else {
 			logger.Warn("SL placement failed (non-fatal): %s", execResult.StopLossError)

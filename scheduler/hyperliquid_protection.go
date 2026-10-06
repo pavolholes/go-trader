@@ -81,7 +81,7 @@ func notifyHLProtectionGuardStall(notifier *MultiNotifier, sc StrategyConfig, sy
 	msg := fmt.Sprintf("CRITICAL: [%s] %s: reduce-only stop-loss and take-profit placement has been skipped for %d consecutive protection syncs because %s. The position holds no maintained exchange-side protection. Drain or clear the queued manual action, then verify the open orders on Hyperliquid.",
 		sc.ID, symbol, blocks, reason)
 	if notifier != nil && notifier.HasBackends() {
-		notifier.SendToAllChannels(msg)
+		notifier.SendToTradeAlertChannels(msg)
 	}
 	return msg
 }
@@ -462,7 +462,7 @@ var syncHyperliquidProtection = func(sc StrategyConfig, plan hlProtectionPlan, n
 			logger.Error("%s", msg)
 		}
 		if notifier != nil && notifier.HasBackends() {
-			notifier.SendToAllChannels(msg)
+			notifier.SendToTradeAlertChannels(msg)
 		}
 	}
 	if hlProtectionStopOutcomeUnknown(result) {
@@ -471,7 +471,7 @@ var syncHyperliquidProtection = func(sc StrategyConfig, plan hlProtectionPlan, n
 			logger.Error("%s", msg)
 		}
 		if notifier != nil && notifier.HasBackends() {
-			notifier.SendToAllChannels(msg)
+			notifier.SendToTradeAlertChannels(msg)
 		}
 	}
 	return result, true
@@ -624,7 +624,7 @@ func notifyHLProtectionTPOutcomeUnknown(notifier *MultiNotifier, logger *Strateg
 		logger.Error("%s", msg)
 	}
 	if notifier != nil && notifier.HasBackends() {
-		notifier.SendToAllChannels(msg)
+		notifier.SendToTradeAlertChannels(msg)
 	}
 }
 
@@ -1143,5 +1143,5 @@ func notifyHLProtectionFailure(notifier *MultiNotifier, sc StrategyConfig, symbo
 		return
 	}
 	msg := fmt.Sprintf("**HL PROTECTION WARNING** [%s] %s reduce-only SL/TP sync failed: %s", sc.ID, symbol, reason)
-	notifier.SendToAllChannels(msg)
+	notifier.SendToTradeAlertChannels(msg)
 }

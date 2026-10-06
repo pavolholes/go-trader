@@ -331,7 +331,7 @@ func notifyMarketFeedDegraded(notifier *MultiNotifier, key marketFeedKey, snapsh
 	}
 	msg := fmt.Sprintf("**MARKET FEED DEGRADED** [%s] %s (%d consecutive cycles): entries are held; closes, stops, ratchet and protection continue on verified inputs.",
 		key.PayloadID(), detail, count)
-	notifier.SendToAllChannels(msg)
+	notifier.SendToTradeAlertChannels(msg)
 }
 
 func clearMarketFeedDegraded(notifier *MultiNotifier, key marketFeedKey) {

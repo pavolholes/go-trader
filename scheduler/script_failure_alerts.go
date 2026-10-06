@@ -147,7 +147,7 @@ func notifyScriptFailure(notifier *MultiNotifier, sc StrategyConfig, mode script
 			return
 		}
 		msg := formatScriptFailureTransientAlert(sc, mode, errMsg, count)
-		notifier.SendToAllChannels(msg)
+		notifier.SendToTradeAlertChannels(msg)
 		return
 	}
 	shouldNotify, count := scriptFailureTracker.Record(sc.ID, errMsg, now)
@@ -155,7 +155,7 @@ func notifyScriptFailure(notifier *MultiNotifier, sc StrategyConfig, mode script
 		return
 	}
 	msg := formatScriptFailureAlert(sc, mode, errMsg, count)
-	notifier.SendToAllChannels(msg)
+	notifier.SendToTradeAlertChannels(msg)
 }
 
 // notifyLiveExecuteFailure posiela alert OKAMZITE (bez prahu 3 opakovani).
@@ -165,7 +165,7 @@ func notifyLiveExecuteFailure(notifier *MultiNotifier, sc StrategyConfig, errMsg
 		return
 	}
 	msg := formatScriptFailureAlert(sc, scriptFailureError, errMsg, 1)
-	notifier.SendToAllChannels(msg)
+	notifier.SendToTradeAlertChannels(msg)
 }
 
 func formatBatchSharedStateFailureAlert(sc StrategyConfig, errMsg string, memberIDs []string, count int) string {
@@ -193,7 +193,7 @@ func notifyBatchSharedStateFailure(notifier *MultiNotifier, sc StrategyConfig, e
 			return
 		}
 		msg := formatBatchSharedStateFailureAlert(sc, errMsg, memberIDs, count)
-		notifier.SendToAllChannels(msg)
+		notifier.SendToTradeAlertChannels(msg)
 		return
 	}
 	shouldNotify, count := scriptFailureTracker.Record(sc.ID, errMsg, now)
@@ -201,7 +201,7 @@ func notifyBatchSharedStateFailure(notifier *MultiNotifier, sc StrategyConfig, e
 		return
 	}
 	msg := formatBatchSharedStateFailureAlert(sc, errMsg, memberIDs, count)
-	notifier.SendToAllChannels(msg)
+	notifier.SendToTradeAlertChannels(msg)
 }
 
 func clearBatchSharedStateFailure(notifier *MultiNotifier, sc StrategyConfig) {
