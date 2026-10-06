@@ -3471,13 +3471,13 @@ class Backtester:
                 equity = cash + position * mark_price
             equity_curve.append({"date": idx, "equity": equity})
 
-            # Insolvency is terminal: later candles cannot resurrect this account.
-            if equity <= 0:
-                if position != 0:
-                    _book_close(
-                        idx, 1.0, mark_price, self.slippage_pct,
-                        "liquidation", mark_price, mark_price,
-                    )
+            # Insolvency with a position still open is terminal; a position
+            # already closed by a signal keeps its realized negative cash.
+            if equity <= 0 and position != 0:
+                _book_close(
+                    idx, 1.0, mark_price, self.slippage_pct,
+                    "liquidation", mark_price, mark_price,
+                )
                 cash = 0.0
                 equity_curve[-1]["equity"] = 0.0
                 for future_idx in df.index[i + 1:]:
