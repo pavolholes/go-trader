@@ -3471,9 +3471,19 @@ class Backtester:
                 equity = cash + position * mark_price
             equity_curve.append({"date": idx, "equity": equity})
 
-            # Insolvency with a position still open is terminal; a position
-            # already closed by a signal keeps its realized negative cash.
-            if equity <= 0 and position != 0:
+            # Insolvency with a still-open, unprotected position is terminal.
+            # Give an already-triggered stop, an explicit opposing signal, or
+            # a configured close evaluator the opportunity to book its exit
+            # before modelling the venue liquidation.
+            side_before = "long" if position > 0 else "short"
+            opposing_signal = (position > 0 and signal < 0) or (position < 0 and signal > 0)
+            stop_already_triggered = (
+                position != 0 and sl_trigger_px > 0
+                and self._sl_hit(side_before, mark_price, sl_trigger_px)
+            )
+            close_evaluator_owns_exit = bool(self.close_strategies)
+            if (equity <= 0 and position != 0 and not opposing_signal
+                    and not stop_already_triggered and not close_evaluator_owns_exit):
                 _book_close(
                     idx, 1.0, mark_price, self.slippage_pct,
                     "liquidation", mark_price, mark_price,
