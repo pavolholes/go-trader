@@ -270,7 +270,7 @@ func reportSharedWalletDrift(notifier *MultiNotifier, results []sharedWalletDrif
 			default:
 				msg = formatSharedWalletDriftAlert(r.Key, r.Balance, r.MemberSum, r.Drift, count, r.OrphanCoins)
 			}
-			notifier.SendToAllChannels(msg)
+			notifier.SendToTradeAlertChannels(msg)
 			continue
 		}
 		recovered, priorCount := sharedWalletDriftTracker.Clear(trackerKey)

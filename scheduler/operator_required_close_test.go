@@ -177,9 +177,10 @@ type captureNotifier struct {
 	dms         []string
 }
 
-func (n *captureNotifier) HasBackends() bool          { return n.hasBackends }
-func (n *captureNotifier) SendToAllChannels(c string) { n.channels = append(n.channels, c) }
-func (n *captureNotifier) SendOwnerDM(c string)       { n.dms = append(n.dms, c) }
+func (n *captureNotifier) HasBackends() bool                 { return n.hasBackends }
+func (n *captureNotifier) SendToAllChannels(c string)        { n.channels = append(n.channels, c) }
+func (n *captureNotifier) SendToTradeAlertChannels(c string) { n.channels = append(n.channels, c) }
+func (n *captureNotifier) SendOwnerDM(c string)              { n.dms = append(n.dms, c) }
 
 func TestPlanOperatorRequiredWarning_EmptyStateNoEntries(t *testing.T) {
 	state := &AppState{Strategies: map[string]*StrategyState{

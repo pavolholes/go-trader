@@ -966,7 +966,7 @@ func notifyHedgeCritical(notifier *MultiNotifier, sc StrategyConfig, msg string)
 	if notifier == nil {
 		return
 	}
-	notifier.SendToAllChannels(msg)
+	notifier.SendToTradeAlertChannels(msg)
 }
 
 func hedgeCoinsForStrategies(strategies []StrategyConfig) []string {

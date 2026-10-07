@@ -1200,21 +1200,64 @@ func tradeCloseKind(details string) string {
 	return "full"
 }
 
+func tradeAlertClosePnL(t Trade) (float64, bool, bool) {
+	if !t.IsClose && !isTradeCloseDetails(t.Details) {
+		return 0, false, false
+	}
+	if t.PnLGross || t.RealizedPnL != 0 || t.ExchangeFee != 0 {
+		return tradeLedgerDelta(t), true, true
+	}
+	raw, ok := extractPnL(t.Details)
+	if !ok {
+		return 0, false, false
+	}
+	var pnl float64
+	if _, err := fmt.Sscanf(raw, "%f", &pnl); err != nil {
+		return 0, false, false
+	}
+	return pnl, true, false
+}
+
+func tradeAlertOutcomeIcon(pnl float64, known bool) string {
+	if !known {
+		return "🟡"
+	}
+	if pnl > 1e-9 {
+		return "🟢"
+	}
+	if pnl < -1e-9 {
+		return "🔴"
+	}
+	return "🟡"
+}
+
+func tradeAlertPnLLabel(pnl float64) string {
+	if pnl > 1e-9 {
+		return "PROFIT"
+	}
+	if pnl < -1e-9 {
+		return "LOSS"
+	}
+	return "BREAKEVEN"
+}
+
 func FormatTradeDM(sc StrategyConfig, trade Trade, mode string, rc *RegimeConfig) string {
 	isClose := isTradeCloseDetails(trade.Details)
+	closePnL, closePnLKnown, _ := tradeAlertClosePnL(trade)
 
 	icon := "🟢"
 	header := "TRADE EXECUTED"
 	if isClose {
+		closeIcon := tradeAlertOutcomeIcon(closePnL, closePnLKnown)
 		switch tradeCloseKind(trade.Details) {
 		case "partial":
-			icon = "🟡"
+			icon = closeIcon
 			header = "TRADE PARTIAL"
 		case "stop":
-			icon = "🟠"
+			icon = closeIcon
 			header = "TRADE STOPPED"
 		default:
-			icon = "🔴"
+			icon = closeIcon
 			header = "TRADE CLOSED"
 		}
 	}
@@ -1247,8 +1290,15 @@ func tradeAlertExtras(sc StrategyConfig, trade Trade, isClose bool, rc *RegimeCo
 		if src := tradeAlertCloseSource(trade.Details); src != "" {
 			extras = append(extras, "Source: "+src)
 		}
-		if pnl, ok := extractPnL(trade.Details); ok {
-			extras = append(extras, fmt.Sprintf("PnL: $%s", pnl))
+		if pnl, ok, netOfFees := tradeAlertClosePnL(trade); ok {
+			label := tradeAlertPnLLabel(pnl)
+			if netOfFees {
+				extras = append(extras, fmt.Sprintf("Close fill result: %s (%+.2f USDT net of fees)", label, pnl))
+			} else {
+				extras = append(extras, fmt.Sprintf("Reported close result: %s (%+.2f USDT; fee basis unconfirmed)", label, pnl))
+			}
+		} else {
+			extras = append(extras, "Close fill result: PnL unavailable")
 		}
 	}
 	if trade.Regime != "" {

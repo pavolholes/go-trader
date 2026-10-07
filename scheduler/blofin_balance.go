@@ -52,7 +52,7 @@ func blofinRiskTransitionNotices(sr *scopeCycleRisk) []string {
 		notices = append(notices, fmt.Sprintf("**BLOFIN EQUITY FEED RESTORED**\nTrusted %s snapshot received: $%.2f. New/increasing exposure may resume if the account is below its risk thresholds.", sr.RiskEquitySource, sr.TotalPV))
 	}
 	if sr.KillSwitchActivated && sr.Prs != nil {
-		notices = append(notices, fmt.Sprintf("**BLOFIN PORTFOLIO ENTRY HALT**\nSource: %s\nEquity drawdown: %.1f%% ($%.2f / peak $%.2f). New/increasing exposure is blocked; no existing position is automatically closed. Bot-managed exits, partial closes, and stop management continue. Auto-rearm requires 3 consecutive trusted readings below %.1f%%.",
+		notices = append(notices, fmt.Sprintf("⚠️ **BLOFIN PORTFOLIO ENTRY HALT**\nSource: %s\nEquity drawdown: %.1f%% ($%.2f / peak $%.2f). New/increasing exposure is blocked; no existing position is automatically closed. Bot-managed exits, partial closes, and stop management continue. Auto-rearm requires 3 consecutive trusted readings below %.1f%%.",
 			sr.RiskEquitySource, sr.Prs.CurrentDrawdownPct, sr.TotalPV, sr.Prs.PeakValue, portfolioRearmThresholdPct(sr.Config)))
 	}
 	if sr.KillSwitchRearmed && sr.Prs != nil {
