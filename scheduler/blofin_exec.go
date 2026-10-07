@@ -322,6 +322,6 @@ func notifyBloFinOrderFillPending(notifier *MultiNotifier, sc StrategyConfig, si
 		}
 		refs += "client=" + clientOrderID
 	}
-	content := fmt.Sprintf("⏳ **BLOFIN FILL CONFIRMATION PENDING** [%s] %s %s (%s)\nNo exchange fill has been confirmed, so no trade was written. Check this reference in BloFin history before retrying; this alert does not mean the order was rejected.", sc.ID, signal, symbol, refs)
-	notifier.SendToTradeAlertChannels(content)
+	content := fmt.Sprintf("⏳ **BLOFIN ORDER AWAITING FILL** [%s] %s %s (%s)\nBloFin has not confirmed a fill; Go-Trader has not recorded a trade. This is not a rejection—the order may still be pending. Check the OID/client ID in BloFin history before retrying to avoid a duplicate; confirmed fills will be reconciled automatically.", sc.ID, signal, symbol, refs)
+	notifier.SendToAllChannels(content)
 }

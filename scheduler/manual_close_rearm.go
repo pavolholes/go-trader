@@ -333,7 +333,7 @@ func notifyCloseRearm(notifier *MultiNotifier, msg string) {
 	if notifier == nil || !notifier.HasBackends() {
 		return
 	}
-	notifier.SendToAllChannels(msg)
+	notifier.SendToTradeAlertChannels(msg)
 }
 
 func hlPositionGoneForSide(onChainAbsQty map[string]float64, netSideByCoin map[string]string, symbol, side string) (bool, string) {

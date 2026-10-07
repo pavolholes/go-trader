@@ -122,6 +122,7 @@ func formatOperatorRequiredWarningMessage(entries []OperatorRequiredEntry) strin
 type operatorRequiredNotifier interface {
 	HasBackends() bool
 	SendToAllChannels(content string)
+	SendToTradeAlertChannels(content string)
 	SendOwnerDM(content string)
 }
 
@@ -140,6 +141,6 @@ func drainOperatorRequiredPendingCloses(state *AppState, notifier operatorRequir
 		fmt.Println(line)
 	}
 	if notifier != nil && notifier.HasBackends() && plan.Message != "" {
-		notifier.SendToAllChannels(plan.Message)
+		notifier.SendToTradeAlertChannels(plan.Message)
 	}
 }

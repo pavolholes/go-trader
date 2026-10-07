@@ -222,12 +222,20 @@ func (t *TelegramNotifier) Close() {
 
 func FormatTradeDMPlain(sc StrategyConfig, trade Trade, mode string, rc *RegimeConfig) string {
 	isClose := isTradeCloseDetails(trade.Details)
+	closePnL, closePnLKnown, _ := tradeAlertClosePnL(trade)
 
 	icon := "🟢"
 	header := "TRADE EXECUTED"
 	if isClose {
-		icon = "🔴"
-		header = "TRADE CLOSED"
+		icon = tradeAlertOutcomeIcon(closePnL, closePnLKnown)
+		switch tradeCloseKind(trade.Details) {
+		case "partial":
+			header = "TRADE PARTIAL"
+		case "stop":
+			header = "TRADE STOPPED"
+		default:
+			header = "TRADE CLOSED"
+		}
 	}
 
 	platformLabel := sc.Platform
